@@ -89,6 +89,11 @@ class SizeHint(StrEnum):
         """Decimal-safe string, converted by the money layer. Never a float."""
         return _SIZE_HINT_FRACTION[self]
 
+    @property
+    def rank(self) -> int:
+        """Ordering, so a panel can be reduced to its *most conservative* size hint."""
+        return _SIZE_HINT_RANK[self]
+
 
 _SIZE_HINT_FRACTION: dict[SizeHint, str] = {
     SizeHint.NONE: "0",
@@ -96,6 +101,31 @@ _SIZE_HINT_FRACTION: dict[SizeHint, str] = {
     SizeHint.HALF: "0.5",
     SizeHint.FULL: "1",
 }
+_SIZE_HINT_RANK: dict[SizeHint, int] = {
+    SizeHint.NONE: 0,
+    SizeHint.QUARTER: 1,
+    SizeHint.HALF: 2,
+    SizeHint.FULL: 3,
+}
+
+
+class DecisionMode(StrEnum):
+    """How a basket's panel is run (DESIGN §4)."""
+
+    PER_ASSET = "per_asset"
+    BASKET = "basket"
+
+
+class BasketStatus(StrEnum):
+    """`HALTED` is deliberately not self-clearing — it requires a human in the GUI."""
+
+    ACTIVE = "active"
+    PAUSED = "paused"
+    HALTED = "halted"
+
+    @property
+    def may_trade(self) -> bool:
+        return self is BasketStatus.ACTIVE
 
 
 class OrderType(StrEnum):

@@ -80,6 +80,10 @@ class ManualClock:
         self._now += timedelta(seconds=seconds)
         self._monotonic += seconds
 
+    def set(self, moment: datetime) -> None:
+        """Jump to an absolute instant, for replaying a specific point in history."""
+        self._now = ensure_utc(moment)
+
     async def sleep(self, seconds: float) -> None:
         self.advance(seconds)
         await asyncio.sleep(0)

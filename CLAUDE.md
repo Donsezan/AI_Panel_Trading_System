@@ -14,6 +14,17 @@ Both are authoritative — this file only records conventions.
 .venv\Scripts\python.exe -m tradebot run --mode sim --once
 ```
 
+Schema changes go through Alembic — never `create_all`. After editing
+[persistence/schema.py](tradebot/persistence/schema.py):
+
+```powershell
+.venv\Scripts\python.exe -m alembic revision --autogenerate -m "what changed"
+```
+
+Review the generated file: autogenerate does not see data migrations, and it renders custom
+column types fully qualified (the template imports `tradebot.persistence.schema` for that).
+`create_database` upgrades to head on every start, including for a fresh database.
+
 Dependencies are hash-pinned. After editing `pyproject.toml`:
 
 ```powershell

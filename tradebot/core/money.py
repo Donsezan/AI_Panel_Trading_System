@@ -113,7 +113,10 @@ def round_to_step(value: Decimal, step: Decimal, rounding: str) -> Decimal:
     if step <= ZERO:
         raise MoneyError(f"step must be positive, got {step}")
     steps = MONEY_CONTEXT.divide(value, step).to_integral_value(rounding=rounding)
-    return MONEY_CONTEXT.multiply(steps, step)
+    # Re-quantize to the step's own exponent. Decimal multiplication leaves the exponent free
+    # (100 × 0.01 can render as `1E+0`), and the string form is what reaches the database and
+    # the venue — a canonical scale keeps both stable.
+    return MONEY_CONTEXT.quantize(MONEY_CONTEXT.multiply(steps, step), step)
 
 
 def quantize_quantity(qty: Decimal, lot_size: Decimal) -> Decimal:
