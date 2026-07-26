@@ -16,10 +16,10 @@ from collections.abc import Sequence
 from decimal import Decimal
 
 from tradebot.core.clock import Clock
-from tradebot.core.enums import Mode, OrderType, RiskDecision
+from tradebot.core.enums import Mode, OrderType, RiskDecision, Side
 from tradebot.core.ids import client_order_id
-from tradebot.core.money import ZERO, QuantizedOrder, percent_of, quantize_order
-from tradebot.core.orders import OrderIntent, RiskCheckResult
+from tradebot.core.money import ZERO, QuantizedOrder, multiply, percent_of, quantize_order
+from tradebot.core.orders import OrderIntent, ProtectivePlan, RiskCheckResult
 from tradebot.core.schema import DomainModel
 from tradebot.interfaces.risk import RiskProposal, RiskRule
 from tradebot.risk.rules import DEFAULT_TIER1_RULES
@@ -40,8 +40,12 @@ class RiskOutcome(DomainModel):
         return self.intent is not None
 
     @property
+    def blocking_check(self) -> RiskCheckResult | None:
+        return next((check for check in self.checks if check.blocked), None)
+
+    @property
     def veto_reason(self) -> str:
-        blocked = next((check for check in self.checks if check.blocked), None)
+        blocked = self.blocking_check
         return f"{blocked.rule}: {blocked.detail}" if blocked else ""
 
 
@@ -60,6 +64,7 @@ class Tier1RiskEngine:
         basket_id: str,
         cycle_id: str,
         seq: int = 0,
+        ttl_seconds: int | None = None,
     ) -> RiskOutcome:
         instrument = proposal.instrument
         qty, sizing_check = base_quantity(proposal)
@@ -74,9 +79,8 @@ class Tier1RiskEngine:
                 return RiskOutcome(instrument_key=instrument.key, checks=tuple(checks))
             qty = min(qty, result.max_qty) if result.max_qty is not None else qty
 
-        quantized = quantize_order(
-            qty, proposal.price, proposal.decision.action.side, instrument.trading_rules
-        )
+        side = proposal.decision.action.side
+        quantized = quantize_order(qty, proposal.price, side, instrument.trading_rules)
         checks.append(_quantization_check(quantized, qty))
         if not quantized.approved:
             return RiskOutcome(instrument_key=instrument.key, checks=tuple(checks))
@@ -92,14 +96,38 @@ class Tier1RiskEngine:
             basket_id=basket_id,
             cycle_id=cycle_id,
             instrument_key=instrument.key,
-            side=proposal.decision.action.side,
+            side=side,
             qty=quantized.qty,
             order_type=OrderType.LIMIT,
             limit_price=quantized.price,
+            protective=protective_plan(proposal, quantized.price),
+            ttl_seconds=ttl_seconds,
             risk_checks=tuple(checks),
             created_at=self._clock.now(),
         )
         return RiskOutcome(instrument_key=instrument.key, intent=intent, checks=tuple(checks))
+
+
+def protective_plan(proposal: RiskProposal, entry_price: Decimal) -> ProtectivePlan | None:
+    """Where this entry's stop and target sit, in the same ATR units that sized it.
+
+    Returned only for an opening trade on a venue that can hold the legs. A reducing SELL needs
+    no protection — it *is* the exit — and an unprotected venue has already been charged the
+    sizing haircut instead (DESIGN §6.6, §6.7).
+    """
+    if proposal.decision.action.side is not Side.BUY or proposal.unprotected:
+        return None
+    if proposal.atr <= ZERO:
+        return None
+    policy = proposal.policy
+    stop = entry_price - multiply(policy.stop_loss_atr_multiple, proposal.atr)
+    if stop <= ZERO:
+        return None
+    return ProtectivePlan(
+        stop_price=stop,
+        take_profit_price=entry_price + multiply(policy.take_profit_atr_multiple, proposal.atr),
+        limit_offset_pct=policy.protective_limit_offset_pct,
+    )
 
 
 def _quantization_check(quantized: QuantizedOrder, requested: Decimal) -> RiskCheckResult:

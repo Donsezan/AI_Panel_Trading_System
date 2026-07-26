@@ -14,7 +14,7 @@ import pytest
 from tradebot.core.clock import ManualClock
 from tradebot.core.enums import OrderState, OrderType, Side
 from tradebot.core.errors import FailClosedError, SubmitUnknownError
-from tradebot.core.events import EventFactory, EventType
+from tradebot.core.events import EventType
 from tradebot.core.instrument import Instrument
 from tradebot.core.orders import Fill, OrderIntent
 from tradebot.core.portfolio import AccountState
@@ -79,6 +79,7 @@ class ScriptedBroker:
             filled_qty=Decimal(0),
             observed_at=NOW,
             reject_reason="not found at venue",
+            found=False,
         )
 
     async def fetch_open_orders(self) -> tuple[OrderStatus, ...]:
@@ -132,11 +133,6 @@ def make_fill(qty: str = "0.5") -> Fill:
     )
 
 
-@pytest.fixture
-def events(clock: ManualClock) -> EventFactory:
-    return EventFactory(clock=clock, basket_id="b1", cycle_id="c1")
-
-
 def service(
     broker: ScriptedBroker, store: EventStore, ledger: Ledger, clock: ManualClock
 ) -> ExecutionService:
@@ -149,7 +145,6 @@ class TestDurability:
         store: EventStore,
         ledger: Ledger,
         clock: ManualClock,
-        events: EventFactory,
         instrument: Instrument,
     ) -> None:
         """A crash mid-submit must leave a recoverable trace, never an orphan order."""
@@ -165,7 +160,7 @@ class TestDurability:
                 return await super().submit(intent)
 
         broker = ObservingBroker(store)
-        await service(broker, store, ledger, clock).execute(make_intent(), instrument, events)
+        await service(broker, store, ledger, clock).submit(make_intent(), instrument)
         assert EventType.ORDER_SUBMITTED in broker.log_at_submit
 
 
@@ -175,13 +170,10 @@ class TestOutcomes:
         store: EventStore,
         ledger: Ledger,
         clock: ManualClock,
-        events: EventFactory,
         instrument: Instrument,
     ) -> None:
         broker = ScriptedBroker(status=status_with(OrderState.FILLED, (make_fill(),), "0.5"))
-        order = await service(broker, store, ledger, clock).execute(
-            make_intent(), instrument, events
-        )
+        order = await service(broker, store, ledger, clock).submit(make_intent(), instrument)
         assert order.state is OrderState.FILLED
         assert ledger.position(KEY).qty == Decimal("0.5")
 
@@ -190,13 +182,10 @@ class TestOutcomes:
         store: EventStore,
         ledger: Ledger,
         clock: ManualClock,
-        events: EventFactory,
         instrument: Instrument,
     ) -> None:
         broker = ScriptedBroker(status=status_with(OrderState.OPEN))
-        order = await service(broker, store, ledger, clock).execute(
-            make_intent(), instrument, events
-        )
+        order = await service(broker, store, ledger, clock).submit(make_intent(), instrument)
         assert order.state is OrderState.OPEN
         assert ledger.position(KEY).is_flat
 
@@ -205,13 +194,10 @@ class TestOutcomes:
         store: EventStore,
         ledger: Ledger,
         clock: ManualClock,
-        events: EventFactory,
         instrument: Instrument,
     ) -> None:
         broker = ScriptedBroker(ack_state=OrderState.REJECTED)
-        order = await service(broker, store, ledger, clock).execute(
-            make_intent(), instrument, events
-        )
+        order = await service(broker, store, ledger, clock).submit(make_intent(), instrument)
         assert order.state is OrderState.REJECTED
         assert ledger.position(KEY).is_flat
 
@@ -220,15 +206,12 @@ class TestOutcomes:
         store: EventStore,
         ledger: Ledger,
         clock: ManualClock,
-        events: EventFactory,
         instrument: Instrument,
     ) -> None:
         broker = ScriptedBroker(
             status=status_with(OrderState.PARTIALLY_FILLED, (make_fill("0.2"),), "0.2")
         )
-        order = await service(broker, store, ledger, clock).execute(
-            make_intent(), instrument, events
-        )
+        order = await service(broker, store, ledger, clock).submit(make_intent(), instrument)
         assert order.state is OrderState.PARTIALLY_FILLED
         assert order.remaining_qty == Decimal("0.3")
         assert ledger.position(KEY).qty == Decimal("0.2")
@@ -240,7 +223,6 @@ class TestSubmitUnknown:
         store: EventStore,
         ledger: Ledger,
         clock: ManualClock,
-        events: EventFactory,
         instrument: Instrument,
     ) -> None:
         """The only legal resolution: ask the venue by our own id (PLAN §2.3)."""
@@ -248,9 +230,7 @@ class TestSubmitUnknown:
             raise_submit_unknown=True,
             status=status_with(OrderState.FILLED, (make_fill(),), "0.5"),
         )
-        order = await service(broker, store, ledger, clock).execute(
-            make_intent(), instrument, events
-        )
+        order = await service(broker, store, ledger, clock).submit(make_intent(), instrument)
         assert order.state is OrderState.FILLED
         assert broker.submits == 1, "there is no code path that resubmits"
 
@@ -259,13 +239,10 @@ class TestSubmitUnknown:
         store: EventStore,
         ledger: Ledger,
         clock: ManualClock,
-        events: EventFactory,
         instrument: Instrument,
     ) -> None:
         broker = ScriptedBroker(raise_submit_unknown=True, status=status_with(OrderState.OPEN))
-        order = await service(broker, store, ledger, clock).execute(
-            make_intent(), instrument, events
-        )
+        order = await service(broker, store, ledger, clock).submit(make_intent(), instrument)
         assert order.state is OrderState.OPEN
 
     async def test_a_vanished_order_halts_the_basket_for_human_review(
@@ -273,18 +250,17 @@ class TestSubmitUnknown:
         store: EventStore,
         ledger: Ledger,
         clock: ManualClock,
-        events: EventFactory,
         instrument: Instrument,
     ) -> None:
         """An order that vanished after an ambiguous submit is never routine (REVIEW B4)."""
         broker = ScriptedBroker(raise_submit_unknown=True)  # venue has no record
         with pytest.raises(FailClosedError, match="halted for human review"):
-            await service(broker, store, ledger, clock).execute(make_intent(), instrument, events)
+            await service(broker, store, ledger, clock).submit(make_intent(), instrument)
 
         types = tuple(event.type for event in store.read_all())
         assert EventType.RISK_EVENT in types
         risk_event = next(e for e in store.read_all() if e.type is EventType.RISK_EVENT)
-        assert risk_event.payload["rule"] == "submit_unknown_unresolved"
+        assert risk_event.payload["rule"] == "order_vanished"
         assert risk_event.payload["action_taken"] == "basket_halted"
 
     async def test_the_submit_unknown_state_is_recorded_before_resolution(
@@ -292,14 +268,46 @@ class TestSubmitUnknown:
         store: EventStore,
         ledger: Ledger,
         clock: ManualClock,
-        events: EventFactory,
         instrument: Instrument,
     ) -> None:
         broker = ScriptedBroker(raise_submit_unknown=True, status=status_with(OrderState.OPEN))
-        await service(broker, store, ledger, clock).execute(make_intent(), instrument, events)
+        await service(broker, store, ledger, clock).submit(make_intent(), instrument)
         states = [
             event.payload["state"]
             for event in store.read_all()
             if event.type is EventType.ORDER_STATE_CHANGED
         ]
         assert states[0] == OrderState.SUBMIT_UNKNOWN.value
+
+
+class TestVenueQuirks:
+    async def test_a_state_we_have_already_passed_is_logged_not_forced(
+        self,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+    ) -> None:
+        """Venues report `OPEN` for an order we have booked a partial fill on. That is a quirk,
+        not an error, and forcing the transition would raise on a perfectly normal response."""
+        broker = ScriptedBroker(status=status_with(OrderState.OPEN, (make_fill("0.2"),), "0.2"))
+
+        order = await service(broker, store, ledger, clock).submit(make_intent(), instrument)
+
+        assert order.state is OrderState.PARTIALLY_FILLED
+        assert ledger.position(KEY).qty == Decimal("0.2")
+
+    async def test_cancelling_an_already_terminal_order_is_a_no_op(
+        self,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+    ) -> None:
+        broker = ScriptedBroker(status=status_with(OrderState.FILLED, (make_fill(),), "0.5"))
+        execution = service(broker, store, ledger, clock)
+        order = await execution.submit(make_intent(), instrument)
+
+        unchanged = await execution.cancel(order, reason="ttl", state=OrderState.EXPIRED)
+
+        assert unchanged.state is OrderState.FILLED

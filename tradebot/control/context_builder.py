@@ -10,7 +10,7 @@ and places no order. That is the intended behaviour, not a degradation.
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from tradebot.core.clock import Clock
 from tradebot.core.config import Basket
@@ -27,6 +27,7 @@ from tradebot.core.snapshot import (
 )
 from tradebot.indicators.library import compute_readings
 from tradebot.interfaces.market_data import MarketDataProvider
+from tradebot.ledger.history import HistoryReader
 from tradebot.ledger.portfolio import Ledger
 
 DEFAULT_TIMEFRAMES = ("1h", "4h", "1d")
@@ -59,6 +60,7 @@ class ContextBuilder:
         history: int = 200,
         staleness_tolerance: timedelta = timedelta(minutes=15),
         protective_orders_supported: bool = False,
+        trading_history: HistoryReader | None = None,
     ) -> None:
         self._market_data = market_data
         self._ledger = ledger
@@ -68,12 +70,15 @@ class ContextBuilder:
         self._history = history
         self._tolerance = staleness_tolerance
         self._protective = protective_orders_supported
+        self._trading_history = trading_history
 
     async def build(
         self, basket: Basket, *, news: tuple[NewsItemView, ...] = ()
     ) -> ContextSnapshot:
         as_of = self._clock.now()
-        contexts = tuple([await self._build_instrument(i) for i in basket.instruments])
+        contexts = tuple(
+            [await self._build_instrument(i, basket.basket_id) for i in basket.instruments]
+        )
         return ContextSnapshot(
             snapshot_id=new_uuid(),
             basket_id=basket.basket_id,
@@ -93,7 +98,7 @@ class ContextBuilder:
         series.require_fresh(self._clock.now(), timeframe_interval(timeframe) + self._tolerance)
         return series
 
-    async def _build_instrument(self, instrument: Instrument) -> InstrumentContext:
+    async def _build_instrument(self, instrument: Instrument, basket_id: str) -> InstrumentContext:
         summaries: list[tuple[str, str]] = []
         readings: list[IndicatorReading] = []
         for timeframe in self._timeframes:
@@ -113,7 +118,12 @@ class ContextBuilder:
             else PositionView(
                 qty=position.qty,
                 unrealized_pnl_pct=position.unrealized_pnl_pct(quote.last),
-                held_cycles=position.held_cycles,
+                held_cycles=self._held_cycles(basket_id, position.opened_at),
             ),
             unprotected_position=not self._protective,
         )
+
+    def _held_cycles(self, basket_id: str, opened_at: datetime | None) -> int:
+        if self._trading_history is None:
+            return 0
+        return self._trading_history.held_cycles(basket_id, opened_at)

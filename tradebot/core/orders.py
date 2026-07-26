@@ -2,15 +2,22 @@
 
 Positions and balances update from **fills only**, never from an order reaching a terminal
 state. Partial fills are the normal case, not an edge case (PLAN §2.5).
+
+An entry and its protective legs form a **group** keyed by the entry's `client_order_id`: one
+leg filling cancels the sibling, and a partial entry fill resizes the legs down to what is
+actually held (DESIGN §6.7). The group id is derived rather than generated, so it survives a
+crash without needing to have been stored separately.
 """
 
 from __future__ import annotations
 
+from datetime import timedelta
 from decimal import Decimal
+from typing import Any
 
 from pydantic import model_validator
 
-from tradebot.core.enums import OrderState, OrderType, RiskDecision, Side
+from tradebot.core.enums import OrderRole, OrderState, OrderType, RiskDecision, Side
 from tradebot.core.errors import IllegalTransitionError
 from tradebot.core.money import ZERO, divide, multiply
 from tradebot.core.schema import DomainModel, Money, UtcDatetime
@@ -90,6 +97,30 @@ class RiskCheckResult(DomainModel):
         return self.decision is RiskDecision.VETO
 
 
+class ProtectivePlan(DomainModel):
+    """Where the exits sit for an entry, decided by Tier-1 risk and placed by execution.
+
+    Risk owns these prices because `risk_amount` in the sizing formula is only a truthful
+    "amount at risk" if a stop actually sits at `stop_multiple × ATR` (DESIGN §6.6). Execution
+    owns *placing* them. Carrying the plan on the order is what lets recovery rebuild a leg
+    after a crash without recomputing ATR from data that has since moved.
+    """
+
+    stop_price: Money
+    take_profit_price: Money | None = None
+    #: How far through the trigger the leg's limit sits, so a triggered stop can actually fill
+    #: instead of resting untouched while the market runs away from it.
+    limit_offset_pct: Money = Decimal("0.5")
+
+    @model_validator(mode="after")
+    def _check_prices(self) -> ProtectivePlan:
+        if self.stop_price <= ZERO:
+            raise ValueError(f"stop price must be positive, got {self.stop_price}")
+        if self.limit_offset_pct < ZERO:
+            raise ValueError("limit_offset_pct must not be negative")
+        return self
+
+
 class OrderIntent(DomainModel):
     """A risk-approved, sized, ready-to-submit instruction.
 
@@ -105,6 +136,15 @@ class OrderIntent(DomainModel):
     qty: Money
     order_type: OrderType = OrderType.LIMIT
     limit_price: Money | None = None
+    #: Trigger price for a protective leg. The leg becomes a limit order once the venue's last
+    #: trade crosses it.
+    stop_price: Money | None = None
+    role: OrderRole = OrderRole.ENTRY
+    #: The entry's `client_order_id`. An entry is its own group, so this is never empty.
+    group_id: str = ""
+    #: Where this entry's protective legs will sit. `None` means the position is unguarded
+    #: between cycles, which Tier-1 has already priced in as a sizing haircut.
+    protective: ProtectivePlan | None = None
     ttl_seconds: int | None = None
     risk_checks: tuple[RiskCheckResult, ...] = ()
     created_at: UtcDatetime
@@ -113,15 +153,32 @@ class OrderIntent(DomainModel):
     def _check_submittable(self) -> OrderIntent:
         if self.qty <= ZERO:
             raise ValueError(f"intent quantity must be positive, got {self.qty}")
-        if self.order_type is OrderType.LIMIT and self.limit_price is None:
-            raise ValueError("limit order requires a limit_price")
+        if self.order_type is not OrderType.MARKET and self.limit_price is None:
+            raise ValueError(f"{self.order_type} requires a limit_price")
+        if self.order_type.needs_stop_price and self.stop_price is None:
+            raise ValueError(f"{self.order_type} requires a stop_price")
         if any(check.blocked for check in self.risk_checks):
             raise ValueError("a vetoed proposal must never become an OrderIntent")
         return self
 
+    @model_validator(mode="before")
+    @classmethod
+    def _default_group(cls, data: Any) -> Any:
+        """An entry is its own group. Applied *before* validation: an `after` validator that
+        returns a copy is silently discarded when the model is built by `__init__`."""
+        if isinstance(data, dict) and not data.get("group_id"):
+            return {**data, "group_id": data.get("client_order_id", "")}
+        return data
+
     @property
     def notional(self) -> Money:
         return multiply(self.qty, self.limit_price) if self.limit_price else ZERO
+
+    def expires_at(self) -> UtcDatetime | None:
+        """When the bot cancels the remainder. TTL is bot-enforced — Binance spot has no GTT."""
+        if self.ttl_seconds is None:
+            return None
+        return self.created_at + timedelta(seconds=self.ttl_seconds)
 
 
 class Fill(DomainModel):
@@ -163,6 +220,11 @@ class Order(DomainModel):
     qty: Money
     order_type: OrderType
     limit_price: Money | None = None
+    stop_price: Money | None = None
+    role: OrderRole = OrderRole.ENTRY
+    group_id: str = ""
+    protective: ProtectivePlan | None = None
+    expires_at: UtcDatetime | None = None
     state: OrderState = OrderState.PENDING_SUBMIT
     venue_order_id: str | None = None
     fills: tuple[Fill, ...] = ()
@@ -180,9 +242,27 @@ class Order(DomainModel):
             qty=intent.qty,
             order_type=intent.order_type,
             limit_price=intent.limit_price,
+            stop_price=intent.stop_price,
+            role=intent.role,
+            group_id=intent.group_id,
+            protective=intent.protective,
+            expires_at=intent.expires_at(),
             created_at=intent.created_at,
             updated_at=intent.created_at,
         )
+
+    def is_expired(self, now: UtcDatetime) -> bool:
+        """True once the bot-enforced TTL has passed and the order is still working."""
+        return self.expires_at is not None and now >= self.expires_at and self.state.is_open
+
+    def new_fills(self, observed: tuple[Fill, ...]) -> tuple[Fill, ...]:
+        """Fills the venue reports that we have not booked yet.
+
+        The monitor re-reads the same order every poll, so booking is idempotent by fill id.
+        Without this a position would grow by the whole order on every poll.
+        """
+        known = {fill.fill_id for fill in self.fills}
+        return tuple(fill for fill in observed if fill.fill_id not in known)
 
     @property
     def filled_qty(self) -> Money:
@@ -225,7 +305,8 @@ class Order(DomainModel):
                 f"fills {total} exceed order quantity {self.qty} on {self.client_order_id}"
             )
         target = OrderState.FILLED if total == self.qty else OrderState.PARTIALLY_FILLED
-        assert_legal_transition(self.state, target)
+        if target is not self.state:
+            assert_legal_transition(self.state, target)
         return self.model_copy(
             update={"fills": fills, "state": target, "updated_at": fill.filled_at}
         )

@@ -134,6 +134,40 @@ class OrderType(StrEnum):
     STOP_LOSS_LIMIT = "stop_loss_limit"
     TAKE_PROFIT_LIMIT = "take_profit_limit"
 
+    @property
+    def needs_stop_price(self) -> bool:
+        return self in _TRIGGERED_ORDER_TYPES
+
+
+_TRIGGERED_ORDER_TYPES = frozenset({OrderType.STOP_LOSS_LIMIT, OrderType.TAKE_PROFIT_LIMIT})
+
+
+class OrderRole(StrEnum):
+    """An order's job within its protective group (DESIGN §6.7).
+
+    A cycle-based system cannot babysit stops itself: between cycles the *venue* holds them.
+    Entry and its protective legs are one group — one leg fills, the sibling is cancelled.
+    """
+
+    ENTRY = "entry"
+    STOP_LOSS = "stop_loss"
+    TAKE_PROFIT = "take_profit"
+
+    @property
+    def is_protective(self) -> bool:
+        return self is not OrderRole.ENTRY
+
+    @property
+    def order_type(self) -> OrderType:
+        return _ROLE_ORDER_TYPE[self]
+
+
+_ROLE_ORDER_TYPE: dict[OrderRole, OrderType] = {
+    OrderRole.ENTRY: OrderType.LIMIT,
+    OrderRole.STOP_LOSS: OrderType.STOP_LOSS_LIMIT,
+    OrderRole.TAKE_PROFIT: OrderType.TAKE_PROFIT_LIMIT,
+}
+
 
 class OrderState(StrEnum):
     """Order lifecycle (DESIGN §6.7).
@@ -184,6 +218,52 @@ class RiskDecision(StrEnum):
     VETO = "veto"
 
 
+class RiskTier(StrEnum):
+    """Which layer produced a risk event. Tier 2 outranks Tier 1 and can halt everything."""
+
+    TIER1 = "tier1"
+    TIER2 = "tier2"
+    EXECUTION = "execution"
+    RECONCILIATION = "reconciliation"
+
+
+class ReconcileClass(StrEnum):
+    """How the reconciler explains a difference between the ledger and the venue (DESIGN §6.8).
+
+    The classification *is* the response: only `MISMATCH` is unexplained, and only unexplained
+    differences halt. Misclassifying a corporate action or a testnet wipe as drift would halt
+    for a routine event; misclassifying a real discrepancy as drift would trade on a fiction.
+    """
+
+    MATCH = "match"
+    DRIFT = "drift"
+    EXTERNAL_CHANGE = "external_change"
+    CORPORATE_ACTION = "corporate_action"
+    VENUE_RESET = "venue_reset"
+    MISMATCH = "mismatch"
+
+    @property
+    def is_clean(self) -> bool:
+        """True when the ledger may keep trading after auto-correction."""
+        return self in _CLEAN_RECONCILE_CLASSES
+
+
+_CLEAN_RECONCILE_CLASSES = frozenset(
+    {ReconcileClass.MATCH, ReconcileClass.DRIFT, ReconcileClass.EXTERNAL_CHANGE}
+)
+
+
+class KillSwitchState(StrEnum):
+    """The one big red button. Re-arming is a human act with a typed phrase (DESIGN §6.6)."""
+
+    ARMED = "armed"
+    TRIPPED = "tripped"
+
+    @property
+    def may_trade(self) -> bool:
+        return self is KillSwitchState.ARMED
+
+
 class CycleOutcome(StrEnum):
     """Terminal outcome of one decision cycle, recorded for research and ops."""
 
@@ -192,4 +272,7 @@ class CycleOutcome(StrEnum):
     RISK_VETOED = "risk_vetoed"
     DATA_STALE = "data_stale"
     PANEL_DEGRADED = "panel_degraded"
+    #: Trading was blocked before the panel ran — kill switch tripped or basket halted. The
+    #: cycle is recorded rather than skipped, so a halt is visible in the log as a decision.
+    BLOCKED = "blocked"
     FAILED = "failed"

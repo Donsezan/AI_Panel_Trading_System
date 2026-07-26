@@ -11,6 +11,9 @@ querying the venue by our own id, or failing the order and halting the basket fo
 **There is no code path in this module that resubmits** — that is the defence against the
 duplicate-order-after-retry failure that dominates practitioner incident reports (PLAN §2.3).
 
+Booking is idempotent by fill id, because the `ExecutionMonitor` re-reads the same order every
+poll and a fill counted twice is a position that does not exist.
+
 Failure semantics:
 * venue ambiguity      → `SUBMIT_UNKNOWN` → adopt what the venue has, else halt the basket
 * venue rejects        → recorded as `REJECTED`; a normal outcome, not an exception
@@ -20,12 +23,12 @@ Failure semantics:
 from __future__ import annotations
 
 from tradebot.core.clock import Clock
-from tradebot.core.enums import OrderState
+from tradebot.core.enums import OrderState, RiskTier
 from tradebot.core.errors import FailClosedError, SubmitUnknownError
 from tradebot.core.events import EventFactory
 from tradebot.core.instrument import Instrument
 from tradebot.core.logging import get_logger
-from tradebot.core.orders import Fill, Order, OrderIntent
+from tradebot.core.orders import LEGAL_TRANSITIONS, Fill, Order, OrderIntent
 from tradebot.interfaces.broker import BrokerAdapter, OrderRef, OrderStatus
 from tradebot.ledger.portfolio import Ledger
 from tradebot.persistence.store import EventStore
@@ -34,7 +37,7 @@ logger = get_logger(__name__)
 
 
 class ExecutionService:
-    """Owns an order from intent to booked fills."""
+    """Owns the durable record of an order and the booking of its fills."""
 
     def __init__(
         self,
@@ -48,10 +51,14 @@ class ExecutionService:
         self._ledger = ledger
         self._clock = clock
 
-    async def execute(
-        self, intent: OrderIntent, instrument: Instrument, events: EventFactory
-    ) -> Order:
+    def events_for(self, order: Order) -> EventFactory:
+        """Correlate events with the cycle the order came from, even long after it ended."""
+        return EventFactory(clock=self._clock, basket_id=order.basket_id, cycle_id=order.cycle_id)
+
+    async def submit(self, intent: OrderIntent, instrument: Instrument) -> Order:
+        """Record the intent, submit it, and fold in whatever the venue reports back."""
         order = Order.from_intent(intent)
+        events = self.events_for(order)
 
         # Durable first, network second. Never the other way round.
         await self._store.append(events.order_submitted(order))
@@ -60,14 +67,82 @@ class ExecutionService:
             ack = await self._broker.submit(intent)
         except SubmitUnknownError:
             order = await self._enter_submit_unknown(order, events)
-            status = await self._query(intent, order)
         else:
             order = await self._advance(order, OrderState.SUBMITTED, events)
+            order = order.model_copy(update={"venue_order_id": ack.venue_order_id})
             if ack.state is OrderState.REJECTED:
                 return await self._advance(order, OrderState.REJECTED, events)
-            status = await self._query(intent, order)
 
-        return await self._book(order, status, instrument, events)
+        return await self.sync(order, instrument)
+
+    async def sync(self, order: Order, instrument: Instrument) -> Order:
+        """Re-read the order at the venue and fold its truth into ours."""
+        status = await self._broker.fetch_order(
+            OrderRef(
+                client_order_id=order.client_order_id,
+                instrument_key=order.instrument_key,
+                venue_order_id=order.venue_order_id,
+            )
+        )
+        return await self.apply(order, status, instrument)
+
+    async def apply(self, order: Order, status: OrderStatus, instrument: Instrument) -> Order:
+        """Book any fills we have not seen, then adopt the venue's state."""
+        events = self.events_for(order)
+        if not status.found:
+            return await self._resolve_vanished(order, events)
+
+        for fill in order.new_fills(status.fills):
+            order = await self._book_fill(order, fill, instrument, events)
+
+        return await self._adopt_state(order, status, events)
+
+    async def _adopt_state(self, order: Order, status: OrderStatus, events: EventFactory) -> Order:
+        """Move to the venue's state where the lifecycle allows it.
+
+        Venues legitimately report a state we have already moved past — `OPEN` for an order we
+        have booked a partial fill on, for instance. Consulting the transition table rather than
+        forcing the move keeps that quirk from raising, while a genuinely impossible report is
+        logged instead of silently adopted.
+        """
+        if status.state is order.state:
+            return order
+        if status.state in LEGAL_TRANSITIONS[order.state]:
+            return await self._advance(order, status.state, events)
+        logger.info(
+            "venue reports a state the lifecycle has already passed",
+            extra={
+                "client_order_id": order.client_order_id,
+                "ours": order.state.value,
+                "theirs": status.state.value,
+            },
+        )
+        return order
+
+    async def cancel(self, order: Order, *, reason: str, state: OrderState) -> Order:
+        """Cancel the working remainder and record why. Already-terminal orders are left alone."""
+        if not order.state.is_open:
+            return order
+        events = self.events_for(order)
+        ack = await self._broker.cancel(
+            OrderRef(
+                client_order_id=order.client_order_id,
+                instrument_key=order.instrument_key,
+                venue_order_id=order.venue_order_id,
+            )
+        )
+        logger.info(
+            "cancelled working order",
+            extra={
+                "client_order_id": order.client_order_id,
+                "reason": reason,
+                "cancelled": ack.cancelled,
+                "fill_ratio": str(order.fill_ratio),
+            },
+        )
+        return await self._advance(order, state, events)
+
+    # ------------------------------------------------------------------ internals
 
     async def _enter_submit_unknown(self, order: Order, events: EventFactory) -> Order:
         logger.error(
@@ -76,72 +151,46 @@ class ExecutionService:
         )
         return await self._advance(order, OrderState.SUBMIT_UNKNOWN, events)
 
-    async def _query(self, intent: OrderIntent, order: Order) -> OrderStatus:
-        return await self._broker.fetch_order(
-            OrderRef(
-                client_order_id=intent.client_order_id,
-                instrument_key=intent.instrument_key,
-                venue_order_id=order.venue_order_id,
-            )
-        )
-
     async def _advance(self, order: Order, state: OrderState, events: EventFactory) -> Order:
         previous = order.state
         moved = order.transition_to(state, at=self._clock.now())
         await self._store.append(events.order_state_changed(moved, previous))
         return moved
 
-    async def _book(
-        self, order: Order, status: OrderStatus, instrument: Instrument, events: EventFactory
-    ) -> Order:
-        """Fold the venue's view into ours: fills first, then any remaining state change."""
-        if order.state is OrderState.SUBMIT_UNKNOWN and not status.fills:
-            return await self._resolve_vanished(order, status, events)
-
-        for fill in status.fills:
-            order = await self._book_fill(order, fill, instrument, events)
-
-        if not status.fills and status.state is not order.state:
-            order = await self._advance(order, status.state, events)
-        return order
-
     async def _book_fill(
         self, order: Order, fill: Fill, instrument: Instrument, events: EventFactory
     ) -> Order:
         order = order.with_fill(fill)
-        position = self._ledger.apply_fill(
+        booking = self._ledger.apply_fill(
             fill,
             base_currency=instrument.base_currency,
             quote_currency=instrument.quote_currency,
         )
-        await self._store.append(
-            events.fill_received(fill, order), events.position_updated(position)
-        )
+        records = [events.fill_received(fill, order), events.position_updated(booking.position)]
+        if booking.round_trip is not None:
+            records.append(events.round_trip_closed(booking.round_trip))
+        await self._store.append(*records)
         return order
 
-    async def _resolve_vanished(
-        self, order: Order, status: OrderStatus, events: EventFactory
-    ) -> Order:
-        """The venue has no record of an order we may have sent.
+    async def _resolve_vanished(self, order: Order, events: EventFactory) -> Order:
+        """The venue has no record of an order we believe exists.
 
-        A vanished order is never routine. It is marked failed and the basket halts for human
-        review — the alternative, assuming it never landed and carrying on, is how a duplicate
-        position gets created (PLAN §2.3, REVIEW B4).
+        Never routine, and deliberately distinguished from a *rejection*: a rejection is a
+        definite answer that the order did not execute, while "no record" may mean it was lost,
+        or that we are querying the wrong account. Assuming it never landed and carrying on is
+        how a duplicate position gets created (PLAN §2.3, REVIEW B4).
         """
-        if status.state is not OrderState.REJECTED:
-            return await self._advance(order, status.state, events)
-
         failed = await self._advance(order, OrderState.FAILED, events)
         await self._store.append(
             events.risk_event(
-                tier="execution",
-                rule="submit_unknown_unresolved",
+                tier=RiskTier.EXECUTION,
+                rule="order_vanished",
                 scope=order.client_order_id,
                 action="basket_halted",
-                detail="venue has no record of an order whose submit outcome was unknown",
+                detail="the venue has no record of an order we believe we placed",
             )
         )
         raise FailClosedError(
-            f"order {order.client_order_id} vanished after an ambiguous submit; "
+            f"order {order.client_order_id} has vanished from the venue; "
             f"basket {failed.basket_id} halted for human review"
         )

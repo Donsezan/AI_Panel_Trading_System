@@ -8,8 +8,25 @@ from decimal import Decimal
 import pytest
 from pydantic import ValidationError
 
+from tradebot.core.config import (
+    Basket,
+    CorrelationCluster,
+    GlobalRiskPolicy,
+    PanelConfig,
+    RiskPolicy,
+    SeatConfig,
+)
 from tradebot.core.decision import Decision, SeatResponse, SeatVote
-from tradebot.core.enums import Action, OrderState, OrderType, RiskDecision, Side, SizeHint
+from tradebot.core.enums import (
+    Action,
+    AssetClass,
+    OrderRole,
+    OrderState,
+    OrderType,
+    RiskDecision,
+    Side,
+    SizeHint,
+)
 from tradebot.core.errors import ConfigError, IllegalTransitionError, MoneyError
 from tradebot.core.instrument import Instrument
 from tradebot.core.market import Candle, CandleSeries, Quote
@@ -303,3 +320,134 @@ class TestOrderLifecycle:
 class TestCanonicalJson:
     def test_key_order_does_not_change_the_hash_input(self) -> None:
         assert canonical_json({"b": 1, "a": 2}) == canonical_json({"a": 2, "b": 1})
+
+
+class TestOrderIntentValidation:
+    """The last deterministic gate before anything reaches a venue."""
+
+    def _intent(self, **overrides: object) -> OrderIntent:
+        fields: dict[str, object] = {
+            "client_order_id": "sim-ABCDEF",
+            "basket_id": "b1",
+            "cycle_id": "c1",
+            "instrument_key": "sim:BTC/USDT",
+            "side": Side.BUY,
+            "qty": Decimal("0.5"),
+            "order_type": OrderType.LIMIT,
+            "limit_price": Decimal("50000"),
+            "created_at": NOW,
+        }
+        return OrderIntent(**{**fields, **overrides})  # type: ignore[arg-type]
+
+    def test_a_limit_order_without_a_price_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="requires a limit_price"):
+            self._intent(limit_price=None)
+
+    def test_a_stop_order_without_a_trigger_is_refused(self) -> None:
+        """A triggered order with no trigger would rest forever, guarding nothing."""
+        with pytest.raises(ValueError, match="requires a stop_price"):
+            self._intent(order_type=OrderType.STOP_LOSS_LIMIT, role=OrderRole.STOP_LOSS)
+
+    def test_a_market_order_needs_neither(self) -> None:
+        intent = self._intent(order_type=OrderType.MARKET, limit_price=None)
+
+        assert intent.notional == 0
+
+    def test_an_entry_is_its_own_group(self) -> None:
+        assert self._intent().group_id == "sim-ABCDEF"
+
+    def test_an_explicit_group_is_kept(self) -> None:
+        assert self._intent(group_id="sim-PARENT").group_id == "sim-PARENT"
+
+    def test_a_ttl_becomes_an_absolute_deadline(self) -> None:
+        assert self._intent(ttl_seconds=60).expires_at() == NOW + timedelta(seconds=60)
+
+    def test_no_ttl_means_no_deadline(self) -> None:
+        assert self._intent().expires_at() is None
+
+
+class TestFillValidation:
+    def test_a_zero_price_fill_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="positive quantity and price"):
+            Fill(
+                fill_id="f1",
+                client_order_id="sim-ABCDEF",
+                instrument_key="sim:BTC/USDT",
+                side=Side.BUY,
+                qty=Decimal("1"),
+                price=Decimal(0),
+                filled_at=NOW,
+            )
+
+
+class TestConfigLimits:
+    """Every configurable limit rejects a value that would make it meaningless."""
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("max_basket_allocation_pct", Decimal(0)),
+            ("max_position_pct_of_basket", Decimal(101)),
+            ("risk_per_trade_pct", Decimal(-1)),
+        ],
+    )
+    def test_percentages_must_be_within_zero_to_one_hundred(
+        self, field: str, value: Decimal
+    ) -> None:
+        with pytest.raises(ValueError, match="within"):
+            RiskPolicy(**{field: value})  # type: ignore[arg-type]
+
+    def test_conviction_is_on_the_zero_to_one_scale(self) -> None:
+        with pytest.raises(ValueError, match="0–1 scale"):
+            RiskPolicy(min_conviction=Decimal(60))
+
+    def test_the_unprotected_haircut_cannot_remove_the_whole_position(self) -> None:
+        with pytest.raises(ValueError, match="within"):
+            RiskPolicy(unprotected_haircut_pct=Decimal(100))
+
+    def test_a_target_inside_the_stop_is_refused(self) -> None:
+        """A take-profit nearer than the stop guarantees a losing expectancy."""
+        with pytest.raises(ValueError, match="must exceed"):
+            RiskPolicy(stop_loss_atr_multiple=Decimal(3), take_profit_atr_multiple=Decimal(2))
+
+    def test_a_non_positive_atr_multiple_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="must be positive"):
+            RiskPolicy(stop_loss_atr_multiple=Decimal(0))
+
+    def test_long_only_cannot_be_turned_off(self) -> None:
+        """Shorting ripples through every other rule; v1 does not model it (DESIGN §12)."""
+        with pytest.raises(ValueError, match="long-only"):
+            RiskPolicy(long_only=False)
+
+    def test_a_ttl_buffer_must_leave_a_positive_order_lifetime(
+        self, instrument: Instrument
+    ) -> None:
+        with pytest.raises(ValueError, match="positive order lifetime"):
+            Basket(
+                basket_id="b",
+                name="b",
+                instruments=(instrument,),
+                panel=PanelConfig(
+                    panel_id="p",
+                    seats=(SeatConfig(seat_id="s", role="r", provider_id="stub", model="m"),),
+                ),
+                cycle_interval_seconds=60,
+                ttl_buffer_seconds=60,
+            )
+
+    def test_duplicate_cluster_ids_are_refused(self) -> None:
+        with pytest.raises(ValueError, match="unique"):
+            GlobalRiskPolicy(
+                clusters=(
+                    CorrelationCluster(cluster_id="x"),
+                    CorrelationCluster(cluster_id="x"),
+                )
+            )
+
+    def test_cluster_membership_resolves_across_a_universe(self, instrument: Instrument) -> None:
+        other = instrument.model_copy(update={"symbol": "ETH/USDT"})
+        equity = instrument.model_copy(update={"symbol": "AAPL", "asset_class": AssetClass.EQUITY})
+
+        members = GlobalRiskPolicy().cluster_members(instrument, (instrument, other, equity))
+
+        assert set(members) == {instrument.key, other.key}

@@ -25,7 +25,7 @@ import uuid
 from hashlib import blake2s
 from typing import Final
 
-from tradebot.core.enums import Mode
+from tradebot.core.enums import Mode, OrderRole
 from tradebot.core.errors import ConfigError
 
 #: Binance spot `newClientOrderId` charset and length cap — the tightest of our venues.
@@ -53,6 +53,21 @@ def client_order_id(*, mode: Mode, basket_id: str, cycle_id: str, instrument: st
     digest = blake2s(payload, digest_size=_DIGEST_BYTES).digest()
     suffix = base64.b32encode(digest).decode().rstrip("=")
     return assert_venue_safe(f"{mode.id_prefix}-{suffix}")
+
+
+def protective_order_id(entry_client_order_id: str, role: OrderRole, revision: int) -> str:
+    """Derive a protective leg's id from the entry it guards.
+
+    Deriving rather than generating keeps the leg recomputable from the entry alone, so recovery
+    can find it at the venue without having stored it, and keeps the mode prefix — a leg is
+    provably ours by the same test as its entry. `revision` changes when a leg is replaced after
+    a further partial entry fill, since no venue lets a resting order's quantity be edited.
+    """
+    prefix, _, _ = entry_client_order_id.partition("-")
+    payload = "|".join((entry_client_order_id, role.value, str(revision))).encode()
+    digest = blake2s(payload, digest_size=_DIGEST_BYTES).digest()
+    suffix = base64.b32encode(digest).decode().rstrip("=")
+    return assert_venue_safe(f"{prefix}-{suffix}")
 
 
 def owns_client_order_id(client_order_id_: str, mode: Mode) -> bool:

@@ -18,6 +18,7 @@ from typing import Any
 
 from sqlalchemy import (
     Column,
+    Connection,
     Index,
     Integer,
     MetaData,
@@ -26,6 +27,7 @@ from sqlalchemy import (
     Text,
     TypeDecorator,
 )
+from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.engine import Dialect
 
 from tradebot.core.clock import ensure_utc
@@ -130,16 +132,21 @@ orders = Table(
     Column("instrument_key", String(128), nullable=False),
     Column("side", String(8), nullable=False),
     Column("order_type", String(24), nullable=False),
+    Column("role", String(16), nullable=False, default="entry"),
+    Column("group_id", String(64), nullable=False, default=""),
     Column("qty", DecimalText, nullable=False),
     Column("limit_price", DecimalText),
+    Column("stop_price", DecimalText),
     Column("state", String(24), nullable=False),
     Column("venue_order_id", String(64)),
     Column("filled_qty", DecimalText, nullable=False),
     Column("avg_fill_price", DecimalText),
+    Column("expires_at", UtcText),
     Column("created_at", UtcText, nullable=False),
     Column("updated_at", UtcText, nullable=False),
     Index("ix_orders_state", "state"),
     Index("ix_orders_cycle", "cycle_id"),
+    Index("ix_orders_group", "group_id"),
 )
 
 fills = Table(
@@ -164,7 +171,7 @@ positions = Table(
     Column("qty", DecimalText, nullable=False),
     Column("avg_entry", DecimalText, nullable=False),
     Column("realized_pnl", DecimalText, nullable=False),
-    Column("held_cycles", Integer, nullable=False, default=0),
+    Column("opened_at", UtcText),
     Column("updated_at", UtcText, nullable=False),
 )
 
@@ -180,10 +187,81 @@ risk_events = Table(
     Column("detail", Text, default=""),
 )
 
-#: Every table except `events`. Truncated and rebuilt by a replay.
-PROJECTION_TABLES: tuple[Table, ...] = (cycles, decisions, orders, fills, positions, risk_events)
+#: Closed positions. The unit the consecutive-loss rule counts, and the tax artifact.
+round_trips = Table(
+    "round_trips",
+    metadata,
+    Column("event_seq", Integer, primary_key=True),
+    Column("basket_id", String(64), nullable=False),
+    Column("instrument_key", String(128), nullable=False),
+    Column("qty", DecimalText, nullable=False),
+    Column("entry_price", DecimalText, nullable=False),
+    Column("exit_price", DecimalText, nullable=False),
+    Column("realized_pnl", DecimalText, nullable=False),
+    Column("opened_at", UtcText),
+    Column("closed_at", UtcText, nullable=False),
+    Index("ix_round_trips_instrument", "instrument_key"),
+)
+
+reconciliations = Table(
+    "reconciliations",
+    metadata,
+    Column("event_seq", Integer, primary_key=True),
+    Column("venue", String(32), nullable=False),
+    Column("classification", String(32), nullable=False),
+    Column("observed_at", UtcText, nullable=False),
+    Column("detail", Text, default=""),
+    Index("ix_reconciliations_class", "classification"),
+)
+
+#: Risk state that must survive a restart (DESIGN §8.2 step 4). Written directly rather than
+#: projected: it is *current posture*, not a fold of history, and the startup sequence reads it
+#: before any event has been replayed. Every change also emits an event for the audit trail.
+risk_state = Table(
+    "risk_state",
+    metadata,
+    Column("scope", String(32), primary_key=True),
+    Column("kill_switch", String(16), nullable=False),
+    Column("reason", Text, default=""),
+    Column("high_water_mark", DecimalText, nullable=False),
+    Column("day_start_equity", DecimalText, nullable=False),
+    Column("day_started_on", String(10), default=""),
+    Column("updated_at", UtcText, nullable=False),
+)
+
+basket_status = Table(
+    "basket_status",
+    metadata,
+    Column("basket_id", String(64), primary_key=True),
+    Column("status", String(16), nullable=False),
+    Column("reason", Text, default=""),
+    Column("updated_at", UtcText, nullable=False),
+)
+
+#: Derived from the log and rebuilt by a replay. `risk_state` and `basket_status` are excluded
+#: deliberately: truncating them during a rebuild would un-halt a halted system.
+PROJECTION_TABLES: tuple[Table, ...] = (
+    cycles,
+    decisions,
+    orders,
+    fills,
+    positions,
+    risk_events,
+    round_trips,
+    reconciliations,
+)
 
 
-def as_row(mapping: dict[str, Any]) -> dict[str, Any]:
-    """Drop `None` values so an update never overwrites a known column with nothing."""
-    return {key: value for key, value in mapping.items() if value is not None}
+def upsert(connection: Connection, table: Table, values: dict[str, Any], keys: list[str]) -> None:
+    """Insert or update on the table's natural key.
+
+    Shared by the projectors and the risk-state store so that "write a row" means exactly one
+    thing, and so replay and live application cannot diverge on conflict handling.
+    """
+    statement = insert(table).values(**values)
+    updates = {key: value for key, value in values.items() if key not in keys}
+    connection.execute(
+        statement.on_conflict_do_update(index_elements=keys, set_=updates)
+        if updates
+        else statement.on_conflict_do_nothing(index_elements=keys)
+    )

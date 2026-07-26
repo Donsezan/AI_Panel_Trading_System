@@ -20,8 +20,10 @@ class Position(DomainModel):
     qty: Money = Decimal(0)
     avg_entry: Money = Decimal(0)
     realized_pnl: Money = Decimal(0)
+    #: When the position last left flat. How *long* it has been held is derived from this and
+    #: the cycle log rather than counted in memory — a counter would reset on every restart, and
+    #: the panel would be told a five-day position was opened this cycle.
     opened_at: UtcDatetime | None = None
-    held_cycles: int = 0
 
     @property
     def is_flat(self) -> bool:
@@ -39,6 +41,28 @@ class Position(DomainModel):
         if cost <= ZERO:
             return ZERO
         return multiply(divide(self.unrealized_pnl(price), cost), Decimal(100))
+
+
+class RoundTrip(DomainModel):
+    """One completed position: opened from flat, closed back to flat.
+
+    This is the unit the consecutive-loss rule counts, because it is the only unit in which
+    "was that trade a loss" has an answer. Partial fills in and out aggregate into one trip
+    (DESIGN §6.6) — counting fills instead would auto-pause a basket for a scratch exit that
+    happened to be split across three fills.
+    """
+
+    instrument_key: str
+    qty: Money
+    entry_price: Money
+    exit_price: Money
+    realized_pnl: Money
+    opened_at: UtcDatetime | None = None
+    closed_at: UtcDatetime
+
+    @property
+    def is_loss(self) -> bool:
+        return self.realized_pnl < ZERO
 
 
 class Balance(DomainModel):
@@ -66,3 +90,12 @@ class AccountState(DomainModel):
 
     def balance(self, currency: str) -> Balance | None:
         return next((b for b in self.balances if b.currency == currency), None)
+
+    def qty(self, instrument_key: str) -> Money:
+        """Held quantity, treating an absent position as flat rather than as unknown."""
+        position = self.position(instrument_key)
+        return position.qty if position else ZERO
+
+    def total(self, currency: str) -> Money:
+        balance = self.balance(currency)
+        return balance.total if balance else ZERO

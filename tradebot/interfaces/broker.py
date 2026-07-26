@@ -17,7 +17,7 @@ from __future__ import annotations
 from typing import Protocol, runtime_checkable
 
 from tradebot.core.enums import OrderState, OrderType
-from tradebot.core.orders import Fill, OrderIntent
+from tradebot.core.orders import Fill, Order, OrderIntent
 from tradebot.core.portfolio import AccountState
 from tradebot.core.schema import DomainModel, Money, UtcDatetime
 
@@ -62,6 +62,12 @@ class OrderStatus(DomainModel):
     fills: tuple[Fill, ...] = ()
     observed_at: UtcDatetime
     reject_reason: str | None = None
+    #: Whether the venue has a record of this order at all. A *rejected* order is a definite
+    #: answer — it did not execute. An order the venue has never heard of is not: it may have
+    #: been lost, or we may be querying the wrong account, and only one of those is survivable.
+    #: Every adapter must distinguish the two; inferring it from a reject string cannot be done
+    #: portably (PLAN §2.3).
+    found: bool = True
 
 
 class BrokerCapabilities(DomainModel):
@@ -74,6 +80,10 @@ class BrokerCapabilities(DomainModel):
     venue_id: str
     order_types: tuple[OrderType, ...]
     protective_orders: bool = False
+    #: Whether the venue *links* protective legs (Binance spot OCO, Alpaca bracket). Without it,
+    #: only a single stop leg is placed: two unlinked exit orders on one holding can both fill
+    #: and sell the position twice (DESIGN §6.7).
+    oco_groups: bool = False
     fractional_quantities: bool = True
     #: Whether the venue can be queried by *our* id. Without it, `SUBMIT_UNKNOWN` recovery has
     #: no safe resolution and the adapter must not be used for live trading.
@@ -81,6 +91,22 @@ class BrokerCapabilities(DomainModel):
     max_client_order_id_length: int = 36
     #: Venue-side good-till-time. Binance spot has none, so TTL is bot-enforced (REVIEW B7).
     venue_side_ttl: bool = False
+
+
+@runtime_checkable
+class RestorableVenue(Protocol):
+    """A venue whose books live inside this process and are lost when it exits.
+
+    Only *simulated* venues implement this. A real venue keeps its own records and is the source
+    of truth; handing it ours would be exactly backwards. Without it, restarting against a
+    simulated venue looks identical to a venue reset — every position gone at once — and the
+    reconciler correctly refuses to trade. The restore closes that gap without weakening the
+    classification that catches a genuine reset (R15).
+    """
+
+    def restore(self, state: AccountState, orders: tuple[Order, ...]) -> None:
+        """Adopt the account state and working orders recovered from our own event log."""
+        ...
 
 
 @runtime_checkable

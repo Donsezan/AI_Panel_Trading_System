@@ -22,8 +22,9 @@ from pathlib import Path
 
 from tradebot.control.basket_runner import BasketRunner
 from tradebot.control.context_builder import ContextBuilder
+from tradebot.control.startup import Recovery, StartupSequence
 from tradebot.core.clock import Clock, SystemClock
-from tradebot.core.config import Basket, PanelConfig, RiskPolicy, SeatConfig
+from tradebot.core.config import Basket, GlobalRiskPolicy, PanelConfig, RiskPolicy, SeatConfig
 from tradebot.core.enums import AssetClass, Mode
 from tradebot.core.errors import ConfigError
 from tradebot.core.instrument import Instrument
@@ -32,13 +33,19 @@ from tradebot.decision.engine import DecisionEngine
 from tradebot.decision.protocols import SingleRoundProtocol
 from tradebot.decision.providers import StubLLMProvider
 from tradebot.decision.seat import SeatRunner
+from tradebot.execution.monitor import ExecutionMonitor
 from tradebot.execution.service import ExecutionService
-from tradebot.execution.sim_broker import SimBroker
+from tradebot.execution.sim_broker import SimBroker, SimulatedMarket
+from tradebot.ledger.history import HistoryReader
 from tradebot.ledger.portfolio import Ledger
+from tradebot.ledger.reconciler import Reconciler
 from tradebot.marketdata.replay import ReplayMarketData, synthetic_candles
 from tradebot.persistence.database import SingleWriter, create_database
 from tradebot.persistence.store import EventStore
+from tradebot.risk.state import RiskStateStore
 from tradebot.risk.tier1 import Tier1RiskEngine
+from tradebot.risk.tier2 import Tier2RiskEngine
+from tradebot.risk.watchdog import Watchdog
 
 LIVE_CONFIRMATION_PHRASE = "I ACCEPT REAL MONEY RISK"
 
@@ -51,7 +58,21 @@ class Application:
     store: EventStore
     ledger: Ledger
     runners: tuple[BasketRunner, ...]
+    startup: StartupSequence
+    watchdog: Watchdog
+    states: RiskStateStore
+    quote_currency: str
     _writer: SingleWriter
+
+    async def recover(self) -> Recovery:
+        """Run DESIGN §8.2 before anything trades. Nothing else may be called first."""
+        return await self.startup.recover()
+
+    def equity(self) -> Decimal:
+        return self.ledger.equity(
+            {p.instrument_key: p.avg_entry for p in self.ledger.positions()},
+            quote_currency=self.quote_currency,
+        )
 
     def close(self) -> None:
         self._writer.close()
@@ -69,26 +90,31 @@ def database_path(mode: Mode, root: Path = Path("data")) -> Path:
 
 
 def demo_basket() -> Basket:
-    """The single-instrument basket the simulation runs out of the box.
+    """The two-instrument basket the simulation runs out of the box.
 
     A stand-in for the ConfigStore that Phase 6 replaces it with; the shapes are identical, so
-    the runner does not change when configuration moves into the database.
+    the runner does not change when configuration moves into the database. Two correlated
+    instruments rather than one, so the Tier-2 cluster limit is exercised by the demo instead of
+    only by its tests.
     """
-    instrument = Instrument(
-        symbol="BTC/USDT",
-        venue="sim",
-        asset_class=AssetClass.CRYPTO,
-        base_currency="BTC",
-        quote_currency="USDT",
-        lot_size=Decimal("0.00001"),
-        tick_size=Decimal("0.01"),
-        min_qty=Decimal("0.00001"),
-        min_notional=Decimal("10"),
+    instruments = tuple(
+        Instrument(
+            symbol=symbol,
+            venue="sim",
+            asset_class=AssetClass.CRYPTO,
+            base_currency=symbol.split("/")[0],
+            quote_currency="USDT",
+            lot_size=lot,
+            tick_size=Decimal("0.01"),
+            min_qty=lot,
+            min_notional=Decimal("10"),
+        )
+        for symbol, lot in (("BTC/USDT", Decimal("0.00001")), ("ETH/USDT", Decimal("0.0001")))
     )
     return Basket(
         basket_id="demo",
         name="Demo crypto basket",
-        instruments=(instrument,),
+        instruments=instruments,
         panel=PanelConfig(
             panel_id="demo-panel",
             seats=(
@@ -105,34 +131,16 @@ def demo_basket() -> Basket:
     )
 
 
-def build_sim(
-    *,
-    clock: Clock | None = None,
-    db_path: Path | None = None,
-    basket: Basket | None = None,
-    start_equity: Decimal = Decimal(10_000),
-) -> Application:
-    """Wire the simulation stack: replayed data, a scripted panel, and `SimBroker`."""
-    clock = clock or SystemClock()
-    basket = basket or demo_basket()
-
-    engine = create_database(db_path)
-    writer = SingleWriter(engine)
-    store = EventStore(engine, writer)
-
-    quote_currency = basket.instruments[0].quote_currency
-    ledger = Ledger(clock, venue="sim", balances={quote_currency: start_equity})
-
-    # Generate up to *now*, so the staleness policy is exercised for real rather than being
-    # permanently tripped (or permanently disabled) by data from a fixed date in the past.
+def _synthetic_market(basket: Basket, clock: Clock, opens: dict[str, Decimal]) -> ReplayMarketData:
+    """Series ending at *now*, so the staleness policy is exercised rather than tripped."""
     bars = 240
-    market_data = ReplayMarketData(
+    return ReplayMarketData(
         {
             (instrument.key, timeframe): synthetic_candles(
                 start=clock.now() - timeframe_interval(timeframe) * bars,
                 timeframe=timeframe,
                 count=bars,
-                open_price=Decimal("50000"),
+                open_price=opens.get(instrument.key, Decimal("50000")),
                 step=Decimal("25"),
                 seed=_seed_for(instrument.key),
             )
@@ -142,8 +150,49 @@ def build_sim(
         clock,
     )
 
-    broker = SimBroker(clock, balances={quote_currency: start_equity})
-    seat_runner = SeatRunner({"stub": StubLLMProvider()}, clock)
+
+def build_sim(
+    *,
+    clock: Clock | None = None,
+    db_path: Path | None = None,
+    basket: Basket | None = None,
+    start_equity: Decimal = Decimal(10_000),
+    global_policy: GlobalRiskPolicy | None = None,
+) -> Application:
+    """Wire the simulation stack: replayed data, a scripted panel, and `SimBroker`."""
+    clock = clock or SystemClock()
+    basket = basket or demo_basket()
+    policy = global_policy or GlobalRiskPolicy()
+
+    engine = create_database(db_path)
+    writer = SingleWriter(engine)
+    store = EventStore(engine, writer)
+
+    quote_currency = basket.instruments[0].quote_currency
+    ledger = Ledger(clock, venue="sim", balances={quote_currency: start_equity})
+    broker = SimBroker(
+        clock, balances={quote_currency: start_equity}, default_quote_currency=quote_currency
+    )
+    market_data = SimulatedMarket(
+        _synthetic_market(
+            basket,
+            clock,
+            {
+                i.key: Decimal("50000") if i.base_currency == "BTC" else Decimal("3000")
+                for i in basket.instruments
+            },
+        ),
+        broker,
+    )
+
+    history = HistoryReader(engine, clock)
+    execution = ExecutionService(broker, store, ledger, clock)
+    monitor = ExecutionMonitor(broker, execution, store, clock)
+    states = RiskStateStore(engine, writer, clock)
+    watchdog = Watchdog(policy, states, store, clock)
+    reconciler = Reconciler(
+        broker, ledger, store, clock, mode=Mode.SIM, instruments=basket.instruments
+    )
 
     runner = BasketRunner(
         basket,
@@ -153,16 +202,48 @@ def build_sim(
             ledger,
             clock,
             protective_orders_supported=broker.capabilities().protective_orders,
+            trading_history=history,
         ),
-        decision_engine=DecisionEngine(SingleRoundProtocol(seat_runner)),
+        decision_engine=DecisionEngine(
+            SingleRoundProtocol(SeatRunner({"stub": StubLLMProvider()}, clock))
+        ),
         risk_engine=Tier1RiskEngine(clock),
-        execution=ExecutionService(broker, store, ledger, clock),
+        tier2=Tier2RiskEngine(policy),
+        watchdog=watchdog,
+        history=history,
+        execution=execution,
+        monitor=monitor,
         ledger=ledger,
         store=store,
         clock=clock,
+        global_policy=policy,
         quote_currency=quote_currency,
     )
-    return Application(mode=Mode.SIM, store=store, ledger=ledger, runners=(runner,), _writer=writer)
+    return Application(
+        mode=Mode.SIM,
+        store=store,
+        ledger=ledger,
+        runners=(runner,),
+        startup=StartupSequence(
+            store,
+            ledger,
+            reconciler,
+            execution,
+            monitor,
+            states,
+            watchdog,
+            clock,
+            instruments=basket.instruments,
+            quote_currency=quote_currency,
+            # The simulated venue's books die with the process; without this an ordinary
+            # restart is indistinguishable from a testnet wipe.
+            venue_restore=broker,
+        ),
+        watchdog=watchdog,
+        states=states,
+        quote_currency=quote_currency,
+        _writer=writer,
+    )
 
 
 def build(mode: Mode, *, confirmation: str | None = None, **kwargs: object) -> Application:

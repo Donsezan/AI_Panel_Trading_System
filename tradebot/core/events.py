@@ -18,10 +18,16 @@ from pydantic import Field
 
 from tradebot.core.clock import Clock
 from tradebot.core.decision import Decision, SeatResponse
-from tradebot.core.enums import CycleOutcome, OrderState
+from tradebot.core.enums import (
+    BasketStatus,
+    CycleOutcome,
+    KillSwitchState,
+    OrderState,
+    RiskTier,
+)
 from tradebot.core.ids import new_uuid
 from tradebot.core.orders import Fill, Order, RiskCheckResult
-from tradebot.core.portfolio import Position
+from tradebot.core.portfolio import Position, RoundTrip
 from tradebot.core.schema import DomainModel, UtcDatetime, canonical_json
 from tradebot.core.snapshot import ContextSnapshot
 
@@ -36,12 +42,17 @@ class EventType(StrEnum):
     RISK_CHECKED = "RISK_CHECKED"
     ORDER_SUBMITTED = "ORDER_SUBMITTED"
     ORDER_STATE_CHANGED = "ORDER_STATE_CHANGED"
+    PROTECTIVE_PLACED = "PROTECTIVE_PLACED"
     FILL_RECEIVED = "FILL_RECEIVED"
     POSITION_UPDATED = "POSITION_UPDATED"
+    ROUND_TRIP_CLOSED = "ROUND_TRIP_CLOSED"
     CYCLE_COMPLETED = "CYCLE_COMPLETED"
     RISK_EVENT = "RISK_EVENT"
     RECONCILED = "RECONCILED"
     EXTERNAL_CHANGE = "EXTERNAL_CHANGE"
+    CORPORATE_ACTION = "CORPORATE_ACTION"
+    KILL_SWITCH_CHANGED = "KILL_SWITCH_CHANGED"
+    BASKET_STATUS_CHANGED = "BASKET_STATUS_CHANGED"
     CONFIG_CHANGED = "CONFIG_CHANGED"
 
 
@@ -155,11 +166,59 @@ class EventFactory:
             EventType.POSITION_UPDATED, position.instrument_key, position=_json(position)
         )
 
-    def risk_event(self, *, tier: str, rule: str, scope: str, action: str, detail: str) -> Event:
+    def round_trip_closed(self, trip: RoundTrip) -> Event:
+        return self._event(EventType.ROUND_TRIP_CLOSED, trip.instrument_key, round_trip=_json(trip))
+
+    def protective_placed(self, entry: Order, legs: tuple[Order, ...], detail: str = "") -> Event:
+        return self._event(
+            EventType.PROTECTIVE_PLACED,
+            entry.client_order_id,
+            group_id=entry.group_id,
+            legs=[_json(leg) for leg in legs],
+            protected=bool(legs),
+            detail=detail,
+        )
+
+    def reconciled(self, report: DomainModel) -> Event:
+        return self._event(EventType.RECONCILED, self._basket_id, report=_json(report))
+
+    def external_change(self, currency: str, amount: Decimal, reason: str) -> Event:
+        return self._event(
+            EventType.EXTERNAL_CHANGE,
+            currency,
+            currency=currency,
+            amount=str(amount),
+            reason=reason,
+        )
+
+    def corporate_action(self, instrument_key: str, detail: str, **fields: Any) -> Event:
+        return self._event(EventType.CORPORATE_ACTION, instrument_key, detail=detail, **fields)
+
+    def kill_switch_changed(self, state: KillSwitchState, reason: str, actor: str) -> Event:
+        return self._event(
+            EventType.KILL_SWITCH_CHANGED,
+            "global",
+            state=state.value,
+            reason=reason,
+            actor=actor,
+        )
+
+    def basket_status_changed(self, basket_id: str, status: BasketStatus, reason: str) -> Event:
+        return self._event(
+            EventType.BASKET_STATUS_CHANGED,
+            basket_id,
+            basket_id=basket_id,
+            status=status.value,
+            reason=reason,
+        )
+
+    def risk_event(
+        self, *, tier: RiskTier, rule: str, scope: str, action: str, detail: str
+    ) -> Event:
         return self._event(
             EventType.RISK_EVENT,
             scope,
-            tier=tier,
+            tier=tier.value,
             rule=rule,
             scope=scope,
             action_taken=action,

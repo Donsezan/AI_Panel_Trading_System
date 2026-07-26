@@ -16,6 +16,7 @@ from tradebot.core.config import RiskPolicy
 from tradebot.core.decision import Decision
 from tradebot.core.enums import Action, Mode, RiskDecision, SizeHint
 from tradebot.core.instrument import Instrument
+from tradebot.core.orders import ProtectivePlan
 from tradebot.core.portfolio import Position
 from tradebot.interfaces.risk import RiskProposal
 from tradebot.risk.rules import (
@@ -25,7 +26,7 @@ from tradebot.risk.rules import (
     MinConvictionRule,
 )
 from tradebot.risk.sizing import base_quantity
-from tradebot.risk.tier1 import Tier1RiskEngine, basket_budget
+from tradebot.risk.tier1 import Tier1RiskEngine, basket_budget, protective_plan
 
 NOW = datetime(2026, 3, 1, tzinfo=UTC)
 
@@ -219,10 +220,13 @@ class TestTier1Engine:
             "sizing",
             "min_conviction",
             "long_only",
+            "max_consecutive_losses",
+            "cooldown",
+            "max_trades_per_day",
             "max_position_size",
             "max_basket_allocation",
             "venue_quantization",
-        }
+        }, "every Tier-1 limit records a verdict, not only the ones that bind"
 
     def test_the_tightest_cap_wins_regardless_of_rule_order(
         self, clock: ManualClock, instrument: Instrument
@@ -293,3 +297,59 @@ class TestRiskPolicyValidation:
         """v1's rules model long exposure only; turning this off would silently invalidate them."""
         with pytest.raises(ValueError, match="long-only"):
             RiskPolicy(long_only=False)
+
+
+class TestProtectivePlanning:
+    """Where the stop sits, and every reason there is no stop to place."""
+
+    def test_an_opening_buy_gets_a_stop_and_a_target_in_atr_units(
+        self, instrument: Instrument
+    ) -> None:
+        plan = protective_plan(proposal(instrument), Decimal("50000"))
+
+        assert plan is not None
+        assert plan.stop_price == Decimal("49000")  # 50000 − 2 × 500
+        assert plan.take_profit_price == Decimal("51500")  # 50000 + 3 × 500
+
+    def test_a_reducing_sell_needs_no_protection_because_it_is_the_exit(
+        self, instrument: Instrument
+    ) -> None:
+        selling = proposal(instrument, action=Action.SELL, held="1")
+
+        assert protective_plan(selling, Decimal("50000")) is None
+
+    def test_an_unprotected_venue_gets_no_plan_because_it_took_the_haircut_instead(
+        self, instrument: Instrument
+    ) -> None:
+        assert protective_plan(proposal(instrument, unprotected=True), Decimal("50000")) is None
+
+    def test_no_volatility_estimate_means_no_defensible_stop(self, instrument: Instrument) -> None:
+        assert protective_plan(proposal(instrument, atr="0"), Decimal("50000")) is None
+
+    def test_a_stop_that_would_fall_below_zero_is_refused(self, instrument: Instrument) -> None:
+        """A negative stop price is not a wider stop; it is an order no venue will accept."""
+        wild = proposal(instrument, atr="40000")
+
+        assert protective_plan(wild, Decimal("50000")) is None
+
+    def test_an_approved_intent_carries_its_plan_to_execution(
+        self, clock: ManualClock, instrument: Instrument
+    ) -> None:
+        outcome = Tier1RiskEngine(clock).approve(
+            proposal(instrument), mode=Mode.SIM, basket_id="b1", cycle_id="c1", ttl_seconds=540
+        )
+
+        assert outcome.intent is not None
+        assert outcome.intent.protective is not None
+        assert outcome.intent.ttl_seconds == 540
+        assert outcome.intent.expires_at() is not None
+
+
+class TestProtectivePlanValidation:
+    def test_a_non_positive_stop_is_rejected_at_the_model_boundary(self) -> None:
+        with pytest.raises(ValueError, match="stop price must be positive"):
+            ProtectivePlan(stop_price=Decimal(0))
+
+    def test_a_negative_limit_offset_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="must not be negative"):
+            ProtectivePlan(stop_price=Decimal("100"), limit_offset_pct=Decimal("-1"))

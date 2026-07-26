@@ -120,14 +120,25 @@ class TestValuation:
 
 
 class TestHoldingPeriod:
-    def test_held_cycles_advance_only_while_a_position_exists(self, ledger: Ledger) -> None:
-        ledger.mark_cycle_held(KEY)
-        assert ledger.position(KEY).held_cycles == 0
+    def test_a_position_records_when_it_left_flat(self, ledger: Ledger) -> None:
+        """How long it has been held derives from this; a counter would reset on every restart."""
+        assert ledger.position(KEY).opened_at is None
 
         book(ledger, fill(Side.BUY, "1", "100"))
-        ledger.mark_cycle_held(KEY)
-        ledger.mark_cycle_held(KEY)
-        assert ledger.position(KEY).held_cycles == 2
+
+        assert ledger.position(KEY).opened_at == NOW
+
+    def test_adding_to_a_position_keeps_its_original_opening(self, ledger: Ledger) -> None:
+        book(ledger, fill(Side.BUY, "1", "100", fill_id="b1"))
+        book(ledger, fill(Side.BUY, "1", "110", fill_id="b2"))
+
+        assert ledger.position(KEY).opened_at == NOW
+
+    def test_closing_a_position_clears_its_opening(self, ledger: Ledger) -> None:
+        book(ledger, fill(Side.BUY, "1", "100", fill_id="b1"))
+        book(ledger, fill(Side.SELL, "1", "100", fill_id="s1"))
+
+        assert ledger.position(KEY).opened_at is None
 
 
 class TestSnapshot:
@@ -141,3 +152,222 @@ class TestSnapshot:
         assert state.position(KEY) is not None
         assert state.balance("USDT") is not None
         assert state.balance("EUR") is None
+
+
+class TestRoundTrips:
+    def test_a_position_returning_to_flat_closes_a_round_trip(self, ledger: Ledger) -> None:
+        """The unit the consecutive-loss rule counts — the only unit where 'was that a loss'
+        has an answer."""
+        book(ledger, fill(Side.BUY, "1", "50000", fill_id="b1"))
+        booking = ledger.apply_fill(
+            fill(Side.SELL, "1", "51000", fill_id="s1"),
+            base_currency="BTC",
+            quote_currency="USDT",
+        )
+
+        trip = booking.round_trip
+        assert trip is not None
+        assert trip.realized_pnl == Decimal("1000")
+        assert not trip.is_loss
+
+    def test_a_partial_exit_does_not_close_the_trip(self, ledger: Ledger) -> None:
+        book(ledger, fill(Side.BUY, "1", "50000", fill_id="b1"))
+        booking = ledger.apply_fill(
+            fill(Side.SELL, "0.4", "51000", fill_id="s1"),
+            base_currency="BTC",
+            quote_currency="USDT",
+        )
+
+        assert booking.round_trip is None
+
+    def test_partial_fills_in_and_out_aggregate_into_one_trip(self, ledger: Ledger) -> None:
+        """Counting fills instead would auto-pause a basket for a scratch exit split in three."""
+        book(ledger, fill(Side.BUY, "0.5", "50000", fill_id="b1"))
+        book(ledger, fill(Side.BUY, "0.5", "52000", fill_id="b2"))
+        book(ledger, fill(Side.SELL, "0.6", "53000", fill_id="s1"))
+        booking = ledger.apply_fill(
+            fill(Side.SELL, "0.4", "53000", fill_id="s2"),
+            base_currency="BTC",
+            quote_currency="USDT",
+        )
+
+        trip = booking.round_trip
+        assert trip is not None
+        assert trip.qty == Decimal("1")
+        assert trip.entry_price == Decimal("51000")
+        assert trip.realized_pnl == Decimal("2000")
+
+    def test_fees_count_against_the_trip_on_both_legs(self, ledger: Ledger) -> None:
+        """A scratch exit that paid two commissions is a losing trade, and must read as one."""
+        book(ledger, fill(Side.BUY, "1", "50000", fee="25", fill_id="b1"))
+        booking = ledger.apply_fill(
+            fill(Side.SELL, "1", "50000", fee="25", fill_id="s1"),
+            base_currency="BTC",
+            quote_currency="USDT",
+        )
+
+        trip = booking.round_trip
+        assert trip is not None
+        assert trip.realized_pnl == Decimal("-50")
+        assert trip.is_loss
+
+    def test_a_new_position_starts_a_new_trip(self, ledger: Ledger) -> None:
+        book(ledger, fill(Side.BUY, "1", "50000", fill_id="b1"))
+        book(ledger, fill(Side.SELL, "1", "49000", fill_id="s1"))
+        book(ledger, fill(Side.BUY, "1", "48000", fill_id="b2"))
+        booking = ledger.apply_fill(
+            fill(Side.SELL, "1", "49000", fill_id="s2"),
+            base_currency="BTC",
+            quote_currency="USDT",
+        )
+
+        trip = booking.round_trip
+        assert trip is not None
+        assert trip.realized_pnl == Decimal("1000"), "the previous trip's loss is not carried"
+
+
+class TestExternalFlows:
+    def test_a_deposit_moves_the_balance(self, ledger: Ledger) -> None:
+        from tradebot.ledger.portfolio import ExternalFlow
+
+        total = ledger.apply_external_change(
+            ExternalFlow(currency="USDT", amount=Decimal("5000"), reason="deposit")
+        )
+
+        assert total == Decimal("15000")
+
+    def test_a_withdrawal_is_recognisable_as_one(self) -> None:
+        from tradebot.ledger.portfolio import ExternalFlow
+
+        assert ExternalFlow(currency="USDT", amount=Decimal("-1")).is_withdrawal
+
+
+class TestVenueAdoption:
+    def test_a_venue_position_replaces_ours(self, ledger: Ledger) -> None:
+        book(ledger, fill(Side.BUY, "1", "50000", fill_id="b1"))
+
+        from tradebot.core.portfolio import Position
+
+        adopted = ledger.adopt_position(
+            Position(instrument_key=KEY, qty=Decimal("0.9"), avg_entry=Decimal("50000"))
+        )
+
+        assert adopted.qty == Decimal("0.9")
+        assert ledger.position(KEY).qty == Decimal("0.9")
+
+    def test_locked_funds_are_reported_separately_from_free(self, ledger: Ledger) -> None:
+        ledger.set_locked("USDT", Decimal("2500"))
+
+        balance = ledger.snapshot().balance("USDT")
+        assert balance is not None
+        assert balance.free == Decimal("7500")
+        assert balance.locked == Decimal("2500")
+        assert balance.total == Decimal("10000")
+
+
+class TestReplay:
+    async def test_the_ledger_rebuilds_from_the_event_log_alone(
+        self, ledger: Ledger, store, clock: ManualClock
+    ) -> None:
+        from tradebot.core.events import EventFactory
+
+        events = EventFactory(clock=clock, basket_id="b1", cycle_id="c1")
+        booking = ledger.apply_fill(
+            fill(Side.BUY, "1", "50000", fill_id="b1"),
+            base_currency="BTC",
+            quote_currency="USDT",
+        )
+        await store.append(
+            events.fill_received(fill(Side.BUY, "1", "50000", fill_id="b1"), _stub_order()),
+            events.position_updated(booking.position),
+        )
+
+        fresh = Ledger(clock, venue="sim", balances={"USDT": Decimal(10_000)})
+        applied = fresh.replay(store.read_all(), {KEY: ("BTC", "USDT")})
+
+        assert applied == 1
+        assert fresh.position(KEY).qty == Decimal("1")
+        assert fresh.balance("USDT") == ledger.balance("USDT")
+
+    async def test_an_external_change_replays_too(
+        self, ledger: Ledger, store, clock: ManualClock
+    ) -> None:
+        from tradebot.core.events import EventFactory
+
+        events = EventFactory(clock=clock, basket_id="b1", cycle_id="c1")
+        await store.append(events.external_change("USDT", Decimal("2500"), "deposit"))
+
+        fresh = Ledger(clock, venue="sim", balances={"USDT": Decimal(10_000)})
+        fresh.replay(store.read_all(), {KEY: ("BTC", "USDT")})
+
+        assert fresh.balance("USDT") == Decimal("12500")
+
+    async def test_replaying_a_fill_on_an_unknown_instrument_raises(
+        self, ledger: Ledger, store, clock: ManualClock
+    ) -> None:
+        """Silently skipping it would leave a ledger that quietly disagrees with the log."""
+        from tradebot.core.events import EventFactory
+
+        events = EventFactory(clock=clock, basket_id="b1", cycle_id="c1")
+        await store.append(
+            events.fill_received(fill(Side.BUY, "1", "50000", fill_id="b1"), _stub_order())
+        )
+
+        with pytest.raises(ReconciliationMismatchError, match="unknown instrument"):
+            Ledger(clock, venue="sim", balances={}).replay(store.read_all(), {})
+
+
+def _stub_order():
+    from tradebot.core.enums import OrderType
+    from tradebot.core.orders import Order, OrderIntent
+
+    return Order.from_intent(
+        OrderIntent(
+            client_order_id="sim-ABC",
+            basket_id="b1",
+            cycle_id="c1",
+            instrument_key=KEY,
+            side=Side.BUY,
+            qty=Decimal("1"),
+            order_type=OrderType.LIMIT,
+            limit_price=Decimal("50000"),
+            created_at=NOW,
+        )
+    )
+
+
+class TestMarkToMarket:
+    def test_unrealized_pnl_marks_every_holding(self, ledger: Ledger) -> None:
+        book(ledger, fill(Side.BUY, "1", "50000", fill_id="b1"))
+
+        assert ledger.unrealized_pnl({KEY: Decimal("51000")}) == Decimal("1000")
+
+    def test_an_unpriced_holding_is_marked_at_cost_not_dropped(self, ledger: Ledger) -> None:
+        """Dropping it would understate exposure and loosen every percentage-based limit."""
+        book(ledger, fill(Side.BUY, "1", "50000", fill_id="b1"))
+
+        assert ledger.unrealized_pnl({}) == Decimal(0)
+
+    def test_realized_pnl_sums_across_instruments(self, ledger: Ledger) -> None:
+        book(ledger, fill(Side.BUY, "1", "50000", fill_id="b1"))
+        book(ledger, fill(Side.SELL, "1", "51000", fill_id="s1"))
+
+        assert ledger.realized_pnl() == Decimal("1000")
+
+    def test_adopting_a_flat_position_abandons_its_open_round_trip(self, ledger: Ledger) -> None:
+        """After a venue reset there is no trip to close; carrying one forward would invent PnL."""
+        from tradebot.core.portfolio import Position
+
+        book(ledger, fill(Side.BUY, "1", "50000", fill_id="b1"))
+        ledger.adopt_position(Position(instrument_key=KEY))
+
+        book(ledger, fill(Side.BUY, "1", "48000", fill_id="b2"))
+        booking = ledger.apply_fill(
+            fill(Side.SELL, "1", "49000", fill_id="s1"),
+            base_currency="BTC",
+            quote_currency="USDT",
+        )
+
+        trip = booking.round_trip
+        assert trip is not None
+        assert trip.entry_price == Decimal("48000")

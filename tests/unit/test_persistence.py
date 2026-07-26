@@ -13,7 +13,7 @@ from decimal import Decimal
 import pytest
 from sqlalchemy import select
 
-from tradebot.core.enums import CycleOutcome, OrderState, OrderType, Side
+from tradebot.core.enums import CycleOutcome, OrderState, OrderType, RiskTier, Side
 from tradebot.core.errors import MoneyError, SingleWriterViolationError
 from tradebot.core.events import Event, EventFactory, EventType
 from tradebot.core.orders import Fill, Order, OrderIntent
@@ -71,7 +71,11 @@ async def write_a_full_cycle(store: EventStore, clock: object) -> EventFactory:
     )
     await store.append(
         events.risk_event(
-            tier="tier2", rule="max_drawdown", scope="portfolio", action="halt", detail="test"
+            tier=RiskTier.TIER2,
+            rule="max_drawdown",
+            scope="portfolio",
+            action="halt",
+            detail="test",
         )
     )
     await store.append(events.cycle_completed(CycleOutcome.ORDERS_PLACED, Decimal("0.02")))
@@ -207,7 +211,6 @@ class TestTypeGuards:
                     qty=0.1,
                     avg_entry=Decimal(1),
                     realized_pnl=Decimal(0),
-                    held_cycles=0,
                     updated_at=NOW,
                 )
             )
@@ -220,7 +223,6 @@ class TestTypeGuards:
                     qty=Decimal(1),
                     avg_entry=Decimal(1),
                     realized_pnl=Decimal(0),
-                    held_cycles=0,
                     updated_at=datetime(2026, 3, 1, 12, 0),
                 )
             )

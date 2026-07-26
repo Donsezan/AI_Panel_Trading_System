@@ -14,10 +14,8 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
-from typing import Any
 
 from sqlalchemy import Connection, delete, select, update
-from sqlalchemy.dialects.sqlite import insert
 
 from tradebot.core.events import Event, EventType
 from tradebot.persistence.schema import (
@@ -28,21 +26,15 @@ from tradebot.persistence.schema import (
     fills,
     orders,
     positions,
+    reconciliations,
     risk_events,
+    round_trips,
+    upsert,
 )
 
 Projector = Callable[[Connection, Event], None]
 
-
-def _upsert(connection: Connection, table: Any, values: dict[str, Any], keys: list[str]) -> None:
-    """Insert or update on the table's natural key."""
-    statement = insert(table).values(**values)
-    update_columns = {k: v for k, v in values.items() if k not in keys}
-    connection.execute(
-        statement.on_conflict_do_update(index_elements=keys, set_=update_columns)
-        if update_columns
-        else statement.on_conflict_do_nothing(index_elements=keys)
-    )
+_upsert = upsert
 
 
 def _project_cycle_started(connection: Connection, event: Event) -> None:
@@ -97,11 +89,15 @@ def _project_order_submitted(connection: Connection, event: Event) -> None:
             "instrument_key": order["instrument_key"],
             "side": order["side"],
             "order_type": order["order_type"],
+            "role": order["role"],
+            "group_id": order["group_id"],
             "qty": order["qty"],
             "limit_price": order["limit_price"],
+            "stop_price": order["stop_price"],
             "state": order["state"],
             "venue_order_id": order["venue_order_id"],
             "filled_qty": "0",
+            "expires_at": order["expires_at"],
             "created_at": order["created_at"],
             "updated_at": order["updated_at"],
         },
@@ -161,7 +157,7 @@ def _project_position_updated(connection: Connection, event: Event) -> None:
             "qty": position["qty"],
             "avg_entry": position["avg_entry"],
             "realized_pnl": position["realized_pnl"],
-            "held_cycles": position["held_cycles"],
+            "opened_at": position["opened_at"],
             "updated_at": event.ts,
         },
         ["instrument_key"],
@@ -197,7 +193,44 @@ def _project_cycle_completed(connection: Connection, event: Event) -> None:
     )
 
 
-#: Audit-only event types are absent by design, not by omission.
+def _project_round_trip_closed(connection: Connection, event: Event) -> None:
+    trip = event.payload["round_trip"]
+    _upsert(
+        connection,
+        round_trips,
+        {
+            "event_seq": event.seq,
+            "basket_id": event.basket_id,
+            "instrument_key": trip["instrument_key"],
+            "qty": trip["qty"],
+            "entry_price": trip["entry_price"],
+            "exit_price": trip["exit_price"],
+            "realized_pnl": trip["realized_pnl"],
+            "opened_at": trip["opened_at"],
+            "closed_at": trip["closed_at"],
+        },
+        ["event_seq"],
+    )
+
+
+def _project_reconciled(connection: Connection, event: Event) -> None:
+    report = event.payload["report"]
+    _upsert(
+        connection,
+        reconciliations,
+        {
+            "event_seq": event.seq,
+            "venue": report["venue"],
+            "classification": report["classification"],
+            "observed_at": report["observed_at"],
+            "detail": json.dumps(report["differences"]),
+        },
+        ["event_seq"],
+    )
+
+
+#: Audit-only event types are absent by design, not by omission: seat responses, risk-check
+#: provenance, protective-leg placement and config changes are read from the log, not queried.
 PROJECTORS: dict[EventType, Projector] = {
     EventType.CYCLE_STARTED: _project_cycle_started,
     EventType.SNAPSHOT_FROZEN: _project_snapshot_frozen,
@@ -206,6 +239,8 @@ PROJECTORS: dict[EventType, Projector] = {
     EventType.ORDER_STATE_CHANGED: _project_order_state_changed,
     EventType.FILL_RECEIVED: _project_fill_received,
     EventType.POSITION_UPDATED: _project_position_updated,
+    EventType.ROUND_TRIP_CLOSED: _project_round_trip_closed,
+    EventType.RECONCILED: _project_reconciled,
     EventType.RISK_EVENT: _project_risk_event,
     EventType.CYCLE_COMPLETED: _project_cycle_completed,
 }
