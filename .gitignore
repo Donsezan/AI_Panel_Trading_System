@@ -1,0 +1,29 @@
+# Secrets and local state — never commit
+.env
+.env.*
+!.env.example
+*.db
+*.db-wal
+*.db-shm
+data/
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+coverage.json
+htmlcov/
+
+# Editors
+.vscode/
+.idea/
