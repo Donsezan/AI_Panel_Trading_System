@@ -17,11 +17,11 @@ from tradebot.core.enums import KillSwitchState, Mode, OrderState, OrderType, Si
 from tradebot.core.errors import VenueError
 from tradebot.core.events import EventType
 from tradebot.core.instrument import Instrument
-from tradebot.core.orders import OrderIntent, ProtectivePlan
+from tradebot.core.orders import Order, OrderIntent, ProtectivePlan
 from tradebot.core.portfolio import AccountState
+from tradebot.execution.brokers.sim import SimBroker, Tick
 from tradebot.execution.monitor import ExecutionMonitor
 from tradebot.execution.service import ExecutionService
-from tradebot.execution.sim_broker import SimBroker, Tick
 from tradebot.ledger.portfolio import Ledger
 from tradebot.ledger.reconciler import Reconciler
 from tradebot.persistence.store import EventStore
@@ -340,3 +340,61 @@ def test_an_order_state_that_is_neither_open_nor_terminal_cannot_exist() -> None
     """Step 3 enumerates non-terminal states; a gap there would leave an order unresolved."""
     unresolved = [s for s in OrderState if not s.is_terminal and not s.is_open]
     assert {s.value for s in unresolved} == {"pending_submit", "submit_unknown"}
+
+
+class TestPendingSubmitRecovery:
+    """An order committed but never acknowledged is `SUBMIT_UNKNOWN`, not a dead row.
+
+    The gap this closes: syncing a `PENDING_SUBMIT` order directly asks the lifecycle to jump
+    straight to whatever the venue reports, which the transition table rightly forbids — so the
+    order would stay `PENDING_SUBMIT`, fail `is_open`, and never be tracked. A live order at the
+    venue that nothing monitors is the outcome this whole sequence exists to prevent.
+    """
+
+    async def _persist_intent_only(
+        self, stack: Stack, store: EventStore, clock: ManualClock, instrument: Instrument
+    ) -> OrderIntent:
+        """Write the durable record, exactly as `submit` does before the network call."""
+        intent = entry(instrument, clock)
+        order = Order.from_intent(intent)
+        await store.append(stack.execution.events_for(order).order_submitted(order))
+        return intent
+
+    async def test_an_order_the_venue_has_is_adopted_and_monitored(
+        self, stack: Stack, store: EventStore, clock: ManualClock, instrument: Instrument
+    ) -> None:
+        intent = await self._persist_intent_only(stack, store, clock, instrument)
+        await stack.broker.submit(intent)  # type: ignore[attr-defined] — the venue did take it
+
+        recovery = await stack.sequence.recover()
+
+        assert not recovery.halted
+        assert [order.state for order in recovery.resolved] == [OrderState.OPEN]
+        assert intent.client_order_id in {o.client_order_id for o in stack.monitor.working}
+
+    async def test_the_uncertainty_is_recorded_before_the_answer(
+        self, stack: Stack, store: EventStore, clock: ManualClock, instrument: Instrument
+    ) -> None:
+        """Without this the audit trail claims we always knew where the order stood."""
+        intent = await self._persist_intent_only(stack, store, clock, instrument)
+        await stack.broker.submit(intent)  # type: ignore[attr-defined]
+
+        await stack.sequence.recover()
+
+        states = [
+            event.payload.get("state")
+            for event in store.read_all()
+            if event.type is EventType.ORDER_STATE_CHANGED
+        ]
+        assert states[0] == OrderState.SUBMIT_UNKNOWN.value
+
+    async def test_an_order_the_venue_never_saw_halts(
+        self, stack: Stack, store: EventStore, clock: ManualClock, instrument: Instrument
+    ) -> None:
+        """A vanished order is never routine, whatever state our own record was in."""
+        await self._persist_intent_only(stack, store, clock, instrument)
+
+        recovery = await stack.sequence.recover()
+
+        assert recovery.halted
+        assert any("resolution failed" in failure for failure in recovery.failures)

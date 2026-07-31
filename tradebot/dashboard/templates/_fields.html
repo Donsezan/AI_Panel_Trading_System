@@ -1,0 +1,91 @@
+{# Form field macros. Every input is named `doc.<path>` so one parser turns the whole form into
+   the nested document, and every error is located on the same path (`dashboard/forms.py`).
+   `errors` is passed explicitly rather than read from context: an imported macro has no caller
+   context, and a message that silently stopped rendering would be worse than a noisy one. #}
+
+{% macro _message(errors, path) %}
+  {% for error in errors if error.field == path %}
+    <span class="error small">{{ error.message }}</span>
+  {% endfor %}
+{% endmacro %}
+
+{% macro field(path, label, value, errors, type="text", hint="", attrs="") %}
+  <div class="field">
+    <label for="doc.{{ path }}">{{ label }}</label>
+    <input id="doc.{{ path }}" name="doc.{{ path }}" type="{{ type }}"
+           value="{{ value if value is not none else '' }}" {{ attrs | safe }}>
+    {% if hint %}<span class="muted small">{{ hint }}</span>{% endif %}
+    {{ _message(errors, path) }}
+  </div>
+{% endmacro %}
+
+{% macro choice(path, label, value, options, errors, hint="") %}
+  <div class="field">
+    <label for="doc.{{ path }}">{{ label }}</label>
+    <select id="doc.{{ path }}" name="doc.{{ path }}">
+      {% for option in options %}
+        <option value="{{ option }}" {% if option == value %}selected{% endif %}>{{ option }}</option>
+      {% endfor %}
+    </select>
+    {% if hint %}<span class="muted small">{{ hint }}</span>{% endif %}
+    {{ _message(errors, path) }}
+  </div>
+{% endmacro %}
+
+{% macro flag(path, label, value, hint="") %}
+  <div class="field">
+    {# The hidden input is what makes an unticked box reach the server as `false`; without it the
+       key is simply absent and the model's default silently wins. #}
+    <input type="hidden" name="doc.{{ path }}" value="false">
+    <label class="inline">
+      <input type="checkbox" name="doc.{{ path }}" value="true" {% if value %}checked{% endif %}>
+      {{ label }}
+    </label>
+    {% if hint %}<span class="muted small">{{ hint }}</span>{% endif %}
+  </div>
+{% endmacro %}
+
+{% macro multi(path, label, selected, options, hint="") %}
+  <div class="field">
+    <label for="doc.{{ path }}[]">{{ label }}</label>
+    {# The empty sentinel is how "nothing selected" reaches the server at all: an unselected
+       <select multiple> sends no key, which would read as "leave it as it was". #}
+    <input type="hidden" name="doc.{{ path }}[]" value="">
+    <select id="doc.{{ path }}[]" name="doc.{{ path }}[]" multiple size="{{ options | length }}">
+      {% for option in options %}
+        <option value="{{ option }}" {% if option in selected %}selected{% endif %}>{{ option }}</option>
+      {% endfor %}
+    </select>
+    {% if hint %}<span class="muted small">{{ hint }}</span>{% endif %}
+  </div>
+{% endmacro %}
+
+{# Add and remove re-post the whole form to the draft endpoint and publish nothing, so a row
+   change never loses what the operator has already typed elsewhere on the page. #}
+{% macro row_buttons(add_path, remove_path, add_label, action) %}
+  <div class="row-buttons">
+    {% if remove_path %}
+      <button type="submit" name="remove" value="{{ remove_path }}" class="ghost"
+              formaction="{{ action }}" formnovalidate>remove</button>
+    {% endif %}
+    {% if add_path %}
+      <button type="submit" name="add" value="{{ add_path }}" class="ghost"
+              formaction="{{ action }}" formnovalidate>{{ add_label }}</button>
+    {% endif %}
+  </div>
+{% endmacro %}
+
+{# Every error, including the ones that also render inline. A cross-field rule on a *nested*
+   model — "take profit must exceed the stop" inside a basket's risk policy — is located on the
+   parent field, which matches no input on the page; showing only the unlocated ones would drop
+   it silently. On a form that edits risk limits, saying something twice beats losing it. #}
+{% macro error_summary(errors) %}
+  {% if errors %}
+    <div class="banner danger">
+      <strong>This was not published.</strong>
+      {% for error in errors %}
+        <div>{% if error.field %}<code>{{ error.field }}</code> — {% endif %}{{ error.message }}</div>
+      {% endfor %}
+    </div>
+  {% endif %}
+{% endmacro %}

@@ -10,6 +10,7 @@ are derived and disposable; the log is not.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from decimal import Decimal
 from enum import StrEnum
 from typing import Any
@@ -17,6 +18,7 @@ from typing import Any
 from pydantic import Field
 
 from tradebot.core.clock import Clock
+from tradebot.core.config import ConfigRef
 from tradebot.core.decision import Decision, SeatResponse
 from tradebot.core.enums import (
     BasketStatus,
@@ -109,8 +111,27 @@ class EventFactory:
             payload=payload,
         )
 
-    def cycle_started(self) -> Event:
-        return self._event(EventType.CYCLE_STARTED, self._cycle_id, basket_id=self._basket_id)
+    def cycle_started(self, config_refs: Sequence[ConfigRef] = ()) -> Event:
+        """Open a cycle, pinning the configuration versions it will run on (DESIGN §6.1)."""
+        return self._event(
+            EventType.CYCLE_STARTED,
+            self._cycle_id,
+            basket_id=self._basket_id,
+            config_versions={ref.key: ref.version for ref in config_refs},
+        )
+
+    def config_changed(self, ref: ConfigRef, *, actor: str, note: str, retired: bool) -> Event:
+        """A new configuration version was published. The audit record of who changed what."""
+        return self._event(
+            EventType.CONFIG_CHANGED,
+            ref.key,
+            kind=ref.kind.value,
+            config_id=ref.config_id,
+            version=ref.version,
+            retired=retired,
+            actor=actor,
+            note=note,
+        )
 
     def snapshot_frozen(self, snapshot: ContextSnapshot) -> Event:
         return self._event(

@@ -176,7 +176,7 @@ Core entities (persisted; names are the ubiquitous language of the codebase):
 |---|---|---|
 | **Instrument** | A tradable thing, asset-class-aware | `symbol`, `asset_class` (crypto/equity/index_etf), `venue`, `quote_currency`, `lot_size`, `min_notional`, `tick_size`, `trading_hours` |
 | **Basket** | GUI-created group of 1..N instruments with its own config | `name`, `instruments[]`, `decision_mode` (per_asset \| basket), `schedule`, `panel_config_id`, `risk_policy_id`, `status` (active/paused/halted) |
-| **PanelConfig** | The agent panel definition | `seats[]` (role, provider, model, temperature), `debate_protocol`, `max_rounds`, `consensus_rule`, `token_budget` |
+| **PanelConfig** | The agent panel definition | `providers[]` (endpoint, kind, `secret_ref`, prices), `seats[]` (role, provider, model, temperature, `fallbacks[]`), `debate_protocol`, `max_rounds`, `consensus_rule`, `token_budget` |
 | **RiskPolicy** | Tier-1 limits attached to a basket (and defaults per asset) | see [§6.6](#66-risk-management-two-tier) |
 | **GlobalRiskPolicy** | Tier-2 limits: one instance per venue portfolio (hard, synchronous), plus cross-venue aggregate rules over the PortfolioAggregate | see [§6.6](#66-risk-management-two-tier) |
 | **DecisionCycle** | One run of the loop for one basket | `basket_id`, `started_at`, `context_snapshot_id`, `status`, `outcome` |
@@ -369,9 +369,15 @@ class LLMProvider(Protocol):
     # CompletionResult: text, token_usage, latency_ms, model_fingerprint
 ```
 
-Implementations: `openai_compat` (covers OpenAI, OpenRouter, Qwen, local vLLM — one
-adapter, many endpoints), `anthropic`, `gemini`. Each **seat** in a panel binds
-(role, provider, model, params). A panel is *data*, not code — fully GUI-configurable.
+Implementations: `openai_compat` (covers OpenAI, OpenRouter, Qwen, local vLLM, **LM Studio and
+`llama.cpp --server`** — one adapter, many endpoints), `anthropic`, `gemini`. Each **seat** in a
+panel binds (role, provider, model, params). A panel is *data*, not code — fully GUI-configurable.
+
+A **PanelConfig is self-describing**: it carries the `providers[]` it may reach *and* the
+`seats[]` that reach them, so the dashboard edits endpoints and bindings as one tree and
+validation can prove, before anything runs, that every binding resolves to a declared provider.
+Nothing outside `providers[]` is ever constructed or contacted. Provider settings hold a
+`secret_ref` (an env-var *name*), never a key.
 
 **Panel structure** (defaults informed by TradingAgents [L1] and sycophancy research [L5]):
 
@@ -412,11 +418,32 @@ yields `WAIT (PANEL_DEGRADED)`.
 
 **Fallback & budget:**
 
-- Per-seat fallback chain (e.g. OpenRouter slot → Anthropic) taken from config; a fallback
-  model inherits the seat's role, and the substitution is recorded in the transcript.
+- **Per-seat fallback chain, configured independently for every seat.** A chain is an ordered
+  list of `(provider, model)` **bindings**, not provider names: a model id is only meaningful to
+  the provider that serves it, so moving a seat to another vendor means naming that vendor's
+  model too. Each seat gets its *own* chain — the point is that they differ. Example default:
+
+  | Seat | Primary | Falls back to |
+  |---|---|---|
+  | Technical Analyst | OpenRouter (DeepSeek, free) | LM Studio (local Qwen) |
+  | News/Sentiment Analyst | OpenRouter (Llama, free) | Gemini |
+  | Macro/Risk Skeptic | OpenRouter (Qwen, free) | LM Studio (local Mistral) |
+
+  Two rules follow, and both are enforced at configuration time rather than discovered at
+  runtime: a chain may not repeat a binding (that is a retry of something that just failed, not
+  a fallback), and every binding must name a provider the panel declares (a mistyped provider in
+  a GUI form must fail the form, not become a seat quietly short of its backup).
+
+  Chains should **leave the vendor entirely** — a chain from one OpenRouter slot to another does
+  not survive an OpenRouter outage, and free slots are exactly what disappears without notice
+  [R11]. A local runtime at the end of a chain is the one binding no hosted outage can remove.
+
+  A fallback model inherits the seat's role, and the substitution is recorded in the transcript.
   If fallbacks leave two or more seats on the same provider+model, the cycle is flagged
   `PANEL_HOMOGENEOUS` (event + dashboard) — heterogeneity is a design control [L5] and its
-  silent loss must be visible; config may escalate the flag to `WAIT`.
+  silent loss must be visible; config may escalate the flag to `WAIT`. Seeded panels therefore
+  give each seat a *different* backup, so one vendor outage cannot collapse the panel onto one
+  model with three names.
 - Per-cycle token/cost budget from `PanelConfig`; exceeding it truncates debate early and
   resolves with whatever rounds completed. Costs are persisted per cycle (the dashboard
   shows $/decision — essential for a research testbed comparing panel configurations).
@@ -614,7 +641,10 @@ PENDING_SUBMIT ─► SUBMITTED ─► OPEN ─► PARTIALLY_FILLED ─► FILLE
 FastAPI + server-rendered or light SPA frontend; WebSocket for live updates. Three jobs:
 
 1. **Configure** — CRUD for Baskets (instrument picker with venue search, decision mode,
-   schedule), PanelConfigs (seat editor: role/provider/model, protocol, budgets),
+   schedule), PanelConfigs (**provider editor**: endpoint, kind, `secret_ref`, per-model prices;
+   **seat editor**: role, evidence slice, primary provider+model, devil's-advocate flag, and an
+   ordered **per-seat fallback chain** built from the panel's declared providers — a picker, so a
+   provider that is not declared cannot be typed in; plus protocol and budgets),
    RiskPolicies (tier-1 forms), GlobalRiskPolicy (tier-2, extra confirmation to loosen) —
    every limit and risk control in §6.6 is editable here and persisted in the DB; nothing
    risk-related is hardcoded.

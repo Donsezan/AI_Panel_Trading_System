@@ -1,0 +1,72 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% block title %}Portfolio{% endblock %}
+{% block heading %}Portfolio{% endblock %}
+
+{% block content %}
+<section class="figures">
+  <div class="figure">
+    <span class="label">Equity, mark-to-market ({{ quote_currency }})</span>
+    <span class="value">{{ equity | money }}</span>
+  </div>
+  <div class="figure">
+    <span class="label">Closed round trips</span>
+    <span class="value">{{ curve | length }}</span>
+  </div>
+  <div class="figure">
+    <span class="label">Realized to date</span>
+    <span class="value">{{ (curve[-1].cumulative if curve else 0) | money }}</span>
+  </div>
+</section>
+
+<h2>Positions</h2>
+{{ m.positions_table(positions) }}
+
+<h2>Equity curve (realized)</h2>
+<p class="muted small">
+  Realized PnL accumulated over closed round trips. Deliberately not mark-to-market: no
+  historical marks are persisted, and interpolating them would put a number on the research
+  record that nothing ever observed. Current unrealized value is in the equity figure above.
+</p>
+<table>
+  <thead><tr><th>Closed</th><th>Instrument</th><th>Realized</th><th>Cumulative</th></tr></thead>
+  <tbody>
+  {% for point in curve %}
+    <tr>
+      <td class="mono">{{ point.closed_at | moment }}</td>
+      <td><code>{{ point.instrument_key }}</code></td>
+      <td class="num {{ 'ok' if point.realized_pnl >= 0 else 'danger' }}">{{ point.realized_pnl | money }}</td>
+      <td class="num">{{ point.cumulative | money }}</td>
+    </tr>
+  {% else %}
+    {{ m.empty(4, "No round trip has closed yet.") }}
+  {% endfor %}
+  </tbody>
+</table>
+
+<h2>Round trips</h2>
+<table>
+  <thead><tr>
+    <th>Closed</th><th>Basket</th><th>Instrument</th><th>Qty</th>
+    <th>Entry</th><th>Exit</th><th>Realized</th>
+  </tr></thead>
+  <tbody>
+  {% for row in round_trips %}
+    <tr>
+      <td class="mono">{{ row.closed_at | moment }}</td>
+      <td><code>{{ row.basket_id }}</code></td>
+      <td><code>{{ row.instrument_key }}</code></td>
+      <td class="num">{{ row.qty | quantity }}</td>
+      <td class="num">{{ row.entry_price | money }}</td>
+      <td class="num">{{ row.exit_price | money }}</td>
+      <td class="num {{ 'ok' if row.realized_pnl >= 0 else 'danger' }}">{{ row.realized_pnl | money }}</td>
+    </tr>
+  {% else %}
+    {{ m.empty(7, "No closed positions.") }}
+  {% endfor %}
+  </tbody>
+</table>
+
+<h2>Recent orders</h2>
+{{ m.orders_table(orders, "No order has been placed.") }}
+{% endblock %}

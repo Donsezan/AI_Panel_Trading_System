@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}tradebot{% endblock %} — {{ mode }}</title>
+  <link rel="stylesheet" href="/static/app.css">
+  {# Vendored, never a CDN: the repo hash-pins every dependency and must work offline (ADR 0014).
+     The integrity attribute is inert for a same-origin file and is kept so the hash recorded in
+     the ADR and the hash served to the browser are the same string in two places. #}
+  <script src="/static/htmx.min.js"
+          integrity="sha384-ZBXiYtYQ6hJ2Y0ZNoYuI+Nq5MqWBr+chMrS/RkXpNzQCApHEhOt2aY8EJgqwHLkJ"
+          defer></script>
+</head>
+<body>
+<header class="mode-{{ mode_tone }}">
+  <span class="mode-badge">{{ mode | upper }}</span>
+  <nav>
+    <a href="/">Overview</a>
+    <a href="/portfolio">Portfolio</a>
+    <a href="/cycles">Cycles</a>
+    <a href="/risk">Risk</a>
+    <a href="/costs">Costs</a>
+    <a href="/configure">Configure</a>
+    <a href="/control">Control</a>
+  </nav>
+  <span class="spacer"></span>
+  {% if observe_only %}<span class="pill warn" title="serving without the supervisor">observe-only</span>{% endif %}
+  <a class="logout" href="/logout">Log out</a>
+</header>
+
+{% if not risk_state.may_trade %}
+<div class="banner danger">
+  <strong>Kill switch tripped.</strong> Nothing will trade until a human re-arms it.
+  {% if risk_state.reason %}<span class="detail">{{ risk_state.reason }}</span>{% endif %}
+</div>
+{% endif %}
+{% if halted %}
+<div class="banner warn">
+  <strong>Halted baskets:</strong>
+  {% for basket_id, reason in halted.items() %}
+    <span class="detail"><code>{{ basket_id }}</code> — {{ reason or "no reason recorded" }}</span>
+  {% endfor %}
+</div>
+{% endif %}
+
+<main>
+  <h1>{% block heading %}{% endblock %}</h1>
+  {% block content %}{% endblock %}
+</main>
+</body>
+</html>

@@ -307,18 +307,28 @@ the same inputs. Rate limiter proven to stay under budget under a burst test.
 
 ### Phase 4 — Decision engine · ~2 weeks
 
-- `LLMProvider` adapters: `openai_compat` (OpenRouter/OpenAI/local), `anthropic`, `gemini`.
-- Seats bind (role, provider, model, params) — **panel is data, not code**.
+- `LLMProvider` adapters: `openai_compat` (OpenRouter/OpenAI/vLLM/**LM Studio**/**llama.cpp**),
+  `anthropic`, `gemini` — written against the HTTP APIs, not vendor SDKs ([ADR 0009](docs/adr/0009-llm-providers-over-plain-http.md)).
+- Seats bind (role, provider, model, params) — **panel is data, not code**. A `PanelConfig`
+  carries its own `providers[]`, so it is self-describing and GUI-editable as one tree.
 - `blind_then_debate` protocol: blind round 0, anonymized transcripts, devil's-advocate seat,
   differentiated evidence slices per seat.
 - Consensus in **deterministic code**: qualified majority, conviction scaling, non-consensus ⇒
   `WAIT` with recorded dissent. (DESIGN [L6])
 - Hard output contract: pydantic validation, one repair attempt, then `ABSTAIN`;
   >⅓ abstain ⇒ `WAIT (PANEL_DEGRADED)`. (DESIGN [L8])
-- Per-seat fallback chains; per-cycle token/cost budget with early truncation; cost persisted
-  per cycle.
-- Prompt-injection hardening: news wrapped in delimited data blocks, panel has no tools,
-  output schema-bound and risk-gated.
+- **Per-seat fallback chains, each configured independently** — an ordered list of
+  `(provider, model)` bindings per seat, crossing vendor families and ending at a local runtime.
+  Validated at configuration time: no repeated binding within a chain, and every binding must
+  name a provider the panel declares. Seeded panels give each seat a *different* backup so one
+  vendor outage cannot collapse heterogeneity (R11).
+- Per-cycle token/cost budget with early truncation; cost persisted per cycle and de-duplicated
+  by provider call, so `basket` mode is not double-counted.
+- Both decision modes: `per_asset` and `basket` (one panel run, an assessment per instrument).
+- Prompt-injection hardening: news **and peer transcripts** wrapped in delimited data blocks
+  (a seat's thesis is model text derived from news, so an injection can otherwise launder through
+  one seat into every other seat's prompt), panel has no tools, output schema-bound and
+  risk-gated.
 
 **Exit:** cassette-based tests (recorded provider responses) make the suite deterministic and
 free. A malformed-response fuzz test proves no junk escapes into a `Decision`.
@@ -356,6 +366,12 @@ the process refuses to start on every one of the §2.4 missing-precondition case
   validation against the same pydantic schemas), **Monitor** (equity curve, cycle history, decision drill-down = the
   research artifact, cost tracking), **Control** (pause/resume, un-halt, manual close *through
   the normal risk/execution path — no side doors*, kill switch).
+- **Panel editor** specifically (the Phase 4 config shapes made editable, DESIGN §6.10):
+  a provider list (endpoint, kind, `secret_ref` by name, per-model prices) and a seat list where
+  each seat picks its primary provider+model and builds its **own ordered fallback chain** from
+  the declared providers — a picker rather than free text, so an undeclared provider cannot be
+  entered. `PanelConfig`'s existing validators are the server-side check, unchanged; the form
+  surfaces their messages rather than reimplementing them.
 - Auth mandatory on non-loopback bind.
 
 **Exit:** a basket can be created, configured, run, paused, and killed entirely from the GUI,
@@ -444,7 +460,7 @@ Two tests I consider load-bearing and will write early:
 | R8 | Backtest mistaken for alpha evidence | High | Med (research validity) | Banner + docs; paper trading is the only evaluation |
 | R9 | Scraping ToS exposure | Med | Med (legal) | §3.3 RSS/API only, robots.txt respected, excerpt-only storage |
 | R10 | Scope overrun — this is a big system | High | Med | Walking skeleton first; every phase independently demoable |
-| R11 | Free OpenRouter models degrade/disappear | High | Low | Per-seat fallback chains; substitution recorded in transcript; `PANEL_HOMOGENEOUS` flag when fallbacks collapse model heterogeneity |
+| R11 | Free OpenRouter models degrade/disappear | High | Low | Per-seat fallback chains of `(provider, model)` bindings that leave the vendor entirely and end at a local runtime (LM Studio / llama.cpp); each seat given a *different* backup so one outage cannot collapse the panel; substitution recorded in transcript; `PANEL_HOMOGENEOUS` flag when fallbacks collapse model heterogeneity |
 | R12 | Venue lacks native protective orders → position unprotected between cycles | Med | High | `BrokerCapabilities` gate; sizing haircut; `unprotected_position` flag in RiskCheckResult and panel context (DESIGN §6.7) |
 | R13 | Accidental short on equities (SELL while flat) | Med | **Severe (money)** | Tier-1 long-only/reduce-only veto (DESIGN §6.6) |
 | R14 | Corporate action (split/dividend) mistaken for ledger drift → false halt/kill | Med | Med (ops) | Reconciler corporate-action classification against venue announcements (Phase 2c/5) |

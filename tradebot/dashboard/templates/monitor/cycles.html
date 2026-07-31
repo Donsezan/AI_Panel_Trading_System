@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% block title %}Cycles{% endblock %}
+{% block heading %}Cycle history{% endblock %}
+
+{% block content %}
+<form class="filters" method="get" action="/cycles">
+  <label for="basket">Basket</label>
+  <select id="basket" name="basket" onchange="this.form.submit()">
+    <option value="">all</option>
+    {% for record in baskets %}
+      <option value="{{ record.ref.config_id }}" {% if selected == record.ref.config_id %}selected{% endif %}>
+        {{ record.ref.config_id }}
+      </option>
+    {% endfor %}
+  </select>
+  <noscript><button type="submit">Filter</button></noscript>
+</form>
+
+{{ m.cycles_table(cycles) }}
+{% endblock %}

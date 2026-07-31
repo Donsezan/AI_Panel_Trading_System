@@ -13,8 +13,9 @@ from __future__ import annotations
 
 import json
 from collections.abc import Sequence
+from typing import Any
 
-from sqlalchemy import Connection, Engine, func, select
+from sqlalchemy import Connection, Engine, Select, func, select
 
 from tradebot.core.events import Event, EventType
 from tradebot.persistence.database import SingleWriter
@@ -39,6 +40,15 @@ class EventStore:
         if not new_events:
             return ()
         return await self._writer.run(lambda connection: self._append(connection, new_events))
+
+    def append_within(self, connection: Connection, *new_events: Event) -> tuple[Event, ...]:
+        """Append inside a transaction the caller already owns.
+
+        For stores that write a row of their own *and* its audit event: two `append` calls would
+        be two transactions, and a crash between them would leave either a configuration nobody
+        authorised or an authorisation of a configuration that was never stored.
+        """
+        return self._append(connection, new_events)
 
     @staticmethod
     def _append(connection: Connection, new_events: Sequence[Event]) -> tuple[Event, ...]:
@@ -71,8 +81,22 @@ class EventStore:
     # Reads bypass the writer: WAL lets them run concurrently with a cycle in flight.
 
     def read_all(self) -> tuple[Event, ...]:
+        return self._read(select(events).order_by(events.c.seq))
+
+    def read_cycle(self, cycle_id: str) -> tuple[Event, ...]:
+        """One cycle's events, in order — the dashboard's decision drill-down.
+
+        Scoped rather than filtered from `read_all`, because seat responses and frozen snapshots
+        are the largest payloads in the log and a soak accumulates months of them: the drill-down
+        must cost one cycle, not one database.
+        """
+        return self._read(
+            select(events).where(events.c.cycle_id == cycle_id).order_by(events.c.seq)
+        )
+
+    def _read(self, query: Select[Any]) -> tuple[Event, ...]:
         with self._engine.connect() as connection:
-            rows = connection.execute(select(events).order_by(events.c.seq)).all()
+            rows = connection.execute(query).all()
         return tuple(
             Event(
                 event_id=row.event_id,

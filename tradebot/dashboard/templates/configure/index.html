@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% block title %}Configure{% endblock %}
+{% block heading %}Configure{% endblock %}
+
+{% block content %}
+<p class="muted">
+  Configuration lives in the database as versioned documents. An edit publishes a new version and
+  nothing is overwritten, so a past decision stays readable against the limits that produced it.
+</p>
+
+<h2>Baskets</h2>
+<table>
+  <thead><tr><th>Basket</th><th>Name</th><th>Version</th><th>Status</th><th>Instruments</th><th></th></tr></thead>
+  <tbody>
+  {% for record in baskets %}
+    <tr>
+      <td><code>{{ record.ref.config_id }}</code></td>
+      <td>{{ record.document.name }}</td>
+      <td class="num">{{ record.ref.version }}</td>
+      <td>{{ m.pill(record.document.status.value) }}</td>
+      <td class="small">{% for i in record.document.instruments %}<code>{{ i.key }}</code> {% endfor %}</td>
+      <td>
+        <a href="/configure/baskets/{{ record.ref.config_id }}">edit</a> ·
+        <a href="/configure/history/basket/{{ record.ref.config_id }}">history</a>
+      </td>
+    </tr>
+  {% else %}
+    {{ m.empty(6, "No baskets configured.") }}
+  {% endfor %}
+  </tbody>
+</table>
+<p class="actions"><a class="button-link" href="/configure/baskets/new">New basket</a></p>
+
+<h2>Global (Tier-2) risk policy</h2>
+{% if policy %}
+  <p>
+    Version {{ policy.ref.version }}, published by {{ policy.actor }}.
+    <a href="/configure/risk">edit</a> ·
+    <a href="/configure/history/global_risk/global">history</a>
+  </p>
+{% else %}
+  <p class="empty danger">
+    No Tier-2 policy is published — nothing may run without global limits.
+    <a href="/configure/risk">publish one</a>.
+  </p>
+{% endif %}
+{% endblock %}

@@ -41,7 +41,14 @@ def _project_cycle_started(connection: Connection, event: Event) -> None:
     _upsert(
         connection,
         cycles,
-        {"cycle_id": event.cycle_id, "basket_id": event.basket_id, "started_at": event.ts},
+        {
+            "cycle_id": event.cycle_id,
+            "basket_id": event.basket_id,
+            "started_at": event.ts,
+            # Absent on cycles recorded before version pinning existed; an empty pin set is the
+            # honest reading of those, not a reason to fail the replay.
+            "config_versions_json": json.dumps(event.payload.get("config_versions", {})),
+        },
         ["cycle_id"],
     )
 

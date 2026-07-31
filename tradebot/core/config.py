@@ -1,8 +1,9 @@
 """User-editable configuration as data.
 
-Nothing risk-related is a constant in code: every limit here becomes a versioned row in the
-ConfigStore and a form field in the dashboard (PLAN scope, DESIGN §6.6, §6.10). Phase 6 adds
-versioning; the shapes are already the ones the engine consumes.
+Nothing risk-related is a constant in code: every limit here is stored as a versioned row by
+`control/config_store.py` and edited from the dashboard (PLAN scope, DESIGN §6.6, §6.10). These
+models are both the storage format and what the engine consumes, so a form validated against them
+is validated against exactly what will run.
 
 **Only limits that are actually enforced appear here.** A configurable field that no rule reads
 is worse than a missing one — an operator would believe a limit is in force when it is not.
@@ -12,13 +13,22 @@ rules in Phase 2d.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from pydantic import Field, model_validator
 
-from tradebot.core.enums import AssetClass, BasketStatus, DecisionMode
+from tradebot.core.clock import ensure_utc
+from tradebot.core.enums import AssetClass, BasketStatus, ConfigKind, DecisionMode, ProviderKind
 from tradebot.core.instrument import Instrument
 from tradebot.core.schema import DomainModel, Money
+
+TOKENS_PER_PRICING_UNIT = Decimal(1_000_000)
+
+#: Ticks are counted from here rather than from process start, so a restart cannot shift a
+#: basket's cadence and two processes reading one config agree on the same instants.
+EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
 
 class RiskPolicy(DomainModel):
@@ -145,6 +155,11 @@ class GlobalRiskPolicy(DomainModel):
     #: against a bug that decides to trade every cycle forever (PLAN §3.1).
     max_orders_per_hour: int = Field(default=20, gt=0)
 
+    #: Largest notional a single order may carry, in the quote currency. `None` means uncapped,
+    #: which is the sim and paper default. Live mode **requires** it: the value comes from the
+    #: operator's arming row and is enforced by `OrderNotionalRule` (PLAN §2.4).
+    max_order_notional: Money | None = None
+
     #: Loss against day-start equity that halts all new orders for the day. Watchdog-enforced.
     max_daily_loss_pct: Money = Decimal(3)
 
@@ -182,6 +197,8 @@ class GlobalRiskPolicy(DomainModel):
                 raise ValueError(f"{name} must be within (0, 100], got {value}")
         if len({cluster.cluster_id for cluster in self.clusters}) != len(self.clusters):
             raise ValueError("cluster ids must be unique")
+        if self.max_order_notional is not None and self.max_order_notional <= Decimal(0):
+            raise ValueError("max_order_notional must be positive when set, or left unset")
         return self
 
     def cluster_for(self, instrument: Instrument) -> CorrelationCluster | None:
@@ -197,6 +214,87 @@ class GlobalRiskPolicy(DomainModel):
         return tuple(other.key for other in universe if cluster.contains(other))
 
 
+class ModelPricing(DomainModel):
+    """USD per million tokens, quoted the way every provider quotes it.
+
+    Free slots price at zero, which is the v1 default. A model absent from the table costing zero
+    is the right failure direction for a budget: a zero-cost model can never be truncated by a
+    budget it cannot consume.
+    """
+
+    prompt_per_million: Money = Decimal(0)
+    completion_per_million: Money = Decimal(0)
+
+    @property
+    def is_free(self) -> bool:
+        return not self.prompt_per_million and not self.completion_per_million
+
+    def cost(self, prompt_tokens: int, completion_tokens: int) -> Decimal:
+        if self.is_free:
+            return Decimal(0)
+        billed = self.prompt_per_million * Decimal(prompt_tokens) + (
+            self.completion_per_million * Decimal(completion_tokens)
+        )
+        return billed / TOKENS_PER_PRICING_UNIT
+
+
+#: What an unpriced model costs. Free slots are the v1 default panel, so this is the common case.
+FREE = ModelPricing()
+
+
+class PriceList(DomainModel):
+    """One provider's prices, keyed by model id. GUI-editable, like every other limit."""
+
+    models: Mapping[str, ModelPricing] = Field(default_factory=dict)
+
+    def for_model(self, model: str) -> ModelPricing:
+        return self.models.get(model, FREE)
+
+
+class ProviderSettings(DomainModel):
+    """One reachable LLM endpoint.
+
+    DESIGN §6.1 lists provider settings among the things the GUI edits and the ConfigStore
+    versions, which is why this lives in `core` beside the panel that uses it rather than inside
+    an adapter: the dashboard edits endpoints and seat bindings as one tree.
+    """
+
+    provider_id: str
+    kind: ProviderKind
+    #: Empty only for `STUB`, which has no endpoint at all.
+    base_url: str = ""
+    #: Environment variable *name* holding the key — never the value. The indirection is the
+    #: control: a key can then be absent from the database, the logs and every prompt (PLAN §3.2).
+    secret_ref: str | None = None
+    prices: PriceList = PriceList()
+    #: Several local servers reject `response_format`; asking for it there would take a fallback
+    #: out of service exactly when the hosted slot it backs up has already failed.
+    supports_json_mode: bool = True
+
+    @model_validator(mode="after")
+    def _check_endpoint(self) -> ProviderSettings:
+        if self.kind.needs_endpoint and not self.base_url:
+            raise ValueError(f"provider {self.provider_id!r} ({self.kind}) needs a base_url")
+        return self
+
+
+class ProviderBinding(DomainModel):
+    """One (provider, model) pair a seat can run on.
+
+    A fallback is a *binding* rather than a provider id because a model id is only meaningful to
+    the provider that serves it: a seat whose free OpenRouter slot disappears has to move to a
+    different model as well as a different endpoint (DESIGN §6.5, R11).
+    """
+
+    provider_id: str
+    model: str
+
+    @property
+    def fingerprint(self) -> str:
+        """What heterogeneity is measured over — two seats sharing one is a collapsed panel."""
+        return f"{self.provider_id}:{self.model}"
+
+
 class SeatConfig(DomainModel):
     """One seat in the panel: a role bound to a provider and model.
 
@@ -210,15 +308,60 @@ class SeatConfig(DomainModel):
     model: str
     temperature: float = 0.3
     evidence: tuple[str, ...] = ("indicators", "news", "position")
-    fallbacks: tuple[str, ...] = ()
+
+    #: Tried in order when the primary binding fails. Deliberately allowed to cross provider
+    #: families — a chain that stays inside one provider does not survive that provider's outage,
+    #: which is the failure R11 predicts for free model slots.
+    fallbacks: tuple[ProviderBinding, ...] = ()
+
+    #: This seat argues against the emerging majority in every debate round. At least one such
+    #: seat is a structural control against sycophantic convergence (DESIGN §6.5, [L5]).
+    devils_advocate: bool = False
+
+    @property
+    def primary(self) -> ProviderBinding:
+        return ProviderBinding(provider_id=self.provider_id, model=self.model)
+
+    @property
+    def bindings(self) -> tuple[ProviderBinding, ...]:
+        """The primary binding, then the fallback chain, in the order they are attempted."""
+        return (self.primary, *self.fallbacks)
+
+    @model_validator(mode="after")
+    def _check_chain(self) -> SeatConfig:
+        """A chain must actually be a chain.
+
+        Repeating a binding is not a fallback, it is a retry of something that just failed — and
+        a silent one, since the seat would report the same binding it started on. Rejected at
+        configuration time so a mis-filled GUI form cannot produce a seat with no real backup.
+        """
+        seen = [binding.fingerprint for binding in self.bindings]
+        duplicates = sorted({name for name in seen if seen.count(name) > 1})
+        if duplicates:
+            raise ValueError(
+                f"seat {self.seat_id!r} repeats {', '.join(duplicates)} in its fallback chain; "
+                "a fallback must be a different provider or a different model"
+            )
+        return self
 
 
 class PanelConfig(DomainModel):
-    """The agent panel definition. A panel is data, not code."""
+    """The agent panel definition. A panel is data, not code.
+
+    Self-describing on purpose: the panel carries the endpoints it may reach *and* the seats that
+    reach them, so one GUI form edits both and validation can prove every binding resolves. A
+    panel that named providers someone else had to remember to wire would fail at runtime as a
+    quietly degraded seat — the failure mode hardest to notice and most expensive to diagnose.
+    """
 
     panel_id: str
     seats: tuple[SeatConfig, ...]
+    #: Endpoints this panel may reach. Nothing outside this tuple is ever constructed or
+    #: contacted, and every seat binding must resolve to one of them.
+    providers: tuple[ProviderSettings, ...] = ()
     protocol: str = "single_round"
+    #: Total rounds *including* the blind round 0, so `3` is one blind round plus two debate
+    #: rounds — the DESIGN §6.5 default. A protocol may stop earlier; it may never run more.
     max_rounds: int = Field(default=1, ge=1)
     #: Fraction of the original seat count that must agree for a tradable action. Counted over
     #: the *original* seats, never the remaining ones, so an abstention can never make a
@@ -236,11 +379,119 @@ class PanelConfig(DomainModel):
             raise ValueError("seat ids must be unique within a panel")
         if not Decimal(0) < self.qualified_majority <= Decimal(1):
             raise ValueError("qualified_majority must be within (0, 1]")
+        if self.max_cost_usd_per_cycle < Decimal(0):
+            raise ValueError("max_cost_usd_per_cycle cannot be negative")
+        if all(seat.devils_advocate for seat in self.seats):
+            raise ValueError(
+                "a panel of nothing but devil's advocates has no majority to argue against; "
+                "at least one seat must reason from the evidence directly"
+            )
+        self._check_bindings_resolve()
         return self
+
+    def _check_bindings_resolve(self) -> None:
+        """Every binding, primary and fallback, must name a provider this panel declares.
+
+        A panel with no declared providers is exempt: that is a panel whose providers are supplied
+        by the composition root, which is how the test suite and the scenario harness build one.
+        """
+        declared = {provider.provider_id for provider in self.providers}
+        if len(declared) != len(self.providers):
+            raise ValueError("provider ids must be unique within a panel")
+        if not declared:
+            return
+        unresolved = sorted(
+            {
+                f"{seat.seat_id} → {binding.provider_id}"
+                for seat in self.seats
+                for binding in seat.bindings
+                if binding.provider_id not in declared
+            }
+        )
+        if unresolved:
+            raise ValueError(
+                f"these bindings name providers the panel does not declare: "
+                f"{'; '.join(unresolved)}. Declared: {', '.join(sorted(declared))}"
+            )
 
     @property
     def seat_count(self) -> int:
         return len(self.seats)
+
+    @property
+    def is_heterogeneous(self) -> bool:
+        """Whether the configured seats span more than one provider+model.
+
+        Checked at configuration time; the panel can still *collapse* at runtime when fallbacks
+        land two seats on the same binding, which the consensus rule flags separately.
+        """
+        return len({seat.primary.fingerprint for seat in self.seats}) == self.seat_count
+
+    def provider(self, provider_id: str) -> ProviderSettings:
+        found = next((p for p in self.providers if p.provider_id == provider_id), None)
+        if found is None:
+            raise KeyError(f"{provider_id} is not declared by panel {self.panel_id}")
+        return found
+
+    def fallback_plan(self) -> dict[str, tuple[str, ...]]:
+        """Each seat's chain as readable fingerprints — what the GUI renders and an operator reads.
+
+        The whole point of per-seat chains is that they differ; a plan showing three identical
+        rows is a panel that will lose every seat to the same outage (R11).
+        """
+        return {seat.seat_id: tuple(b.fingerprint for b in seat.bindings) for seat in self.seats}
+
+
+class Schedule(DomainModel):
+    """When a basket cycles (DESIGN §6.1).
+
+    `market_open+15m` is deliberately *not* a second schedule kind. It is a daily interval whose
+    first tick of a session is deferred to that session's open by the trading calendar, plus
+    `open_delay_seconds` — so an equities schedule and a crypto schedule are one code path and one
+    set of tests, rather than two that agree only by inspection (`control/scheduler.py`).
+    """
+
+    every_seconds: int = Field(default=600, gt=0)
+    #: Phase within the interval: "every 1h at :05" is `every_seconds=3600, offset_seconds=300`.
+    offset_seconds: int = Field(default=0, ge=0)
+    #: How long after a session opens the first cycle of that session runs. Zero fires at the open;
+    #: a delay lets the opening auction's prints clear before indicators are computed over them.
+    open_delay_seconds: int = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def _check_offset(self) -> Schedule:
+        if self.offset_seconds >= self.every_seconds:
+            raise ValueError(
+                f"offset_seconds must fall inside one interval, got {self.offset_seconds} "
+                f"in {self.every_seconds}s"
+            )
+        return self
+
+    def next_tick(self, after: datetime) -> datetime:
+        """The first scheduled instant strictly after `after`.
+
+        Strictly, because a tick is consumed by the cycle it starts: computing the next fire from
+        the instant a cycle *ended* must never hand back the tick that cycle just ran.
+        """
+        elapsed = (ensure_utc(after) - EPOCH) // timedelta(seconds=1)
+        periods = (elapsed - self.offset_seconds) // self.every_seconds + 1
+        return EPOCH + timedelta(seconds=self.offset_seconds + periods * self.every_seconds)
+
+
+class ConfigRef(DomainModel):
+    """One exact configuration version — what a cycle pins and a replay resolves.
+
+    A cycle records the refs it ran on, so a past decision can be re-read against the
+    configuration that produced it rather than against whatever the limits are today (DESIGN §6.1).
+    """
+
+    kind: ConfigKind
+    config_id: str
+    version: int = Field(ge=1)
+
+    @property
+    def key(self) -> str:
+        return f"{self.kind.value}:{self.config_id}"
 
 
 class Basket(DomainModel):
@@ -252,7 +503,17 @@ class Basket(DomainModel):
     panel: PanelConfig
     risk_policy: RiskPolicy = RiskPolicy()
     decision_mode: DecisionMode = DecisionMode.PER_ASSET
-    cycle_interval_seconds: int = Field(default=600, gt=0)
+
+    #: Timeframes indicators are computed over. Empty means the indicator engine's default set.
+    #: Validated against the registry where the registry lives — `core` must not import it.
+    timeframes: tuple[str, ...] = ()
+    #: Indicator reading names from the registry. Empty means the engine's default set.
+    indicators: tuple[str, ...] = ()
+    #: News source ids feeding this basket's snapshots. Empty means no news at all, which the
+    #: snapshot states explicitly rather than leaving the panel to assume a quiet market.
+    news_sources: tuple[str, ...] = ()
+
+    schedule: Schedule = Schedule()
     #: Slack between an order's TTL and the next cycle, so the remainder is cancelled and booked
     #: before the next decision is taken against a position that is still moving.
     ttl_buffer_seconds: int = Field(default=60, ge=0)
@@ -267,6 +528,10 @@ class Basket(DomainModel):
         if self.ttl_buffer_seconds >= self.cycle_interval_seconds:
             raise ValueError("ttl_buffer_seconds must leave a positive order lifetime")
         return self
+
+    @property
+    def cycle_interval_seconds(self) -> int:
+        return self.schedule.every_seconds
 
     @property
     def order_ttl_seconds(self) -> int:

@@ -1,0 +1,164 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% set cycle = detail.cycle %}
+{% block title %}Cycle {{ cycle.cycle_id[:8] }}{% endblock %}
+{% block heading %}Decision drill-down{% endblock %}
+
+{% block content %}
+<p class="muted">
+  The full record of one cycle: what the panel saw, what each seat said, why risk approved or
+  refused, and what reached the venue — read against the configuration versions that produced it.
+</p>
+
+<section class="figures">
+  <div class="figure"><span class="label">Basket</span><span class="value"><code>{{ cycle.basket_id }}</code></span></div>
+  <div class="figure"><span class="label">Outcome</span><span class="value">{{ m.pill(cycle.outcome or "running") }}</span></div>
+  <div class="figure"><span class="label">Started</span><span class="value mono small">{{ cycle.started_at | moment }}</span></div>
+  <div class="figure"><span class="label">Completed</span><span class="value mono small">{{ cycle.completed_at | moment }}</span></div>
+  <div class="figure"><span class="label">Cost (USD)</span><span class="value">{{ cycle.cost_usd | money(4) }}</span></div>
+</section>
+
+<dl class="facts">
+  <dt>Cycle id</dt><dd class="mono">{{ cycle.cycle_id }}</dd>
+  <dt>Snapshot digest</dt><dd class="mono">{{ cycle.snapshot_digest or absent }}</dd>
+</dl>
+
+<h2>Configuration in force</h2>
+<table>
+  <thead><tr><th>Document</th><th>Version</th><th>Published by</th><th>Note</th></tr></thead>
+  <tbody>
+  {% for ref, record in pinned %}
+    <tr>
+      <td><code>{{ ref.key }}</code></td>
+      <td class="num">{{ ref.version }}</td>
+      {% if record %}
+        <td>{{ record.actor }}</td><td class="detail-cell">{{ record.note }}</td>
+      {% else %}
+        <td colspan="2" class="danger">pinned version no longer resolves</td>
+      {% endif %}
+    </tr>
+  {% else %}
+    {{ m.empty(4, "This cycle recorded no configuration pins.") }}
+  {% endfor %}
+  </tbody>
+</table>
+
+<h2>Decisions</h2>
+<table>
+  <thead><tr>
+    <th>Instrument</th><th>Action</th><th>Conviction</th><th>Size hint</th>
+    <th>Reasoning</th><th>Dissent</th><th>Flags</th>
+  </tr></thead>
+  <tbody>
+  {% for row in detail.decisions %}
+    <tr>
+      <td><code>{{ row.instrument_key }}</code></td>
+      <td>{{ m.pill(row.action) }}</td>
+      <td class="num">{{ row.conviction | money(2) }}</td>
+      <td class="muted">{{ row.size_hint }}</td>
+      <td class="detail-cell">{{ row.reasoning_summary }}</td>
+      <td class="detail-cell small">
+        {% for line in row.dissent_json | fromjson or [] %}<div>{{ line }}</div>{% endfor %}
+      </td>
+      <td class="small">
+        {% for flag in row.flags_json | fromjson or [] %}{{ m.pill(flag) }}{% endfor %}
+      </td>
+    </tr>
+  {% else %}
+    {{ m.empty(7, "No decision was reached — the cycle ended before the panel ran.") }}
+  {% endfor %}
+  </tbody>
+</table>
+
+<h2>Debate transcript</h2>
+<p class="muted small">
+  Every round, including abstentions and losing arguments. Model names are anonymized between
+  seats during the debate; they are shown here because this view is for a human afterwards.
+</p>
+{% for event in detail.events_of("SEAT_RESPONDED") %}
+  {% set r = event.payload.response %}
+  <details class="transcript">
+    <summary>
+      <strong>{{ r.role }}</strong>
+      <code>{{ r.seat_id }}</code>
+      round {{ r.round_index }} · <code>{{ r.instrument_key }}</code> ·
+      <span class="muted">{{ r.provider_id }}:{{ r.model }}</span>
+      {% if r.vote %}{{ m.pill(r.vote.action) }}{% else %}{{ m.pill("ABSTAIN") }}{% endif %}
+    </summary>
+    {% if r.vote %}
+      <dl class="facts">
+        <dt>Conviction</dt><dd>{{ r.vote.conviction }} / 5</dd>
+        <dt>Size hint</dt><dd>{{ r.vote.size_hint }}</dd>
+        <dt>Thesis</dt><dd>{{ r.vote.thesis }}</dd>
+        <dt>Key risks</dt><dd>{% for risk in r.vote.key_risks %}<div>{{ risk }}</div>{% endfor %}</dd>
+        <dt>Invalidation</dt><dd>{{ r.vote.invalidation }}</dd>
+      </dl>
+    {% else %}
+      <p class="warn">Abstained: {{ r.abstain_reason }}</p>
+    {% endif %}
+    <p class="muted small">
+      {{ r.latency_ms }} ms · {{ r.prompt_tokens }} prompt + {{ r.completion_tokens }} completion
+      tokens · call <code>{{ r.call_id[:8] }}</code> · {{ r.cost_usd | money(4) }} USD
+    </p>
+  </details>
+{% else %}
+  <p class="empty">No seat responded in this cycle.</p>
+{% endfor %}
+
+<h2>Risk checks</h2>
+{% for event in detail.events_of("RISK_CHECKED") %}
+  <table class="checks">
+    <caption>
+      <code>{{ event.payload.instrument_key }}</code> —
+      {{ m.pill("approved" if event.payload.approved else "vetoed") }}
+    </caption>
+    <thead><tr><th>Rule</th><th>Decision</th><th>Limit</th><th>Observed</th><th>Max qty</th><th>Detail</th></tr></thead>
+    <tbody>
+    {% for check in event.payload.checks %}
+      <tr>
+        <td><code>{{ check.rule }}</code></td>
+        <td>{{ m.pill(check.decision) }}</td>
+        <td class="num">{{ check.limit | money(4) }}</td>
+        <td class="num">{{ check.observed | money(4) }}</td>
+        <td class="num">{{ check.max_qty | quantity }}</td>
+        <td class="detail-cell">{{ check.detail }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+{% else %}
+  <p class="empty">No risk check ran — nothing was proposed.</p>
+{% endfor %}
+
+<h2>Orders</h2>
+{{ m.orders_table(detail.orders, "This cycle placed no order.") }}
+
+<h2>Fills</h2>
+<table>
+  <thead><tr><th>Filled</th><th>Instrument</th><th>Side</th><th>Qty</th><th>Price</th><th>Fee</th></tr></thead>
+  <tbody>
+  {% for row in detail.fills %}
+    <tr>
+      <td class="mono">{{ row.filled_at | moment }}</td>
+      <td><code>{{ row.instrument_key }}</code></td>
+      <td>{{ m.pill(row.side | upper) }}</td>
+      <td class="num">{{ row.qty | quantity }}</td>
+      <td class="num">{{ row.price | money }}</td>
+      <td class="num">{{ row.fee | money(6) }} {{ row.fee_currency }}</td>
+    </tr>
+  {% else %}
+    {{ m.empty(6, "Nothing filled.") }}
+  {% endfor %}
+  </tbody>
+</table>
+
+<h2>Frozen snapshot</h2>
+{% if detail.snapshot %}
+  <details>
+    <summary>The exact input packet every seat was given</summary>
+    <pre class="json">{{ detail.snapshot | prettyjson }}</pre>
+  </details>
+{% else %}
+  <p class="empty">No snapshot was frozen — the cycle was blocked before one was built.</p>
+{% endif %}
+{% endblock %}

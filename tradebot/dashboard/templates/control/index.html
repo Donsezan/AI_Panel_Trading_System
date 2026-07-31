@@ -1,0 +1,167 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% block title %}Control{% endblock %}
+{% block heading %}Control{% endblock %}
+
+{% block content %}
+{% if error %}<div class="banner danger"><strong>Not done.</strong> {{ error }}</div>{% endif %}
+
+{% if outcome %}
+  {% if outcome.partial %}
+    <div class="banner warn">
+      <strong>Partial close submitted — you are not flat.</strong>
+      <code>{{ outcome.order.client_order_id }}</code> closes
+      {{ outcome.order.qty | quantity }} of {{ outcome.held_qty | quantity }}
+      {{ outcome.instrument_key }} at {{ outcome.order.limit_price | money }}. A Tier-2 limit
+      shrank it; the provenance below says which.
+    </div>
+  {% elif outcome.submitted %}
+    <div class="banner ok-banner">
+      <strong>Close submitted.</strong>
+      <code>{{ outcome.order.client_order_id }}</code> — {{ outcome.order.qty | quantity }}
+      {{ outcome.instrument_key }} at {{ outcome.order.limit_price | money }}.
+    </div>
+  {% else %}
+    <div class="banner warn">
+      <strong>Close refused by risk.</strong> {{ outcome.reason }}
+      <div class="muted small">
+        The close went through the ordinary Tier-1 → Tier-2 path and a rule declined it. Nothing
+        here bypasses a limit: raise it in Configure, which is itself a versioned, attributable
+        act, or use the kill switch to stop everything.
+      </div>
+    </div>
+  {% endif %}
+  {% if outcome.checks %}
+    <details>
+      <summary>Risk provenance for this request</summary>
+      <table class="checks">
+        <thead><tr><th>Rule</th><th>Decision</th><th>Detail</th></tr></thead>
+        <tbody>
+        {% for check in outcome.checks %}
+          <tr>
+            <td><code>{{ check.rule }}</code></td>
+            <td>{{ m.pill(check.decision.value) }}</td>
+            <td class="detail-cell">{{ check.detail }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </details>
+  {% endif %}
+{% endif %}
+
+<h2>Kill switch</h2>
+<section class="figures">
+  <div class="figure">
+    <span class="label">State</span>
+    <span class="value">{{ m.pill(risk_state.kill_switch.value) }}</span>
+  </div>
+  <div class="figure">
+    <span class="label">Equity ({{ quote_currency }})</span>
+    <span class="value">{{ equity | money }}</span>
+  </div>
+  <div class="figure">
+    <span class="label">High-water mark</span>
+    <span class="value">{{ risk_state.high_water_mark | money }}</span>
+  </div>
+</section>
+{% if risk_state.reason %}<p class="muted">{{ risk_state.reason }}</p>{% endif %}
+
+{% if risk_state.may_trade %}
+  <form method="post" action="/control/kill" class="danger-zone">
+    <p class="muted small">
+      Cancels working orders and halts every runner. It does <strong>not</strong> liquidate:
+      flattening into a broken market is often the worse outcome, and that call is yours.
+    </p>
+    <label for="kill-confirm">Type <code>{{ kill_phrase }}</code></label>
+    <input id="kill-confirm" name="confirm" type="text" autocomplete="off" required>
+    <input name="note" type="text" placeholder="why (recorded on the event)">
+    <button type="submit" class="danger-button">Trip the kill switch</button>
+  </form>
+{% else %}
+  <form method="post" action="/control/rearm" class="danger-zone">
+    <p class="muted small">
+      Re-arming restarts the drawdown and daily-loss baselines from current equity — it asserts
+      that you have looked at what happened and accept this as the new starting point.
+    </p>
+    <label for="rearm-confirm">Type <code>{{ rearm_phrase }}</code></label>
+    <input id="rearm-confirm" name="confirm" type="text" autocomplete="off" required>
+    <button type="submit">Re-arm trading</button>
+  </form>
+{% endif %}
+
+<h2>Baskets</h2>
+<p class="muted small">
+  A <strong>pause</strong> is your intent, published as a new configuration version. A
+  <strong>halt</strong> is the system stopping a basket for cause; it is database state and
+  clearing it is a separate, typed act. The two are never the same button.
+</p>
+<table>
+  <thead><tr><th>Basket</th><th>Configured</th><th>Halted</th><th>Pause / resume</th><th>Un-halt</th></tr></thead>
+  <tbody>
+  {% for record in baskets %}
+    {% set bid = record.ref.config_id %}
+    <tr>
+      <td><code>{{ bid }}</code></td>
+      <td>{{ m.pill(record.document.status.value) }}</td>
+      <td>{% if bid in halted %}{{ m.pill("halted") }}{% else %}<span class="muted">—</span>{% endif %}</td>
+      <td>
+        <form method="post" action="/control/baskets/{{ bid }}/status" class="inline-form">
+          <select name="status">
+            {% for status in statuses %}
+              <option value="{{ status }}" {% if status == record.document.status.value %}selected{% endif %}>{{ status }}</option>
+            {% endfor %}
+          </select>
+          <button type="submit">apply</button>
+        </form>
+      </td>
+      <td>
+        {% if bid in halted %}
+          <form method="post" action="/control/baskets/{{ bid }}/unhalt" class="inline-form">
+            <input name="confirm" type="text" placeholder="{{ rearm_phrase }}" autocomplete="off" required>
+            <button type="submit">un-halt</button>
+          </form>
+        {% else %}<span class="muted">—</span>{% endif %}
+      </td>
+    </tr>
+  {% else %}
+    {{ m.empty(5, "No baskets configured.") }}
+  {% endfor %}
+  </tbody>
+</table>
+
+<h2>Manual close</h2>
+<p class="muted small">
+  Goes through the ordinary <code>OrderIntent</code> → Tier-1 → Tier-2 → execution path, exactly
+  as a panel decision would. A metering rule — cooldown, the daily cap, the loss streak — can
+  refuse it, and if it does you will see which rule and why.
+</p>
+{% if observe_only %}
+  <p class="empty warn">
+    Serving in observe-only mode: nothing is polling open orders, so no order may be placed.
+  </p>
+{% endif %}
+<table>
+  <thead><tr><th>Instrument</th><th>Basket</th><th>Qty held</th><th>Avg entry</th><th></th></tr></thead>
+  <tbody>
+  {% for basket_id, instrument_key in closable %}
+    {% set position = positions[instrument_key] %}
+    <tr>
+      <td><code>{{ instrument_key }}</code></td>
+      <td><code>{{ basket_id }}</code></td>
+      <td class="num">{{ position.qty | quantity }}</td>
+      <td class="num">{{ position.avg_entry | money }}</td>
+      <td>
+        <form method="post" action="/control/close" class="inline-form">
+          <input type="hidden" name="basket_id" value="{{ basket_id }}">
+          <input type="hidden" name="instrument_key" value="{{ instrument_key }}">
+          <button type="submit" {% if observe_only %}disabled{% endif %}>close position</button>
+        </form>
+      </td>
+    </tr>
+  {% else %}
+    {{ m.empty(5, "No position is held by a basket in service.") }}
+  {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

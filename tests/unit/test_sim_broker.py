@@ -19,7 +19,7 @@ from tradebot.core.clock import ManualClock
 from tradebot.core.enums import OrderRole, OrderState, OrderType, Side
 from tradebot.core.errors import SubmitUnknownError
 from tradebot.core.orders import OrderIntent
-from tradebot.execution.sim_broker import SimBroker, Tick
+from tradebot.execution.brokers.sim import SimBroker, Tick
 from tradebot.interfaces.broker import OrderRef
 
 NOW = datetime(2026, 3, 1, 12, 0, tzinfo=UTC)

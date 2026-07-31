@@ -1,12 +1,15 @@
-"""The startup / recovery sequence. The same five steps on every start (DESIGN §8.2).
+"""The startup / recovery sequence. The same steps on every start (DESIGN §8.2).
 
 1. Open the database and **verify the projections against the event log** by replaying it.
-2. For each venue: fetch open orders and `AccountState`, adopt orders carrying our
+2. **Preflight the venue**: clock skew, key restrictions, and the capabilities that
+   `SUBMIT_UNKNOWN` recovery depends on (`control/preflight.py`, PLAN §3.1/§3.2). Before
+   reconciliation, because a skewed clock makes every later signed call unreliable.
+3. For each venue: fetch open orders and `AccountState`, adopt orders carrying our
    `client_order_id` prefix, and reconcile the ledger.
-3. Resolve every non-terminal order in the database to a terminal or monitored state.
-4. Restore persisted risk state — kill switch, halted baskets, high-water mark, day-start
+4. Resolve every non-terminal order in the database to a terminal or monitored state.
+5. Restore persisted risk state — kill switch, halted baskets, high-water mark, day-start
    equity — and arm the watchdog. Only then may runners start.
-5. **Any step failing leaves the process up and halted.** Nothing trades, and the reason is in
+6. **Any step failing leaves the process up and halted.** Nothing trades, and the reason is in
    the log.
 
 Step 5 is the point of the whole module. The tempting alternative — crash on a failed recovery —
@@ -25,6 +28,7 @@ from dataclasses import dataclass, field
 
 from sqlalchemy import select
 
+from tradebot.control.preflight import VenuePreflight
 from tradebot.core.clock import Clock
 from tradebot.core.config import Basket
 from tradebot.core.enums import KillSwitchState, OrderState, RiskTier
@@ -32,7 +36,6 @@ from tradebot.core.errors import TradebotError
 from tradebot.core.events import EventFactory
 from tradebot.core.instrument import Instrument
 from tradebot.core.logging import get_logger
-from tradebot.core.money import ZERO
 from tradebot.core.orders import Fill, Order
 from tradebot.execution.monitor import ExecutionMonitor
 from tradebot.execution.service import ExecutionService
@@ -85,6 +88,7 @@ class StartupSequence:
         instruments: Sequence[Instrument] = (),
         quote_currency: str = "USDT",
         venue_restore: RestorableVenue | None = None,
+        preflight: VenuePreflight | None = None,
     ) -> None:
         self._store = store
         self._ledger = ledger
@@ -97,6 +101,9 @@ class StartupSequence:
         self._instruments = {i.key: i for i in instruments}
         self._quote_currency = quote_currency
         self._venue_restore = venue_restore
+        #: Absent for a simulated venue, which has no clock of its own to disagree with and no key
+        #: to hold permissions. Present for every real one.
+        self._preflight = preflight
 
     async def recover(self) -> Recovery:
         """Bring the process to a known state, or to a halted one."""
@@ -104,12 +111,18 @@ class StartupSequence:
         replayed = 0
         reports: tuple[ReconcileReport, ...] = ()
         resolved: tuple[Order, ...] = ()
+        # Captured before anything writes: reconciliation against a real venue records the
+        # account's funds as an external flow, which persists a risk row of its own.
+        first_run = not self._states.initialised()
 
         try:
             replayed = await self._replay()
             self._restore_simulated_venue()
         except TradebotError as exc:
             failures.append(f"projection replay failed: {exc}")
+
+        if not failures and self._preflight is not None:
+            failures.extend(await self._preflight.run())
 
         if not failures:
             try:
@@ -123,7 +136,7 @@ class StartupSequence:
             except TradebotError as exc:
                 failures.append(f"open-order resolution failed: {exc}")
 
-        if not failures:
+        if not failures and first_run:
             await self._arm_first_run()
 
         recovery = Recovery(
@@ -181,7 +194,7 @@ class StartupSequence:
                     f"order {order.client_order_id} references unknown instrument "
                     f"{order.instrument_key}; its state cannot be resolved"
                 )
-            synced = await self._execution.sync(order, instrument)
+            synced = await self._execution.recover(order, instrument)
             if synced.state.is_open:
                 self._monitor.track(synced, instrument)
             resolved.append(synced)
@@ -270,15 +283,14 @@ class StartupSequence:
         logger.error("startup recovery failed; nothing will trade", extra={"detail": detail})
 
     async def _arm_first_run(self) -> RiskState:
-        """Step 4: establish the baselines so the watchdog has something to measure against.
+        """Establish the baselines so the watchdog has something to measure against.
 
-        Only ever moves an *uninitialised* switch — no persisted state and no high-water mark,
-        which is only true of a database that has never traded. A switch tripped by a real
-        breach stays tripped until a human types the re-arm phrase; that is the entire point of
-        persisting it (DESIGN §8.2 step 4).
+        Reached only on a database that has never held risk state — the caller checks that before
+        any step can write one. A switch tripped by a real breach stays tripped until a human types
+        the re-arm phrase; that is the entire point of persisting it (DESIGN §8.2 step 4).
         """
         state = self._states.load()
-        if state.high_water_mark > ZERO or state.kill_switch is KillSwitchState.ARMED:
+        if state.kill_switch is KillSwitchState.ARMED:
             return state
         equity = self._ledger.equity(
             {p.instrument_key: p.avg_entry for p in self._ledger.positions()},

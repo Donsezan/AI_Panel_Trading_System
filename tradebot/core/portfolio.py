@@ -13,6 +13,24 @@ from tradebot.core.money import ZERO, divide, multiply
 from tradebot.core.schema import DomainModel, Money, UtcDatetime
 
 
+class CorporateAction(DomainModel):
+    """A split or dividend the venue announced, used to explain an equity position change.
+
+    Domain data rather than reconciler internals, because two layers need it: the venue adapter
+    that fetches announcements and the reconciler that matches them against a diff. A split the
+    reconciler cannot see is a mismatch, and a mismatch halts a basket for a routine event (R14).
+    """
+
+    instrument_key: str
+    #: New shares per old share. `3` for a 3-for-1 split, `Decimal("0.5")` for a 1-for-2 reverse.
+    ratio: Money = Decimal(1)
+    cash_per_share: Money = Decimal(0)
+    detail: str = ""
+    #: When the position change takes effect. Announcements arrive days early, so an action is
+    #: only an explanation once its effective date has passed.
+    effective_on: str = ""
+
+
 class Position(DomainModel):
     """Holding in one instrument. v1 is long-only, so `qty` is never negative."""
 

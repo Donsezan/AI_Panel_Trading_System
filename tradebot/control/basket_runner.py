@@ -26,9 +26,9 @@ from decimal import Decimal
 
 from tradebot.control.context_builder import ContextBuilder
 from tradebot.core.clock import Clock
-from tradebot.core.config import Basket, GlobalRiskPolicy
+from tradebot.core.config import Basket, ConfigRef, GlobalRiskPolicy
 from tradebot.core.decision import Decision
-from tradebot.core.enums import BasketStatus, CycleOutcome, Mode, RiskTier, Side
+from tradebot.core.enums import BasketStatus, CycleOutcome, Mode, OrderState, RiskTier, Side
 from tradebot.core.errors import DataStaleError, FailClosedError
 from tradebot.core.events import EventFactory
 from tradebot.core.ids import new_uuid
@@ -105,6 +105,7 @@ class BasketRunner:
         store: EventStore,
         clock: Clock,
         global_policy: GlobalRiskPolicy | None = None,
+        config_refs: tuple[ConfigRef, ...] = (),
         quote_currency: str = "USDT",
         risk_timeframe: str = "1h",
     ) -> None:
@@ -122,6 +123,9 @@ class BasketRunner:
         self._store = store
         self._clock = clock
         self._policy = global_policy or GlobalRiskPolicy()
+        #: The configuration versions this runner was built from, recorded on every cycle it
+        #: starts so a past decision is re-read against the limits that produced it (DESIGN §6.1).
+        self._config_refs = config_refs
         self._quote_currency = quote_currency
         self._risk_timeframe = risk_timeframe
 
@@ -135,7 +139,7 @@ class BasketRunner:
             clock=self._clock, basket_id=self._basket.basket_id, cycle_id=cycle_id
         )
         with correlate(cycle_id=cycle_id, basket_id=self._basket.basket_id):
-            await self._store.append(events.cycle_started())
+            await self._store.append(events.cycle_started(self._config_refs))
             try:
                 blocked = await self._gate()
                 if blocked:
@@ -174,25 +178,22 @@ class BasketRunner:
         snapshot = await self._context.build(self._basket)
         await self._store.append(events.snapshot_frozen(snapshot))
 
+        # One call covers the whole basket, so the panel's cost ceiling and its decision mode
+        # are the engine's to enforce; the runner only sees decisions (DESIGN §6.5).
+        panel = await self._decisions.deliberate(snapshot, self._basket)
+        await self._store.append(*(events.seat_responded(r) for r in panel.responses))
+
         decisions: list[Decision] = []
         orders: list[Order] = []
-        cost = ZERO
         vetoed = False
 
-        for instrument in self._basket.instruments:
-            decision, deliberation = await self._decisions.decide(
-                snapshot, self._basket.panel, instrument.key
-            )
-            cost += deliberation.cost_usd
-            await self._store.append(
-                *(events.seat_responded(r) for r in deliberation.responses),
-                events.decision_made(decision),
-            )
+        for decision in panel.decisions:
+            await self._store.append(events.decision_made(decision))
             decisions.append(decision)
-
             if not decision.is_actionable:
                 continue
 
+            instrument = self._basket.instrument(decision.instrument_key)
             order = await self._act(snapshot, instrument, decision, cycle_id, events)
             if order is None:
                 vetoed = True
@@ -202,7 +203,12 @@ class BasketRunner:
         settled = await self._settle(orders)
         outcome = self._classify(decisions, settled, vetoed=vetoed)
         return await self._finish(
-            cycle_id, events, outcome, decisions=decisions, orders=settled, cost=cost
+            cycle_id,
+            events,
+            outcome,
+            decisions=decisions,
+            orders=settled,
+            cost=panel.cost_usd,
         )
 
     async def _settle(self, orders: list[Order]) -> tuple[Order, ...]:
@@ -217,7 +223,7 @@ class BasketRunner:
             return ()
         await self._monitor.poll()
         settled = {order.client_order_id: order for order in self._monitor.tracked}
-        self._monitor.prune()
+        self._monitor.prune(*{order.group_id for order in orders})
         return tuple(settled.get(order.client_order_id, order) for order in orders)
 
     async def _act(
@@ -318,9 +324,15 @@ class BasketRunner:
     def _classify(
         decisions: list[Decision], orders: tuple[Order, ...], *, vetoed: bool
     ) -> CycleOutcome:
-        if orders:
+        """A refused order is not a placed one.
+
+        An order the venue rejected, or that the self-trade check refused to send, reached no
+        market. Counting it as `ORDERS_PLACED` would make the promotion gates read a cycle that
+        traded nothing as a cycle that traded (DESIGN §9).
+        """
+        if any(order.state is not OrderState.REJECTED for order in orders):
             return CycleOutcome.ORDERS_PLACED
-        if vetoed:
+        if vetoed or orders:
             return CycleOutcome.RISK_VETOED
         if any("PANEL_DEGRADED" in decision.flags for decision in decisions):
             return CycleOutcome.PANEL_DEGRADED

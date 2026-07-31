@@ -6,15 +6,18 @@ does the right thing on a bad day, and the bad days are all injected here.
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 from sqlalchemy import select
 from tests.scenario.harness import Harness
 
-from tradebot.app import build, build_sim
+from tradebot.app import BrokerChoice, build, build_sim
+from tradebot.control.arming import LIVE_CONFIRMATION_PHRASE
 from tradebot.core.clock import ManualClock
 from tradebot.core.config import Basket, PanelConfig, SeatConfig
 from tradebot.core.decision import Decision
@@ -42,14 +45,12 @@ EXPECTED_CHAIN = (
     EventType.ORDER_STATE_CHANGED,
     EventType.FILL_RECEIVED,
     EventType.POSITION_UPDATED,
-    *(  # stop-loss leg, then take-profit leg: submitted → acknowledged → resting
-        (
-            EventType.ORDER_SUBMITTED,
-            EventType.ORDER_STATE_CHANGED,
-            EventType.ORDER_STATE_CHANGED,
-        )
-        * 2
-    ),
+    # The OCO pair is one venue call, so **both** leg ids are written before it is made: a crash
+    # in between must leave a trace of every id that may now exist at the venue (PLAN §1.4, §2.3).
+    # Hence two ORDER_SUBMITTED first, then each leg acknowledged, then each leg resting.
+    EventType.ORDER_SUBMITTED,
+    EventType.ORDER_SUBMITTED,
+    *((EventType.ORDER_STATE_CHANGED,) * 4),
     EventType.PROTECTIVE_PLACED,
     EventType.CYCLE_COMPLETED,
 )
@@ -368,19 +369,48 @@ class TestMultiInstrumentBasket:
 
 
 class TestModeSafety:
-    def test_paper_and_live_have_no_wiring_and_refuse_to_start(self) -> None:
-        """A mode that quietly does something else is the catastrophic failure (PLAN §2.4)."""
-        with pytest.raises(ConfigError, match="no wiring"):
-            build(Mode.PAPER)
+    async def test_paper_wires_the_same_loop_with_simulated_fills(
+        self, tmp_path: Path, market_data: ReplayMarketData
+    ) -> None:
+        """Paper's default venue is `SimBroker`: real data, deterministic fills (DESIGN §9)."""
+        application = await build(
+            Mode.PAPER, db_path=tmp_path / "paper.db", market_data=market_data, panel_id="stub"
+        )
+        try:
+            assert application.mode is Mode.PAPER
+            assert [basket.basket_id for basket in application.baskets] == ["demo"]
+        finally:
+            await application.shutdown()
 
-    def test_live_refuses_without_the_typed_confirmation(self) -> None:
+    async def test_a_real_venue_in_paper_needs_its_own_named_credentials(
+        self, tmp_path: Path
+    ) -> None:
+        """Paper reads `*_TESTNET_*` names, so a live key in the environment is unreachable."""
+        with pytest.raises(ConfigError, match="BINANCE_TESTNET_API_KEY"):
+            await build(
+                Mode.PAPER,
+                db_path=tmp_path / "paper.db",
+                broker=BrokerChoice.BINANCE,
+                market_data=None,
+            )
+
+    async def test_simulation_refuses_to_reach_a_venue(self, tmp_path: Path) -> None:
+        """Sim's promise is offline and reproducible; a venue run is neither."""
+        with pytest.raises(ConfigError, match="offline and reproducible"):
+            await build(Mode.SIM, db_path=tmp_path / "sim.db", broker=BrokerChoice.BINANCE)
+
+    async def test_live_refuses_without_the_typed_confirmation(self, tmp_path: Path) -> None:
         with pytest.raises(ConfigError, match="typed confirmation"):
-            build(Mode.LIVE)
+            await build(Mode.LIVE, db_path=tmp_path / "live.db")
 
-    def test_live_still_refuses_even_with_the_confirmation(self) -> None:
-        """Live ships disabled: there is no wiring to reach, confirmation or not."""
-        with pytest.raises(ConfigError, match="no wiring"):
-            build(Mode.LIVE, confirmation="I ACCEPT REAL MONEY RISK")
+    async def test_live_still_refuses_with_the_confirmation_alone(self, tmp_path: Path) -> None:
+        """Every unmet precondition is listed at once, not one refusal at a time (PLAN §2.4)."""
+        with pytest.raises(ConfigError, match="an armed row in the live database"):
+            await build(
+                Mode.LIVE,
+                db_path=tmp_path / "live.db",
+                confirmation=LIVE_CONFIRMATION_PHRASE,
+            )
 
     def test_each_mode_uses_its_own_database_file(self) -> None:
         from tradebot.app import database_path
@@ -388,13 +418,82 @@ class TestModeSafety:
         paths = {mode: database_path(mode) for mode in Mode}
         assert len({str(path) for path in paths.values()}) == len(Mode)
 
-    def test_sim_wiring_builds_and_runs(self, clock: ManualClock) -> None:
-        application = build_sim(clock=clock)
+    async def test_sim_wiring_builds_and_runs(self, clock: ManualClock) -> None:
+        application = await build_sim(clock=clock)
         try:
             assert application.mode is Mode.SIM
-            assert len(application.runners) == 1
+            assert len(application.baskets) == 1
         finally:
-            application.close()
+            await application.shutdown()
+
+    async def test_the_seeded_basket_is_published_as_configuration(
+        self, clock: ManualClock
+    ) -> None:
+        """A fresh database is seeded once; from then on the stored basket is the truth."""
+        application = await build_sim(clock=clock)
+        try:
+            records = application.configs.baskets()
+            assert [record.ref.version for record in records] == [1]
+            assert records[0].ref.config_id == "demo"
+        finally:
+            await application.shutdown()
+
+    async def test_news_is_off_unless_asked_for(self, clock: ManualClock) -> None:
+        """A default that reaches the internet on the first simulated cycle is a surprise.
+
+        Asking for a source is what opens the HTTP session, so it is exactly one owned resource
+        more than a quiet run — and the session must be owned, or the process outlives its cycle.
+        """
+        quiet = await build_sim(clock=clock)
+        noisy = await build_sim(clock=clock, news_sources=("cointelegraph",))
+        try:
+            assert len(noisy._closers) == len(quiet._closers) + 1
+        finally:
+            await quiet.shutdown()
+            await noisy.shutdown()
+
+    async def test_an_unknown_news_source_refuses_to_wire(self, clock: ManualClock) -> None:
+        with pytest.raises(ConfigError, match="unknown news source"):
+            await build_sim(clock=clock, news_sources=("not-a-feed",))
+
+
+class TestConfigPinning:
+    async def test_a_supervised_cycle_records_the_versions_it_ran_on(
+        self, clock: ManualClock
+    ) -> None:
+        """A decision is re-read against the limits of its day, not today's (DESIGN §6.1)."""
+        application = await build_sim(clock=clock)
+        try:
+            await application.recover()
+            results = await application.supervisor.run_once()
+
+            assert len(results) == 1
+            with application.store.engine.connect() as connection:
+                row = connection.execute(select(cycles)).one()
+            assert json.loads(row.config_versions_json) == {
+                "basket:demo": 1,
+                "global_risk:global": 1,
+            }
+        finally:
+            await application.shutdown()
+
+    async def test_an_edited_basket_is_pinned_at_its_new_version(self, clock: ManualClock) -> None:
+        application = await build_sim(clock=clock)
+        try:
+            await application.recover()
+            await application.supervisor.run_once()
+
+            basket = application.baskets[0]
+            await application.configs.put(
+                basket.basket_id, basket.model_copy(update={"name": "renamed"}), actor="human"
+            )
+            await application.supervisor.run_once()
+
+            with application.store.engine.connect() as connection:
+                rows = connection.execute(select(cycles).order_by(cycles.c.started_at)).all()
+            assert [json.loads(row.config_versions_json)["basket:demo"] for row in rows] == [1, 2]
+        finally:
+            await application.shutdown()
 
 
 class TestDecisionRecording:

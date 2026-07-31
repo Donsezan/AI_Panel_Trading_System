@@ -9,7 +9,7 @@ The switch trips on exactly three things, and every one of them is tested:
 
 1. **Drawdown** past `max_drawdown_pct` of the flow-adjusted high-water mark.
 2. **A reconciliation mismatch** the reconciler could not explain.
-3. **A human**, through the CLI (the GUI in Phase 6).
+3. **A human**, through `tradebot risk` (and the dashboard's Control page).
 
 Its effect is to cancel working orders and halt every runner. It does **not** liquidate:
 `flatten_on_kill` defaults to false because flattening into a broken market is frequently the
@@ -33,6 +33,7 @@ from tradebot.core.enums import BasketStatus, KillSwitchState, RiskTier
 from tradebot.core.events import EventFactory
 from tradebot.core.logging import get_logger
 from tradebot.core.money import ZERO
+from tradebot.interfaces.broker import TradingCalendar
 from tradebot.persistence.store import EventStore
 from tradebot.risk.state import RiskState, RiskStateStore, rolled_over, start_of_day
 
@@ -65,11 +66,28 @@ class Watchdog:
         states: RiskStateStore,
         store: EventStore,
         clock: Clock,
+        *,
+        calendar: TradingCalendar | None = None,
     ) -> None:
         self._policy = policy
         self._states = states
         self._store = store
         self._clock = clock
+        #: Whose "day" the daily-loss baseline rolls over on. Absent means the UTC date, which is
+        #: correct for crypto and wrong for equities: a US session ends at 20:00 UTC and its
+        #: after-hours prints land the next UTC day, so a UTC rollover would reset the baseline
+        #: in the middle of a session (DESIGN §6.6).
+        self._calendar = calendar
+
+    def use_policy(self, policy: GlobalRiskPolicy) -> None:
+        """Adopt a newly published Tier-2 policy (DESIGN §6.6).
+
+        The watchdog outlives every cycle, so unlike Tier-2's per-cycle engine it cannot be
+        rebuilt from the pinned configuration — a policy fixed at construction would leave it
+        enforcing the drawdown limit the process started with, hours after the dashboard changed
+        it. Swapped at a cycle boundary by the supervisor, never mid-sweep.
+        """
+        self._policy = policy
 
     def _events(self) -> EventFactory:
         return EventFactory(clock=self._clock, basket_id="global", cycle_id="watchdog")
@@ -197,16 +215,18 @@ class Watchdog:
         logger.info("risk baselines flow-adjusted", extra={"amount": str(amount), "why": reason})
         return adjusted
 
+    async def _session_day(self) -> str:
+        now = self._clock.now()
+        if self._calendar is None:
+            return start_of_day(now)
+        return await self._calendar.session_day(now)
+
     async def _roll_day(self, state: RiskState, equity: Decimal) -> RiskState:
-        if not rolled_over(state, self._clock.now()):
+        today = await self._session_day()
+        if not rolled_over(state, today):
             return state
         return await self._states.save(
-            state.model_copy(
-                update={
-                    "day_start_equity": equity,
-                    "day_started_on": start_of_day(self._clock.now()),
-                }
-            )
+            state.model_copy(update={"day_start_equity": equity, "day_started_on": today})
         )
 
     async def _raise_mark(self, state: RiskState, equity: Decimal) -> RiskState:

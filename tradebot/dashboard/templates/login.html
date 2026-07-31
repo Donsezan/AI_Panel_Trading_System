@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign in — tradebot {{ mode }}</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body class="centred">
+<form class="card" method="post" action="/login" autocomplete="off">
+  <h1>tradebot <span class="mode-badge mode-{{ mode_tone }}">{{ mode | upper }}</span></h1>
+  <p class="muted">
+    This dashboard can trip the kill switch, publish a risk policy and close a position, so it is
+    authenticated even on localhost.
+  </p>
+  <label for="token">Dashboard token</label>
+  <input id="token" name="token" type="password" autofocus required>
+  {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+  <button type="submit">Sign in</button>
+  <p class="muted small">Set in <code>TRADEBOT_DASHBOARD_TOKEN</code>. Rotating it ends every session.</p>
+</form>
+</body>
+</html>

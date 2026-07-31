@@ -1,0 +1,186 @@
+{% extends "base.html" %}
+{% import "_fields.html" as f %}
+{% set action = "/configure/baskets/" ~ (basket_id or "new") %}
+{% set draft_action = action ~ "/draft" %}
+{% block title %}{{ basket_id or "New basket" }}{% endblock %}
+{% block heading %}{{ "Edit basket " ~ basket_id if basket_id else "New basket" }}{% endblock %}
+
+{% block content %}
+<p class="muted">
+  Published as a new version; nothing is overwritten. The basket's worker re-reads it and rebuilds
+  its runner at the next cycle boundary — never mid-cycle.
+  {% if existing %}Currently at version {{ existing }}.{% endif %}
+</p>
+
+{{ f.error_summary(errors) }}
+
+<form method="post" action="{{ action }}">
+  <input type="hidden" name="existing" value="{{ existing or '' }}">
+
+  <h2>Identity</h2>
+  <div class="grid">
+    {{ f.field("basket_id", "Basket id", draft.get("basket_id"), errors, hint="stable; used in every event and order id") }}
+    {{ f.field("name", "Name", draft.get("name"), errors) }}
+    {{ f.choice("status", "Status", draft.get("status"), statuses, errors, hint="pausing here is your intent; a halt is the system's") }}
+    {{ f.choice("decision_mode", "Decision mode", draft.get("decision_mode"), decision_modes, errors, hint="basket mode is one panel run for every instrument") }}
+  </div>
+
+  <h2>Schedule</h2>
+  {% set schedule = draft.get("schedule") or {} %}
+  <div class="grid">
+    {{ f.field("schedule.every_seconds", "Every (seconds)", schedule.get("every_seconds"), errors, type="number") }}
+    {{ f.field("schedule.offset_seconds", "Offset (seconds)", schedule.get("offset_seconds"), errors, type="number", hint="“every 1h at :05” is 3600 / 300") }}
+    {{ f.field("schedule.open_delay_seconds", "Open delay (seconds)", schedule.get("open_delay_seconds"), errors, type="number", hint="first cycle of a session, after the open") }}
+    {{ f.field("ttl_buffer_seconds", "Order TTL buffer (seconds)", draft.get("ttl_buffer_seconds"), errors, type="number", hint="order lifetime is the interval minus this") }}
+  </div>
+
+  <h2>Instruments</h2>
+  {% for row in draft.get("instruments") or [] %}
+    {% set i = "instruments[" ~ loop.index0 ~ "]" %}
+    <fieldset>
+      <legend>{{ row.get("symbol") or "new instrument" }}</legend>
+      <div class="grid">
+        {{ f.field(i ~ ".symbol", "Symbol", row.get("symbol"), errors) }}
+        {{ f.field(i ~ ".venue", "Venue", row.get("venue"), errors) }}
+        {{ f.choice(i ~ ".asset_class", "Asset class", row.get("asset_class"), asset_classes, errors) }}
+        {{ f.field(i ~ ".base_currency", "Base currency", row.get("base_currency"), errors) }}
+        {{ f.field(i ~ ".quote_currency", "Quote currency", row.get("quote_currency"), errors, hint="every basket in one process must agree") }}
+        {{ f.field(i ~ ".lot_size", "Lot size", row.get("lot_size"), errors) }}
+        {{ f.field(i ~ ".tick_size", "Tick size", row.get("tick_size"), errors) }}
+        {{ f.field(i ~ ".min_qty", "Min qty", row.get("min_qty"), errors) }}
+        {{ f.field(i ~ ".min_notional", "Min notional", row.get("min_notional"), errors) }}
+      </div>
+      {{ f.row_buttons("", i, "", draft_action) }}
+    </fieldset>
+  {% endfor %}
+  {{ f.row_buttons("instruments", "", "add instrument", draft_action) }}
+
+  <h2>Data</h2>
+  <div class="grid">
+    {{ f.multi("timeframes", "Timeframes", draft.get("timeframes") or [], timeframes, hint="empty means the engine's default set") }}
+    {{ f.multi("indicators", "Indicators", draft.get("indicators") or [], indicators, hint="empty means the engine's default set") }}
+    {{ f.multi("news_sources", "News sources", draft.get("news_sources") or [], news_sources, hint="empty means no news, stated as such in the snapshot") }}
+  </div>
+
+  <h2>Tier-1 risk policy</h2>
+  {% set risk = draft.get("risk_policy") or {} %}
+  <div class="grid">
+    {{ f.field("risk_policy.max_basket_allocation_pct", "Max basket allocation (% equity)", risk.get("max_basket_allocation_pct"), errors) }}
+    {{ f.field("risk_policy.max_position_pct_of_basket", "Max position (% of basket)", risk.get("max_position_pct_of_basket"), errors) }}
+    {{ f.field("risk_policy.risk_per_trade_pct", "Risk per trade (% of basket)", risk.get("risk_per_trade_pct"), errors) }}
+    {{ f.field("risk_policy.stop_loss_atr_multiple", "Stop loss (× ATR)", risk.get("stop_loss_atr_multiple"), errors) }}
+    {{ f.field("risk_policy.take_profit_atr_multiple", "Take profit (× ATR)", risk.get("take_profit_atr_multiple"), errors, hint="must exceed the stop") }}
+    {{ f.field("risk_policy.protective_limit_offset_pct", "Protective limit offset (%)", risk.get("protective_limit_offset_pct"), errors) }}
+    {{ f.field("risk_policy.marketable_cross_pct", "Marketable cross (%)", risk.get("marketable_cross_pct"), errors) }}
+    {{ f.field("risk_policy.min_conviction", "Min conviction (0–1)", risk.get("min_conviction"), errors) }}
+    {{ f.field("risk_policy.cooldown_cycles", "Cooldown (cycles)", risk.get("cooldown_cycles"), errors, type="number") }}
+    {{ f.field("risk_policy.max_trades_per_day", "Max trades per day", risk.get("max_trades_per_day"), errors, type="number") }}
+    {{ f.field("risk_policy.max_consecutive_losses", "Max consecutive losses", risk.get("max_consecutive_losses"), errors, type="number", hint="the basket auto-pauses at this count") }}
+    {{ f.field("risk_policy.unprotected_haircut_pct", "Unprotected haircut (%)", risk.get("unprotected_haircut_pct"), errors, hint="applied where the venue cannot hold a stop") }}
+  </div>
+  {{ f.flag("risk_policy.long_only", "Long only (SELL is reduce-only)", risk.get("long_only"), hint="v1 cannot be turned off: shorting ripples through every other rule") }}
+
+  <h2>Panel</h2>
+  {% set panel = draft.get("panel") or {} %}
+  <div class="grid">
+    {{ f.field("panel.panel_id", "Panel id", panel.get("panel_id"), errors) }}
+    {{ f.choice("panel.protocol", "Debate protocol", panel.get("protocol"), protocols, errors) }}
+    {{ f.field("panel.max_rounds", "Max rounds", panel.get("max_rounds"), errors, type="number", hint="includes the blind round 0") }}
+    {{ f.field("panel.qualified_majority", "Qualified majority (0–1)", panel.get("qualified_majority"), errors, hint="counted over the original seat count") }}
+    {{ f.field("panel.max_abstain_fraction", "Max abstain fraction", panel.get("max_abstain_fraction"), errors, hint="above this the panel is degraded and the cycle waits") }}
+    {{ f.field("panel.max_cost_usd_per_cycle", "Max cost per cycle (USD)", panel.get("max_cost_usd_per_cycle"), errors) }}
+  </div>
+
+  <h3>Providers</h3>
+  <p class="muted small">
+    Endpoints this panel may reach. Nothing outside this list is ever constructed or contacted.
+    A key is referenced by <strong>environment-variable name</strong>; pasting a key value here is
+    refused at publish time.
+  </p>
+  {% for row in panel.get("providers") or [] %}
+    {% set p = "panel.providers[" ~ loop.index0 ~ "]" %}
+    <fieldset>
+      <legend>{{ row.get("provider_id") or "new provider" }}</legend>
+      <div class="grid">
+        {{ f.field(p ~ ".provider_id", "Provider id", row.get("provider_id"), errors) }}
+        {{ f.choice(p ~ ".kind", "Kind", row.get("kind"), provider_kinds, errors) }}
+        {{ f.field(p ~ ".base_url", "Base URL", row.get("base_url"), errors, hint="empty only for the offline stub") }}
+        {{ f.field(p ~ ".secret_ref", "Secret ref (env var NAME)", row.get("secret_ref"), errors, hint="e.g. OPENROUTER_API_KEY — never the key itself") }}
+      </div>
+      {{ f.flag(p ~ ".supports_json_mode", "Supports JSON mode", row.get("supports_json_mode"), hint="off for local servers that reject response_format") }}
+
+      <h4>Prices (USD per million tokens)</h4>
+      {% for price in row.get("price_rows") or [] %}
+        {% set pr = p ~ ".price_rows[" ~ loop.index0 ~ "]" %}
+        <div class="grid tight">
+          {{ f.field(pr ~ ".model", "Model", price.get("model"), errors) }}
+          {{ f.field(pr ~ ".prompt_per_million", "Prompt", price.get("prompt_per_million"), errors) }}
+          {{ f.field(pr ~ ".completion_per_million", "Completion", price.get("completion_per_million"), errors) }}
+          {{ f.row_buttons("", pr, "", draft_action) }}
+        </div>
+      {% endfor %}
+      {{ f.row_buttons(p ~ ".price_rows", p, "add price", draft_action) }}
+    </fieldset>
+  {% endfor %}
+  {{ f.row_buttons("panel.providers", "", "add provider", draft_action) }}
+
+  <h3>Seats</h3>
+  <p class="muted small">
+    Each seat picks its primary provider and builds its own ordered fallback chain
+    <strong>from the declared providers</strong> — a picker, never free text. A chain that stays
+    inside one vendor does not survive that vendor's outage, and a chain may not repeat a binding.
+  </p>
+  {% if not providers %}
+    <p class="empty warn">Declare a provider above, then add it to the draft, before binding a seat.</p>
+  {% endif %}
+  {% for row in panel.get("seats") or [] %}
+    {% set s = "panel.seats[" ~ loop.index0 ~ "]" %}
+    <fieldset>
+      <legend>{{ row.get("seat_id") or "new seat" }}</legend>
+      <div class="grid">
+        {{ f.field(s ~ ".seat_id", "Seat id", row.get("seat_id"), errors) }}
+        {{ f.field(s ~ ".role", "Role", row.get("role"), errors, hint="what this seat reasons about") }}
+        {{ f.choice(s ~ ".provider_id", "Primary provider", row.get("provider_id"), providers, errors) }}
+        {{ f.field(s ~ ".model", "Primary model", row.get("model"), errors) }}
+        {{ f.field(s ~ ".temperature", "Temperature", row.get("temperature"), errors) }}
+        {{ f.multi(s ~ ".evidence", "Evidence slice", row.get("evidence") or [], evidence_slices, hint="different slices per seat manufacture genuine disagreement") }}
+      </div>
+      {{ f.flag(s ~ ".devils_advocate", "Devil's advocate", row.get("devils_advocate"), hint="argues against the emerging majority every round") }}
+
+      <h4>Fallback chain</h4>
+      {% for binding in row.get("fallbacks") or [] %}
+        {% set b = s ~ ".fallbacks[" ~ loop.index0 ~ "]" %}
+        <div class="grid tight">
+          {{ f.choice(b ~ ".provider_id", "Provider", binding.get("provider_id"), providers, errors) }}
+          {{ f.field(b ~ ".model", "Model", binding.get("model"), errors) }}
+          {{ f.row_buttons("", b, "", draft_action) }}
+        </div>
+      {% endfor %}
+      {{ f.row_buttons(s ~ ".fallbacks", s, "add fallback", draft_action) }}
+    </fieldset>
+  {% endfor %}
+  {{ f.row_buttons("panel.seats", "", "add seat", draft_action) }}
+
+  <h2>Publish</h2>
+  <div class="grid">
+    <div class="field">
+      <label for="note">Note (recorded on the version)</label>
+      <input id="note" name="note" type="text" placeholder="why this changed">
+    </div>
+  </div>
+  <div class="actions">
+    <button type="submit">Publish new version</button>
+    {% if basket_id %}
+      <a class="ghost-link" href="/configure/history/basket/{{ basket_id }}">version history</a>
+    {% endif %}
+  </div>
+</form>
+
+{% if basket_id and existing %}
+<form method="post" action="/configure/baskets/{{ basket_id }}/retire" class="retire">
+  <input name="note" type="text" placeholder="why it is being retired">
+  <button type="submit" class="danger-button">Retire basket</button>
+  <span class="muted small">Stops it being run. Every version stays resolvable for the cycles that ran it.</span>
+</form>
+{% endif %}
+{% endblock %}

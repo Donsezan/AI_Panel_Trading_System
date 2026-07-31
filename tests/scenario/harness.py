@@ -19,12 +19,11 @@ from tradebot.core.clock import ManualClock
 from tradebot.core.config import Basket, GlobalRiskPolicy
 from tradebot.core.enums import Mode
 from tradebot.decision.engine import DecisionEngine
-from tradebot.decision.protocols import SingleRoundProtocol
 from tradebot.decision.providers import StubLLMProvider
 from tradebot.decision.seat import SeatRunner
+from tradebot.execution.brokers.sim import SimBroker, SimulatedMarket
 from tradebot.execution.monitor import ExecutionMonitor
 from tradebot.execution.service import ExecutionService
-from tradebot.execution.sim_broker import SimBroker, SimulatedMarket
 from tradebot.interfaces.market_data import MarketDataProvider
 from tradebot.ledger.history import HistoryReader
 from tradebot.ledger.portfolio import Ledger
@@ -114,9 +113,7 @@ class Harness:
             basket,
             mode=Mode.SIM,
             context_builder=self.context,
-            decision_engine=DecisionEngine(
-                SingleRoundProtocol(SeatRunner({"stub": self.provider}, clock))
-            ),
+            decision_engine=DecisionEngine(SeatRunner({"stub": self.provider}, clock)),
             risk_engine=Tier1RiskEngine(clock),
             tier2=Tier2RiskEngine(self.policy),
             watchdog=self.watchdog,

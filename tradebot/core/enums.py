@@ -35,6 +35,25 @@ class AssetClass(StrEnum):
     INDEX_ETF = "index_etf"
 
 
+class MarketSession(StrEnum):
+    """Which trading session a bar belongs to (DESIGN §6.2).
+
+    Crypto is `CONTINUOUS`: there is no session structure to respect. Equities have `REGULAR`
+    and `EXTENDED` bars, and mixing them into one indicator average silently blends two
+    different liquidity regimes — extended-hours prints are thin and wide, so an ATR computed
+    across them misstates the stop distance that sizing divides by.
+    """
+
+    CONTINUOUS = "continuous"
+    REGULAR = "regular"
+    EXTENDED = "extended"
+
+    @property
+    def is_indicator_input(self) -> bool:
+        """Whether an indicator may include this bar in its window."""
+        return self is not MarketSession.EXTENDED
+
+
 class Side(StrEnum):
     """Order side.
 
@@ -116,6 +135,26 @@ class DecisionMode(StrEnum):
     BASKET = "basket"
 
 
+class ProviderKind(StrEnum):
+    """Wire protocol an LLM endpoint speaks.
+
+    The *kind* is what varies between vendors; the endpoint, the key and the models are data. One
+    `OPENAI_COMPAT` adapter therefore covers OpenRouter, OpenAI, vLLM, LM Studio and llama.cpp,
+    which is what lets a local runtime be a seat's fallback rather than a separate integration.
+    """
+
+    OPENAI_COMPAT = "openai_compat"
+    ANTHROPIC = "anthropic"
+    GEMINI = "gemini"
+    #: The scripted offline provider. Not a vendor — it is how the demo and the whole test suite
+    #: run without a key or a network, and it needs no endpoint.
+    STUB = "stub"
+
+    @property
+    def needs_endpoint(self) -> bool:
+        return self is not ProviderKind.STUB
+
+
 class BasketStatus(StrEnum):
     """`HALTED` is deliberately not self-clearing — it requires a human in the GUI."""
 
@@ -126,6 +165,24 @@ class BasketStatus(StrEnum):
     @property
     def may_trade(self) -> bool:
         return self is BasketStatus.ACTIVE
+
+
+class ConfigKind(StrEnum):
+    """What a versioned ConfigStore document holds (DESIGN §6.1).
+
+    A basket carries its panel and its Tier-1 policy *inside* it, because that is the tree the
+    dashboard edits and the runner consumes; pinning one version therefore pins the whole
+    decision-making configuration of a cycle. The Tier-2 policy is separate because it belongs to
+    no basket — it outranks all of them.
+    """
+
+    BASKET = "basket"
+    GLOBAL_RISK = "global_risk"
+
+    @property
+    def is_singleton(self) -> bool:
+        """Whether exactly one document of this kind exists, under `SINGLETON_ID`."""
+        return self is ConfigKind.GLOBAL_RISK
 
 
 class OrderType(StrEnum):

@@ -10,15 +10,20 @@ suite:
   its budget.
 * A rejected order is a *result*, not an exception: it comes back as `OrderState.REJECTED`
   with the venue's reason.
+* Transport-level truth is never guessed at: `OrderStatus.found` distinguishes "the venue says
+  no" from "the venue has never heard of it", and only one of those is survivable.
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from datetime import date, datetime
 from typing import Protocol, runtime_checkable
 
-from tradebot.core.enums import OrderState, OrderType
+from tradebot.core.enums import OrderState, OrderType, Side
+from tradebot.core.instrument import Instrument
 from tradebot.core.orders import Fill, Order, OrderIntent
-from tradebot.core.portfolio import AccountState
+from tradebot.core.portfolio import AccountState, CorporateAction
 from tradebot.core.schema import DomainModel, Money, UtcDatetime
 
 
@@ -62,6 +67,15 @@ class OrderStatus(DomainModel):
     fills: tuple[Fill, ...] = ()
     observed_at: UtcDatetime
     reject_reason: str | None = None
+    #: The instruction as the venue holds it. Reported because two things need to reason about a
+    #: resting order we did not place in this process: the self-trade check, which must know
+    #: whether a price is actually resting (PLAN §3.3), and reconciliation, which reports foreign
+    #: orders to a human. `order_type` is what separates a live limit from an untriggered stop —
+    #: comparing a stop's limit price as though it were resting vetoes every entry behind a stop.
+    side: Side | None = None
+    order_type: OrderType | None = None
+    limit_price: Money | None = None
+    stop_price: Money | None = None
     #: Whether the venue has a record of this order at all. A *rejected* order is a definite
     #: answer — it did not execute. An order the venue has never heard of is not: it may have
     #: been lost, or we may be querying the wrong account, and only one of those is survivable.
@@ -111,12 +125,28 @@ class RestorableVenue(Protocol):
 
 @runtime_checkable
 class BrokerAdapter(Protocol):
-    """One venue account. Implementations: `SimBroker`, `CcxtBroker`, `AlpacaBroker`."""
+    """One venue account. Implementations: `SimBroker`, `BinanceSpotBroker`, `AlpacaBroker`."""
 
     venue_id: str
 
     async def submit(self, intent: OrderIntent) -> OrderAck:
         """Submit an order. Raises `SubmitUnknownError` if the outcome cannot be determined."""
+        ...
+
+    async def submit_group(self, intents: Sequence[OrderIntent]) -> tuple[OrderAck, ...]:
+        """Submit protective legs the venue will hold as **one linked group**.
+
+        Called only where `capabilities().oco_groups` is true, and only for the exit legs of one
+        entry. The linkage is the whole point: two independent exit orders on one holding can both
+        fill, and the second sells a position that is already gone — a short in a long-only system
+        (DESIGN §6.7). A venue that cannot link legs must declare `oco_groups=False`, and then
+        only a stop is ever placed.
+
+        Binance expresses this as an OCO order list, Alpaca as an `oco` order class, `SimBroker`
+        by cancelling siblings inside its own book. Raises `SubmitUnknownError` for the whole
+        group if the outcome cannot be determined — a half-known group is resolved by querying,
+        never by resubmitting.
+        """
         ...
 
     async def cancel(self, order_ref: OrderRef) -> CancelAck: ...
@@ -135,3 +165,57 @@ class BrokerAdapter(Protocol):
         ...
 
     def capabilities(self) -> BrokerCapabilities: ...
+
+    async def server_time(self) -> datetime:
+        """The venue's clock, for the startup skew check.
+
+        Repeated signature rejection from a skewed clock is itself a ban vector, and candle
+        alignment depends on the same figure (PLAN §3.1).
+        """
+        ...
+
+    async def close(self) -> None:
+        """Release the transport. Safe to call more than once."""
+        ...
+
+
+@runtime_checkable
+class TradingCalendar(Protocol):
+    """When a venue is open, and what a venue's "day" is.
+
+    Two consumers, both of which get it wrong without a calendar: the scheduler must not cycle an
+    equities basket at 3 a.m., and the daily-loss baseline resets on the *exchange session* for
+    equities and on UTC midnight for crypto (DESIGN §6.6). Hard-coding either would misstate the
+    limit for the other.
+    """
+
+    venue_id: str
+
+    async def is_open(self, at: datetime) -> bool: ...
+
+    async def session_day(self, at: datetime) -> str:
+        """The trading day `at` belongs to, as an ISO date.
+
+        The key the daily-loss baseline rolls over on. For equities an evening extended-hours
+        print still belongs to that session's day; for crypto it is simply the UTC date.
+        """
+        ...
+
+    async def next_open(self, after: datetime) -> datetime | None:
+        """When trading next becomes possible, or `None` if it already is."""
+        ...
+
+
+@runtime_checkable
+class CorporateActionSource(Protocol):
+    """Venue-announced splits and dividends, so the reconciler can explain an equity change.
+
+    Failure semantics: an unreachable announcement feed returns nothing rather than raising. The
+    consequence is a position change classified `MISMATCH` and a halted basket — which is the
+    correct fail-closed direction, and is why the source is consulted before the diff is judged
+    rather than after (R14).
+    """
+
+    async def fetch(
+        self, instruments: Sequence[Instrument], *, since: date, until: date
+    ) -> tuple[CorporateAction, ...]: ...

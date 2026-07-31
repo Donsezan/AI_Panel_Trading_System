@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% block title %}Costs{% endblock %}
+{% block heading %}Deliberation cost{% endblock %}
+
+{% block content %}
+<p class="muted">
+  What each basket has spent on its panel. The figure that makes panel configurations comparable
+  — a research testbed needs $/decision as much as it needs PnL. Costs are attributed to a
+  provider <em>call</em>, so basket mode is counted once rather than once per instrument.
+</p>
+
+<table>
+  <thead><tr><th>Basket</th><th>Cycles</th><th>Total (USD)</th><th>Per cycle (USD)</th></tr></thead>
+  <tbody>
+  {% for row in costs %}
+    <tr>
+      <td><code>{{ row.basket_id }}</code></td>
+      <td class="num">{{ row.cycle_count }}</td>
+      <td class="num">{{ row.total_cost | money(4) }}</td>
+      <td class="num">{{ row.per_cycle | money(4) }}</td>
+    </tr>
+  {% else %}
+    {{ m.empty(4, "No cycle has run, so nothing has been spent.") }}
+  {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

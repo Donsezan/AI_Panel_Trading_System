@@ -29,8 +29,8 @@ half-applied reconciliation is worse than none.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
+from datetime import timedelta
 from decimal import Decimal
 
 from tradebot.core.clock import Clock
@@ -40,9 +40,9 @@ from tradebot.core.ids import owns_client_order_id
 from tradebot.core.instrument import Instrument
 from tradebot.core.logging import get_logger
 from tradebot.core.money import ZERO, divide, multiply
-from tradebot.core.portfolio import AccountState, Position
+from tradebot.core.portfolio import AccountState, CorporateAction, Position
 from tradebot.core.schema import DomainModel, Money, UtcDatetime
-from tradebot.interfaces.broker import BrokerAdapter, OrderStatus
+from tradebot.interfaces.broker import BrokerAdapter, CorporateActionSource, OrderStatus
 from tradebot.ledger.portfolio import ExternalFlow, Ledger
 from tradebot.persistence.store import EventStore
 
@@ -82,14 +82,9 @@ class ReconcileReport(DomainModel):
         return "; ".join(f"{d.scope}: {d.detail}" for d in self.differences if d.detail)
 
 
-@dataclass(frozen=True, slots=True)
-class CorporateAction:
-    """A split or dividend the venue announced, used to explain an equity position change."""
-
-    instrument_key: str
-    ratio: Decimal = Decimal(1)
-    cash_per_share: Decimal = ZERO
-    detail: str = ""
+#: How far back announcements are searched. An action effective before this was already absorbed
+#: by an earlier reconciliation; re-explaining it would excuse a genuine discrepancy today.
+ANNOUNCEMENT_LOOKBACK = timedelta(days=7)
 
 
 class Reconciler:
@@ -108,6 +103,7 @@ class Reconciler:
         drift_tolerance_pct: Decimal = Decimal("0.5"),
         mismatch_kill_pct: Decimal = Decimal(5),
         corporate_actions: Sequence[CorporateAction] = (),
+        announcements: CorporateActionSource | None = None,
     ) -> None:
         self._broker = broker
         self._ledger = ledger
@@ -118,14 +114,15 @@ class Reconciler:
         self._dust = dust_tolerance
         self._drift_pct = drift_tolerance_pct
         self._mismatch_kill_pct = mismatch_kill_pct
-        self._actions = {action.instrument_key: action for action in corporate_actions}
+        self._static_actions = tuple(corporate_actions)
+        self._announcements = announcements
 
     async def reconcile(self, *, basket_id: str = "global") -> ReconcileReport:
         """Fetch venue truth, classify every difference, and adopt what is explained."""
         venue_state = await self._broker.fetch_positions_and_balances()
         open_orders = await self._broker.fetch_open_orders()
 
-        differences = self._diff(venue_state)
+        differences = self._diff(venue_state, await self._corporate_actions())
         if self._is_venue_reset(venue_state, differences):
             report = self._report(venue_state, ReconcileClass.VENUE_RESET, differences)
         else:
@@ -143,7 +140,28 @@ class Reconciler:
 
     # ------------------------------------------------------------------ diffing
 
-    def _diff(self, venue_state: AccountState) -> tuple[Difference, ...]:
+    async def _corporate_actions(self) -> Mapping[str, CorporateAction]:
+        """Announcements that could explain a position change, keyed by instrument.
+
+        Consulted *before* the diff is judged, because after it the difference has already been
+        classified as a mismatch and halted a basket for a stock split (R14). An unreachable feed
+        yields nothing and the halt stands — the fail-closed direction.
+        """
+        actions = list(self._static_actions)
+        if self._announcements is not None and self._instruments:
+            today = self._clock.now().date()
+            actions.extend(
+                await self._announcements.fetch(
+                    tuple(self._instruments.values()),
+                    since=today - ANNOUNCEMENT_LOOKBACK,
+                    until=today,
+                )
+            )
+        return {action.instrument_key: action for action in actions}
+
+    def _diff(
+        self, venue_state: AccountState, actions: Mapping[str, CorporateAction]
+    ) -> tuple[Difference, ...]:
         """Diff positions, then the currencies a position does not already account for.
 
         On a spot venue an instrument's base asset *is* a balance, so diffing both would report
@@ -157,13 +175,17 @@ class Reconciler:
             b.currency for b in (*ours.balances, *venue_state.balances)
         } - held_as_positions
         return (
-            *(self._diff_position(key, ours, venue_state) for key in sorted(keys)),
+            *(
+                self._classify(
+                    scope=key,
+                    ours=ours.qty(key),
+                    theirs=venue_state.qty(key),
+                    action=actions.get(key),
+                )
+                for key in sorted(keys)
+            ),
             *(self._diff_balance(currency, ours, venue_state) for currency in sorted(currencies)),
         )
-
-    def _diff_position(self, key: str, ours: AccountState, theirs: AccountState) -> Difference:
-        mine, yours = ours.qty(key), theirs.qty(key)
-        return self._classify(scope=key, ours=mine, theirs=yours, action=self._actions.get(key))
 
     def _diff_balance(self, currency: str, ours: AccountState, theirs: AccountState) -> Difference:
         return self._classify(
@@ -203,7 +225,13 @@ class Reconciler:
     def _as_corporate_action(
         self, ours: Decimal, theirs: Decimal, _delta: Decimal, action: CorporateAction | None
     ) -> tuple[ReconcileClass, str] | None:
-        if action is None or ours <= ZERO:
+        """An *effective* announcement whose ratio predicts exactly what the venue now reports.
+
+        Announcements are published days ahead of their effective date. One that has not taken
+        effect yet explains nothing, and letting it explain a change anyway would excuse a real
+        discrepancy for as long as the announcement stands.
+        """
+        if action is None or ours <= ZERO or not self._is_effective(action):
             return None
         expected = multiply(ours, action.ratio)
         if abs(theirs - expected) <= self._dust:
@@ -212,6 +240,12 @@ class Reconciler:
                 f"{action.detail or 'announced action'} ratio {action.ratio}: {ours} → {theirs}",
             )
         return None
+
+    def _is_effective(self, action: CorporateAction) -> bool:
+        """An undated action is taken as already effective; that is how a static one is declared."""
+        return (
+            not action.effective_on or action.effective_on <= self._clock.now().date().isoformat()
+        )
 
     def _as_drift(
         self, ours: Decimal, _theirs: Decimal, delta: Decimal, _a: CorporateAction | None

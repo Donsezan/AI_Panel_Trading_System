@@ -14,6 +14,7 @@ from tradebot.core.config import (
     GlobalRiskPolicy,
     PanelConfig,
     RiskPolicy,
+    Schedule,
     SeatConfig,
 )
 from tradebot.core.decision import Decision, SeatResponse, SeatVote
@@ -431,7 +432,7 @@ class TestConfigLimits:
                     panel_id="p",
                     seats=(SeatConfig(seat_id="s", role="r", provider_id="stub", model="m"),),
                 ),
-                cycle_interval_seconds=60,
+                schedule=Schedule(every_seconds=60),
                 ttl_buffer_seconds=60,
             )
 

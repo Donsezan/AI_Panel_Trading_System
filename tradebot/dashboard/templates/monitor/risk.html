@@ -1,0 +1,68 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% block title %}Risk{% endblock %}
+{% block heading %}Risk{% endblock %}
+
+{% block content %}
+<section class="figures">
+  <div class="figure">
+    <span class="label">Kill switch</span>
+    <span class="value">{{ m.pill(risk_state.kill_switch.value) }}</span>
+  </div>
+  <div class="figure">
+    <span class="label">High-water mark</span>
+    <span class="value">{{ risk_state.high_water_mark | money }}</span>
+  </div>
+  <div class="figure">
+    <span class="label">Day-start equity</span>
+    <span class="value">{{ risk_state.day_start_equity | money }}</span>
+  </div>
+  <div class="figure">
+    <span class="label">Risk day</span>
+    <span class="value mono small">{{ risk_state.day_started_on or absent }}</span>
+  </div>
+</section>
+{% if risk_state.reason %}<p class="muted">Last change: {{ risk_state.reason }}</p>{% endif %}
+
+<h2>Tier-2 policy in force</h2>
+{% if policy %}
+<table>
+  <thead><tr><th>Limit</th><th>Value</th></tr></thead>
+  <tbody>
+    <tr><td>Max gross exposure</td><td class="num">{{ policy.document.max_gross_exposure_pct }}%</td></tr>
+    <tr><td>Max single-instrument exposure</td><td class="num">{{ policy.document.max_instrument_exposure_pct }}%</td></tr>
+    <tr><td>Max correlated-cluster exposure</td><td class="num">{{ policy.document.max_cluster_exposure_pct }}%</td></tr>
+    <tr><td>Price collar</td><td class="num">{{ policy.document.price_collar_pct }}%</td></tr>
+    <tr><td>Max orders per hour</td><td class="num">{{ policy.document.max_orders_per_hour }}</td></tr>
+    <tr><td>Max order notional</td><td class="num">{{ policy.document.max_order_notional | money }}</td></tr>
+    <tr><td>Max daily loss</td><td class="num">{{ policy.document.max_daily_loss_pct }}%</td></tr>
+    <tr><td>Max drawdown (trips the kill switch)</td><td class="num">{{ policy.document.max_drawdown_pct }}%</td></tr>
+    <tr><td>Stablecoin peg tolerance</td><td class="num">{{ policy.document.stablecoin_peg_tolerance_pct }}%</td></tr>
+    <tr><td>Flatten on kill</td><td>{{ policy.document.flatten_on_kill }}</td></tr>
+  </tbody>
+</table>
+<p class="muted small">Version {{ policy.ref.version }}, published by {{ policy.actor }}.</p>
+{% else %}
+  <p class="empty danger">No Tier-2 policy is published. Nothing may run without global limits.</p>
+{% endif %}
+
+<h2>Risk events</h2>
+{{ m.risk_table(risk_events) }}
+
+<h2>Reconciliations</h2>
+<table>
+  <thead><tr><th>Observed</th><th>Venue</th><th>Classification</th><th>Detail</th></tr></thead>
+  <tbody>
+  {% for row in reconciliations %}
+    <tr>
+      <td class="mono">{{ row.observed_at | moment }}</td>
+      <td><code>{{ row.venue }}</code></td>
+      <td>{{ m.pill(row.classification) }}</td>
+      <td class="detail-cell">{{ row.detail }}</td>
+    </tr>
+  {% else %}
+    {{ m.empty(4, "No reconciliation sweep has been recorded.") }}
+  {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

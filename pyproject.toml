@@ -12,6 +12,28 @@ dependencies = [
     "pydantic>=2.9,<3",
     "SQLAlchemy>=2.0,<3",
     "alembic>=1.13,<2",
+    # Venue transport. Numbers are read from ccxt's *raw* responses as strings, never from its
+    # float-parsed unified fields — a venue price must not enter a money path through a float.
+    "ccxt>=4.4,<5",
+    # News fetching. httpx so timeouts, User-Agent and robots.txt are ours to control, and so
+    # the suite can exercise the real client offline through MockTransport.
+    "httpx>=0.27,<1",
+    # Feed parsing. Real feeds are malformed in ways a hand-rolled RSS/Atom parser gets wrong.
+    "feedparser>=6.0,<7",
+    # IANA time zones. Windows ships no tz database, and an equities session is defined in
+    # America/New_York: fixed UTC offsets would be wrong on both sides of every DST transition,
+    # which would misplace the market open and the daily-loss day boundary (DESIGN §6.6).
+    "tzdata>=2024.1",
+    # Dashboard (DESIGN §6.10). Server-rendered on purpose: no npm, no build step, and htmx is
+    # vendored into the repo rather than fetched from a CDN, so the whole surface is hash-pinned
+    # and works offline (ADR 0014).
+    "fastapi>=0.115,<1",
+    "uvicorn>=0.30,<1",
+    "jinja2>=3.1,<4",
+    "python-multipart>=0.0.9,<1",
+    # Signs the session cookie. The key is derived from the dashboard token, so rotating the
+    # token invalidates every live session.
+    "itsdangerous>=2.2,<3",
 ]
 
 [project.optional-dependencies]
@@ -71,6 +93,9 @@ ignore = [
 "tests/**" = ["S", "ARG", "DTZ"]
 "scripts/**" = ["T20"]   # the check runner reports to a human on stdout
 "tradebot/core/logging.py" = ["A005"]   # module name shadows stdlib by design (package-qualified)
+# `secret_ref` holds an environment variable *name*, never a value — that indirection is the
+# control (DESIGN §6.1), so bandit's hardcoded-password heuristic is inverted here.
+"tradebot/decision/providers/registry.py" = ["S106"]
 
 [tool.ruff.lint.flake8-tidy-imports.banned-api]
 "decimal.getcontext".msg = "Use tradebot.core.money.money_context(); global Decimal context is shared state."
@@ -94,16 +119,27 @@ module = ["tradebot.core.*", "tradebot.risk.*", "tradebot.execution.*", "tradebo
 strict = true
 disallow_any_explicit = false
 
+# Neither ships type information. Both are confined to a single adapter module each
+# (`marketdata/ccxt_transport.py`, `news/rss.py`), which is the reason those modules exist:
+# untyped third-party surface stops at one boundary instead of spreading.
+[[tool.mypy.overrides]]
+module = ["ccxt.*", "feedparser.*"]
+ignore_missing_imports = true
+
 # ---------------------------------------------------------------- pytest
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
-addopts = "-q --strict-markers --strict-config"
+# Smoke tests are deselected by default: they need venue keys and the network, and a default
+# `pytest` run must stay offline, deterministic and free. Run them deliberately with `-m smoke`
+# (a `-m` on the command line replaces this one).
+addopts = "-q --strict-markers --strict-config -m 'not smoke'"
 filterwarnings = ["error"]
 markers = [
     "scenario: full-loop scenario and chaos tests (rung 3)",
     "contract: adapter contract tests (rung 2)",
+    "smoke: opt-in read-only checks against a real test venue; needs keys, never in CI",
 ]
 
 # ---------------------------------------------------------------- coverage

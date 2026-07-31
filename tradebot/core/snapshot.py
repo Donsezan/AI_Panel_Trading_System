@@ -85,6 +85,33 @@ class BasketState(DomainModel):
     recent_actions: tuple[str, ...] = ()
 
 
+class NewsCoverage(DomainModel):
+    """Which news sources answered this cycle, and which did not.
+
+    A source being down is not a reason to abort a cycle, but it *is* a reason the panel must
+    know about: silence from a feed is indistinguishable from a quiet market unless the gap is
+    stated. Recorded in the snapshot and rendered into the prompt (DESIGN §8.1).
+    """
+
+    sources_ok: tuple[str, ...] = ()
+    sources_failed: tuple[str, ...] = ()
+
+    @property
+    def is_complete(self) -> bool:
+        return not self.sources_failed
+
+    @property
+    def summary(self) -> str:
+        if not self.sources_ok and not self.sources_failed:
+            return "no news sources are configured for this basket"
+        if self.is_complete:
+            return f"all {len(self.sources_ok)} configured sources responded"
+        return (
+            f"{len(self.sources_ok)} of {len(self.sources_ok) + len(self.sources_failed)} sources "
+            f"responded; no coverage from {', '.join(self.sources_failed)}"
+        )
+
+
 class ContextSnapshot(DomainModel):
     """A frozen decision context. Immutable by construction, hashable for replay."""
 
@@ -93,6 +120,7 @@ class ContextSnapshot(DomainModel):
     as_of: UtcDatetime
     instruments: tuple[InstrumentContext, ...]
     news: tuple[NewsItemView, ...] = ()
+    news_coverage: NewsCoverage = NewsCoverage()
     basket_state: BasketState = BasketState()
     actions_allowed: tuple[str, ...] = ("BUY", "SELL", "HOLD", "WAIT")
     note: str = "sizing is decided by risk management, not by the panel"

@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% block title %}Overview{% endblock %}
+{% block heading %}Overview{% endblock %}
+
+{% block content %}
+<section class="figures">
+  <div class="figure">
+    <span class="label">Equity ({{ quote_currency }})</span>
+    <span class="value">{{ equity | money }}</span>
+  </div>
+  <div class="figure">
+    <span class="label">Baskets in service</span>
+    <span class="value">{{ baskets | length }}</span>
+  </div>
+  <div class="figure">
+    <span class="label">Open orders</span>
+    <span class="value">{{ open_orders | length }}</span>
+  </div>
+  <div class="figure">
+    <span class="label">Kill switch</span>
+    <span class="value">{{ m.pill(risk_state.kill_switch.value) }}</span>
+  </div>
+</section>
+
+<h2>Baskets</h2>
+<table>
+  <thead><tr><th>Basket</th><th>Name</th><th>Version</th><th>Status</th><th>Every</th><th>Instruments</th></tr></thead>
+  <tbody>
+  {% for record in baskets %}
+    <tr>
+      <td><code>{{ record.ref.config_id }}</code></td>
+      <td>{{ record.document.name }}</td>
+      <td class="num">{{ record.ref.version }}</td>
+      <td>{{ m.pill(record.document.status.value) }}</td>
+      <td class="num">{{ record.document.schedule.every_seconds }}s</td>
+      <td class="small">{% for i in record.document.instruments %}<code>{{ i.key }}</code> {% endfor %}</td>
+    </tr>
+  {% else %}
+    {{ m.empty(6, "No baskets configured.") }}
+  {% endfor %}
+  </tbody>
+</table>
+
+<h2>Positions</h2>
+{{ m.positions_table(positions) }}
+
+<h2>Open orders</h2>
+{{ m.orders_table(open_orders, "Nothing working at the venue.") }}
+
+<h2>Recent cycles</h2>
+{{ m.cycles_table(recent_cycles) }}
+
+<h2>Recent risk events</h2>
+{{ m.risk_table(risk_events) }}
+{% endblock %}

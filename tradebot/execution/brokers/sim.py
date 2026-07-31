@@ -33,7 +33,7 @@ order still exists here afterwards — that is the whole point of the scenario.
 from __future__ import annotations
 
 import operator
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
@@ -161,6 +161,10 @@ class _Resting:
             filled_qty=self.filled_qty,
             fills=tuple(self.fills),
             observed_at=observed_at,
+            side=self.intent.side,
+            order_type=self.intent.order_type,
+            limit_price=self.intent.limit_price,
+            stop_price=self.intent.stop_price,
         )
 
 
@@ -182,7 +186,10 @@ class SimBroker:
         self._clock = clock
         self._fee_pct = fee_pct
         self._slippage_pct = slippage_pct
-        self._fill_ratio = fill_ratio
+        #: Share of a matched order's remainder that actually fills. Public because it is a test
+        #: seam like `fail_next_submit`: a contract suite has to be able to *cause* a partial fill,
+        #: and the alternative — building a second simulated venue to do it — would test the copy.
+        self.fill_ratio = fill_ratio
         self._default_quote = default_quote_currency
         self._free: dict[str, Decimal] = dict(balances or {"USDT": Decimal(10_000)})
         self._locked: dict[str, Decimal] = {}
@@ -291,7 +298,7 @@ class SimBroker:
         return tick.last + drift
 
     def _fill(self, resting: _Resting, price: Decimal) -> tuple[Fill, ...]:
-        qty = multiply(resting.remaining, self._fill_ratio)
+        qty = multiply(resting.remaining, self.fill_ratio)
         if qty <= ZERO:
             return ()
         intent = resting.intent
@@ -330,6 +337,16 @@ class SimBroker:
                 self._release(other)
                 other.state = OrderState.CANCELLED
 
+    async def submit_group(self, intents: Sequence[OrderIntent]) -> tuple[OrderAck, ...]:
+        """Place linked exit legs. The linkage already exists here: `_cancel_siblings`.
+
+        A real venue needs one atomic call for this (Binance's OCO list, Alpaca's `oco` class); a
+        simulated venue holds both legs in the same book, so placing them in turn *is* the linked
+        outcome. What matters for the contract is that one leg filling cancels the other inside the
+        venue, which is what `oco_groups=True` claims and what `_fill` does (ADR 0011).
+        """
+        return tuple([await self.submit(intent) for intent in intents])
+
     async def cancel(self, order_ref: OrderRef) -> CancelAck:
         resting = self._orders.get(order_ref.client_order_id)
         if resting is None or not resting.state.is_open:
@@ -364,6 +381,17 @@ class SimBroker:
         return tuple(
             resting.status(now) for resting in self._orders.values() if resting.state.is_open
         )
+
+    async def server_time(self) -> datetime:
+        """The simulated venue's clock *is* ours, so the startup skew check is trivially satisfied.
+
+        Answering rather than refusing keeps `BrokerAdapter` uniform: the preflight that asserts
+        skew against a real venue runs against this one too, and finds nothing.
+        """
+        return self._clock.now()
+
+    async def close(self) -> None:
+        """Nothing to release: there is no socket behind a simulated venue."""
 
     async def fetch_positions_and_balances(self) -> AccountState:
         currencies = sorted(set(self._free) | set(self._locked))

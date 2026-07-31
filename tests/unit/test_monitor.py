@@ -16,9 +16,9 @@ from tradebot.core.enums import OrderRole, OrderState, OrderType, Side
 from tradebot.core.events import EventType
 from tradebot.core.instrument import Instrument
 from tradebot.core.orders import OrderIntent, ProtectivePlan
+from tradebot.execution.brokers.sim import SimBroker, Tick
 from tradebot.execution.monitor import ExecutionMonitor
 from tradebot.execution.service import ExecutionService
-from tradebot.execution.sim_broker import SimBroker, Tick
 from tradebot.ledger.portfolio import Ledger
 from tradebot.persistence.store import EventStore
 

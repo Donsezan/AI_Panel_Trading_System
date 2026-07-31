@@ -4,8 +4,16 @@ Core packages depend on these interfaces; concrete adapters are wired in `app.py
 else. Freezing this surface early is what keeps venue assumptions out of core (PLAN Phase 1).
 """
 
-from tradebot.interfaces.broker import BrokerAdapter, BrokerCapabilities, OrderAck, OrderRef
+from tradebot.interfaces.broker import (
+    BrokerAdapter,
+    BrokerCapabilities,
+    CorporateActionSource,
+    OrderAck,
+    OrderRef,
+    TradingCalendar,
+)
 from tradebot.interfaces.debate import DebateProtocol
+from tradebot.interfaces.exchange import TradingTransport, VenueGateway, VenueTransport
 from tradebot.interfaces.llm import CompletionRequest, CompletionResult, LLMProvider
 from tradebot.interfaces.market_data import DataCapabilities, MarketDataProvider
 from tradebot.interfaces.news import NewsSource, RawNewsItem, RelevanceFilter
@@ -17,6 +25,7 @@ __all__ = [
     "BrokerCapabilities",
     "CompletionRequest",
     "CompletionResult",
+    "CorporateActionSource",
     "DataCapabilities",
     "DebateProtocol",
     "LLMProvider",
@@ -28,5 +37,9 @@ __all__ = [
     "RelevanceFilter",
     "RiskProposal",
     "RiskRule",
+    "TradingCalendar",
+    "TradingTransport",
     "VectorStore",
+    "VenueGateway",
+    "VenueTransport",
 ]

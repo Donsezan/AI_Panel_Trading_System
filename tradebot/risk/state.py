@@ -102,6 +102,22 @@ class RiskStateStore:
             updated_at=row.updated_at,
         )
 
+    def initialised(self) -> bool:
+        """Whether risk state has ever been written for this database.
+
+        The honest test for "first run", and not the same as an unset high-water mark: the first
+        reconciliation against a real venue discovers the account's funds as an external flow,
+        which writes a mark *before* the startup sequence gets to arming. Inferring first-run from
+        the mark would leave the switch tripped on every real venue's first start (DESIGN §8.2).
+        """
+        with self._engine.connect() as connection:
+            return (
+                connection.execute(
+                    select(risk_state.c.scope).where(risk_state.c.scope == _SINGLETON)
+                ).one_or_none()
+                is not None
+            )
+
     def halted_baskets(self) -> dict[str, str]:
         """Basket id → why it is not trading. Halted baskets need a human to clear them."""
         with self._engine.connect() as connection:
@@ -146,13 +162,15 @@ class RiskStateStore:
         return status
 
 
-def rolled_over(state: RiskState, now: datetime) -> bool:
-    """Whether `now` starts a new risk day.
+def rolled_over(state: RiskState, day: str) -> bool:
+    """Whether `day` starts a new risk day.
 
-    UTC for crypto, which is what v1 trades. Equity sessions arrive with the trading calendars
-    in Phase 5; hard-coding a market close here would be wrong for the venue we actually run.
+    The *caller* decides what a day is, because the answer is venue-specific: UTC midnight for
+    crypto, the exchange session for equities (DESIGN §6.6). The watchdog asks a `TradingCalendar`
+    and passes the answer in; hard-coding either here would misstate the daily-loss limit for the
+    other.
     """
-    return state.day_started_on != now.date().isoformat()
+    return state.day_started_on != day
 
 
 def start_of_day(now: datetime) -> str:

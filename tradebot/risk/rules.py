@@ -29,6 +29,16 @@ def _block(rule_id: str, detail: str, *, limit: Decimal | None = None) -> RiskCh
     return RiskCheckResult(rule=rule_id, decision=RiskDecision.VETO, detail=detail, limit=limit)
 
 
+#: What a metering rule records when it declines to meter a human's exit. A `PASS` with a stated
+#: reason, not silence: the event log has to show which rules stood aside and why, which is what
+#: makes this an auditable decision by the risk layer rather than a bypass around it (ADR 0015).
+STOOD_ASIDE = "stood aside: an operator exit reduces exposure and is not metered"
+
+
+def _stand_aside(rule_id: str, qty: Decimal) -> RiskCheckResult:
+    return _allow(rule_id, qty, STOOD_ASIDE)
+
+
 class MinConvictionRule:
     """No order below the panel conviction floor, on the 0–1 scale (DESIGN §6.6)."""
 
@@ -171,6 +181,8 @@ class CooldownRule:
     rule_id = "cooldown"
 
     def evaluate(self, proposal: RiskProposal, requested_qty: Decimal) -> RiskCheckResult:
+        if proposal.is_operator_exit:
+            return _stand_aside(self.rule_id, requested_qty)
         elapsed = proposal.history.cycles_since_trade
         required = proposal.policy.cooldown_cycles
         if elapsed is None or elapsed >= required:
@@ -188,6 +200,8 @@ class DailyTradeCapRule:
     rule_id = "max_trades_per_day"
 
     def evaluate(self, proposal: RiskProposal, requested_qty: Decimal) -> RiskCheckResult:
+        if proposal.is_operator_exit:
+            return _stand_aside(self.rule_id, requested_qty)
         placed = proposal.history.trades_today
         cap = proposal.policy.max_trades_per_day
         if placed >= cap:
@@ -207,6 +221,10 @@ class ConsecutiveLossRule:
     rule_id = "max_consecutive_losses"
 
     def evaluate(self, proposal: RiskProposal, requested_qty: Decimal) -> RiskCheckResult:
+        # The starkest case for standing aside: a loss streak is exactly when an operator most
+        # needs to be able to flatten, and this is the rule that would otherwise stop them.
+        if proposal.is_operator_exit:
+            return _stand_aside(self.rule_id, requested_qty)
         losses = proposal.history.consecutive_losses
         cap = proposal.policy.max_consecutive_losses
         if losses >= cap:

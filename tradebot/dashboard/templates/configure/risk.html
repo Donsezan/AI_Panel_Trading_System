@@ -1,0 +1,91 @@
+{% extends "base.html" %}
+{% import "_fields.html" as f %}
+{% block title %}Tier-2 risk{% endblock %}
+{% block heading %}Global (Tier-2) risk policy{% endblock %}
+
+{% block content %}
+<p class="muted">
+  Tier 2 outranks every basket and may veto or shrink any order. Limits take effect at the next
+  cycle boundary; the watchdog adopts the new policy without a restart.
+</p>
+
+{{ f.error_summary(errors) }}
+
+{% if needs_confirmation %}
+<div class="banner danger">
+  <strong>This edit loosens a global limit.</strong>
+  <div class="loosened">
+    {% for line in loosened %}<div class="mono small">{{ line }}</div>{% endfor %}
+  </div>
+  Type <code>{{ phrase }}</code> below to publish it. Tightening never asks.
+</div>
+{% endif %}
+
+<form method="post" action="/configure/risk">
+  <h2>Exposure</h2>
+  <div class="grid">
+    {{ f.field("max_gross_exposure_pct", "Max gross exposure (% equity)", draft.get("max_gross_exposure_pct"), errors) }}
+    {{ f.field("max_instrument_exposure_pct", "Max single-instrument exposure (%)", draft.get("max_instrument_exposure_pct"), errors, hint="across all baskets — Tier 1 cannot see a sibling") }}
+    {{ f.field("max_cluster_exposure_pct", "Max correlated-cluster exposure (%)", draft.get("max_cluster_exposure_pct"), errors) }}
+  </div>
+
+  <h2>Order sanity</h2>
+  <div class="grid">
+    {{ f.field("price_collar_pct", "Price collar (%)", draft.get("price_collar_pct"), errors, hint="how far from the last trade an order may be priced") }}
+    {{ f.field("max_orders_per_hour", "Max orders per hour", draft.get("max_orders_per_hour"), errors, type="number", hint="the brake on a loop that will not stop trading") }}
+    {{ f.field("max_order_notional", "Max order notional", draft.get("max_order_notional"), errors, hint="blank means uncapped, which is itself a loosening") }}
+  </div>
+
+  <h2>Drawdown and loss</h2>
+  <div class="grid">
+    {{ f.field("max_daily_loss_pct", "Max daily loss (%)", draft.get("max_daily_loss_pct"), errors, hint="halts new orders for the day; not a kill") }}
+    {{ f.field("max_drawdown_pct", "Max drawdown (%)", draft.get("max_drawdown_pct"), errors, hint="trips the kill switch") }}
+    {{ f.field("stablecoin_peg_tolerance_pct", "Stablecoin peg tolerance (%)", draft.get("stablecoin_peg_tolerance_pct"), errors, hint="aggregation freezes beyond this drift") }}
+  </div>
+  {{ f.flag("flatten_on_kill", "Flatten positions when the kill switch trips", draft.get("flatten_on_kill"), hint="off by default: flattening into a broken market is often the worse outcome") }}
+
+  <h2>Correlation clusters</h2>
+  <p class="muted small">
+    Static buckets in v1. They prevent two baskets independently maxing out on near-identical
+    assets. An instrument that belongs to no bucket is <em>vetoed</em>, not waved through.
+  </p>
+  {% for cluster in draft.get("clusters") or [] %}
+    {% set c = "clusters[" ~ loop.index0 ~ "]" %}
+    <fieldset>
+      <legend>{{ cluster.get("cluster_id") or "new cluster" }}</legend>
+      <div class="grid">
+        {{ f.field(c ~ ".cluster_id", "Cluster id", cluster.get("cluster_id"), errors) }}
+      </div>
+      {% for key in cluster.get("instrument_keys") or [] %}
+        <input type="hidden" name="doc.{{ c }}.instrument_keys[]" value="{{ key }}">
+      {% endfor %}
+      {% for asset_class in cluster.get("asset_classes") or [] %}
+        <input type="hidden" name="doc.{{ c }}.asset_classes[]" value="{{ asset_class }}">
+      {% endfor %}
+      <p class="muted small">
+        asset classes: {{ (cluster.get("asset_classes") or []) | join(", ") or absent }} ·
+        instruments: {{ (cluster.get("instrument_keys") or []) | join(", ") or absent }}
+      </p>
+    </fieldset>
+  {% endfor %}
+
+  <h2>Publish</h2>
+  <div class="grid">
+    <div class="field">
+      <label for="note">Note (recorded on the version)</label>
+      <input id="note" name="note" type="text" placeholder="why this changed">
+    </div>
+    {% if needs_confirmation %}
+      <div class="field">
+        <label for="confirm">Typed confirmation</label>
+        <input id="confirm" name="confirm" type="text" autocomplete="off" placeholder="{{ phrase }}">
+        <span class="error small">Required because this edit permits more than the policy in force.</span>
+      </div>
+    {% endif %}
+  </div>
+  <div class="actions">
+    <button type="submit">Publish new version</button>
+    <a class="ghost-link" href="/configure/history/global_risk/global">version history</a>
+  </div>
+</form>
+{% endblock %}

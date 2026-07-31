@@ -16,6 +16,7 @@ from tradebot.core.config import CorrelationCluster, GlobalRiskPolicy, RiskPolic
 from tradebot.core.decision import Decision
 from tradebot.core.enums import Action, AssetClass, OrderType, RiskDecision, Side, SizeHint
 from tradebot.core.instrument import Instrument
+from tradebot.core.money import ZERO, multiply
 from tradebot.core.orders import OrderIntent
 from tradebot.core.portfolio import Position
 from tradebot.interfaces.risk import RiskProposal, TradingHistory
@@ -23,6 +24,7 @@ from tradebot.risk.tier2 import (
     ClusterExposureRule,
     GrossExposureRule,
     InstrumentExposureRule,
+    OrderNotionalRule,
     OrderRateRule,
     PriceCollarRule,
     Tier2RiskEngine,
@@ -255,3 +257,41 @@ def test_every_percentage_limit_rejects_nonsense(field: str) -> None:
 def test_the_kill_switch_does_not_liquidate_by_default() -> None:
     """Flattening into a broken market is often worse, and it is the operator's call."""
     assert GlobalRiskPolicy().flatten_on_kill is False
+
+
+class TestOrderNotionalRule:
+    """The live training-wheels cap (PLAN §2.4), enforced through the ordinary Tier-2 path.
+
+    Deliberately exercised in every mode's code path rather than only live's: a limit that only
+    one run evaluates is a limit nobody has tested.
+    """
+
+    def test_it_is_inert_until_a_cap_is_configured(self, instrument: Instrument) -> None:
+        rule = OrderNotionalRule(GlobalRiskPolicy())
+        result = rule.evaluate(proposal(instrument), Decimal("1"))
+        assert result.decision is RiskDecision.PASS
+        assert result.max_qty == Decimal("1")
+
+    def test_an_order_within_the_cap_passes(self, instrument: Instrument) -> None:
+        rule = OrderNotionalRule(GlobalRiskPolicy(max_order_notional=Decimal(1000)))
+        result = rule.evaluate(proposal(instrument, price="50000"), Decimal("0.01"))
+        assert result.decision is RiskDecision.PASS
+
+    def test_an_order_above_the_cap_is_shrunk_to_it(self, instrument: Instrument) -> None:
+        """Shrink rather than veto, like every other Tier-2 limit; minimums turn it into a veto."""
+        rule = OrderNotionalRule(GlobalRiskPolicy(max_order_notional=Decimal(500)))
+        result = rule.evaluate(proposal(instrument, price="50000"), Decimal("0.02"))
+        assert result.decision is RiskDecision.ADJUSTED
+        assert result.max_qty == Decimal("0.01")
+        assert result.limit == Decimal(500)
+
+    def test_an_unpriceable_order_is_vetoed(self, instrument: Instrument) -> None:
+        """Not knowing what an order is worth is not the same as knowing it is small enough."""
+        rule = OrderNotionalRule(GlobalRiskPolicy(max_order_notional=Decimal(500)))
+        assert rule.evaluate(proposal(instrument, price="0"), Decimal("1")).blocked
+
+    def test_the_engine_applies_the_cap_end_to_end(self, instrument: Instrument) -> None:
+        engine = Tier2RiskEngine(GlobalRiskPolicy(max_order_notional=Decimal(500)))
+        verdict = engine.review(intent(instrument, "0.02"), proposal(instrument))
+        assert verdict.intent is not None
+        assert multiply(verdict.intent.qty, verdict.intent.limit_price or ZERO) <= Decimal(500)

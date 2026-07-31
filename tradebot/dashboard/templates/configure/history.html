@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% block title %}History{% endblock %}
+{% block heading %}Version history — <code>{{ kind }}:{{ config_id }}</code>{% endblock %}
+
+{% block content %}
+<p class="muted">
+  Every version ever published, oldest first. Retirement is a version too, so a withdrawn
+  document still resolves for the cycles that ran it.
+</p>
+
+<table>
+  <thead><tr><th>Version</th><th>Published</th><th>By</th><th>Note</th><th>State</th></tr></thead>
+  <tbody>
+  {% for record in versions %}
+    <tr>
+      <td class="num">{{ record.ref.version }}</td>
+      <td class="mono">{{ record.created_at | moment }}</td>
+      <td>{{ record.actor }}</td>
+      <td class="detail-cell">{{ record.note }}</td>
+      <td>{{ m.pill("retired" if record.retired else "in service") }}</td>
+    </tr>
+  {% else %}
+    {{ m.empty(5, "No versions.") }}
+  {% endfor %}
+  </tbody>
+</table>
+
+<p class="actions"><a class="ghost-link" href="/configure">back to Configure</a></p>
+{% endblock %}

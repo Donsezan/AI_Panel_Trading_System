@@ -104,6 +104,9 @@ cycles = Table(
     Column("snapshot_id", String(64)),
     Column("snapshot_digest", String(64)),
     Column("cost_usd", DecimalText),
+    #: `{"basket:demo": 4, "global_risk:global": 2}` — the exact config versions this cycle ran
+    #: on, so a decision is re-read against the limits that produced it (DESIGN §6.1).
+    Column("config_versions_json", Text, default="{}"),
     Index("ix_cycles_basket", "basket_id"),
 )
 
@@ -229,6 +232,74 @@ risk_state = Table(
     Column("updated_at", UtcText, nullable=False),
 )
 
+#: The live-arming row (PLAN §2.4). Live mode requires a row here saying `armed`, carrying a
+#: notional cap, and naming the human who set it — one of four independent preconditions, none of
+#: which can be satisfied by a default, an env var or a typo. It lives in the database because the
+#: other three are transient: a flag in a config file survives a reboot nobody authorised.
+live_arming = Table(
+    "live_arming",
+    metadata,
+    Column("scope", String(32), primary_key=True),
+    Column("armed", Integer, nullable=False, default=0),
+    #: Largest notional a single live order may carry. Enforced as a Tier-2 rule; live refuses to
+    #: start without it, because "unlimited" is not a cap someone chose.
+    Column("max_live_notional", DecimalText),
+    Column("armed_by", String(64), default=""),
+    Column("note", Text, default=""),
+    Column("updated_at", UtcText, nullable=False),
+)
+
+#: User-editable configuration, versioned (DESIGN §6.1). An update inserts a new version rather
+#: than overwriting one, because a cycle pins the versions it ran on and a replay has to be able
+#: to resolve them — an overwritten row would make every past decision unauditable. Retirement is
+#: a version too: a deleted basket must still resolve for the cycles that ran it.
+config_versions = Table(
+    "config_versions",
+    metadata,
+    Column("kind", String(32), primary_key=True),
+    Column("config_id", String(64), primary_key=True),
+    Column("version", Integer, primary_key=True),
+    #: The whole document as canonical JSON. Secrets are referenced by env-var *name* and the
+    #: store refuses a document any secret value can be found in (PLAN §3.2).
+    Column("document_json", Text, nullable=False),
+    Column("retired", Integer, nullable=False, default=0),
+    Column("actor", String(64), default=""),
+    Column("note", Text, default=""),
+    Column("created_at", UtcText, nullable=False),
+)
+
+#: Normalized news, point-in-time. `observed_at` is *our* stamp and the only field a replayed
+#: cycle may filter on — `published_at` is the publisher's claim and cannot order a replay
+#: (DESIGN §6.4). Only title + excerpt + link are retained, never article bodies (PLAN §3.3).
+news_items = Table(
+    "news_items",
+    metadata,
+    Column("item_id", String(64), primary_key=True),
+    Column("source_id", String(64), nullable=False),
+    Column("url", Text, nullable=False),
+    Column("url_hash", String(64), nullable=False, unique=True),
+    Column("title", Text, nullable=False),
+    Column("excerpt", Text, nullable=False, default=""),
+    Column("published_at", UtcText, nullable=False),
+    Column("observed_at", UtcText, nullable=False),
+    Index("ix_news_items_observed", "observed_at"),
+    Index("ix_news_items_source", "source_id"),
+)
+
+#: Embeddings for dedup and historical retrieval, one row per stored document. Separate from
+#: `news_items` because it implements the generic `VectorStore` seam: swapping in a real
+#: embedding model, or Chroma, replaces this table and leaves the news rows untouched.
+news_vectors = Table(
+    "news_vectors",
+    metadata,
+    Column("doc_id", String(64), primary_key=True),
+    Column("text", Text, nullable=False),
+    Column("metadata_json", Text, nullable=False, default="{}"),
+    Column("vector_json", Text, nullable=False),
+    Column("observed_at", UtcText, nullable=False),
+    Index("ix_news_vectors_observed", "observed_at"),
+)
+
 basket_status = Table(
     "basket_status",
     metadata,
@@ -239,7 +310,12 @@ basket_status = Table(
 )
 
 #: Derived from the log and rebuilt by a replay. `risk_state` and `basket_status` are excluded
-#: deliberately: truncating them during a rebuild would un-halt a halted system.
+#: deliberately: truncating them during a rebuild would un-halt a halted system. `news_items`
+#: and `news_vectors` are excluded too, for the opposite reason: they are *observations*, not a
+#: fold of our own events, and a rebuild cannot re-fetch what a publisher has since taken down.
+#: `config_versions` is excluded for the first reason and then some: it is what the log's pinned
+#: versions *resolve against*, so a rebuild that truncated it would erase the meaning of the log
+#: it was rebuilding from.
 PROJECTION_TABLES: tuple[Table, ...] = (
     cycles,
     decisions,

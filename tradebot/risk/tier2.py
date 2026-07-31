@@ -31,6 +31,7 @@ from tradebot.core.money import ZERO, QuantizedOrder, divide, multiply, percent_
 from tradebot.core.orders import OrderIntent, RiskCheckResult
 from tradebot.core.schema import DomainModel
 from tradebot.interfaces.risk import RiskProposal, RiskRule
+from tradebot.risk.rules import STOOD_ASIDE
 
 
 def _headroom_rule(
@@ -187,6 +188,11 @@ class OrderRateRule:
         self._policy = policy
 
     def evaluate(self, proposal: RiskProposal, requested_qty: Decimal) -> RiskCheckResult:
+        # Metering, like its Tier-1 counterparts: it brakes a loop that will not stop trading,
+        # and a human closing one position is not that loop. Ban avoidance does not rest on this
+        # rule — the transports' token bucket is what keeps the venue budget (PLAN §3.1).
+        if proposal.is_operator_exit:
+            return _pass(self.rule_id, requested_qty, STOOD_ASIDE)
         placed = proposal.history.orders_last_hour
         cap = self._policy.max_orders_per_hour
         if placed >= cap:
@@ -200,6 +206,47 @@ class OrderRateRule:
         return _pass(self.rule_id, requested_qty, f"{placed}/{cap} orders this hour")
 
 
+class OrderNotionalRule:
+    """Caps what a single order may be worth. The training-wheels limit for live (PLAN §2.4).
+
+    Expressed as a *cap on quantity* rather than a veto, so an oversized order is shrunk to the
+    ceiling instead of refused — and if the shrink lands below an exchange minimum, the shrink
+    machinery turns it into a veto, exactly as every other Tier-2 limit does.
+
+    Inert unless a cap is set, which is what lets live wiring supply the operator's typed figure
+    (`control/arming.py`) through the same rule the other modes already exercise. A limit only the
+    live path evaluates is a limit nobody has tested.
+    """
+
+    rule_id = "max_order_notional"
+
+    def __init__(self, policy: GlobalRiskPolicy) -> None:
+        self._policy = policy
+
+    def evaluate(self, proposal: RiskProposal, requested_qty: Decimal) -> RiskCheckResult:
+        cap = self._policy.max_order_notional
+        if cap is None:
+            return _pass(self.rule_id, requested_qty, "no per-order notional cap configured")
+        if proposal.price <= ZERO:
+            return RiskCheckResult(
+                rule=self.rule_id,
+                decision=RiskDecision.VETO,
+                detail="no price to value the order against",
+                limit=cap,
+            )
+        notional = multiply(requested_qty, proposal.price)
+        if notional <= cap:
+            return _pass(self.rule_id, requested_qty, f"notional {notional} within cap {cap}")
+        return RiskCheckResult(
+            rule=self.rule_id,
+            decision=RiskDecision.ADJUSTED,
+            detail=f"notional {notional} above the per-order cap {cap}",
+            limit=cap,
+            observed=notional,
+            max_qty=divide(cap, proposal.price),
+        )
+
+
 def _pass(rule_id: str, qty: Decimal, detail: str = "") -> RiskCheckResult:
     return RiskCheckResult(rule=rule_id, decision=RiskDecision.PASS, detail=detail, max_qty=qty)
 
@@ -208,6 +255,7 @@ def default_tier2_rules(policy: GlobalRiskPolicy) -> tuple[RiskRule, ...]:
     return (
         PriceCollarRule(policy),
         OrderRateRule(policy),
+        OrderNotionalRule(policy),
         GrossExposureRule(policy),
         InstrumentExposureRule(policy),
         ClusterExposureRule(policy),

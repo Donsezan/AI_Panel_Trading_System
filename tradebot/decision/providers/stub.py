@@ -55,6 +55,10 @@ class StubLLMProvider:
         text = next(self._responses)
         if text == FAIL:
             raise ProviderError(f"scripted failure from {self.provider_id}")
+        # Held to the same contract as a real provider, so the contract suite can run against
+        # this one too and the stub cannot drift into being easier to satisfy than reality.
+        if not text.strip():
+            raise ProviderError(f"{self.provider_id} returned an empty completion")
         return CompletionResult(
             text=text,
             model_fingerprint=f"{self.provider_id}:{request.model}",

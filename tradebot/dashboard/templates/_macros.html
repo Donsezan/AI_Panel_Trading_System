@@ -1,0 +1,108 @@
+{# Shared table fragments. Every projection is rendered in exactly one place, so a column that
+   changes shape changes here once rather than in five pages that drift apart. #}
+
+{% set TONE = {
+  "orders_placed": "ok", "no_action": "muted", "risk_vetoed": "warn",
+  "data_stale": "warn", "panel_degraded": "warn", "blocked": "danger", "failed": "danger",
+  "match": "ok", "drift": "ok", "external_change": "ok",
+  "corporate_action": "warn", "venue_reset": "warn", "mismatch": "danger",
+  "filled": "ok", "partially_filled": "ok", "open": "muted", "submitted": "muted",
+  "cancelled": "muted", "expired": "muted", "rejected": "warn",
+  "submit_unknown": "danger",
+  "BUY": "ok", "SELL": "warn", "HOLD": "muted", "WAIT": "muted", "ABSTAIN": "muted",
+} %}
+
+{% macro pill(value) %}<span class="pill {{ TONE.get(value, 'muted') }}">{{ value }}</span>{% endmacro %}
+
+{% macro empty(colspan, message) %}
+  <tr class="empty"><td colspan="{{ colspan }}">{{ message }}</td></tr>
+{% endmacro %}
+
+{% macro cycles_table(rows) %}
+<table>
+  <thead><tr>
+    <th>Started</th><th>Basket</th><th>Outcome</th><th>Cost (USD)</th><th>Snapshot</th><th></th>
+  </tr></thead>
+  <tbody>
+  {% for row in rows %}
+    <tr>
+      <td class="mono">{{ row.started_at | moment }}</td>
+      <td><code>{{ row.basket_id }}</code></td>
+      <td>{{ pill(row.outcome or "running") }}</td>
+      <td class="num">{{ row.cost_usd | money(4) }}</td>
+      <td class="mono muted small">{{ (row.snapshot_digest or absent)[:12] }}</td>
+      <td><a href="/cycles/{{ row.cycle_id }}">drill down</a></td>
+    </tr>
+  {% else %}
+    {{ empty(6, "No cycles recorded yet.") }}
+  {% endfor %}
+  </tbody>
+</table>
+{% endmacro %}
+
+{% macro positions_table(rows) %}
+<table>
+  <thead><tr>
+    <th>Instrument</th><th>Qty</th><th>Avg entry</th><th>Realized PnL</th><th>Opened</th>
+  </tr></thead>
+  <tbody>
+  {% for row in rows %}
+    <tr>
+      <td><code>{{ row.instrument_key }}</code></td>
+      <td class="num">{{ row.qty | quantity }}</td>
+      <td class="num">{{ row.avg_entry | money }}</td>
+      <td class="num {{ 'ok' if row.realized_pnl >= 0 else 'danger' }}">{{ row.realized_pnl | money }}</td>
+      <td class="mono">{{ row.opened_at | moment }}</td>
+    </tr>
+  {% else %}
+    {{ empty(5, "No positions held.") }}
+  {% endfor %}
+  </tbody>
+</table>
+{% endmacro %}
+
+{% macro orders_table(rows, caption) %}
+<table>
+  <thead><tr>
+    <th>Created</th><th>Instrument</th><th>Side</th><th>Role</th><th>Qty</th>
+    <th>Filled</th><th>Limit</th><th>State</th><th>Client order id</th>
+  </tr></thead>
+  <tbody>
+  {% for row in rows %}
+    <tr>
+      <td class="mono">{{ row.created_at | moment }}</td>
+      <td><code>{{ row.instrument_key }}</code></td>
+      <td>{{ pill(row.side | upper) }}</td>
+      <td class="muted">{{ row.role }}</td>
+      <td class="num">{{ row.qty | quantity }}</td>
+      <td class="num">{{ row.filled_qty | quantity }}</td>
+      <td class="num">{{ row.limit_price | money }}</td>
+      <td>{{ pill(row.state) }}</td>
+      <td class="mono small">{{ row.client_order_id }}</td>
+    </tr>
+  {% else %}
+    {{ empty(9, caption) }}
+  {% endfor %}
+  </tbody>
+</table>
+{% endmacro %}
+
+{% macro risk_table(rows) %}
+<table>
+  <thead><tr><th>When</th><th>Tier</th><th>Rule</th><th>Scope</th><th>Action</th><th>Detail</th></tr></thead>
+  <tbody>
+  {% for row in rows %}
+    <tr>
+      <td class="mono">{{ row.ts | moment }}</td>
+      <td class="muted">{{ row.tier }}</td>
+      <td><code>{{ row.rule }}</code></td>
+      <td class="mono small">{{ row.scope }}</td>
+      <td>{{ pill(row.action_taken) }}</td>
+      <td class="detail-cell">{{ row.detail }}</td>
+    </tr>
+  {% else %}
+    {{ empty(6, "No risk events — nothing has been vetoed, halted or tripped.") }}
+  {% endfor %}
+  </tbody>
+</table>
+{% endmacro %}

@@ -18,7 +18,7 @@ from tradebot.core.events import EventType
 from tradebot.core.instrument import Instrument
 from tradebot.core.orders import Fill
 from tradebot.core.portfolio import AccountState, Balance, Position
-from tradebot.execution.sim_broker import SimBroker, Tick
+from tradebot.execution.brokers.sim import SimBroker, Tick
 from tradebot.interfaces.broker import OrderStatus
 from tradebot.ledger.portfolio import Ledger
 from tradebot.ledger.reconciler import CorporateAction, Reconciler

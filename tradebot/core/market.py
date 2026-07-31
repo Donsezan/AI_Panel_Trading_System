@@ -8,9 +8,11 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from datetime import timedelta
+from itertools import pairwise
 
 from pydantic import model_validator
 
+from tradebot.core.enums import MarketSession
 from tradebot.core.errors import DataStaleError
 from tradebot.core.schema import DomainModel, Money, UtcDatetime
 
@@ -43,6 +45,8 @@ class Candle(DomainModel):
     low: Money
     close: Money
     volume: Money
+    #: Which session produced this bar. Providers stamp it; crypto is always `CONTINUOUS`.
+    session: MarketSession = MarketSession.CONTINUOUS
 
     @model_validator(mode="after")
     def _check_bounds(self) -> Candle:
@@ -80,6 +84,35 @@ class CandleSeries(DomainModel):
         if not self.candles:
             raise DataStaleError(f"no candles for {self.instrument_key} {self.timeframe}")
         return self.candles[-1]
+
+    @property
+    def gaps(self) -> tuple[tuple[UtcDatetime, UtcDatetime], ...]:
+        """Missing intervals, as `(from, to)` pairs — never filled in, only reported.
+
+        A gap is a bar the venue did not publish: a halt, an outage, or a session boundary.
+        Interpolating one would feed a fabricated indicator value into a real order, so the
+        series carries the holes and the consumer decides (DESIGN §6.2).
+        """
+        return tuple(
+            (earlier.close_time, later.open_time)
+            for earlier, later in pairwise(self.candles)
+            if later.open_time > earlier.close_time
+        )
+
+    def indicator_window(self) -> CandleSeries:
+        """The bars an indicator may legitimately average over.
+
+        Extended-hours bars are dropped: they are thin, their spreads are wide, and averaging
+        them into a regular-session indicator misstates volatility in whichever direction the
+        thin tape happened to run. ATR feeds the stop distance that sizing divides by, so this
+        is a money-path concern, not a cosmetic one (DESIGN §6.2, §6.3).
+
+        Crypto series are unaffected — every bar is `CONTINUOUS`.
+        """
+        eligible = tuple(candle for candle in self.candles if candle.session.is_indicator_input)
+        if len(eligible) == len(self.candles):
+            return self
+        return self.model_copy(update={"candles": eligible})
 
     def age(self, now: UtcDatetime) -> timedelta:
         """How far behind the market this series is — measured from the last bar's *close*.

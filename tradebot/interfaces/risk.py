@@ -15,7 +15,9 @@ from typing import Protocol, runtime_checkable
 
 from tradebot.core.config import RiskPolicy
 from tradebot.core.decision import Decision
+from tradebot.core.enums import Side
 from tradebot.core.instrument import Instrument
+from tradebot.core.money import ZERO
 from tradebot.core.orders import RiskCheckResult
 from tradebot.core.portfolio import Position
 from tradebot.core.schema import DomainModel, Money
@@ -68,6 +70,36 @@ class RiskProposal(DomainModel):
     history: TradingHistory = TradingHistory()
     #: True when the venue cannot hold a protective stop, so sizing takes a haircut.
     unprotected: bool = False
+
+    #: True only when a human asked for this through the dashboard's Control page. The panel
+    #: cannot set it: `BasketRunner` never passes it, and `test_risk.py` asserts that.
+    operator_initiated: bool = False
+
+    @property
+    def is_operator_exit(self) -> bool:
+        """A human reducing an existing long — the one case a *metering* rule stands aside for.
+
+        The metering rules — cooldown, the daily cap, the loss streak, the hourly order rate —
+        all exist to stop the **panel** over-trading. None was written with a human exit in mind,
+        and a system that cannot be flattened by its operator during a loss streak has the
+        control exactly backwards (DESIGN §6.6, §6.10).
+
+        All three conditions carry weight. `operator_initiated` alone would let a human *open* a
+        position past the daily cap; the SELL test alone would exempt the panel's own churn,
+        which is precisely what the cooldown exists to meter. Together they describe a strictly
+        risk-reducing act: v1 is long-only and `LongOnlyRule` still clamps the quantity to what
+        is held, so nothing here can open, enlarge or invert a position.
+
+        A rule that stands aside still *answers*, and its `RiskCheckResult` says so — the event
+        log records which rules stood aside and why. That is what separates this from a bypass:
+        the risk layer decides, in deterministic tested code, and the decision is auditable
+        ([ADR 0015](../../docs/adr/0015-an-operator-exit-is-exempt-from-metering-rules.md)).
+        """
+        return (
+            self.operator_initiated
+            and self.decision.action.side is Side.SELL
+            and self.position.qty > ZERO
+        )
 
 
 @runtime_checkable
