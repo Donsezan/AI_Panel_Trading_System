@@ -41,6 +41,8 @@ class EventType(StrEnum):
     SNAPSHOT_FROZEN = "SNAPSHOT_FROZEN"
     SEAT_RESPONDED = "SEAT_RESPONDED"
     DECISION_MADE = "DECISION_MADE"
+    #: A challenger panel's verdict on the same snapshot, for the record only (ADR 0018).
+    SHADOW_EVALUATED = "SHADOW_EVALUATED"
     RISK_CHECKED = "RISK_CHECKED"
     ORDER_SUBMITTED = "ORDER_SUBMITTED"
     ORDER_STATE_CHANGED = "ORDER_STATE_CHANGED"
@@ -111,12 +113,20 @@ class EventFactory:
             payload=payload,
         )
 
-    def cycle_started(self, config_refs: Sequence[ConfigRef] = ()) -> Event:
-        """Open a cycle, pinning the configuration versions it will run on (DESIGN §6.1)."""
+    def cycle_started(self, config_refs: Sequence[ConfigRef] = (), venue: str = "") -> Event:
+        """Open a cycle, pinning the configuration versions it will run on (DESIGN §6.1).
+
+        `venue` names the venue that would have taken this cycle's orders. It is what lets the
+        promotion report separate the evidence base — live data through `SimBroker` — from the
+        testnet runs that sit beside it as adapter integration checks (DESIGN §9). An empty
+        venue means *unknown*, which the report excludes from gate accounting rather than
+        counting towards a promotion decision it cannot substantiate.
+        """
         return self._event(
             EventType.CYCLE_STARTED,
             self._cycle_id,
             basket_id=self._basket_id,
+            venue=venue,
             config_versions={ref.key: ref.version for ref in config_refs},
         )
 
@@ -147,6 +157,30 @@ class EventFactory:
 
     def decision_made(self, decision: Decision) -> Event:
         return self._event(EventType.DECISION_MADE, self._cycle_id, decision=_json(decision))
+
+    def shadow_evaluated(
+        self,
+        panel_id: str,
+        decisions: Sequence[Decision],
+        cost_usd: Decimal,
+        *,
+        error: str = "",
+    ) -> Event:
+        """What the challenger panel would have decided, on the champion's frozen snapshot.
+
+        Its `cost_usd` is recorded *here* rather than on the cycle, so `$/decision` for the panel
+        that actually traded stays a true figure — a shadow run is research spend, not the cost of
+        a decision (ADR 0018). An `error` means the challenger failed and the champion's cycle was
+        unaffected, which is the whole contract: recording the failure is how it stays visible.
+        """
+        return self._event(
+            EventType.SHADOW_EVALUATED,
+            self._cycle_id,
+            panel_id=panel_id,
+            decisions=[_json(decision) for decision in decisions],
+            cost_usd=str(cost_usd),
+            error=error,
+        )
 
     def risk_checked(
         self, instrument_key: str, checks: tuple[RiskCheckResult, ...], approved: bool

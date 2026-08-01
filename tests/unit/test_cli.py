@@ -171,3 +171,155 @@ class TestServe:
         """A `--host` typo must not put the kill switch on a LAN (PLAN §3.3)."""
         monkeypatch.setenv(TOKEN_ENV, "a-token-long-enough-to-pass")
         assert main(["serve", "--mode", "sim", "--host", "0.0.0.0", *data_dir]) == 1
+
+
+class TestValidationCommands:
+    """`backtest` and `report` — the Phase 7 surfaces. Both write a file and never print."""
+
+    def test_a_backtest_is_a_simulation_and_refuses_any_other_mode(
+        self, data_dir: list[str], tmp_path: Path
+    ) -> None:
+        """There is no such thing as a paper backtest: it would mean replaying into a venue."""
+        for mode in ("paper", "live"):
+            exit_code = main(
+                ["backtest", "run", "--mode", mode, "--data", str(tmp_path), *data_dir]
+            )
+            assert exit_code == 2
+
+    def test_a_directory_that_is_not_a_dataset_refuses(
+        self, data_dir: list[str], tmp_path: Path
+    ) -> None:
+        exit_code = main(["backtest", "run", "--mode", "sim", "--data", str(tmp_path), *data_dir])
+
+        assert exit_code == 1
+
+    def test_a_recorded_dataset_replays_and_writes_a_report(
+        self, data_dir: list[str], tmp_path: Path
+    ) -> None:
+        history = _record_history(tmp_path / "history")
+        out = tmp_path / "backtest.md"
+
+        exit_code = main(
+            [
+                "backtest",
+                "run",
+                "--mode",
+                "sim",
+                "--data",
+                str(history),
+                "--out",
+                str(out),
+                *data_dir,
+            ]
+        )
+
+        assert exit_code == 0
+        report = out.read_text(encoding="utf-8")
+        assert "NOT ALPHA EVIDENCE" in report
+        assert "# Backtest report" in report
+
+    def test_fetching_history_never_defaults_to_a_venue_window(self) -> None:
+        """Both edges are required: a recorder with a default window is a recorder that
+        downloads something nobody asked for."""
+        with pytest.raises(SystemExit):
+            parse_args(["backtest", "fetch", "--symbol", "BTC/USDT"])
+
+    def test_a_fresh_database_fails_the_promotion_gates_and_says_so_in_its_exit_code(
+        self, data_dir: list[str], tmp_path: Path
+    ) -> None:
+        main(["run", "--mode", "sim", "--once", *data_dir])
+        out = tmp_path / "promotion.md"
+
+        exit_code = main(["report", "promotion", "--mode", "sim", "--out", str(out), *data_dir])
+
+        assert exit_code == 5
+        report = out.read_text(encoding="utf-8")
+        assert "**Automatic gates: FAILED.**" in report
+        assert "## Sign-off" in report
+
+    def test_a_soak_that_clears_every_gate_still_only_asks_for_a_human(
+        self, data_dir: list[str], tmp_path: Path
+    ) -> None:
+        """`--min-cycles 1` is how the gate is exercised without a four-week soak."""
+        main(["run", "--mode", "sim", "--once", *data_dir])
+        out = tmp_path / "promotion.md"
+
+        exit_code = main(
+            [
+                "report",
+                "promotion",
+                "--mode",
+                "sim",
+                "--min-cycles",
+                "1",
+                "--out",
+                str(out),
+                *data_dir,
+            ]
+        )
+
+        assert exit_code == 0
+        assert "**Automatic gates: PASSED.**" in out.read_text(encoding="utf-8")
+
+    def test_a_shadow_report_over_a_soak_that_ran_no_challenger_says_so(
+        self, data_dir: list[str], tmp_path: Path
+    ) -> None:
+        """The seeded basket has no `shadow_panel`, and an empty report must explain itself."""
+        main(["run", "--mode", "sim", "--once", *data_dir])
+        out = tmp_path / "shadow.md"
+
+        exit_code = main(["report", "shadow", "--mode", "sim", "--out", str(out), *data_dir])
+
+        assert exit_code == 0
+        report = out.read_text(encoding="utf-8")
+        assert "# Shadow A/B comparison" in report
+        assert "**No shadow evaluation ran in this window.**" in report
+
+
+def _record_history(directory: Path) -> Path:
+    """A small recorded dataset on disk, produced by the real recorder."""
+    import asyncio
+    from datetime import UTC, datetime, timedelta
+    from decimal import Decimal
+
+    from tradebot.core.clock import ManualClock
+    from tradebot.core.enums import AssetClass
+    from tradebot.core.instrument import Instrument
+    from tradebot.marketdata.recorder import record
+    from tradebot.marketdata.replay import ReplayMarketData, synthetic_candles
+
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    bars = 400
+    instrument = Instrument(
+        symbol="BTC/USDT",
+        venue="binance",
+        asset_class=AssetClass.CRYPTO,
+        base_currency="BTC",
+        quote_currency="USDT",
+        lot_size=Decimal("0.00001"),
+        tick_size=Decimal("0.01"),
+        min_qty=Decimal("0.00001"),
+        min_notional=Decimal("10"),
+    )
+    clock = ManualClock(start + timedelta(hours=bars))
+    source = ReplayMarketData(
+        {
+            (instrument.key, "1h"): synthetic_candles(
+                start=start, timeframe="1h", count=bars, open_price=Decimal("50000")
+            )
+        },
+        clock,
+    )
+    asyncio.run(
+        record(
+            source,
+            (instrument,),
+            ("1h",),
+            start=start,
+            end=start + timedelta(hours=bars),
+            directory=directory,
+            clock=clock,
+            source="synthetic fixture",
+        )
+    )
+    return directory

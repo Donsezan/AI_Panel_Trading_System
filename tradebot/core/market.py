@@ -132,7 +132,19 @@ class CandleSeries(DomainModel):
         Fail closed: a stale series aborts the cycle rather than producing a decision from data
         the market has already moved past (DESIGN §6.2). `max_age` must account for the bar
         interval — a freshly closed 1d bar is legitimately almost a day old.
+
+        Data from the *future* fails the same way, and it is the more dangerous direction. Both
+        providers cut at `close_time <= cutoff`, so a bar closing after `now` means the series was
+        built against a different clock than the cycle deciding on it — a replay wired to the
+        wall clock, say. That reads as a very fresh series and is a look-ahead leak, which is
+        precisely the failure that makes a backtest quietly meaningless ([L12]).
         """
+        if self.latest.close_time > now:
+            raise DataStaleError(
+                f"{self.instrument_key} {self.timeframe} closes at "
+                f"{self.latest.close_time.isoformat()}, after the cycle's {now.isoformat()}: "
+                "a series from the future is a look-ahead leak, not fresh data"
+            )
         for label, age in (("content", self.age(now)), ("fetch", self.fetch_age(now))):
             if age > max_age:
                 raise DataStaleError(

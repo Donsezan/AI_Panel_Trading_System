@@ -20,8 +20,9 @@ for the phase plan and the money-safety rules this code is held to.
 | 3 | Data layers — market data, indicators, news | ✅ done |
 | 4 | Decision engine (real LLM providers, debate protocol) | ✅ done |
 | 5 | Broker adapters — Binance spot, Alpaca, one contract suite | ✅ done |
-| 6 | Control plane, ConfigStore, dashboard | 🟨 control plane done; dashboard next |
-| 7–8 | Validation ladder → live (locked) | ⬜ |
+| 6 | Control plane, ConfigStore, dashboard | ✅ done |
+| 7 | Validation ladder | 🟨 code complete; the paper soak itself is wall-clock time |
+| 8 | Live, locked | ⬜ |
 
 ## Quick start
 
@@ -60,6 +61,50 @@ the demo and the whole test suite run free. `--panel` selects a real one:
 $env:OPENROUTER_API_KEY = "..."
 .venv\Scripts\python.exe -m tradebot run --mode sim --once --panel free
 .venv\Scripts\python.exe -m tradebot run --mode sim --once --panel local   # no key, no egress
+```
+
+### Backtests and the promotion gates
+
+A backtest replays recorded history through the real loop. It validates **plumbing and risk
+behaviour**, never alpha: the models memorized this period, so every report carries a banner
+saying so and a per-model cutoff table stating how much of the window each of them may have seen.
+
+```powershell
+# record public history (unauthenticated, read-only — no key, no order)
+.venv\Scripts\python.exe -m tradebot backtest fetch --symbol BTC/USDT `
+    --since 2026-01-01 --until 2026-06-01 --out data\history
+
+.venv\Scripts\python.exe -m tradebot backtest run --mode sim --data data\history
+.venv\Scripts\python.exe -m tradebot report promotion --mode paper
+.venv\Scripts\python.exe -m tradebot report shadow --mode paper
+```
+
+All three write a Markdown report under `reports\` rather than printing: a promotion report is
+filed with the decision it justified. `report promotion` exits 5 when a gate fails — ≥200
+completed cycles on the evidence base, zero incidents that needed a human, every reconciliation
+clean. The last gate is a human's signature, and nothing in the code can supply it.
+
+### Comparing two panels honestly
+
+A basket may carry a **shadow panel**: a challenger deliberated on the *same frozen snapshot* as
+the panel that trades, every cycle. That removes the market from the comparison, which is the only
+way a few weeks of data can tell two panels apart. The challenger never trades, its cost is
+accounted separately, and a failure of it leaves the cycle untouched
+([ADR 0018](docs/adr/0018-a-challenger-panel-is-evaluated-on-the-champions-snapshot.md)). Set it in
+the dashboard's basket editor, then read `report shadow`.
+
+### Ops alerts
+
+Kill switch, basket halt, reconciliation mismatch, repeated provider failure, and a daily summary
+reach a webhook or Telegram. Alerting **tails the event log** rather than hooking into it, so it
+can never delay or fail an order, and its cursor advances only after delivery
+([ADR 0019](docs/adr/0019-alerts-are-a-log-tail-with-a-persisted-cursor.md)). It is on exactly
+when a destination is configured — there is no flag to forget:
+
+```powershell
+$env:TRADEBOT_ALERT_WEBHOOK_URL  = "https://hooks.example/..."
+$env:TRADEBOT_TELEGRAM_BOT_TOKEN = "..."   # both, or neither
+$env:TRADEBOT_TELEGRAM_CHAT_ID   = "..."
 ```
 
 ### Panels and per-seat fallbacks
@@ -121,14 +166,16 @@ tradebot/
   interfaces/   the plugin surface — protocols only, no implementations
   persistence/  append-only event log + projections, single writer
   venues/       one raw transport per venue, shared by market data and execution
-  marketdata/   providers: replay, and Binance spot over ccxt
+  marketdata/   providers: replay, and Binance spot over ccxt; the history recorder
   indicators/   feature registry + deterministic verbalization
   news/         sources, relevance, hub
   decision/     seats, debate protocols, consensus, LLM providers
   risk/         tier-1 rules, sizing, tier-2 global manager, kill switch
   execution/    order state machine, execution monitor, brokers/ (sim, binance, alpaca)
   ledger/       positions, PnL, reconciler
-  control/      basket runner, startup recovery, venue preflight, live arming
+  control/      config store, scheduler, supervisor, basket runner, startup recovery
+  dashboard/    FastAPI + Jinja2 + vendored HTMX; configure, monitor, control
+  validation/   backtest harness, promotion gates, reports — all read from the log
   app.py        composition root — the only module that knows concrete classes
 tests/
   unit/ contract/ scenario/ smoke/

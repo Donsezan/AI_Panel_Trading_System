@@ -44,6 +44,27 @@ mode-specific keys in the environment (`BINANCE_TESTNET_API_KEY`, `ALPACA_PAPER_
 .venv\Scripts\python.exe -m pytest -m smoke          # read-only, hits the real test venues
 ```
 
+The validation ladder is two commands, and both write a Markdown file under `reports/` rather
+than printing — a promotion report is filed with the decision it justified:
+
+```powershell
+.venv\Scripts\python.exe -m tradebot backtest fetch --symbol BTC/USDT `
+    --since 2026-01-01 --until 2026-06-01 --out data\history   # public, read-only, no key
+.venv\Scripts\python.exe -m tradebot backtest run --mode sim --data data\history
+.venv\Scripts\python.exe -m tradebot report promotion --mode paper   # exit 5 if a gate fails
+.venv\Scripts\python.exe -m tradebot report shadow --mode paper      # champion vs challenger
+```
+
+Ops alerts are **on exactly when a destination is configured** — there is no flag, so a soak
+cannot be started with alerting forgotten. Destinations are credentials and live in the
+environment, never the database ([ADR 0019](docs/adr/0019-alerts-are-a-log-tail-with-a-persisted-cursor.md)):
+
+```powershell
+$env:TRADEBOT_ALERT_WEBHOOK_URL  = "https://hooks.example/..."
+$env:TRADEBOT_TELEGRAM_BOT_TOKEN = "..."   # both of these, or neither: half-configured refuses
+$env:TRADEBOT_TELEGRAM_CHAT_ID   = "..."
+```
+
 Clearing a safety state is a human act and needs the typed phrase:
 
 ```powershell
@@ -139,7 +160,11 @@ DESIGN §8.1 there should be a test asserting the documented response.
 
 ## Phase status
 
-Phases 0–6 are complete: guardrails and money primitives, the sim-only walking skeleton, the
+Phases 0–7 are **code-complete**. Phase 7's remaining deliverable is the paper soak itself, which
+is wall-clock time rather than code: run `tradebot run --mode paper` for weeks and measure it with
+`report promotion`. Phase 8 (live wiring, `docs/OPERATIONS.md`) is next and is armed by a human.
+
+Phases 0–6: guardrails and money primitives, the sim-only walking skeleton, the
 deterministic shell to full depth (order lifecycle with venue-held protective groups, the
 `ExecutionMonitor`, the fills-driven ledger with round trips, the reconciler, both risk tiers,
 the kill switch, and the DESIGN §8.2 startup sequence), the data layers (Binance spot market
@@ -148,7 +173,72 @@ RSS news pipeline with dedup and point-in-time selection), the decision engine (
 provider adapters, the blind-then-debate protocol, both decision modes, and the per-cycle cost
 budget), and the broker adapters (`BinanceSpotBroker`, `AlpacaBroker`, `SimBroker` under one
 contract suite, plus paper wiring and the live arming gate), and the control plane with its
-dashboard. **Phase 7 (the validation ladder) is next.**
+dashboard.
+
+### Phase 7 layering
+
+Everything in `validation/` and `ops/` **reads**. Neither decides or trades; only the alert
+dispatcher writes, and only its own delivery cursor:
+
+```
+Evidence.gather(store)     folds the log's report-relevant types into counters
+  promotion.evaluate       three automatic gates; the fourth is a human's signature
+  Comparison.gather        pairs champion and challenger verdicts per cycle per instrument
+  BacktestHarness.run      drives the real loop over recorded history, stepping the clock itself
+    ReplayDataset          CSVs plus the venue trading rules they were recorded under
+
+AlertDispatcher.poll       tails the log by seq, delivers, then advances a persisted cursor
+  ops/rules.evaluate       the five PLAN triggers, as a dispatch table over event types
+  ops/sinks                webhook + Telegram over httpx, off unless configured
+```
+
+The one thing in Phase 7 that *runs a panel* is `decision/shadow.py`, which is why it lives in
+`decision/` rather than `validation/` — the report about it is what lives in `validation/`.
+
+Five rules that are easy to get backwards:
+
+- **Reports read the log, not the projections** ([ADR 0016](docs/adr/0016-validation-reports-are-folded-from-the-event-log.md)).
+  A kill switch trip and a basket halt have no projector at all, and the log is the compliance
+  artifact. `EventStore.read_types` narrows to the types a report needs so a soak's snapshots and
+  transcripts are never loaded.
+- **A veto is not an incident.** An incident is one of five things that needed a *human*: a
+  tripped switch, a halted basket, a failed cycle, an unexplained reconciliation, or an order
+  still stranded in `SUBMIT_UNKNOWN` when the window closed. Counting vetoes would make the gate
+  unreachable and select for a soak in which risk never engaged.
+- **The evidence base is the `sim` venue.** Cycles carry their venue in `CYCLE_STARTED`; testnet
+  runs are counted, shown, and excluded, as are `VENUE_RESET` reconciliations (R15). An unstamped
+  cycle is `unknown` and never counted.
+- **A backtest's window starts after the indicators' warm-up**, and the report prints what was
+  requested beside what ran ([ADR 0017](docs/adr/0017-a-backtest-declares-its-warm-up-and-its-contamination.md)).
+  Without it a replay opens with a wall of `DATA_STALE` that reads as a broken system.
+- **A bar closing after the cycle's `now` is a hard error** — staleness has two directions, and the
+  future one is a look-ahead leak wearing very fresh data. Enforced in `CandleSeries.require_fresh`,
+  so it protects live runs too, not only replays.
+
+Model knowledge cutoffs live in `validation/cutoffs.py` with a `source` per entry. An unknown
+model reads as *contaminated*, never as clean, and the banner is on every backtest report
+regardless of the verdict.
+
+### Phase 7 pass 2 — the challenger and the alert tail
+
+Four more rules, from [ADR 0018](docs/adr/0018-a-challenger-panel-is-evaluated-on-the-champions-snapshot.md)
+and [ADR 0019](docs/adr/0019-alerts-are-a-log-tail-with-a-persisted-cursor.md):
+
+- **The challenger runs last and never trades.** `Basket.shadow_panel` is deliberated on the
+  champion's *already-frozen* snapshot after the champion has acted, and produces exactly one
+  `SHADOW_EVALUATED` event — no decision, no risk check, no intent. Its cost is recorded on that
+  event rather than on the cycle, so `$/decision` for the panel that traded stays true. Every
+  exception it raises is caught and written into the event: the cycle's outcome is the champion's.
+- **Both panels are edited by one macro** (`dashboard/templates/_panel.html`). A form rendering
+  only the champion would delete a configured challenger on the first edit, because the form
+  round-trips the whole document.
+- **Alerting never touches the money path.** It tails the log by `seq` and advances its cursor
+  *after* delivery, so the guarantee is at-least-once and a fresh database starts at the log's
+  end. Alert destinations are credentials: environment only, redactor-registered, never named in
+  a log line.
+- **A veto is not an alert**, for the same reason it is not an incident. "Repeated provider
+  failure" is three consecutive `PANEL_DEGRADED` cycles, with the streak persisted beside the
+  cursor — a streak counted in memory is a streak a restart forgives.
 
 **Phase 6 is complete.** Pass 1 landed the control plane — versioned `ConfigStore`, `Scheduler`,
 `Supervisor`, and a composition root that runs N baskets over one venue portfolio. Pass 2 landed

@@ -43,6 +43,24 @@ def binance_spot_market_data(
     return CachingMarketData(provider, clock, quote_ttl=quote_ttl)
 
 
+def binance_spot_history(
+    clock: Clock, *, sandbox: bool = False
+) -> tuple[VenueMarketData, VenueTransport]:
+    """The uncached venue layer, for recording history (PLAN Phase 7).
+
+    Deliberately without the cache: a recorder pages through thousands of distinct cutoffs and
+    would never read the same key twice, so a cache would only hold memory. This is also the
+    layer that resolves symbols to `Instrument`s against the venue's published trading rules,
+    which is what makes a recorded dataset self-describing.
+
+    Read-only and unauthenticated, like `live_binance_spot`: no key is involved and no order can
+    be placed from here.
+    """
+    transport = binance_spot_transport(clock, sandbox=sandbox)
+    gateway = BinanceSpotGateway(transport, clock)
+    return VenueMarketData(gateway, clock, asset_class=AssetClass.CRYPTO), transport
+
+
 def live_binance_spot(
     clock: Clock,
     *,

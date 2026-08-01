@@ -7,6 +7,10 @@
 *.db-shm
 data/
 
+# Generated validation reports. A signed promotion report belongs wherever the decision it
+# justified is filed, not in the tree it was generated from (PLAN Phase 7).
+reports/
+
 # Python
 .venv/
 __pycache__/

@@ -501,6 +501,12 @@ class Basket(DomainModel):
     name: str
     instruments: tuple[Instrument, ...]
     panel: PanelConfig
+    #: A challenger panel evaluated on the **same frozen snapshot** each cycle, for the record
+    #: only — it never trades and never affects the cycle's outcome (DESIGN §12, PLAN Phase 7).
+    #: Comparing two panels on identical evidence is the statistically honest comparison; two
+    #: panels run in different weeks are compared on different markets, not on their reasoning.
+    #: Unset — the default — turns shadow evaluation off entirely and costs nothing.
+    shadow_panel: PanelConfig | None = None
     risk_policy: RiskPolicy = RiskPolicy()
     decision_mode: DecisionMode = DecisionMode.PER_ASSET
 
@@ -527,7 +533,53 @@ class Basket(DomainModel):
             raise ValueError("an instrument may appear in a basket only once")
         if self.ttl_buffer_seconds >= self.cycle_interval_seconds:
             raise ValueError("ttl_buffer_seconds must leave a positive order lifetime")
+        self._check_challenger()
         return self
+
+    def _check_challenger(self) -> None:
+        """Two rules that make a shadow comparison mean something, checked before it can run.
+
+        The panels must be **distinguishable**, because the comparison report names each side by
+        its panel id — two sides called `p1` is a report nobody can read. And a provider id the
+        two panels both declare must be declared *identically*: one wiring serves both, so two
+        endpoints or two price lists under one id would price the challenger's tokens against the
+        champion's table and make `$/decision` a fiction for whichever lost the tie.
+        """
+        if self.shadow_panel is None:
+            return
+        if self.shadow_panel.panel_id == self.panel.panel_id:
+            raise ValueError(
+                f"the shadow panel repeats the champion's id {self.panel.panel_id!r}; a "
+                "comparison whose two sides have the same name cannot be read"
+            )
+        champion = {provider.provider_id: provider for provider in self.panel.providers}
+        conflicting = sorted(
+            provider.provider_id
+            for provider in self.shadow_panel.providers
+            if provider != champion.get(provider.provider_id, provider)
+        )
+        if conflicting:
+            raise ValueError(
+                f"the champion and shadow panels declare {', '.join(conflicting)} differently; "
+                "one wiring serves both, so a shared provider id must carry identical settings"
+            )
+
+    @property
+    def panels(self) -> tuple[PanelConfig, ...]:
+        """Every panel this basket runs — the champion, and the challenger when it has one."""
+        return (self.panel,) if self.shadow_panel is None else (self.panel, self.shadow_panel)
+
+    @property
+    def challenger(self) -> Basket | None:
+        """This basket as the challenger sees it: same instruments and mode, its own panel.
+
+        Shaped as a `Basket` so the decision engine runs the challenger through *exactly* the code
+        the champion went through — same protocol dispatch, same consensus rule, same budget
+        mechanics. A second code path would compare two panels and one implementation difference.
+        """
+        if self.shadow_panel is None:
+            return None
+        return self.model_copy(update={"panel": self.shadow_panel, "shadow_panel": None})
 
     @property
     def cycle_interval_seconds(self) -> int:

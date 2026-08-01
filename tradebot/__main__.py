@@ -19,14 +19,25 @@ import argparse
 import asyncio
 import logging
 import sys
-from collections.abc import Sequence
+from collections.abc import Coroutine, Sequence
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 import uvicorn
 from fastapi import FastAPI
 
-from tradebot.app import Application, BrokerChoice, build, database_path
+from tradebot.app import (
+    Application,
+    BrokerChoice,
+    backtest_database_path,
+    build,
+    build_sim,
+    database_path,
+    dataset_basket,
+    select_panel,
+)
 from tradebot.control.arming import (
     LIVE_CONFIRMATION_PHRASE,
     ArmingStore,
@@ -34,27 +45,50 @@ from tradebot.control.arming import (
 )
 from tradebot.control.basket_runner import CycleResult
 from tradebot.control.config_store import ConfigStore
-from tradebot.control.supervisor import Supervisor
-from tradebot.core.clock import SystemClock
+from tradebot.core.clock import ManualClock, SystemClock, ensure_utc
 from tradebot.core.enums import ConfigKind, Mode
 from tradebot.core.errors import TradebotError
 from tradebot.core.logging import configure_logging, get_logger
 from tradebot.dashboard.app import create_dashboard
 from tradebot.dashboard.auth import assert_bind_allowed, require_token
 from tradebot.decision.presets import PANELS
+from tradebot.marketdata.factory import binance_spot_history
+from tradebot.marketdata.recorder import ReplayDataset
+from tradebot.marketdata.recorder import record as record_history
 from tradebot.news.rss import FEEDS
 from tradebot.persistence.database import SingleWriter, create_database
 from tradebot.risk.state import assert_rearm_phrase
+from tradebot.validation.backtest import BANNER, BacktestHarness
+from tradebot.validation.comparison import Comparison, ComparisonReport
+from tradebot.validation.evidence import Evidence
+from tradebot.validation.promotion import (
+    DEFAULT_EVIDENCE_VENUES,
+    DEFAULT_MIN_CYCLES,
+    Criteria,
+    evaluate,
+)
+from tradebot.validation.render import (
+    backtest_markdown,
+    comparison_markdown,
+    promotion_markdown,
+)
 
 logger = get_logger("tradebot.cli")
 
 CLI_ACTOR = "cli"
+
+#: Where a validation report lands when the operator does not name a path.
+REPORTS_DIR = Path("reports")
+
+#: What a dataset is recorded at unless asked otherwise — the ContextBuilder's default set.
+DEFAULT_BACKTEST_TIMEFRAMES = ("1h", "4h", "1d")
 
 #: Exit codes an operator (or a supervisor script) can act on.
 EXIT_REFUSED = 1  # a `TradebotError`: the process would not start
 EXIT_MISUSE = 2  # the command cannot be carried out as asked
 EXIT_RECOVERY_HALTED = 3  # DESIGN §8.2 left the process up but not trading
 EXIT_CYCLE_FAILED = 4  # a `--once` cycle failed; a supervised run would have retried it
+EXIT_GATES_FAILED = 5  # a promotion gate did not pass; the soak continues
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -129,6 +163,71 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     disarm = risk_actions.add_parser("disarm-live", help="withdraw live arming")
     _add_common(disarm)
     disarm.add_argument("--reason", default="", help="why arming was withdrawn")
+
+    backtest = subparsers.add_parser(
+        "backtest", help="record venue history, and replay it through the real loop"
+    )
+    backtest_actions = backtest.add_subparsers(dest="action", required=True)
+
+    fetch = backtest_actions.add_parser(
+        "fetch",
+        help=(
+            "record public venue history into a replay dataset. Unauthenticated and read-only: "
+            "no key is involved and no order can be placed from here"
+        ),
+    )
+    fetch.add_argument("--symbol", action="append", required=True, metavar="BASE/QUOTE")
+    fetch.add_argument(
+        "--timeframe", action="append", default=[], help="repeatable; defaults to 1h, 4h and 1d"
+    )
+    fetch.add_argument("--since", required=True, help="ISO date or datetime (UTC if unqualified)")
+    fetch.add_argument("--until", required=True, help="ISO date or datetime (UTC if unqualified)")
+    fetch.add_argument("--out", type=Path, default=Path("data/history"), help="dataset directory")
+    fetch.add_argument("--verbose", action="store_true")
+
+    replay = backtest_actions.add_parser(
+        "run", help="replay a recorded dataset — plumbing and risk validation only, never alpha"
+    )
+    _add_common(replay)
+    replay.add_argument("--data", type=Path, required=True, help="dataset directory")
+    replay.add_argument("--since", default=None, help="window start; defaults to the data's")
+    replay.add_argument("--until", default=None, help="window end; defaults to the data's")
+    replay.add_argument("--every", type=int, default=3600, help="cycle interval in seconds")
+    replay.add_argument("--panel", default="stub", choices=sorted(PANELS))
+    replay.add_argument("--equity", type=Decimal, default=Decimal(10_000))
+    replay.add_argument("--out", type=Path, default=None, help="report path (.md)")
+
+    report = subparsers.add_parser("report", help="generate a validation report from the log")
+    report_actions = report.add_subparsers(dest="action", required=True)
+    promotion = report_actions.add_parser(
+        "promotion", help="evaluate the DESIGN §9 promotion gates over a soak"
+    )
+    _add_common(promotion)
+    promotion.add_argument("--since", default=None, help="window start; defaults to the whole log")
+    promotion.add_argument("--until", default=None, help="window end; defaults to the whole log")
+    promotion.add_argument("--min-cycles", type=int, default=DEFAULT_MIN_CYCLES)
+    promotion.add_argument(
+        "--evidence-venue",
+        action="append",
+        default=[],
+        help=(
+            "venue whose cycles count as evidence (repeatable). Defaults to 'sim' — live data "
+            "with simulated fills. Testnet runs are adapter checks and are reported, not counted"
+        ),
+    )
+    promotion.add_argument("--out", type=Path, default=None, help="report path (.md)")
+
+    shadow = report_actions.add_parser(
+        "shadow",
+        help=(
+            "compare a basket's champion and challenger panels over the snapshots they were both "
+            "given. Reads the log; the challenger never traded"
+        ),
+    )
+    _add_common(shadow)
+    shadow.add_argument("--since", default=None, help="window start; defaults to the whole log")
+    shadow.add_argument("--until", default=None, help="window end; defaults to the whole log")
+    shadow.add_argument("--out", type=Path, default=None, help="report path (.md)")
 
     config = subparsers.add_parser("config", help="inspect versioned configuration")
     config_actions = config.add_subparsers(dest="action", required=True)
@@ -216,7 +315,11 @@ async def run_command(args: argparse.Namespace) -> int:
             )
             return EXIT_RECOVERY_HALTED
         if args.once:
-            return _report(application, await application.supervisor.run_once())
+            results = await application.supervisor.run_once()
+            # One flush before exiting: a single cycle that halted a basket still has to reach
+            # whoever is watching, and there is no next poll to catch it.
+            await application.alerts.poll()
+            return _report(application, results)
         await _serve(application)
     finally:
         await application.shutdown()
@@ -249,9 +352,10 @@ async def serve_command(args: argparse.Namespace) -> int:
         )
         await _run_server(
             create_dashboard(application, token=token, observe_only=not trading),
+            application,
             host=args.host,
             port=args.port,
-            supervisor=application.supervisor if trading else None,
+            supervising=trading,
         )
     finally:
         await application.shutdown()
@@ -259,7 +363,7 @@ async def serve_command(args: argparse.Namespace) -> int:
 
 
 async def _run_server(
-    dashboard: FastAPI, *, host: str, port: int, supervisor: Supervisor | None
+    dashboard: FastAPI, application: Application, *, host: str, port: int, supervising: bool
 ) -> None:
     """Serve HTTP and — unless observing — cycle baskets, on one event loop.
 
@@ -267,24 +371,22 @@ async def _run_server(
     supervisor the runners use; a second process would be reading a second, staler view of an
     account that only one of them is allowed to write (PLAN §2.6).
 
-    Whichever task finishes first stops the other: a supervisor still cycling after the operator
-    has stopped the server would trade with nobody watching.
+    Whichever task finishes first stops the others: a supervisor still cycling after the operator
+    has stopped the server would trade with nobody watching. The alert tail runs even when
+    observing — an operator watching an incident is exactly who wants to be told about the next one.
     """
     server = uvicorn.Server(
         uvicorn.Config(dashboard, host=host, port=port, log_config=None, access_log=False)
     )
-    tasks = [asyncio.create_task(server.serve(), name="dashboard")]
-    if supervisor is not None:
-        tasks.append(asyncio.create_task(supervisor.serve(), name="supervisor"))
+    supervisor = application.supervisor.serve() if supervising else None
     try:
-        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-    except (KeyboardInterrupt, asyncio.CancelledError):
-        logger.warning("interrupted; stopping the dashboard and the runners")
+        await _race(
+            application,
+            ("dashboard", server.serve()),
+            *((("supervisor", supervisor),) if supervisor is not None else ()),
+        )
     finally:
         server.should_exit = True
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def _serve(application: Application) -> int:
@@ -298,11 +400,27 @@ async def _serve(application: Application) -> int:
         "supervising baskets on their schedules; interrupt to stop",
         extra={"baskets": [basket.basket_id for basket in application.baskets]},
     )
-    try:
-        await application.supervisor.serve()
-    except (KeyboardInterrupt, asyncio.CancelledError):
-        logger.warning("interrupted; stopping runners")
+    await _race(application, ("supervisor", application.supervisor.serve()))
     return 0
+
+
+async def _race(application: Application, *named: tuple[str, Coroutine[Any, Any, Any]]) -> None:
+    """Run these alongside the alert tail until the first of them finishes, then stop them all.
+
+    The tail is added here rather than by each caller so there is exactly one answer to "is
+    alerting running?" — it runs whenever the process is doing anything long-lived, and it is a
+    no-op when no destination is configured (ADR 0019).
+    """
+    tasks = [asyncio.create_task(coro, name=name) for name, coro in named]
+    tasks.append(asyncio.create_task(application.alerts.run(), name="alerts"))
+    try:
+        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        logger.warning("interrupted; stopping")
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 def _report(application: Application, results: Sequence[CycleResult]) -> int:
@@ -328,6 +446,181 @@ def _report(application: Application, results: Sequence[CycleResult]) -> int:
         logger.error("cycles failed", extra={"baskets": failed})
         return EXIT_CYCLE_FAILED
     return 0
+
+
+async def backtest_command(args: argparse.Namespace) -> int:
+    return await _BACKTEST_ACTIONS[args.action](args)
+
+
+async def _backtest_fetch(args: argparse.Namespace) -> int:
+    """Record public venue history into a replay dataset.
+
+    The one command that reaches the internet without a mode, because it holds no credentials and
+    reads a public endpoint: recording last year's Binance klines is not an execution mode and
+    pretending it is would make `--mode live` a sensible thing to type here (PLAN §2.4).
+    """
+    configure_logging(mode="fetch", level=logging.DEBUG if args.verbose else logging.INFO)
+    clock = SystemClock()
+    provider, transport = binance_spot_history(clock)
+    try:
+        instruments = await provider.instruments(*args.symbol)
+        dataset = await record_history(
+            provider,
+            instruments,
+            tuple(args.timeframe or DEFAULT_BACKTEST_TIMEFRAMES),
+            start=_moment(args.since),
+            end=_moment(args.until),
+            directory=args.out,
+            clock=clock,
+            source="binance spot, public REST",
+        )
+    finally:
+        await transport.close()
+    start, end = dataset.coverage
+    logger.info(
+        "dataset recorded",
+        extra={
+            "directory": str(args.out),
+            "instruments": [i.key for i in dataset.instruments],
+            "timeframes": list(dataset.timeframes),
+            "covers": f"{start.isoformat()}..{end.isoformat()}",
+        },
+    )
+    return 0
+
+
+async def _backtest_run(args: argparse.Namespace) -> int:
+    """Replay a recorded dataset through the real loop. Plumbing validation only (DESIGN §9)."""
+    mode = Mode(args.mode)
+    configure_logging(mode=mode.value, level=logging.DEBUG if args.verbose else logging.INFO)
+    if mode is not Mode.SIM:
+        logger.error(
+            "a backtest is a simulation by construction; run it with --mode sim",
+            extra={"mode": mode.value},
+        )
+        return EXIT_MISUSE
+
+    clock = ManualClock(SystemClock().now())
+    dataset = ReplayDataset.load(args.data, clock)
+    start, end = dataset.window(_bound(args.since), _bound(args.until))
+    application = await build_sim(
+        clock=clock,
+        db_path=backtest_database_path(args.data_dir),
+        baskets=(dataset_basket(dataset, select_panel(args.panel), every_seconds=args.every),),
+        start_equity=args.equity,
+        market_data=dataset.market_data,
+    )
+    try:
+        harness = BacktestHarness(
+            application, clock, start=start, end=end, data_source=dataset.manifest.source
+        )
+        report = await harness.run()
+    finally:
+        await application.shutdown()
+
+    path = _write_report(
+        args.out, backtest_markdown(report), default=f"backtest-{_slug(report.finished_at)}.md"
+    )
+    logger.warning(
+        "backtest complete — %s",
+        BANNER,
+        extra={
+            "report": str(path),
+            "cycles": report.ran_cycles,
+            "realized_pnl": str(report.evidence.realized_pnl),
+            "incidents": len(report.evidence.incidents),
+        },
+    )
+    return 0
+
+
+async def report_command(args: argparse.Namespace) -> int:
+    application = await _open(args)
+    try:
+        return _REPORT_ACTIONS[args.action](application, args)
+    finally:
+        await application.shutdown()
+
+
+def _promotion_report(application: Application, args: argparse.Namespace) -> int:
+    """Evaluate the promotion gates and write the report a human signs (PLAN Phase 7 exit)."""
+    evidence = Evidence.gather(
+        application.store, since=_bound(args.since), until=_bound(args.until)
+    )
+    report = evaluate(
+        evidence,
+        mode=application.mode,
+        generated_at=SystemClock().now(),
+        criteria=Criteria(
+            min_cycles=args.min_cycles,
+            evidence_venues=frozenset(args.evidence_venue or DEFAULT_EVIDENCE_VENUES),
+        ),
+    )
+    path = _write_report(
+        args.out,
+        promotion_markdown(report),
+        default=f"promotion-{application.mode.value}-{_slug(report.generated_at)}.md",
+    )
+    logger.warning(
+        "promotion gates evaluated",
+        extra={
+            "report": str(path),
+            "passed": report.passed,
+            "failed_gates": [gate.name for gate in report.failures],
+        },
+    )
+    return 0 if report.passed else EXIT_GATES_FAILED
+
+
+def _shadow_report(application: Application, args: argparse.Namespace) -> int:
+    """Compare the two panels on the snapshots they were both given (ADR 0018)."""
+    report = ComparisonReport(
+        mode=application.mode,
+        generated_at=SystemClock().now(),
+        comparison=Comparison.gather(
+            application.store, since=_bound(args.since), until=_bound(args.until)
+        ),
+    )
+    path = _write_report(
+        args.out,
+        comparison_markdown(report),
+        default=f"shadow-{application.mode.value}-{_slug(report.generated_at)}.md",
+    )
+    comparison = report.comparison
+    logger.warning(
+        "shadow comparison written",
+        extra={
+            "report": str(path),
+            "cycles_compared": comparison.compared_cycles,
+            "agreement_pct": str(comparison.agreement_pct),
+            "tradable_divergences": len(comparison.tradable_divergences),
+            "challenger_failures": len(comparison.failures),
+        },
+    )
+    return 0
+
+
+def _write_report(out: Path | None, markdown: str, *, default: str) -> Path:
+    """Reports are written, never printed: they get attached to the decision they justified."""
+    path = out or REPORTS_DIR / default
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(markdown, encoding="utf-8")
+    return path
+
+
+def _slug(moment: datetime) -> str:
+    return moment.strftime("%Y%m%dT%H%M%SZ")
+
+
+def _moment(value: str) -> datetime:
+    """ISO date or datetime → UTC-aware. A bare date is midnight UTC, never local time."""
+    parsed = datetime.fromisoformat(value)
+    return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else ensure_utc(parsed)
+
+
+def _bound(value: str | None) -> datetime | None:
+    """An optional window edge. Absent means "as far as the data or the log goes"."""
+    return _moment(value) if value else None
 
 
 async def risk_command(args: argparse.Namespace) -> int:
@@ -463,11 +756,15 @@ async def _disarm_live(store: ArmingStore, args: argparse.Namespace) -> int:
 _ARMING_ACTIONS = {"arm-live": _arm_live, "disarm-live": _disarm_live}
 _RISK_ACTIONS = {"status": _risk_status, "rearm": _risk_rearm, "unhalt": _risk_unhalt}
 _CONFIG_ACTIONS = {"list": _config_list, "history": _config_history}
+_BACKTEST_ACTIONS = {"fetch": _backtest_fetch, "run": _backtest_run}
+_REPORT_ACTIONS = {"promotion": _promotion_report, "shadow": _shadow_report}
 _COMMANDS = {
     "run": run_command,
     "serve": serve_command,
     "risk": risk_command,
     "config": config_command,
+    "backtest": backtest_command,
+    "report": report_command,
 }
 
 

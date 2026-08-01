@@ -71,9 +71,11 @@ class DecisionEngine:
         """Fail at wiring time on a basket this engine cannot run.
 
         Called by the composition root, so a panel naming a protocol that does not exist refuses
-        to start rather than failing on the first cycle.
+        to start rather than failing on the first cycle. Both panels are checked: a challenger
+        that could never be deliberated would leave a comparison report empty and blame the log.
         """
-        self.protocol_for(basket.panel)
+        for panel in basket.panels:
+            self.protocol_for(panel)
         if basket.decision_mode not in self._modes:
             raise ConfigError(f"unsupported decision mode {basket.decision_mode.value!r}")
 

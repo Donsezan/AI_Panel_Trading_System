@@ -14,6 +14,9 @@ Three rules this module exists to honour:
 * **A fallback binding is picked, never typed.** The seat editor's selects are built from the
   providers the panel declares, so an undeclared provider cannot be entered at all — and
   `PanelConfig`'s validator is still the thing that proves it.
+* **Both panels are edited by one macro** (`_panel.html`). The A/B challenger is a `PanelConfig`
+  like the champion, and a form that rendered only the champion would silently drop a configured
+  challenger the first time anyone edited the basket (ADR 0018).
 
 Editing is stateless: the form round-trips as a *draft* dict, so adding a seat, removing an
 instrument or fixing a validation error never loses what the operator has already typed. Only
@@ -67,6 +70,11 @@ TIMEFRAMES = ("15m", "1h", "4h", "1d")
 #: Which parts of the snapshot a seat is shown. Giving seats *different* slices is what
 #: manufactures genuine disagreement, so it is editable rather than fixed (DESIGN §6.5).
 EVIDENCE_SLICES = ("indicators", "news", "position")
+
+#: The optional A/B challenger (ADR 0018). Edited by the same macro as the champion, so a field
+#: cannot exist on one panel's form and not the other's.
+SHADOW_PATH = "shadow_panel"
+PANEL_PATHS = ("panel", SHADOW_PATH)
 
 
 # ---------------------------------------------------------------------- index
@@ -134,7 +142,7 @@ async def publish_basket(request: Request) -> Response:
     the URL would then publish version 2 of the old id carrying a document that names a new one.
     """
     form = await request.form()
-    draft = fold_prices(nest(form.multi_items()))
+    draft = fold_prices(drop_blank_shadow(nest(form.multi_items())))
     basket, errors = validate(Basket, draft)
     if basket is None:
         return _basket_form(request, draft, existing=_version_field(form), errors=errors)
@@ -221,7 +229,8 @@ def _basket_form(
         errors=errors,
         existing=existing,
         basket_id=str(draft.get("basket_id") or basket_id),
-        providers=_declared_providers(draft),
+        providers=_declared_providers(draft, "panel"),
+        shadow_providers=_declared_providers(draft, SHADOW_PATH),
         timeframes=TIMEFRAMES,
         indicators=sorted(REGISTRY),
         news_sources=sorted(FEEDS),
@@ -296,20 +305,38 @@ def unfold_prices(draft: dict[str, Any]) -> dict[str, Any]:
 
 
 def _providers_of(draft: dict[str, Any]) -> list[dict[str, Any]]:
-    panel = draft.get("panel")
+    """Provider rows across **both** panels — the champion's and the challenger's."""
+    return [row for path in PANEL_PATHS for row in _panel_providers(draft, path)]
+
+
+def _panel_providers(draft: dict[str, Any], path: str) -> list[dict[str, Any]]:
+    panel = draft.get(path)
     providers = panel.get("providers") if isinstance(panel, dict) else None
     return [p for p in providers if isinstance(p, dict)] if isinstance(providers, list) else []
 
 
-def _declared_providers(draft: dict[str, Any]) -> tuple[str, ...]:
-    """Provider ids the draft declares — the only options a seat's picker may offer."""
-    panel = draft.get("panel")
-    providers = panel.get("providers", []) if isinstance(panel, dict) else []
+def _declared_providers(draft: dict[str, Any], path: str) -> tuple[str, ...]:
+    """Provider ids one panel declares — the only options its seats' pickers may offer."""
     return tuple(
         str(p["provider_id"])
-        for p in providers
-        if isinstance(p, dict) and str(p.get("provider_id", "")).strip()
+        for p in _panel_providers(draft, path)
+        if str(p.get("provider_id", "")).strip()
     )
+
+
+def drop_blank_shadow(draft: dict[str, Any]) -> dict[str, Any]:
+    """An untouched challenger section is *no challenger*, not an invalid one.
+
+    The shadow panel is optional and its fields are always rendered, so a basket that wants no
+    challenger still posts the section — and a `<select>` always submits something, so the draft
+    arrives carrying a protocol and nothing else. Without this, publishing any basket at all would
+    fail on a panel the operator never asked for. A panel id *is* content, so anything typed there
+    keeps the section and lets `PanelConfig` say what else it needs.
+    """
+    panel = draft.get(SHADOW_PATH)
+    if isinstance(panel, dict) and not str(panel.get("panel_id", "")).strip():
+        draft.pop(SHADOW_PATH)
+    return draft
 
 
 def blank_basket_draft() -> dict[str, Any]:

@@ -15,6 +15,7 @@ Failure semantics — every one of these ends the cycle with no order and a reco
 * degraded panel / no consensus         → `PANEL_DEGRADED` or `NO_ACTION`
 * any Tier-1 or Tier-2 veto             → `RISK_VETOED`
 * a fail-closed error mid-cycle         → `FAILED`, and the basket is halted for review
+* a shadow panel failing                → nothing; it is recorded and the outcome is unchanged
 
 The cycle never raises past `run_once`; it records what happened and returns.
 """
@@ -40,6 +41,7 @@ from tradebot.core.orders import Order
 from tradebot.core.schema import DomainModel
 from tradebot.core.snapshot import ContextSnapshot
 from tradebot.decision.engine import DecisionEngine
+from tradebot.decision.shadow import ShadowEvaluator
 from tradebot.execution.monitor import ExecutionMonitor
 from tradebot.execution.service import ExecutionService
 from tradebot.interfaces.risk import RiskProposal
@@ -104,10 +106,12 @@ class BasketRunner:
         ledger: Ledger,
         store: EventStore,
         clock: Clock,
+        venue: str,
         global_policy: GlobalRiskPolicy | None = None,
         config_refs: tuple[ConfigRef, ...] = (),
         quote_currency: str = "USDT",
         risk_timeframe: str = "1h",
+        shadow: ShadowEvaluator | None = None,
     ) -> None:
         self._basket = basket
         self._mode = mode
@@ -122,12 +126,19 @@ class BasketRunner:
         self._ledger = ledger
         self._store = store
         self._clock = clock
+        #: Which venue would have taken this cycle's orders. Recorded on every cycle so the
+        #: promotion report can tell the evidence base from an adapter integration check that
+        #: shares the same database (DESIGN §9).
+        self._venue = venue
         self._policy = global_policy or GlobalRiskPolicy()
         #: The configuration versions this runner was built from, recorded on every cycle it
         #: starts so a past decision is re-read against the limits that produced it (DESIGN §6.1).
         self._config_refs = config_refs
         self._quote_currency = quote_currency
         self._risk_timeframe = risk_timeframe
+        #: The challenger, evaluated on this cycle's snapshot after the champion has acted.
+        #: `None` whenever the basket declares no `shadow_panel` — which is the default.
+        self._shadow = shadow
 
     @property
     def basket(self) -> Basket:
@@ -139,7 +150,7 @@ class BasketRunner:
             clock=self._clock, basket_id=self._basket.basket_id, cycle_id=cycle_id
         )
         with correlate(cycle_id=cycle_id, basket_id=self._basket.basket_id):
-            await self._store.append(events.cycle_started(self._config_refs))
+            await self._store.append(events.cycle_started(self._config_refs, self._venue))
             try:
                 blocked = await self._gate()
                 if blocked:
@@ -201,6 +212,11 @@ class BasketRunner:
                 orders.append(order)
 
         settled = await self._settle(orders)
+        # Last, and deliberately after the champion has acted: the challenger is a research
+        # record, so it may not delay an order or change what this cycle decided (ADR 0018).
+        if self._shadow is not None:
+            await self._shadow.evaluate(snapshot, self._basket, events)
+
         outcome = self._classify(decisions, settled, vetoed=vetoed)
         return await self._finish(
             cycle_id,

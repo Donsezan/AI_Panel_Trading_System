@@ -13,10 +13,12 @@ from __future__ import annotations
 
 import json
 from collections.abc import Sequence
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy import Connection, Engine, Select, func, select
 
+from tradebot.core.clock import ensure_utc
 from tradebot.core.events import Event, EventType
 from tradebot.persistence.database import SingleWriter
 from tradebot.persistence.projections import apply_event, rebuild_projections
@@ -93,6 +95,47 @@ class EventStore:
         return self._read(
             select(events).where(events.c.cycle_id == cycle_id).order_by(events.c.seq)
         )
+
+    def read_types(
+        self,
+        *types: EventType,
+        since: datetime | None = None,
+        until: datetime | None = None,
+    ) -> tuple[Event, ...]:
+        """The log, narrowed to the given types and an optional window, in order.
+
+        What the validation reports are built from. They read the **log** rather than the
+        projections because the facts a promotion decision turns on — a kill switch trip, a
+        basket halt — are audit-only and have no projector at all (DESIGN §9, `projections.py`).
+        Narrowing by type is what keeps that affordable: frozen snapshots and seat transcripts
+        are the largest payloads in the log and no report needs them.
+        """
+        query = select(events).where(events.c.type.in_([type_.value for type_ in types]))
+        if since is not None:
+            query = query.where(events.c.ts >= ensure_utc(since))
+        if until is not None:
+            query = query.where(events.c.ts <= ensure_utc(until))
+        return self._read(query.order_by(events.c.seq))
+
+    def read_after(self, seq: int, *types: EventType, limit: int = 500) -> tuple[Event, ...]:
+        """The next events of the given types after `seq`, oldest first.
+
+        Ordered by **sequence, not timestamp**, because this is what ops alerting tails and a
+        cursor has to be exact: two events sharing a timestamp must not let a restart skip one
+        (ADR 0019). `limit` bounds the batch so a tailer starting on a months-old database
+        delivers in chunks rather than loading the whole log into memory.
+        """
+        return self._read(
+            select(events)
+            .where(events.c.seq > seq, events.c.type.in_([type_.value for type_ in types]))
+            .order_by(events.c.seq)
+            .limit(limit)
+        )
+
+    def last_seq(self) -> int:
+        """The log's high-water sequence. Zero on an empty log."""
+        with self._engine.connect() as connection:
+            return int(connection.execute(select(func.max(events.c.seq))).scalar() or 0)
 
     def _read(self, query: Select[Any]) -> tuple[Event, ...]:
         with self._engine.connect() as connection:

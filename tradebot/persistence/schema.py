@@ -300,6 +300,23 @@ news_vectors = Table(
     Index("ix_news_vectors_observed", "observed_at"),
 )
 
+#: How far ops alerting has read the log (ADR 0019). Not a projection and not risk state: it is a
+#: *delivery* position, written after a batch has actually been sent, so a restart resumes at the
+#: last alert that reached a human rather than replaying weeks of them or skipping the one that
+#: mattered. `degraded_streak` is here for the same reason the risk baselines are persisted — a
+#: streak counted in memory is a streak a restart forgives.
+alert_cursor = Table(
+    "alert_cursor",
+    metadata,
+    Column("scope", String(32), primary_key=True),
+    Column("last_seq", Integer, nullable=False, default=0),
+    #: The session day the last daily summary covered. Empty means none has been sent, which is
+    #: how the first poll of a fresh database avoids summarising a day it only saw the end of.
+    Column("last_summary_day", String(10), default=""),
+    Column("degraded_streak", Integer, nullable=False, default=0),
+    Column("updated_at", UtcText, nullable=False),
+)
+
 basket_status = Table(
     "basket_status",
     metadata,
@@ -309,8 +326,9 @@ basket_status = Table(
     Column("updated_at", UtcText, nullable=False),
 )
 
-#: Derived from the log and rebuilt by a replay. `risk_state` and `basket_status` are excluded
-#: deliberately: truncating them during a rebuild would un-halt a halted system. `news_items`
+#: Derived from the log and rebuilt by a replay. `risk_state`, `basket_status` and `alert_cursor`
+#: are excluded deliberately: truncating the first two during a rebuild would un-halt a halted
+#: system, and truncating the third would re-send every alert in the log. `news_items`
 #: and `news_vectors` are excluded too, for the opposite reason: they are *observations*, not a
 #: fold of our own events, and a rebuild cannot re-fetch what a publisher has since taken down.
 #: `config_versions` is excluded for the first reason and then some: it is what the log's pinned

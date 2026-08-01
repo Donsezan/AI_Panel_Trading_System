@@ -22,6 +22,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from tradebot.core.clock import Clock, ensure_utc
+from tradebot.core.enums import MarketSession
 from tradebot.core.errors import DataStaleError
 from tradebot.core.instrument import Instrument
 from tradebot.core.market import Candle, CandleSeries, Quote, timeframe_interval
@@ -51,8 +52,10 @@ class ReplayMarketData:
     def from_directory(cls, directory: Path, clock: Clock) -> ReplayMarketData:
         """Load every `{venue}__{symbol}__{timeframe}.csv` in a directory.
 
-        Columns: `open_time,close_time,open,high,low,close,volume`. Both times are stored rather
-        than inferred from the timeframe, so a session gap or an irregular bar stays truthful.
+        Columns: `open_time,close_time,open,high,low,close,volume,session`. Both times are stored
+        rather than inferred from the timeframe, so a session gap or an irregular bar stays
+        truthful, and `session` is stored rather than assumed continuous — an equity series whose
+        extended-hours bars arrived unlabelled would be averaged into every indicator.
         """
         series: dict[SeriesKey, tuple[Candle, ...]] = {}
         for path in sorted(directory.glob("*.csv")):
@@ -108,6 +111,23 @@ class ReplayMarketData:
             supports_point_in_time=True,
         )
 
+    @property
+    def keys(self) -> tuple[SeriesKey, ...]:
+        """Every `(instrument_key, timeframe)` this provider can serve, sorted."""
+        return tuple(sorted(self._series))
+
+    def coverage(self) -> tuple[datetime, datetime] | None:
+        """The period every loaded series has bars in, or `None` when nothing is loaded.
+
+        The **intersection**, not the union: a backtest may only run where all of its instruments
+        have data, or the first cycle outside one series' range aborts as `DATA_STALE` and the
+        run reports a fault of the dataset as a fault of the system.
+        """
+        spans = [(c[0].open_time, c[-1].close_time) for c in self._series.values() if c]
+        if not spans:
+            return None
+        return max(start for start, _ in spans), min(end for _, end in spans)
+
     def _lookup(self, instrument_key: str, timeframe: str) -> tuple[Candle, ...]:
         candles = self._series.get((instrument_key, timeframe))
         if candles is None:
@@ -132,6 +152,9 @@ def _read_csv(path: Path) -> Iterable[Candle]:
                 low=to_decimal(row["low"]),
                 close=to_decimal(row["close"]),
                 volume=to_decimal(row["volume"]),
+                # Absent in a series recorded before sessions were stored, and correct for every
+                # crypto series ever recorded.
+                session=MarketSession(row.get("session") or MarketSession.CONTINUOUS),
             )
 
 

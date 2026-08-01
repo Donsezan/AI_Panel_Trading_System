@@ -363,3 +363,93 @@ def _replace(pairs: list[tuple[str, str]], name: str, value: str) -> list[tuple[
     """Set one field, adding it if the form did not carry it."""
     replaced = [(key, value if key == name else current) for key, current in pairs]
     return replaced if any(key == name for key, _ in pairs) else [*replaced, (name, value)]
+
+
+# ---------------------------------------------------------------- shadow panel
+
+
+async def test_a_basket_without_a_challenger_publishes_unchanged(
+    sim_application: Application, client: httpx.AsyncClient, basket_form: list[tuple[str, str]]
+) -> None:
+    """The challenger section is always rendered, and a `<select>` always submits something.
+
+    Without `drop_blank_shadow` that stray protocol would fail validation and no basket could be
+    published at all.
+    """
+    response = await client.post(
+        "/configure/baskets/demo",
+        data=as_form([*basket_form, ("doc.shadow_panel.protocol", "single_round")]),
+    )
+
+    assert response.status_code == 303
+    record = sim_application.configs.latest(ConfigKind.BASKET, "demo")
+    assert record is not None
+    assert record.document.shadow_panel is None
+
+
+async def test_a_challenger_can_be_added_from_the_form(
+    sim_application: Application, client: httpx.AsyncClient, basket_form: list[tuple[str, str]]
+) -> None:
+    response = await client.post(
+        "/configure/baskets/demo", data=as_form([*basket_form, *_shadow_fields()])
+    )
+
+    assert response.status_code == 303
+    record = sim_application.configs.latest(ConfigKind.BASKET, "demo")
+    assert record is not None
+    shadow = record.document.shadow_panel
+    assert shadow is not None
+    assert shadow.panel_id == "challenger"
+    assert [seat.seat_id for seat in shadow.seats] == ["contrarian"]
+
+
+async def test_editing_a_basket_does_not_silently_drop_its_challenger(
+    sim_application: Application, client: httpx.AsyncClient, basket_form: list[tuple[str, str]]
+) -> None:
+    """The hazard the shared macro exists to remove: a form that renders one panel of two."""
+    await client.post("/configure/baskets/demo", data=as_form([*basket_form, *_shadow_fields()]))
+
+    page = await client.get("/configure/baskets/demo")
+    assert "challenger" in page.text
+
+    record = sim_application.configs.latest(ConfigKind.BASKET, "demo")
+    assert record is not None
+    reposted = flat(unfold_prices(draft_of(record.document)))
+    await client.post(
+        "/configure/baskets/demo",
+        data=as_form(_replace(reposted, "doc.risk_policy.min_conviction", "0.75")),
+    )
+
+    latest = sim_application.configs.latest(ConfigKind.BASKET, "demo")
+    assert latest is not None
+    assert latest.document.risk_policy.min_conviction == Decimal("0.75")
+    assert latest.document.shadow_panel is not None
+    assert latest.document.shadow_panel.panel_id == "challenger"
+
+
+async def test_a_challenger_repeating_the_champions_id_is_refused(
+    client: httpx.AsyncClient, basket_form: list[tuple[str, str]]
+) -> None:
+    clashing = [
+        (key, "stub" if key == "doc.shadow_panel.panel_id" else value)
+        for key, value in _shadow_fields()
+    ]
+
+    response = await client.post("/configure/baskets/demo", data=as_form([*basket_form, *clashing]))
+
+    assert response.status_code == 200
+    assert "repeats the champion&#39;s id" in response.text
+
+
+def _shadow_fields() -> list[tuple[str, str]]:
+    """A minimal, valid challenger panel as the form would submit it."""
+    return [
+        ("doc.shadow_panel.panel_id", "challenger"),
+        ("doc.shadow_panel.protocol", "single_round"),
+        ("doc.shadow_panel.providers[0].provider_id", "stub"),
+        ("doc.shadow_panel.providers[0].kind", "stub"),
+        ("doc.shadow_panel.seats[0].seat_id", "contrarian"),
+        ("doc.shadow_panel.seats[0].role", "Devil's advocate"),
+        ("doc.shadow_panel.seats[0].provider_id", "stub"),
+        ("doc.shadow_panel.seats[0].model", "stub-contrarian"),
+    ]

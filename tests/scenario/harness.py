@@ -123,6 +123,7 @@ class Harness:
             ledger=self.ledger,
             store=self.store,
             clock=clock,
+            venue=self.broker.venue_id,
             global_policy=self.policy,
         )
 

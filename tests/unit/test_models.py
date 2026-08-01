@@ -28,7 +28,12 @@ from tradebot.core.enums import (
     Side,
     SizeHint,
 )
-from tradebot.core.errors import ConfigError, IllegalTransitionError, MoneyError
+from tradebot.core.errors import (
+    ConfigError,
+    DataStaleError,
+    IllegalTransitionError,
+    MoneyError,
+)
 from tradebot.core.instrument import Instrument
 from tradebot.core.market import Candle, CandleSeries, Quote
 from tradebot.core.orders import Fill, Order, OrderIntent, RiskCheckResult, assert_legal_transition
@@ -117,12 +122,23 @@ class TestCandleSeries:
             )
 
     def test_stale_series_fails_closed(self) -> None:
+        """The bar closed at `NOW`; five minutes later it is fresh, two hours later it is not."""
+        series = CandleSeries(
+            instrument_key="k", timeframe="1h", candles=(candle(-1),), observed_at=NOW
+        )
+        series.require_fresh(NOW + timedelta(minutes=5), timedelta(minutes=15))
+        with pytest.raises(DataStaleError, match="old, limit"):
+            series.require_fresh(NOW + timedelta(hours=2), timedelta(minutes=15))
+
+    def test_a_bar_closing_after_the_cycle_is_a_look_ahead_leak(self) -> None:
+        """Both providers cut at the cutoff, so a future bar means two clocks — and a backtest
+        built on one of them would be quietly meaningless ([L12])."""
         series = CandleSeries(
             instrument_key="k", timeframe="1h", candles=(candle(),), observed_at=NOW
         )
-        series.require_fresh(NOW + timedelta(minutes=5), timedelta(minutes=15))
-        with pytest.raises(Exception, match="old, limit"):
-            series.require_fresh(NOW + timedelta(hours=2), timedelta(minutes=15))
+
+        with pytest.raises(DataStaleError, match="look-ahead leak"):
+            series.require_fresh(NOW + timedelta(minutes=5), timedelta(minutes=15))
 
 
 class TestQuote:

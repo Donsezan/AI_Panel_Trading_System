@@ -21,6 +21,11 @@ Mode safety (PLAN §2.4) is enforced at construction:
 deterministic fills, no venue-side test artifacts. A real venue adapter is opt-in per venue and
 runs as an *integration check*, not as the evidence base — Binance's spot testnet resets to a
 blank state roughly monthly and its fills are unrealistically good.
+
+Ops alerting is wired here too, and it is **on exactly when a destination is configured in the
+environment** — there is no flag. That is deliberate: an operator starting a six-week soak should
+not be able to forget to turn alerting on, and a developer running the demo should never be asked
+for a webhook (ADR 0019).
 """
 
 from __future__ import annotations
@@ -50,7 +55,14 @@ from tradebot.control.scheduler import Scheduler
 from tradebot.control.startup import Recovery, StartupSequence
 from tradebot.control.supervisor import Supervisor
 from tradebot.core.clock import Clock, SystemClock
-from tradebot.core.config import Basket, GlobalRiskPolicy, PanelConfig, RiskPolicy
+from tradebot.core.config import (
+    Basket,
+    GlobalRiskPolicy,
+    PanelConfig,
+    ProviderSettings,
+    RiskPolicy,
+    Schedule,
+)
 from tradebot.core.enums import AssetClass, Mode
 from tradebot.core.errors import ConfigError
 from tradebot.core.instrument import Instrument
@@ -60,6 +72,7 @@ from tradebot.decision.engine import DecisionEngine
 from tradebot.decision.presets import PANELS, STUB_PANEL
 from tradebot.decision.providers.registry import ProviderPool, build_providers
 from tradebot.decision.seat import SeatRunner
+from tradebot.decision.shadow import ShadowEvaluator
 from tradebot.execution.brokers.alpaca import AlpacaAnnouncements, AlpacaBroker, AlpacaCalendar
 from tradebot.execution.brokers.binance import BinanceSpotBroker
 from tradebot.execution.brokers.calendars import ContinuousCalendar
@@ -79,6 +92,7 @@ from tradebot.ledger.history import HistoryReader
 from tradebot.ledger.portfolio import Ledger
 from tradebot.ledger.reconciler import Reconciler
 from tradebot.marketdata.factory import binance_spot_market_data, live_binance_spot
+from tradebot.marketdata.recorder import ReplayDataset
 from tradebot.marketdata.replay import ReplayMarketData, synthetic_candles
 from tradebot.news.http import build_fetcher
 from tradebot.news.hub import NewsHub
@@ -86,6 +100,9 @@ from tradebot.news.relevance import KeywordRelevanceFilter
 from tradebot.news.rss import build_sources
 from tradebot.news.store import NewsStore
 from tradebot.news.vectorstore import SqliteVectorStore
+from tradebot.ops.cursor import AlertCursorStore
+from tradebot.ops.dispatcher import AlertDispatcher
+from tradebot.ops.sinks import build_sinks
 from tradebot.persistence.database import SingleWriter, create_database
 from tradebot.persistence.store import EventStore
 from tradebot.risk.state import RiskStateStore
@@ -124,6 +141,12 @@ class Application:
     #: The operator's "close this position" action, wired to the same Tier-1 → Tier-2 →
     #: execution path a cycle uses. Exposed here because the dashboard may not build one.
     manual_close: ManualCloser
+    #: The one poller. Exposed for the backtest harness, which steps time itself and therefore
+    #: has to drive between cycles what a running process drives from its own loop.
+    monitor: ExecutionMonitor
+    #: Ops alerting, off unless a destination is configured in the environment (ADR 0019). It
+    #: tails the log beside the supervisor and can never reach the money path.
+    alerts: AlertDispatcher
     quote_currency: str
     _writer: SingleWriter
     #: Async resources that hold sockets — HTTP clients, exchange sessions. Closed by `shutdown`.
@@ -169,6 +192,16 @@ def database_path(mode: Mode, root: Path = Path("data")) -> Path:
     return root / f"{mode.value}.db"
 
 
+def backtest_database_path(root: Path = Path("data")) -> Path:
+    """A backtest gets its own database, separate from the interactive simulation.
+
+    It is still sim mode — same prefix on every `client_order_id`, same refusal to reach a venue
+    — but a replay of last year's prices sharing a ledger with the demo would make both
+    unreadable, and the promotion report counts cycles out of exactly one database.
+    """
+    return root / "backtest.db"
+
+
 def demo_basket(panel: PanelConfig | None = None) -> Basket:
     """The two-instrument basket a fresh database is seeded with.
 
@@ -201,6 +234,32 @@ def demo_basket(panel: PanelConfig | None = None) -> Basket:
         instruments=instruments,
         panel=panel or STUB_PANEL,
         risk_policy=RiskPolicy(),
+    )
+
+
+def dataset_basket(
+    dataset: ReplayDataset,
+    panel: PanelConfig,
+    *,
+    basket_id: str = "backtest",
+    every_seconds: int = 3600,
+) -> Basket:
+    """The basket a recorded dataset implies — every instrument in it, on its own timeframes.
+
+    Built from the dataset rather than from the database on purpose: a backtest is a
+    self-contained experiment, and a basket carrying instruments the dataset has no prices for
+    would abort every cycle as `DATA_STALE` and read as a fault of the system. The trading rules
+    come from the manifest, so quantization matches the venue as it was when the prices were
+    recorded (`marketdata/recorder.py`).
+    """
+    return Basket(
+        basket_id=basket_id,
+        name=f"Backtest over {dataset.manifest.source}",
+        instruments=dataset.instruments,
+        panel=panel,
+        timeframes=dataset.timeframes,
+        schedule=Schedule(every_seconds=every_seconds),
+        ttl_buffer_seconds=min(60, every_seconds // 2),
     )
 
 
@@ -474,6 +533,10 @@ class RunnerBuilder:
             ),
             decision_engine=decision_engine,
             risk_engine=Tier1RiskEngine(self._clock),
+            # Sizing divides by ATR, so it has to be read from a timeframe the snapshot actually
+            # carries. A basket configured for 4h/1d bars would otherwise ask for a 1h ATR that
+            # was never computed, and every entry would veto for want of a volatility estimate.
+            risk_timeframe=min(basket.timeframes, key=timeframe_interval, default="1h"),
             tier2=Tier2RiskEngine(policy),
             watchdog=self._watchdog,
             history=self._history,
@@ -482,16 +545,23 @@ class RunnerBuilder:
             ledger=self._ledger,
             store=self._store,
             clock=self._clock,
+            venue=self._stack.broker.venue_id,
             global_policy=policy,
             config_refs=(record.ref, policy_record.ref),
             quote_currency=self._quote_currency,
+            shadow=ShadowEvaluator(decision_engine, self._store) if basket.shadow_panel else None,
         )
 
     def _providers(self, record: ConfigRecord[Basket]) -> dict[str, LLMProvider]:
-        """This basket's endpoints, wired once per basket and closed when it is released."""
+        """This basket's endpoints, wired once per basket and closed when it is released.
+
+        Both panels' endpoints, on one pool: the challenger is deliberated by the same engine on
+        the same connections, and `Basket` has already refused a provider id the two declare
+        differently — so deduplicating by id here cannot silently pick one of two meanings.
+        """
         pool = self._pools.get(record.ref.config_id)
         if pool is None:
-            pool = build_providers(record.document.panel.providers, self._clock)
+            pool = build_providers(declared_providers(record.document), self._clock)
             self._pools[record.ref.config_id] = pool
         return pool.providers
 
@@ -547,6 +617,14 @@ def _quote_currency(instruments: tuple[Instrument, ...]) -> str:
             "portfolio equity and every Tier-2 percentage are denominated in it"
         )
     return quotes.pop()
+
+
+def declared_providers(basket: Basket) -> tuple[ProviderSettings, ...]:
+    """Every endpoint this basket may reach — champion and challenger — deduplicated by id."""
+    seen: dict[str, ProviderSettings] = {}
+    for panel in basket.panels:
+        seen.update({provider.provider_id: provider for provider in panel.providers})
+    return tuple(seen.values())
 
 
 def _instruments_of(baskets: tuple[Basket, ...]) -> tuple[Instrument, ...]:
@@ -619,6 +697,7 @@ async def _assemble(
         engine, writer, clock, news_sources or _news_sources_of(configured)
     )
 
+    alert_sinks, alert_closers = build_sinks()
     history = HistoryReader(engine, clock)
     execution = ExecutionService(stack.broker, store, ledger, clock)
     monitor = ExecutionMonitor(stack.broker, execution, store, clock)
@@ -684,9 +763,17 @@ async def _assemble(
             store=store,
             quote_currency=quote_currency,
         ),
+        monitor=monitor,
+        alerts=AlertDispatcher(
+            store,
+            AlertCursorStore(engine, writer, clock),
+            alert_sinks,
+            clock,
+            calendar=stack.calendar,
+        ),
         quote_currency=quote_currency,
         _writer=writer,
-        _closers=(builder.close, *news_closers, *stack.closers),
+        _closers=(builder.close, *news_closers, *alert_closers, *stack.closers),
     )
 
 
