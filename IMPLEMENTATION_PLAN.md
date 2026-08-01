@@ -403,6 +403,26 @@ Live wiring completed, tested, and **left disabled**. Delivered with `docs/OPERA
 the pre-live checklist (key permissions, IP allowlist, withdrawal disable, caps, alerting,
 jurisdiction confirmation), the arming procedure, and the incident runbook. I do not arm it.
 
+### Phase 9 — Operator control · ~1 week
+
+Scoped after Phase 8 shipped, from two operator requests. Full plan and decisions:
+[docs/PHASE_9_OPERATOR_CONTROL.md](docs/PHASE_9_OPERATOR_CONTROL.md). Two independent slices:
+
+- **Quarantine** (done) — an operator's exclusion of one instrument, or a whole basket, from
+  *automated* trading, while the cycle keeps running so the data needed to release it keeps
+  arriving. A Tier-1 veto rule reading a versioned `RiskPolicy` field, not a scheduling state:
+  neither a pause (which stops the cycle) nor a halt (which is the system's own doing). A held
+  position stays closable by hand through the existing operator-exit exemption
+  ([ADR 0022](docs/adr/0022-quarantine-is-a-tier-1-veto-rule.md)).
+- **GUI arm/start/stop for live** (planned) — live's four preconditions move from a build-time
+  gate to a runtime one, so an unarmed `serve --mode live` comes up saying "NOT ARMED" instead of
+  refusing, and can be armed and started from the dashboard with the phrase retyped each time
+  ([ADR 0021](docs/adr/0021-live-arming-and-supervision-move-to-a-runtime-gate.md)).
+
+**Exit:** an instrument can be quarantined and released from the GUI, with no automated order
+reaching it in between and its market data uninterrupted; and live can be armed, started and
+stopped from the GUI without weakening any §2.4 precondition.
+
 **Total: ~16–18 weeks of focused work**, plus soak time that runs in parallel from Phase 7.
 Phases 3 and 4 can be parallelized against Phase 2 if more than one person works on this.
 

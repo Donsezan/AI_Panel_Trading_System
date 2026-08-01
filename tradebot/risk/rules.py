@@ -102,6 +102,31 @@ class LongOnlyRule:
         )
 
 
+class QuarantineRule:
+    """An operator's own exclusion: no automated order may act on a quarantined scope.
+
+    Neither a pause nor a halt. A pause stops the whole cycle and a halt is the system protecting
+    itself after failures; quarantine is a reversible judgement call about an instrument the
+    operator has doubts about, so everything except the order keeps running — data, indicators,
+    and the panel's view of the market (ADR 0022).
+
+    A human's exit is exempt, for the reason every metering rule's exemption exists: a position
+    that cannot be closed is not made safer by being excluded from *new* trades.
+    """
+
+    rule_id = "quarantine"
+
+    def evaluate(self, proposal: RiskProposal, requested_qty: Decimal) -> RiskCheckResult:
+        if not proposal.policy.excludes(proposal.instrument.key):
+            return _allow(self.rule_id, requested_qty)
+        if proposal.is_operator_exit:
+            return _stand_aside(self.rule_id, requested_qty)
+        return _block(
+            self.rule_id,
+            f"{proposal.instrument.key} is quarantined; no automated order may act on it",
+        )
+
+
 class MaxPositionSizeRule:
     """Caps one instrument's share of the basket budget (DESIGN §6.6, default 25%)."""
 
@@ -241,6 +266,7 @@ class ConsecutiveLossRule:
 DEFAULT_TIER1_RULES: tuple[RiskRule, ...] = (
     MinConvictionRule(),
     LongOnlyRule(),
+    QuarantineRule(),
     ConsecutiveLossRule(),
     CooldownRule(),
     DailyTradeCapRule(),

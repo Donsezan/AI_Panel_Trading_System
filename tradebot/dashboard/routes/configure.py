@@ -229,6 +229,7 @@ def _basket_form(
         errors=errors,
         existing=existing,
         basket_id=str(draft.get("basket_id") or basket_id),
+        instrument_keys=_instrument_keys(draft),
         providers=_declared_providers(draft, "panel"),
         shadow_providers=_declared_providers(draft, SHADOW_PATH),
         timeframes=TIMEFRAMES,
@@ -313,6 +314,22 @@ def _panel_providers(draft: dict[str, Any], path: str) -> list[dict[str, Any]]:
     panel = draft.get(path)
     providers = panel.get("providers") if isinstance(panel, dict) else None
     return [p for p in providers if isinstance(p, dict)] if isinstance(providers, list) else []
+
+
+def _instrument_keys(draft: dict[str, Any]) -> tuple[str, ...]:
+    """`venue:symbol` for each instrument row — the only scopes a quarantine may name.
+
+    Read from the draft rather than from the stored document, so an instrument added in this same
+    edit is immediately selectable, exactly as a provider added here appears in every seat's
+    picker. `Basket` still refuses a key it does not hold, so this is a convenience, not the check.
+    """
+    rows = draft.get("instruments")
+    return tuple(
+        f"{str(row['venue']).strip()}:{str(row['symbol']).strip()}"
+        for row in (rows if isinstance(rows, list) else ())
+        if isinstance(row, dict) and str(row.get("venue", "")).strip()
+        if str(row.get("symbol", "")).strip()
+    )
 
 
 def _declared_providers(draft: dict[str, Any], path: str) -> tuple[str, ...]:

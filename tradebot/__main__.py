@@ -652,6 +652,7 @@ def _config_list(configs: ConfigStore, _args: argparse.Namespace) -> int:
                 "status": record.document.status.value,
                 "instruments": [i.key for i in record.document.instruments],
                 "every_seconds": record.document.schedule.every_seconds,
+                "quarantined": _quarantine_of(record.document),
             },
         )
     policy = configs.global_risk()
@@ -677,14 +678,33 @@ def _config_history(configs: ConfigStore, args: argparse.Namespace) -> int:
                 "actor": record.actor,
                 "note": record.note,
                 "retired": record.retired,
+                "quarantined": _quarantine_of(record.document),
             },
         )
     return 0
 
 
+def _quarantine_of(document: object) -> str:
+    """What a stored version excludes from automated trading, in one phrase.
+
+    Read here rather than exposed as a mutation: every other Tier-1 limit is edited in the
+    dashboard, where the change is validated against the engine's own models and recorded with an
+    actor, and quarantine is no different (ADR 0022). Empty for a document that carries no policy.
+    """
+    policy = getattr(document, "risk_policy", None)
+    return str(policy.quarantine) if policy is not None else ""
+
+
 async def _risk_status(application: Application, _args: argparse.Namespace) -> int:
+    """What is in force right now: the safety state, the arming row, and the enforced limits.
+
+    All three, because an operator asking "is it safe to start" is asking about all three. The
+    limits are the *effective* ones — the published policy after the arming cap and, in live, the
+    ceiling — so nobody has to join a config document against a constant to know what applies.
+    """
     state = application.states.load()
-    halted = application.states.halted_baskets()
+    arming = application.arming.load()
+    policy = application.policy
     logger.info(
         "risk state",
         extra={
@@ -692,7 +712,27 @@ async def _risk_status(application: Application, _args: argparse.Namespace) -> i
             "reason": state.reason,
             "high_water_mark": str(state.high_water_mark),
             "day_start_equity": str(state.day_start_equity),
-            "halted_baskets": halted,
+            "halted_baskets": application.states.halted_baskets(),
+        },
+    )
+    logger.info(
+        "live arming",
+        extra={
+            "armed": arming.armed,
+            "max_live_notional": str(arming.max_live_notional),
+            "armed_by": arming.armed_by,
+            "note": arming.note,
+        },
+    )
+    logger.info(
+        "tier-2 limits in force",
+        extra={
+            "max_gross_exposure_pct": str(policy.policy.max_gross_exposure_pct),
+            "max_daily_loss_pct": str(policy.policy.max_daily_loss_pct),
+            "max_drawdown_pct": str(policy.policy.max_drawdown_pct),
+            "max_orders_per_hour": policy.policy.max_orders_per_hour,
+            "max_order_notional": str(policy.policy.max_order_notional),
+            "clamped": policy.detail,
         },
     )
     return 0

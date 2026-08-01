@@ -26,6 +26,7 @@ class AlertCursor(DomainModel):
     last_seq: int = 0
     last_summary_day: str = ""
     degraded_streak: int = 0
+    stale_streak: int = 0
 
     @property
     def started(self) -> bool:
@@ -52,6 +53,7 @@ class AlertCursorStore:
             last_seq=row.last_seq,
             last_summary_day=row.last_summary_day or "",
             degraded_streak=row.degraded_streak,
+            stale_streak=row.stale_streak,
         )
 
     async def save(self, cursor: AlertCursor) -> AlertCursor:
@@ -60,6 +62,7 @@ class AlertCursorStore:
             "last_seq": cursor.last_seq,
             "last_summary_day": cursor.last_summary_day,
             "degraded_streak": cursor.degraded_streak,
+            "stale_streak": cursor.stale_streak,
             "updated_at": self._clock.now(),
         }
         await self._writer.run(

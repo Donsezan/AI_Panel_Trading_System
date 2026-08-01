@@ -225,6 +225,32 @@ class TestDegradedStreak:
         assert [alert.kind for alert in second.sent] == [AlertKind.PROVIDER_FAILURE]
 
 
+class TestStaleStreak:
+    """The market-data streak is persisted beside the degraded one, for the same reason."""
+
+    async def _starve(self, store: EventStore, clock: ManualClock, times: int) -> None:
+        for index in range(times):
+            await store.append(
+                events_for(clock, f"s{index}").cycle_completed(CycleOutcome.DATA_STALE, Decimal(0))
+            )
+
+    async def test_the_streak_survives_a_restart(
+        self, wired: tuple[EventStore, AlertCursorStore, Engine], clock: ManualClock
+    ) -> None:
+        store, cursor, _ = wired
+        await dispatcher_for(wired, clock, RecordingSink(), degraded_streak=3).poll()
+
+        await self._starve(store, clock, 2)
+        await dispatcher_for(wired, clock, RecordingSink(), degraded_streak=3).poll()
+        assert cursor.load().stale_streak == 2
+
+        await self._starve(store, clock, 1)
+        resumed = RecordingSink()
+        await dispatcher_for(wired, clock, resumed, degraded_streak=3).poll()
+
+        assert [alert.kind for alert in resumed.sent] == [AlertKind.DATA_STALE]
+
+
 class TestDailySummary:
     async def test_the_first_poll_does_not_summarise_a_day_it_only_saw_the_end_of(
         self, wired: tuple[EventStore, AlertCursorStore, Engine], clock: ManualClock

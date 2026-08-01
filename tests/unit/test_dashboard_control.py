@@ -1,10 +1,11 @@
 """Control: the operator's safety surface, and what each action writes to the log.
 
-Two things are load-bearing here. **Pause and halt must stay distinct** — a config edit may
-never clear a halt the system imposed for cause. And **manual close has no side door**: it goes
+Three things are load-bearing here. **Pause and halt must stay distinct** — a config edit may
+never clear a halt the system imposed for cause. **Manual close has no side door**: it goes
 through Tier-1 and Tier-2, and every rule that stands aside for an operator's exit records that
 it did, so the exemption is visible in the log rather than implied by the absence of a veto
-(ADR 0015).
+(ADR 0015). And **quarantine is a third thing again** — versioned configuration that stops the
+bot acting while the cycle, and therefore the data, keeps running (ADR 0022).
 """
 
 from __future__ import annotations
@@ -19,9 +20,11 @@ from tradebot.app import Application
 from tradebot.control.config_store import SINGLETON_ID
 from tradebot.core.enums import BasketStatus, ConfigKind, CycleOutcome, KillSwitchState
 from tradebot.core.events import EventType
-from tradebot.dashboard.routes.control import KILL_PHRASE
+from tradebot.dashboard.routes.control import KILL_PHRASE, QUARANTINE_CONFIRM
 from tradebot.risk.rules import STOOD_ASIDE
 from tradebot.risk.state import REARM_PHRASE
+
+BTC = "sim:BTC/USDT"
 
 
 @pytest.fixture
@@ -131,6 +134,176 @@ async def test_un_halting_with_the_phrase_clears_it_and_records_it(
     changed = events_of(sim_application, EventType.BASKET_STATUS_CHANGED)
     assert changed[-1].payload["status"] == "active"
     assert "dashboard" in changed[-1].payload["reason"]
+
+
+# ---------------------------------------------------------------- quarantine
+
+
+def quarantine_of(application: Application) -> Any:
+    record = application.configs.latest(ConfigKind.BASKET, "demo")
+    assert record is not None
+    return record.document.risk_policy
+
+
+async def quarantine(
+    client: httpx.AsyncClient, *, instrument_key: str = "", excluded: bool = True, **extra: str
+) -> httpx.Response:
+    return await client.post(
+        "/control/baskets/demo/quarantine",
+        data={
+            "instrument_key": instrument_key,
+            "excluded": "true" if excluded else "false",
+            **extra,
+        },
+    )
+
+
+async def test_quarantining_an_instrument_publishes_a_new_version(
+    sim_application: Application, client: httpx.AsyncClient
+) -> None:
+    """Configuration, like a pause: versioned, attributable, and no typed phrase."""
+    response = await quarantine(client, instrument_key=BTC)
+
+    assert response.status_code == 303
+    record = sim_application.configs.latest(ConfigKind.BASKET, "demo")
+    assert record is not None
+    assert record.ref.version == 2
+    assert record.actor == "dashboard"
+    assert record.document.risk_policy.quarantined_instruments == (BTC,)
+    assert not record.document.risk_policy.quarantined
+
+
+async def test_quarantining_the_whole_basket_leaves_the_instrument_list_alone(
+    sim_application: Application, client: httpx.AsyncClient
+) -> None:
+    await quarantine(client)
+
+    policy = quarantine_of(sim_application)
+    assert policy.quarantined
+    assert policy.quarantined_instruments == ()
+    assert policy.excludes(BTC)
+
+
+async def test_releasing_publishes_another_version(
+    sim_application: Application, client: httpx.AsyncClient
+) -> None:
+    await quarantine(client, instrument_key=BTC)
+    await quarantine(client, instrument_key=BTC, excluded=False)
+
+    assert quarantine_of(sim_application).quarantined_instruments == ()
+
+
+async def test_a_quarantined_instrument_gets_no_order(
+    sim_application: Application, client: httpx.AsyncClient
+) -> None:
+    """The whole point, asserted through the real loop: the panel decides and nothing is sent."""
+    await sim_application.recover()
+    await quarantine(client, instrument_key=BTC)
+
+    results = await sim_application.supervisor.run_once()
+
+    assert results
+    assert not [
+        order for result in results for order in result.orders if order.instrument_key == BTC
+    ]
+    vetoed = [
+        check
+        for event in events_of(sim_application, EventType.RISK_CHECKED)
+        for check in event.payload["checks"]
+        if check["rule"] == "quarantine" and check["decision"] == "veto"
+    ]
+    assert vetoed, "the veto must be recorded as an ordinary Tier-1 verdict"
+
+
+async def test_a_quarantined_basket_still_takes_a_snapshot_but_runs_no_panel(
+    sim_application: Application, client: httpx.AsyncClient
+) -> None:
+    """Data keeps flowing — that is the difference from a pause — and no model call is spent."""
+    await sim_application.recover()
+    await quarantine(client)
+
+    results = await sim_application.supervisor.run_once()
+
+    assert [result.outcome for result in results] == [CycleOutcome.QUARANTINED]
+    chain = sim_application.store.event_types(results[0].cycle_id)
+    assert EventType.SNAPSHOT_FROZEN in chain
+    assert EventType.SEAT_RESPONDED not in chain
+    assert EventType.ORDER_SUBMITTED not in chain
+
+
+async def test_quarantining_a_held_position_asks_for_a_second_click(
+    cycled: Application, client: httpx.AsyncClient
+) -> None:
+    """Inaction can compound a loss; the operator is told what they are about to stop managing."""
+    response = await quarantine(client, instrument_key=BTC)
+
+    assert response.status_code == 200
+    assert "holds a position" in response.text
+    assert quarantine_of(cycled).quarantined_instruments == ()
+
+
+async def test_the_second_click_publishes_it(
+    cycled: Application, client: httpx.AsyncClient
+) -> None:
+    response = await quarantine(client, instrument_key=BTC, confirm=QUARANTINE_CONFIRM)
+
+    assert response.status_code == 303
+    assert quarantine_of(cycled).quarantined_instruments == (BTC,)
+
+
+async def test_releasing_a_held_position_needs_no_confirmation(
+    cycled: Application, client: httpx.AsyncClient
+) -> None:
+    """Only the exclusion is consequential; putting something back in service is not."""
+    await quarantine(client, instrument_key=BTC, confirm=QUARANTINE_CONFIRM)
+
+    response = await quarantine(client, instrument_key=BTC, excluded=False)
+
+    assert response.status_code == 303
+    assert quarantine_of(cycled).quarantined_instruments == ()
+
+
+async def test_a_manual_close_still_works_on_a_quarantined_instrument(
+    cycled: Application, client: httpx.AsyncClient
+) -> None:
+    """The consequence that makes quarantine safe: a held position is never orphaned by it."""
+    await quarantine(client, instrument_key=BTC, confirm=QUARANTINE_CONFIRM)
+
+    response = await client.post(
+        "/control/close", data={"basket_id": "demo", "instrument_key": BTC}
+    )
+
+    assert "Close submitted" in response.text
+    stood_aside = [
+        check
+        for event in events_of(cycled, EventType.RISK_CHECKED)
+        if event.cycle_id.startswith("manual-")
+        for check in event.payload["checks"]
+        if check["rule"] == "quarantine"
+    ]
+    assert [check["detail"] for check in stood_aside] == [STOOD_ASIDE]
+
+
+async def test_the_page_shows_what_is_excluded_and_why(client: httpx.AsyncClient) -> None:
+    """An instrument excluded by its basket rather than by name must read as excluded anyway."""
+    await quarantine(client)
+
+    body = (await client.get("/control")).text
+
+    assert "quarantined" in body
+    assert "via the basket" in body
+    assert "release" in body
+
+
+async def test_quarantining_an_unknown_basket_reports_rather_than_raising(
+    client: httpx.AsyncClient,
+) -> None:
+    response = await client.post(
+        "/control/baskets/ghost/quarantine", data={"instrument_key": "", "excluded": "true"}
+    )
+
+    assert response.status_code == 200
+    assert "no basket ghost" in response.text
 
 
 # ---------------------------------------------------------------- kill switch

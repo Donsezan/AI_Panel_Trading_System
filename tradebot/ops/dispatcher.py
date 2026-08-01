@@ -132,7 +132,7 @@ class AlertDispatcher:
         unread until the destination is back, and none of them is lost.
         """
         events = self._store.read_after(cursor.last_seq, *ALERT_TYPES, limit=self._batch)
-        state = RuleState(cursor.degraded_streak, self._streak_limit)
+        state = RuleState(cursor.degraded_streak, self._streak_limit, cursor.stale_streak)
         delivered: list[Alert] = []
         for event in events:
             alert = evaluate(event, state)
@@ -140,7 +140,11 @@ class AlertDispatcher:
                 break
             cursor = await self._cursor.save(
                 cursor.model_copy(
-                    update={"last_seq": event.seq or 0, "degraded_streak": state.degraded_streak}
+                    update={
+                        "last_seq": event.seq or 0,
+                        "degraded_streak": state.degraded_streak,
+                        "stale_streak": state.stale_streak,
+                    }
                 )
             )
             if alert is not None:

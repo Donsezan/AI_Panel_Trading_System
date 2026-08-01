@@ -68,6 +68,7 @@ class Stack:
         clock: ManualClock,
         instrument: Instrument,
         broker: object | None = None,
+        readiness: object | None = None,
     ) -> None:
         self.broker = broker or SimBroker(clock, balances={"USDT": Decimal(10_000)})
         self.states = RiskStateStore(store.engine, store._writer, clock)
@@ -92,12 +93,61 @@ class Stack:
             self.watchdog,
             clock,
             instruments=(instrument,),
+            readiness=readiness,  # type: ignore[arg-type]
         )
 
 
 @pytest.fixture
 def stack(store: EventStore, ledger: Ledger, clock: ManualClock, instrument: Instrument) -> Stack:
     return Stack(store, ledger, clock, instrument)
+
+
+class FakeReadiness:
+    """Stands in for the live gates, which are absent in every other mode (ADR 0020)."""
+
+    def __init__(self, *failures: str) -> None:
+        self._failures = failures
+        self.ran = 0
+
+    async def run(self) -> tuple[str, ...]:
+        self.ran += 1
+        return self._failures
+
+
+class TestLiveReadiness:
+    async def test_a_failed_gate_leaves_the_process_up_and_halted(
+        self, store: EventStore, ledger: Ledger, clock: ManualClock, instrument: Instrument
+    ) -> None:
+        """DESIGN §8.2 step 5, applied to the live-only gates: nothing trades, and the reason is
+        in the log rather than in a stack trace."""
+        gates = FakeReadiness("no ops alert destination is configured")
+        stack = Stack(store, ledger, clock, instrument, readiness=gates)
+
+        recovery = await stack.sequence.recover()
+
+        assert recovery.halted
+        assert recovery.failures == ("no ops alert destination is configured",)
+
+    async def test_a_clean_gate_does_not_halt(
+        self, store: EventStore, ledger: Ledger, clock: ManualClock, instrument: Instrument
+    ) -> None:
+        gates = FakeReadiness()
+        stack = Stack(store, ledger, clock, instrument, readiness=gates)
+
+        recovery = await stack.sequence.recover()
+
+        assert not recovery.halted
+        assert gates.ran == 1
+
+    async def test_the_baselines_are_not_armed_behind_a_failed_gate(
+        self, store: EventStore, ledger: Ledger, clock: ManualClock, instrument: Instrument
+    ) -> None:
+        """A system that never became ready should not have recorded a high-water mark for it."""
+        stack = Stack(store, ledger, clock, instrument, readiness=FakeReadiness("panel is down"))
+
+        await stack.sequence.recover()
+
+        assert not stack.states.initialised()
 
 
 class TestFirstRun:

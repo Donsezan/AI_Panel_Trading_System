@@ -12,6 +12,13 @@ Collapsing them into one button would let a config edit silently un-halt a baske
 stopped for cause — which is the exact failure "a restart never silently un-halts anything"
 exists to prevent.
 
+**Quarantine** is a third thing again, and the page keeps all three apart. It is the operator's
+judgement that one instrument — or a whole basket — should not be traded automatically for now,
+while its data keeps flowing so they can put it back on evidence. Like a pause it is versioned
+configuration and needs no typed phrase; unlike a pause the cycle still runs, and unlike a halt
+nothing about it is the system's own doing (ADR 0022). The one thing it must not do quietly is
+strand a position, so quarantining a scope that holds one takes a second, deliberate click.
+
 The **kill switch** trips through the same `Watchdog.trip` the drawdown breach uses, and re-arms
 through `Watchdog.rearm` behind `assert_rearm_phrase`. Re-arming resets the baselines, so it is
 an assertion that a human has looked at what happened.
@@ -26,6 +33,8 @@ nothing.
 """
 
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -47,6 +56,12 @@ router = APIRouter(prefix="/control", tags=["control"])
 #: Typed to trip the switch by hand. Distinct from the re-arm phrase on purpose: the two acts
 #: are opposites, and a single phrase that did both could be typed for the wrong one.
 KILL_PHRASE = "STOP TRADING NOW"
+
+#: Sent by the second click that quarantines a scope holding a position. Deliberately *not* a
+#: typed phrase — quarantine is reversible configuration, and demanding one here would make it
+#: feel like a halt. What the click buys is that the consequence was read: from that moment the
+#: bot is hands-off the position, and only a manual close will move it (ADR 0022).
+QUARANTINE_CONFIRM = "quarantine-anyway"
 
 
 @router.get("", response_class=HTMLResponse)
@@ -76,6 +91,78 @@ async def set_status(request: Request, basket_id: str) -> Response:
         extra={"basket_id": basket_id, "status": status.value},
     )
     return RedirectResponse("/control", status_code=303)
+
+
+@dataclass(frozen=True, slots=True)
+class PendingQuarantine:
+    """A quarantine that would leave a held position unmanaged, waiting for a second click."""
+
+    basket_id: str
+    #: Empty for a whole-basket quarantine — the same convention the form and the policy use.
+    instrument_key: str
+    held: tuple[str, ...]
+
+    @property
+    def scope(self) -> str:
+        return self.instrument_key or f"basket {self.basket_id}"
+
+
+@router.post("/baskets/{basket_id}/quarantine")
+async def set_quarantine(request: Request, basket_id: str) -> Response:
+    """Exclude an instrument, or a whole basket, from automated trading — or release it.
+
+    Configuration, like a pause: a new version, attributable, reversible by publishing another.
+    The cycle is untouched, so the data an operator needs in order to decide when to release it
+    keeps arriving. `QuarantineRule` is what refuses the order (ADR 0022).
+    """
+    form = await request.form()
+    configs = state_of(request).application.configs
+    record = configs.latest(ConfigKind.BASKET, basket_id)
+    if record is None or not record.usable:
+        return _page(request, error=f"no basket {basket_id} is in service")
+
+    basket: Basket = record.document
+    instrument_key = _field(form, "instrument_key")
+    excluded = _field(form, "excluded") == "true"
+    held = _held_within(request, basket, instrument_key)
+    if excluded and held and _field(form, "confirm") != QUARANTINE_CONFIRM:
+        return _page(request, pending=PendingQuarantine(basket_id, instrument_key, held))
+
+    policy = basket.risk_policy.with_quarantine(instrument_key, excluded=excluded)
+    published = await configs.put(
+        basket_id,
+        basket.model_copy(update={"risk_policy": policy}),
+        actor=ACTOR,
+        note=_field(form, "note") or _quarantine_note(instrument_key, excluded=excluded),
+    )
+    logger.warning(
+        "quarantine published from the dashboard",
+        extra={
+            "basket_id": basket_id,
+            "instrument_key": instrument_key,
+            "excluded": excluded,
+            "version": published.ref.version,
+            "held": list(held),
+        },
+    )
+    return RedirectResponse("/control", status_code=303)
+
+
+def _held_within(request: Request, basket: Basket, instrument_key: str) -> tuple[str, ...]:
+    """Positions the quarantine would leave the bot hands-off — the reason for the warning.
+
+    Inaction can compound a loss as readily as action can cause one, so an operator excluding
+    something they still hold is told exactly what they are about to stop managing.
+    """
+    scope = (instrument_key,) if instrument_key else tuple(i.key for i in basket.instruments)
+    ledger = state_of(request).application.ledger
+    held = {p.instrument_key for p in ledger.positions() if not p.is_flat}
+    return tuple(key for key in scope if key in held)
+
+
+def _quarantine_note(instrument_key: str, *, excluded: bool) -> str:
+    scope = instrument_key or "the whole basket"
+    return f"{'quarantined' if excluded else 'released'} {scope} from the dashboard"
 
 
 @router.post("/baskets/{basket_id}/unhalt")
@@ -139,7 +226,11 @@ async def close_position(request: Request) -> Response:
 
 
 def _page(
-    request: Request, *, error: str = "", outcome: CloseOutcome | None = None
+    request: Request,
+    *,
+    error: str = "",
+    outcome: CloseOutcome | None = None,
+    pending: PendingQuarantine | None = None,
 ) -> HTMLResponse:
     state = state_of(request)
     application = state.application
@@ -153,8 +244,10 @@ def _page(
         quote_currency=application.quote_currency,
         error=error,
         outcome=outcome,
+        pending=pending,
         kill_phrase=KILL_PHRASE,
         rearm_phrase=REARM_PHRASE,
+        quarantine_confirm=QUARANTINE_CONFIRM,
         statuses=[BasketStatus.ACTIVE.value, BasketStatus.PAUSED.value],
     )
 

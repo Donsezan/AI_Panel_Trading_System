@@ -37,7 +37,7 @@ class TestModeSafety:
         with pytest.raises(SystemExit):
             parse_args(["run", "--mode", "prod", "--once"])
 
-    def test_live_refuses_to_run(self, data_dir: list[str]) -> None:
+    def test_live_refuses_to_run_unarmed(self, data_dir: list[str]) -> None:
         assert main(["run", "--mode", "live", "--once", *data_dir]) == 1
 
     def test_paper_will_not_price_a_sim_basket_off_a_real_venue(self, data_dir: list[str]) -> None:
@@ -49,8 +49,14 @@ class TestModeSafety:
         """
         assert main(["run", "--mode", "paper", "--once", *data_dir]) == 4
 
-    def test_live_refuses_even_with_the_confirmation_phrase(self, data_dir: list[str]) -> None:
-        """Live ships disabled: there is no wiring to reach, confirmation or not (Phase 8)."""
+    def test_live_refuses_with_the_phrase_but_an_unarmed_database(
+        self, data_dir: list[str]
+    ) -> None:
+        """The phrase is transient by design; an armed row in *this* database is not (ADR 0012).
+
+        Live is wired as of Phase 8, and ships disarmed: the wiring is reachable only by someone
+        who has also armed the database, set a cap, and put live keys in the environment.
+        """
         exit_code = main(
             [
                 "run",
@@ -63,6 +69,10 @@ class TestModeSafety:
             ]
         )
         assert exit_code == 1
+
+    def test_live_refuses_the_simulated_broker(self, data_dir: list[str]) -> None:
+        """`--broker sim` defaults everywhere else; in live it is a contradiction, not a default."""
+        assert main(["run", "--mode", "live", "--once", "--broker", "sim", *data_dir]) == 1
 
 
 class TestRunCommand:

@@ -220,6 +220,7 @@ class TestTier1Engine:
             "sizing",
             "min_conviction",
             "long_only",
+            "quarantine",
             "max_consecutive_losses",
             "cooldown",
             "max_trades_per_day",

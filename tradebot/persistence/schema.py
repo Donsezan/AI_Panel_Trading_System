@@ -314,6 +314,7 @@ alert_cursor = Table(
     #: how the first poll of a fresh database avoids summarising a day it only saw the end of.
     Column("last_summary_day", String(10), default=""),
     Column("degraded_streak", Integer, nullable=False, default=0),
+    Column("stale_streak", Integer, nullable=False, default=0),
     Column("updated_at", UtcText, nullable=False),
 )
 

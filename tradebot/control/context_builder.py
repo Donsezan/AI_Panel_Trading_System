@@ -92,6 +92,16 @@ class ContextBuilder:
         self._news_feed = news_feed
         self._news_items = news_items
 
+    @property
+    def timeframes(self) -> tuple[str, ...]:
+        """What this builder fetches: the basket's timeframes, or the engine's default set."""
+        return self._timeframes
+
+    @property
+    def indicators(self) -> tuple[str, ...]:
+        """What this builder computes. Resolved once here, so callers never redo the defaulting."""
+        return self._indicators
+
     async def build(
         self, basket: Basket, *, news: tuple[NewsItemView, ...] | None = None
     ) -> ContextSnapshot:

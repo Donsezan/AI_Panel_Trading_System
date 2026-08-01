@@ -7,12 +7,15 @@
 3. For each venue: fetch open orders and `AccountState`, adopt orders carrying our
    `client_order_id` prefix, and reconcile the ledger.
 4. Resolve every non-terminal order in the database to a terminal or monitored state.
-5. Restore persisted risk state — kill switch, halted baskets, high-water mark, day-start
+5. In **live only**, check readiness: alerting configured, panels reachable, market data complete,
+   every stored basket building (`control/readiness.py`). Last, because it spends provider calls
+   and venue weight on a system the cheaper steps have already agreed is sound.
+6. Restore persisted risk state — kill switch, halted baskets, high-water mark, day-start
    equity — and arm the watchdog. Only then may runners start.
-6. **Any step failing leaves the process up and halted.** Nothing trades, and the reason is in
+7. **Any step failing leaves the process up and halted.** Nothing trades, and the reason is in
    the log.
 
-Step 5 is the point of the whole module. The tempting alternative — crash on a failed recovery —
+Step 6 is the point of the whole module. The tempting alternative — crash on a failed recovery —
 loses the one thing an operator needs, which is a running system that can be asked what went
 wrong. The tempting *other* alternative — carry on and hope — is how a process resumes trading
 against a position it has already lost track of.
@@ -29,6 +32,7 @@ from dataclasses import dataclass, field
 from sqlalchemy import select
 
 from tradebot.control.preflight import VenuePreflight
+from tradebot.control.readiness import LiveReadiness
 from tradebot.core.clock import Clock
 from tradebot.core.config import Basket
 from tradebot.core.enums import KillSwitchState, OrderState, RiskTier
@@ -89,6 +93,7 @@ class StartupSequence:
         quote_currency: str = "USDT",
         venue_restore: RestorableVenue | None = None,
         preflight: VenuePreflight | None = None,
+        readiness: LiveReadiness | None = None,
     ) -> None:
         self._store = store
         self._ledger = ledger
@@ -104,6 +109,8 @@ class StartupSequence:
         #: Absent for a simulated venue, which has no clock of its own to disagree with and no key
         #: to hold permissions. Present for every real one.
         self._preflight = preflight
+        #: Live only. Sim and paper are allowed to run degraded — that is what they are for.
+        self._readiness = readiness
 
     async def recover(self) -> Recovery:
         """Bring the process to a known state, or to a halted one."""
@@ -135,6 +142,11 @@ class StartupSequence:
                 resolved = await self._resolve_open_orders()
             except TradebotError as exc:
                 failures.append(f"open-order resolution failed: {exc}")
+
+        # Last, and only in live: it spends provider calls and venue weight, so it runs once the
+        # cheaper steps have agreed there is a system worth checking.
+        if not failures and self._readiness is not None:
+            failures.extend(await self._readiness.run())
 
         if not failures and first_run:
             await self._arm_first_run()

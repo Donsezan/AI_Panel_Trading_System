@@ -11,6 +11,7 @@ deliberate — a halt that leaves no trace in the log is a halt nobody can audit
 
 Failure semantics — every one of these ends the cycle with no order and a recorded outcome:
 * kill switch / halt / frozen aggregate → `BLOCKED`
+* a basket quarantined by its operator  → `QUARANTINED`, after the snapshot
 * stale market data                     → `DATA_STALE`
 * degraded panel / no consensus         → `PANEL_DEGRADED` or `NO_ACTION`
 * any Tier-1 or Tier-2 veto             → `RISK_VETOED`
@@ -62,6 +63,12 @@ _TOUCH: dict[Side, Callable[[Quote], Decimal]] = {
     Side.SELL: lambda quote: quote.bid,
 }
 _CROSS_SIGN: dict[Side, Decimal] = {Side.BUY: Decimal(1), Side.SELL: Decimal(-1)}
+
+#: Why a whole-basket quarantine ends the cycle *after* the snapshot rather than in `_gate`: the
+#: operator asked for market data and indicators to keep flowing so the basket can be put back
+#: into service on evidence. Only the panel and everything downstream of it are skipped, and
+#: `QuarantineRule` is what actually guarantees no order escapes either way (ADR 0022).
+QUARANTINED = "quarantined by the operator; snapshot taken, no panel run"
 
 
 def marketable_price(quote: Quote, side: Side, cross_pct: Decimal) -> Decimal:
@@ -188,6 +195,10 @@ class BasketRunner:
     async def _run(self, cycle_id: str, events: EventFactory) -> CycleResult:
         snapshot = await self._context.build(self._basket)
         await self._store.append(events.snapshot_frozen(snapshot))
+        if self._basket.risk_policy.quarantined:
+            return await self._finish(
+                cycle_id, events, CycleOutcome.QUARANTINED, detail=QUARANTINED
+            )
 
         # One call covers the whole basket, so the panel's cost ceiling and its decision mode
         # are the engine's to enforce; the runner only sees decisions (DESIGN §6.5).

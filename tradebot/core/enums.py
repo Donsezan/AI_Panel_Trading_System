@@ -332,4 +332,8 @@ class CycleOutcome(StrEnum):
     #: Trading was blocked before the panel ran — kill switch tripped or basket halted. The
     #: cycle is recorded rather than skipped, so a halt is visible in the log as a decision.
     BLOCKED = "blocked"
+    #: The whole basket is quarantined by its operator. Distinct from `BLOCKED` because the
+    #: snapshot was still built: market data and indicators kept flowing, and only the panel and
+    #: everything downstream of it were skipped (ADR 0022).
+    QUARANTINED = "quarantined"
     FAILED = "failed"

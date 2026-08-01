@@ -72,11 +72,16 @@ Clearing a safety state is a human act and needs the typed phrase:
 .venv\Scripts\python.exe -m tradebot risk unhalt demo --mode sim --confirm "RE-ARM TRADING"
 ```
 
-So is arming live, which is a different phrase authorising a different thing:
+So is arming live, which is a different phrase authorising a different thing. Live is **wired and
+disarmed**; the whole procedure is [docs/OPERATIONS.md](docs/OPERATIONS.md):
 
 ```powershell
 .venv\Scripts\python.exe -m tradebot risk arm-live --mode live `
     --max-notional 50 --confirm "I ACCEPT REAL MONEY RISK"
+.venv\Scripts\python.exe -m tradebot risk status --mode live      # state, arming, limits in force
+.venv\Scripts\python.exe -m tradebot run --mode live --broker binance `
+    --panel free --confirm "I ACCEPT REAL MONEY RISK" --once
+.venv\Scripts\python.exe -m tradebot risk disarm-live --mode live --reason "..."
 ```
 
 Schema changes go through Alembic — never `create_all`. After editing
@@ -158,11 +163,46 @@ Coverage gates are CI-enforced by `scripts/coverage_gate.py`: `core/`, `risk/`, 
 Tests assert *behaviour under failure*, not just the happy path. For every failure row in
 DESIGN §8.1 there should be a test asserting the documented response.
 
+### Phase 9 — operator control
+
+Two slices, planned together in [docs/PHASE_9_OPERATOR_CONTROL.md](docs/PHASE_9_OPERATOR_CONTROL.md).
+**Quarantine has shipped; GUI arm/start/stop has not.**
+
+Quarantine is an operator excluding one instrument, or a whole basket, from *automated* trading —
+"I have doubts about this one, keep watching it but don't trade it". Four rules that are easy to
+get backwards ([ADR 0022](docs/adr/0022-quarantine-is-a-tier-1-veto-rule.md)):
+
+- **It is a Tier-1 veto rule, not a scheduling state.** The cycle keeps running: market data,
+  indicators and the panel's deliberation are untouched, and only the resulting order is refused.
+  That is the whole difference from a **pause**, which stops the cycle and so blinds the operator
+  to the instrument they are making up their mind about — and from a **halt**, which is the system
+  protecting itself and needs a typed phrase to clear. Quarantine is versioned configuration and
+  releasing it is one click.
+- **A held position stays closable by hand.** `QuarantineRule` stands aside for the existing
+  ADR 0015 operator exit, and records that it did — but only when the quarantine would otherwise
+  have bitten, so an ordinary manual close does not silently gain a fourth stood-aside rule. The
+  dashboard asks for a second, deliberate click before quarantining a scope that holds something:
+  from that moment the bot is hands-off, and inaction compounds a loss as readily as action causes
+  one.
+- **A whole-basket quarantine also skips the panel** (`CycleOutcome.QUARANTINED`, short-circuiting
+  right after the snapshot is frozen) — there is nothing to spend a model call on when every order
+  is vetoed downstream. The cycle is still *recorded*: a basket that stops appearing in the log is
+  a basket nobody can audit. A *per-instrument* quarantine still pays for its panel call, which is
+  deliberate — what the panel would have done while an instrument was under review is the research
+  record worth having.
+- **A quarantine may only name an instrument its basket holds**, enforced by `Basket`. A key
+  matching nothing excludes nothing, and the operator would believe a limit is in force while the
+  panel trades straight through it.
+
+Edited in Configure (both fields) and toggled per basket *and* per instrument from Control. There
+is no CLI mutation command, consistent with every other Tier-1 limit; `config list` and
+`config history basket` show the state.
+
 ## Phase status
 
-Phases 0–7 are **code-complete**. Phase 7's remaining deliverable is the paper soak itself, which
-is wall-clock time rather than code: run `tradebot run --mode paper` for weeks and measure it with
-`report promotion`. Phase 8 (live wiring, `docs/OPERATIONS.md`) is next and is armed by a human.
+Phases 0–8 are **code-complete**. What remains is not code: the paper soak (weeks of
+`tradebot run --mode paper`, measured with `report promotion`) and then a human's decision to arm
+live, following [docs/OPERATIONS.md](docs/OPERATIONS.md). **Live ships disarmed and I never arm it.**
 
 Phases 0–6: guardrails and money primitives, the sim-only walking skeleton, the
 deterministic shell to full depth (order lifecycle with venue-held protective groups, the
@@ -309,9 +349,44 @@ Baskets share one ledger, one execution service, one monitor and one watchdog, b
 belong to the venue portfolio and not to a basket (DESIGN §4) — which is why the monitor
 serializes its poll and each basket prunes only its own groups.
 
-**Live mode still refuses to start.** Every PLAN §2.4 precondition is built and tested, and
-`build` evaluates all of them before raising: completing the wiring is Phase 8's deliverable,
-shipped with `docs/OPERATIONS.md` and armed by a human.
+### Phase 8 layering — live, wired and disarmed
+
+Live is `_assemble` with `Mode.LIVE`: the same runner, risk engines, ledger and log a soak
+validated. A separate live path would mean the thing that was tested is not the thing that trades
+([ADR 0020](docs/adr/0020-live-is-the-paper-wiring-minus-headroom.md)). What live adds is
+*subtraction*:
+
+```
+build_live                refuses --broker sim; otherwise the paper wiring, with Mode.LIVE
+  assert_live_preconditions   the four facts of ADR 0012 — phrase, armed row, cap, credentials
+  effective_policy            min(published, LIVE_CEILING) per limit, then the arming row's cap
+    StartupSequence           …preflight, reconcile, resolve orders, and then:
+      LiveReadiness           alerting · panel real+reachable · data complete · configs build
+```
+
+Five rules that are easy to get backwards:
+
+- **The ceiling only tightens.** `min(published, ceiling)`, so a policy an operator already
+  narrowed keeps its own number, and widening past the ceiling is a source change rather than a
+  dashboard edit at 03:00. Every clamp is logged *and* written as a `RISK_EVENT` — "what were the
+  limits at 04:12" is answerable from the log alone, not by joining two documents against a
+  constant.
+- **Permission is not readiness.** All four arming preconditions can hold on a machine whose
+  alerting was never configured and whose feed has been returning a holed series since the last
+  restart. `control/readiness.py` is the second question, live only, and a failure leaves the
+  process **up and halted** like every other startup step.
+- **The panel probe is a real completion.** Sixteen tokens per seat. A socket test would pass for a
+  model id that no longer resolves — R11 happening now rather than in theory. A seat answering on
+  its *fallback* is a warning, not a refusal; the chain exists so an outage is survivable.
+- **No seat may bind the stub in live, not even as a fallback.** That is one outage away from a
+  real order sized by canned JSON. Checked before probing, because probing a stub succeeds.
+- **A gap in the tape refuses.** ATR sizes every position, so an ATR computed across a hole is a
+  stop distance derived from a bar the venue never published. Mid-run, the same fault becomes a
+  `DATA_STALE` alert on a streak — persisted, sharing one rule with `PANEL_DEGRADED`, because both
+  are "cycle after cycle deciding nothing".
+
+Sim and paper have none of these gates, deliberately: an unreachable panel there is a `WAIT` and a
+holed series is one `DATA_STALE` cycle. Running degraded is what those modes are *for*.
 
 ### Phase 5 layering
 

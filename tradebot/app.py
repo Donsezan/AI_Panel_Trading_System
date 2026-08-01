@@ -13,9 +13,15 @@ Mode safety (PLAN §2.4) is enforced at construction:
 * every venue transport asserts its resolved host against the mode before the first call;
 * live additionally requires a typed confirmation phrase, an armed database row, a positive
   notional cap, and credentials — enumerated in `control/arming.py`. Any one missing and the
-  process refuses to start. Live *wiring* remains deliberately absent (PLAN Phase 8): the
-  preconditions are built and tested here, and there is still no code path that reaches a real
-  exchange.
+  process refuses to start.
+
+Live is wired (PLAN Phase 8) and ships **disarmed**: `build_live` is reachable only by someone who
+has typed the phrase, armed this database, set a cap, and put live keys in the environment under
+their own names. It is the paper wiring with the same objects and two subtractions — Tier-2 limits
+clamped to `control/live.py`'s ceiling, and `control/readiness.py` refusing to start unless
+alerting, the panel, the market data and every stored configuration are actually working. See
+[docs/OPERATIONS.md](../docs/OPERATIONS.md) for the checklist, the arming procedure, and the
+incident runbook.
 
 **Paper's primary shape is live market data plus `SimBroker`** (DESIGN §9 rung 5): real prices,
 deterministic fills, no venue-side test artifacts. A real venue adapter is opt-in per venue and
@@ -30,7 +36,7 @@ for a webhook (ADR 0019).
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import StrEnum
@@ -44,13 +50,14 @@ from tradebot.control.arming import (
     LIVE_CONFIRMATION_PHRASE,
     ArmingStore,
     assert_live_preconditions,
-    capped,
 )
 from tradebot.control.basket_runner import BasketRunner
 from tradebot.control.config_store import SINGLETON_ID, ConfigRecord, ConfigStore
 from tradebot.control.context_builder import ContextBuilder
+from tradebot.control.live import EffectivePolicy, effective_policy
 from tradebot.control.manual_close import ManualCloser
 from tradebot.control.preflight import VenuePreflight
+from tradebot.control.readiness import LiveReadiness
 from tradebot.control.scheduler import Scheduler
 from tradebot.control.startup import Recovery, StartupSequence
 from tradebot.control.supervisor import Supervisor
@@ -63,13 +70,16 @@ from tradebot.core.config import (
     RiskPolicy,
     Schedule,
 )
-from tradebot.core.enums import AssetClass, Mode
+from tradebot.core.enums import AssetClass, Mode, RiskTier
 from tradebot.core.errors import ConfigError
+from tradebot.core.events import EventFactory
 from tradebot.core.instrument import Instrument
 from tradebot.core.logging import get_logger
 from tradebot.core.market import timeframe_interval
+from tradebot.core.money import ZERO
 from tradebot.decision.engine import DecisionEngine
 from tradebot.decision.presets import PANELS, STUB_PANEL
+from tradebot.decision.probe import PanelProbeResult, probe_panel
 from tradebot.decision.providers.registry import ProviderPool, build_providers
 from tradebot.decision.seat import SeatRunner
 from tradebot.decision.shadow import ShadowEvaluator
@@ -79,6 +89,7 @@ from tradebot.execution.brokers.calendars import ContinuousCalendar
 from tradebot.execution.brokers.sim import SimBroker, SimulatedMarket
 from tradebot.execution.monitor import ExecutionMonitor
 from tradebot.execution.service import ExecutionService
+from tradebot.interfaces.alerts import AlertSink
 from tradebot.interfaces.broker import (
     BrokerAdapter,
     CorporateActionSource,
@@ -138,6 +149,12 @@ class Application:
     startup: StartupSequence
     watchdog: Watchdog
     states: RiskStateStore
+    #: The live arming row for *this* mode's database. Read by `risk status`, so an operator can
+    #: see what live is permitted to do without opening the database (ADR 0012).
+    arming: ArmingStore
+    #: The Tier-2 limits actually in force, after the arming cap and — in live — the ceiling.
+    #: Held rather than recomputed, so the CLI and the dashboard report what was wired.
+    policy: EffectivePolicy
     #: The operator's "close this position" action, wired to the same Tier-1 → Tier-2 →
     #: execution path a cycle uses. Exposed here because the dashboard may not build one.
     manual_close: ManualCloser
@@ -465,9 +482,10 @@ class RunnerBuilder:
     Giving each basket its own ledger would give two baskets two views of one account, which is
     precisely the concentration failure Tier-2 exists to prevent.
 
-    Each build re-reads the Tier-2 policy from the store and re-applies the live notional cap, so
-    a policy edited in the dashboard takes effect at the next cycle boundary and the arming row's
-    cap can never be edited away from underneath it (PLAN §2.4).
+    Each build re-reads the Tier-2 policy from the store and re-applies the mode's limits — the
+    arming row's notional cap, and in live the ceiling of `control/live.py`. So a policy edited in
+    the dashboard takes effect at the next cycle boundary, and neither the cap nor the ceiling can
+    be edited away from underneath it (PLAN §2.4, DESIGN §9 rung 6).
     """
 
     def __init__(
@@ -513,7 +531,9 @@ class RunnerBuilder:
             raise ConfigError(
                 "no Tier-2 policy is published; refusing to run a basket with no global limits"
             )
-        policy = capped(policy_record.document, self._live_cap)
+        policy = effective_policy(
+            policy_record.document, mode=self._mode, max_order_notional=self._live_cap
+        ).policy
         self._watchdog.use_policy(policy)
 
         decision_engine = DecisionEngine(SeatRunner(self._providers(record), self._clock))
@@ -564,6 +584,18 @@ class RunnerBuilder:
             pool = build_providers(declared_providers(record.document), self._clock)
             self._pools[record.ref.config_id] = pool
         return pool.providers
+
+    async def probe(self, record: ConfigRecord[Basket]) -> PanelProbeResult:
+        """Prove this basket's *champion* panel can actually reach a model (live readiness).
+
+        The champion only. A challenger that cannot be reached costs its own `SHADOW_EVALUATED`
+        event an opinion and nothing else — it never trades, and its every exception is already
+        caught and recorded (ADR 0018). Refusing to start live over the research panel would be
+        refusing over the one panel that cannot affect an order.
+        """
+        return await probe_panel(
+            record.document.panel, self._providers(record), label=record.ref.config_id
+        )
 
     async def release(self, basket_id: str) -> None:
         """Close the connections a basket's panel opened. Safe when it opened none."""
@@ -671,15 +703,17 @@ async def _assemble(
 
     # Unconditional, and a no-op for every mode but live. Having the gate *inside* the assembly is
     # what makes it structurally impossible to wire live without evaluating it (PLAN §2.4).
+    arming = ArmingStore(engine, writer, clock)
     live_cap = assert_live_preconditions(
         mode,
         confirmation=confirmation,
-        arming=ArmingStore(engine, writer, clock).load(),
+        arming=arming.load(),
         credentials=broker_choice.is_venue and has_credentials(broker_choice.value, mode),
     )
     policy_record = configs.global_risk()
     assert policy_record is not None  # `_publish` guarantees one exists
-    policy = capped(policy_record.document, live_cap)
+    effective = effective_policy(policy_record.document, mode=mode, max_order_notional=live_cap)
+    policy = effective.policy
 
     stack = _STACKS[broker_choice](
         StackRequest(instruments, clock, mode, market_data, start_equity, quote_currency)
@@ -727,6 +761,7 @@ async def _assemble(
         live_cap=live_cap,
         quote_currency=quote_currency,
     )
+    await _record_effective_policy(store, clock, mode, effective)
     return Application(
         mode=mode,
         store=store,
@@ -748,9 +783,20 @@ async def _assemble(
             # indistinguishable from a testnet wipe.
             venue_restore=stack.venue_restore,
             preflight=stack.preflight,
+            readiness=_readiness_for(
+                mode,
+                configs=configs,
+                factory=builder,
+                stack=stack,
+                ledger=ledger,
+                clock=clock,
+                alert_sinks=alert_sinks,
+            ),
         ),
         watchdog=watchdog,
         states=states,
+        arming=arming,
+        policy=effective,
         manual_close=ManualCloser(
             clock=clock,
             mode=mode,
@@ -774,6 +820,63 @@ async def _assemble(
         quote_currency=quote_currency,
         _writer=writer,
         _closers=(builder.close, *news_closers, *alert_closers, *stack.closers),
+    )
+
+
+def _readiness_for(
+    mode: Mode,
+    *,
+    configs: ConfigStore,
+    factory: RunnerBuilder,
+    stack: VenueStack,
+    ledger: Ledger,
+    clock: Clock,
+    alert_sinks: Sequence[AlertSink],
+) -> LiveReadiness | None:
+    """The live-only startup gates, or nothing at all (`control/readiness.py`).
+
+    Sim and paper are *allowed* to run degraded — an unreachable panel is a `WAIT`, and a holed
+    series is a `DATA_STALE` cycle. That is what those modes are for. Live is the mode where the
+    same fault is holding real positions, so it refuses to begin instead.
+    """
+    if not mode.is_live:
+        return None
+    return LiveReadiness(
+        configs=configs,
+        factory=factory,
+        market_data=stack.prices,
+        ledger=ledger,
+        clock=clock,
+        venue=stack.broker.venue_id,
+        alert_sinks=alert_sinks,
+        panel_probe=factory.probe,
+    )
+
+
+async def _record_effective_policy(
+    store: EventStore, clock: Clock, mode: Mode, effective: EffectivePolicy
+) -> None:
+    """Put the limits actually in force in the log, not just in two documents to be joined.
+
+    Live clamps the published policy to `LIVE_CEILING`, so "what were the limits at 04:12 on the
+    day of the incident" must be answerable from the event log alone — which is the compliance
+    artifact (PLAN §3.3). Nothing is written when nothing was clamped: an event per start that
+    always says the same thing is an event nobody reads.
+    """
+    if not effective.clamps:
+        return
+    logger.warning(
+        "tier-2 limits clamped to the live ceiling",
+        extra={"mode": mode.value, "clamps": [str(clamp) for clamp in effective.clamps]},
+    )
+    await store.append(
+        EventFactory(clock=clock, basket_id="global", cycle_id="startup").risk_event(
+            tier=RiskTier.TIER2,
+            rule="live_ceiling",
+            scope="portfolio",
+            action="clamped",
+            detail=effective.detail,
+        )
     )
 
 
@@ -868,45 +971,77 @@ def _paper_market_data(broker: BrokerChoice, clock: Clock) -> MarketDataProvider
     return provider
 
 
-async def build(mode: Mode, *, confirmation: str | None = None, **kwargs: object) -> Application:
-    """Wire the stack for `mode`, refusing anything that could reach a real exchange.
+async def build_live(
+    *,
+    clock: Clock | None = None,
+    db_path: Path | None = None,
+    baskets: tuple[Basket, ...] | None = None,
+    global_policy: GlobalRiskPolicy | None = None,
+    market_data: MarketDataProvider | None = None,
+    news_sources: tuple[str, ...] = (),
+    panel_id: str = "stub",
+    broker: BrokerChoice = BrokerChoice.BINANCE,
+    confirmation: str | None = None,
+    start_equity: Decimal = ZERO,
+) -> Application:
+    """Wire the live stack. Real venue, real money, and five ways it will refuse.
 
-    Live is gated, not wired. Every one of PLAN §2.4's preconditions is evaluated — the typed
-    phrase, the armed database row, the notional cap, the credentials — and then the build still
-    refuses, because live wiring is Phase 8's deliverable and arming it is a human act, never mine.
+    Structurally this is the paper wiring with a different `Mode`, and that is the point: the
+    runner, the risk engines, the ledger and the event log are the *same objects* a soak proved
+    (DESIGN §5). A separate live path would mean the thing that was tested is not the thing that
+    trades. What live adds is subtraction — the ceiling of `control/live.py` tightens every Tier-2
+    limit, and `control/readiness.py` refuses to begin unless alerting, the panel, the data and
+    every stored configuration are actually working.
+
+    `start_equity` is ignored beyond its signature: a real venue's balances are *discovered* by the
+    startup reconciliation. Seeding a live ledger would invent funds and hide the first discrepancy.
+
+    Arming is a human act and is never done here. This function can only ever be reached by
+    someone who has already typed the phrase, armed the database, set a cap, and put live keys in
+    the environment under their own names.
+    """
+    if not broker.is_venue:
+        raise ConfigError(
+            "live mode cannot use the simulated broker: an order that is not sent to a venue is "
+            "not a live order, and a mode that quietly simulates is the mode confusion PLAN §2.4 "
+            "treats as catastrophic. Use --mode paper for simulated fills."
+        )
+    clock = clock or SystemClock()
+    return await _assemble(
+        clock,
+        mode=Mode.LIVE,
+        db_path=db_path,
+        broker_choice=broker,
+        start_equity=start_equity,
+        baskets=baskets,
+        global_policy=global_policy,
+        market_data=market_data or _live_market_data(broker, clock),
+        news_sources=news_sources,
+        panel_id=panel_id,
+        confirmation=confirmation,
+    )
+
+
+def _live_market_data(broker: BrokerChoice, clock: Clock) -> MarketDataProvider | None:
+    """The real exchange's own book. `None` for Alpaca, which `_alpaca_stack` then refuses.
+
+    Refusing there rather than here keeps one message for one defect: there is no equity
+    market-data provider in v1, so an equities basket cannot go live whatever the mode asks for.
+    """
+    if broker is BrokerChoice.ALPACA:
+        return None
+    provider, _ = live_binance_spot(clock, sandbox=False)
+    return provider
+
+
+async def build(mode: Mode, *, confirmation: str | None = None, **kwargs: object) -> Application:
+    """Wire the stack for `mode`. One dispatch, no defaults, nothing that degrades quietly.
+
     A mode that quietly does something other than what was asked is the mode confusion PLAN §2.4
-    treats as catastrophic, so nothing here degrades to simulation.
+    treats as catastrophic, so no builder here falls back to another.
     """
     if mode is Mode.SIM:
         return await build_sim(**kwargs)  # type: ignore[arg-type]
     if mode is Mode.PAPER:
         return await build_paper(**kwargs)  # type: ignore[arg-type]
-    return _refuse_live(confirmation, kwargs)
-
-
-def _refuse_live(confirmation: str | None, kwargs: dict[str, object]) -> Application:
-    """Evaluate every live precondition, then refuse anyway (PLAN Phase 8).
-
-    The preconditions are checked *first* and deliberately: an operator working towards live must
-    find out about a missing cap or an unarmed database now, from the same refusal they will see
-    when the wiring lands, rather than discovering the list one item at a time later.
-    """
-    db_path = kwargs.get("db_path")
-    engine = create_database(db_path if isinstance(db_path, Path) else None)
-    writer = SingleWriter(engine)
-    clock = SystemClock()
-    try:
-        broker = kwargs.get("broker")
-        venue = broker.value if isinstance(broker, BrokerChoice) else BrokerChoice.BINANCE.value
-        assert_live_preconditions(
-            Mode.LIVE,
-            confirmation=confirmation,
-            arming=ArmingStore(engine, writer, clock).load(),
-            credentials=has_credentials(venue, Mode.LIVE),
-        )
-    finally:
-        writer.close()
-    raise ConfigError(
-        "live preconditions are satisfied, and live wiring is still deliberately absent: "
-        "completing it is PLAN Phase 8, delivered with docs/OPERATIONS.md and armed by a human."
-    )
+    return await build_live(confirmation=confirmation, **kwargs)  # type: ignore[arg-type]

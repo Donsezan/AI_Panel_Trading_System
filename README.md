@@ -155,8 +155,26 @@ precision handling. An adapter that diverges fails CI, which is what makes a pap
 of live behaviour. `pytest -m smoke` additionally runs read-only checks against the real test
 venues; it skips without keys and is never part of CI.
 
-Live mode evaluates all four of its preconditions and then still refuses: the wiring is Phase 8's
-deliverable and arming it is a human act.
+## Live
+
+Live is wired and **ships disarmed**. It is the paper wiring with the same objects — a separate
+live path would mean the thing the soak validated is not the thing that trades — plus two
+subtractions: Tier-2 limits clamped to a ceiling that can only tighten, and a readiness gate that
+refuses to start unless alerting is configured, the panel is real and reachable, market data
+arrives complete, and every stored basket builds for this venue.
+
+Reaching it takes four deliberate acts, in four different places: `--mode live`, the typed phrase,
+an armed row in live's own database, and live-only credentials. Any one missing and the process
+refuses, listing all of them.
+
+```powershell
+.venv\Scripts\python.exe -m tradebot risk arm-live --mode live `
+    --max-notional 50 --confirm "I ACCEPT REAL MONEY RISK"
+.venv\Scripts\python.exe -m tradebot risk status --mode live   # state, arming, limits in force
+```
+
+**Read [docs/OPERATIONS.md](docs/OPERATIONS.md) first** — the pre-live checklist, the arming
+procedure, and the incident runbook. Arming is a human act; nothing here does it for you.
 
 ## Layout
 

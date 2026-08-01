@@ -1,8 +1,9 @@
 """Ops alerting: what gets sent to a human, and the seam it is sent through.
 
 PLAN Phase 7 names five triggers — kill switch, basket halt, reconciliation mismatch, repeated
-provider failure, daily summary. Four of them are things that already stopped the system; the
-alert exists because a soak runs for weeks and nobody watches a dashboard at 03:00.
+provider failure, daily summary — and Phase 8 adds the sixth a live account needs: market data
+that stopped being trustworthy. All but the summary are things that already stopped the system;
+the alert exists because a soak runs for weeks and nobody watches a dashboard at 03:00.
 
 An `Alert` is a *fact that was already recorded*, rendered for a human. It carries no instruction
 and nothing acts on it: alerting is downstream of the log, never upstream of a decision, so a
@@ -22,12 +23,15 @@ from typing import Protocol, runtime_checkable
 
 
 class AlertKind(StrEnum):
-    """The five PLAN Phase 7 triggers. Values reach a human, so they read as English."""
+    """What a human is told about. Values reach a person, so they read as English."""
 
     KILL_SWITCH = "kill_switch"
     BASKET_HALTED = "basket_halted"
     RECON_MISMATCH = "recon_mismatch"
     PROVIDER_FAILURE = "provider_failure"
+    #: A run of cycles that refused their own market data. Live additionally refuses to *start*
+    #: on holed or short data (`control/readiness.py`); this is the same fault appearing later.
+    DATA_STALE = "data_stale"
     DAILY_SUMMARY = "daily_summary"
 
     @property

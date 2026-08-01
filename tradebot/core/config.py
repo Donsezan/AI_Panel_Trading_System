@@ -85,6 +85,40 @@ class RiskPolicy(DomainModel):
     #: other rule (DESIGN §12).
     long_only: bool = True
 
+    #: Instrument keys an operator has excluded from *automated* trading. Enforced by
+    #: `QuarantineRule`. A quarantined instrument keeps its market data, its indicators and its
+    #: place in the panel's deliberation — only the resulting order is refused, and the position
+    #: it already holds stays closable by hand
+    #: ([ADR 0022](../../docs/adr/0022-quarantine-is-a-tier-1-veto-rule.md)).
+    quarantined_instruments: tuple[str, ...] = ()
+
+    #: Excludes every instrument in the basket at once, and additionally skips the panel: there
+    #: is nothing to spend a model call on when every outcome is already vetoed downstream.
+    quarantined: bool = False
+
+    def excludes(self, instrument_key: str) -> bool:
+        """Whether an operator has quarantined this instrument, or the basket holding it."""
+        return self.quarantined or instrument_key in self.quarantined_instruments
+
+    def with_quarantine(self, instrument_key: str = "", *, excluded: bool) -> RiskPolicy:
+        """This policy with one instrument — or, for an empty key, the whole basket — set.
+
+        Sorted and deduplicated, so publishing the same state twice yields the same document and
+        a version diff shows only what an operator actually changed.
+        """
+        if not instrument_key:
+            return self.model_copy(update={"quarantined": excluded})
+        keys = set(self.quarantined_instruments)
+        updated = keys | {instrument_key} if excluded else keys - {instrument_key}
+        return self.model_copy(update={"quarantined_instruments": tuple(sorted(updated))})
+
+    @property
+    def quarantine(self) -> str:
+        """What is excluded, as one phrase for a CLI row or a log line. Empty means nothing is."""
+        if self.quarantined:
+            return "whole basket"
+        return ", ".join(self.quarantined_instruments)
+
     @model_validator(mode="after")
     def _check_ranges(self) -> RiskPolicy:
         for name in (
@@ -533,8 +567,25 @@ class Basket(DomainModel):
             raise ValueError("an instrument may appear in a basket only once")
         if self.ttl_buffer_seconds >= self.cycle_interval_seconds:
             raise ValueError("ttl_buffer_seconds must leave a positive order lifetime")
+        self._check_quarantine()
         self._check_challenger()
         return self
+
+    def _check_quarantine(self) -> None:
+        """A quarantine may only name an instrument this basket holds.
+
+        A key matching nothing excludes nothing, and the operator who typed it would believe an
+        instrument is out of service while the panel keeps trading it — which is exactly the
+        "a limit an operator believes is in force but is not" failure this module refuses to have.
+        """
+        held = {instrument.key for instrument in self.instruments}
+        unknown = sorted(set(self.risk_policy.quarantined_instruments) - held)
+        if unknown:
+            raise ValueError(
+                f"quarantined_instruments names {', '.join(unknown)}, which basket "
+                f"{self.basket_id!r} does not hold, so nothing would be excluded. "
+                f"Held: {', '.join(sorted(held))}"
+            )
 
     def _check_challenger(self) -> None:
         """Two rules that make a shadow comparison mean something, checked before it can run.

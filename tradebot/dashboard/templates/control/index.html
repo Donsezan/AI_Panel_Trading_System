@@ -3,6 +3,26 @@
 {% block title %}Control{% endblock %}
 {% block heading %}Control{% endblock %}
 
+{# One form per scope, so the button's meaning is its current state reversed and nothing on the
+   page can submit a quarantine the operator did not click. An empty key is the whole basket —
+   the same convention `RiskPolicy.with_quarantine` uses. #}
+{% macro quarantine_toggle(basket_id, instrument_key, on) %}
+  <form method="post" action="/control/baskets/{{ basket_id }}/quarantine" class="inline-form">
+    <input type="hidden" name="instrument_key" value="{{ instrument_key }}">
+    <input type="hidden" name="excluded" value="{{ 'false' if on else 'true' }}">
+    <button type="submit">{{ "release" if on else "quarantine" }}</button>
+  </form>
+{% endmacro %}
+
+{% macro quarantine_state(excluded, inherited) %}
+  {% if excluded %}
+    {{ m.pill("quarantined") }}
+    {% if inherited %}<span class="muted small">via the basket</span>{% endif %}
+  {% else %}
+    <span class="muted">permitted</span>
+  {% endif %}
+{% endmacro %}
+
 {% block content %}
 {% if error %}<div class="banner danger"><strong>Not done.</strong> {{ error }}</div>{% endif %}
 
@@ -126,6 +146,59 @@
     </tr>
   {% else %}
     {{ m.empty(5, "No baskets configured.") }}
+  {% endfor %}
+  </tbody>
+</table>
+
+<h2>Quarantine</h2>
+<p class="muted small">
+  Your judgement that something should not be traded <em>automatically</em> for now. The cycle
+  keeps running — market data, indicators and the panel's view are untouched — and only the
+  resulting order is refused, so you keep the evidence you need to put it back. A whole-basket
+  quarantine also skips the panel, since there is nothing to spend a model call on. This is
+  neither a <strong>pause</strong> (which stops the cycle) nor a <strong>halt</strong> (which is
+  the system's own doing): it is versioned configuration, and releasing it is one click.
+</p>
+
+{% if pending %}
+  <div class="banner warn">
+    <strong>{{ pending.scope }} holds a position.</strong>
+    Quarantining stops the bot acting on {{ pending.held | join(", ") }} at all — no entry, and
+    no exit either. The position stays exactly where it is until you close it by hand below, and
+    doing nothing with a position can compound a loss as readily as trading it can cause one.
+    <form method="post" action="/control/baskets/{{ pending.basket_id }}/quarantine" class="inline-form">
+      <input type="hidden" name="instrument_key" value="{{ pending.instrument_key }}">
+      <input type="hidden" name="excluded" value="true">
+      <input type="hidden" name="confirm" value="{{ quarantine_confirm }}">
+      <button type="submit">Quarantine anyway</button>
+    </form>
+  </div>
+{% endif %}
+
+<table>
+  <thead><tr><th>Scope</th><th>Automated trading</th><th>Qty held</th><th></th></tr></thead>
+  <tbody>
+  {% for record in baskets %}
+    {% set bid = record.ref.config_id %}
+    {% set policy = record.document.risk_policy %}
+    <tr>
+      <td><code>{{ bid }}</code> <span class="muted small">whole basket</span></td>
+      <td>{{ quarantine_state(policy.quarantined, false) }}</td>
+      <td class="muted">—</td>
+      <td>{{ quarantine_toggle(bid, "", policy.quarantined) }}</td>
+    </tr>
+    {% for instrument in record.document.instruments %}
+      {% set key = instrument.key %}
+      {% set named = key in policy.quarantined_instruments %}
+      <tr>
+        <td class="indent"><code>{{ key }}</code></td>
+        <td>{{ quarantine_state(policy.excludes(key), policy.quarantined and not named) }}</td>
+        <td class="num">{% if key in positions %}{{ positions[key].qty | quantity }}{% else %}—{% endif %}</td>
+        <td>{{ quarantine_toggle(bid, key, named) }}</td>
+      </tr>
+    {% endfor %}
+  {% else %}
+    {{ m.empty(4, "No baskets configured.") }}
   {% endfor %}
   </tbody>
 </table>

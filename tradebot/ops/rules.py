@@ -1,8 +1,13 @@
-"""The five PLAN Phase 7 alert triggers, as a dispatch table over the log.
+"""The alert triggers, as a dispatch table over the log.
 
-Four are event-driven: a kill switch trip, a basket halt, an unexplained reconciliation, and a
-run of degraded panels. The fifth — the daily summary — is time-driven and lives in the
-dispatcher, because it is about a day passing rather than about something happening.
+Five are event-driven: a kill switch trip, a basket halt, an unexplained reconciliation, a run of
+degraded panels, and a run of cycles that could not trust their own market data. The last — the
+daily summary — is time-driven and lives in the dispatcher, because it is about a day passing
+rather than about something happening.
+
+The two *runs* share one rule and one mechanism (`OUTCOME_STREAKS`). They are the same operational
+fact — cycle after cycle deciding nothing — differing only in which dependency stopped working, so
+adding the third will be a row in a table rather than another counter to keep in step.
 
 They are deliberately the **same vocabulary the promotion gates count** (`validation/evidence.py`).
 Four of these five alerts correspond exactly to an `IncidentKind`, so "what needed a human" has one
@@ -47,6 +52,16 @@ class RuleState:
 
     degraded_streak: int = 0
     streak_limit: int = DEFAULT_DEGRADED_STREAK
+    stale_streak: int = 0
+
+    def streak(self, field: str) -> int:
+        return int(getattr(self, field))
+
+    def advance(self, field: str, *, hit: bool) -> int:
+        """Extend this streak, or reset it. Returns the new count."""
+        count = self.streak(field) + 1 if hit else 0
+        setattr(self, field, count)
+        return count
 
 
 def kill_switch(event: Event, _state: RuleState) -> Alert | None:
@@ -110,36 +125,72 @@ def recon_mismatch(event: Event, _state: RuleState) -> Alert | None:
     )
 
 
-def provider_failure(event: Event, state: RuleState) -> Alert | None:
-    """A run of cycles whose panel could not reach a view.
+@dataclass(frozen=True, slots=True)
+class StreakRule:
+    """An outcome that means nothing traded, and how many in a row before a human is told."""
 
-    Fires **once per streak**, at the moment the limit is reached, because a panel that stays
-    down would otherwise alert on every cycle for hours. Any cycle with a *readable* outcome that
-    is not degraded clears the streak, so the next outage alerts again.
+    #: The `RuleState` field this streak is counted in, and the cursor column it survives in.
+    field: str
+    kind: AlertKind
+    title: str
+    body: str
 
-    An outcome this build cannot read leaves the streak exactly as it was. It is not evidence
-    that the providers recovered, and treating it as such would silence the alert on the strength
-    of a payload nobody could parse.
-    """
-    outcome = _outcome(event)
-    if outcome is None:
-        return None
-    if outcome is not CycleOutcome.PANEL_DEGRADED:
-        state.degraded_streak = 0
-        return None
-    state.degraded_streak += 1
-    if state.degraded_streak != state.streak_limit:
-        return None
-    return Alert(
+
+#: Outcomes worth counting a run of. Both mean the same thing operationally — cycle after cycle
+#: deciding nothing — and differ only in which dependency stopped working.
+OUTCOME_STREAKS: dict[CycleOutcome, StreakRule] = {
+    CycleOutcome.PANEL_DEGRADED: StreakRule(
+        field="degraded_streak",
         kind=AlertKind.PROVIDER_FAILURE,
-        at=event.ts,
-        scope=event.basket_id or "",
-        title=f"Panel degraded for {state.degraded_streak} cycles running",
+        title="Panel degraded for {count} cycles running",
         body=(
             "Seats are abstaining faster than the panel's threshold allows, so every one of "
             "those cycles resolved to WAIT and traded nothing. Check provider availability and "
             "each seat's fallback chain — a free model slot that disappeared is the usual cause."
         ),
+    ),
+    CycleOutcome.DATA_STALE: StreakRule(
+        field="stale_streak",
+        kind=AlertKind.DATA_STALE,
+        title="Market data stale or holed for {count} cycles running",
+        body=(
+            "The context builder refused its own data, so those cycles never reached the panel "
+            "and nothing was decided. Positions already open are still protected by their "
+            "venue-held legs, but nothing will be entered *or exited* until data flows again. "
+            "Check the venue feed, the rate-limit budget, and the system clock."
+        ),
+    ),
+}
+
+
+def cycle_streak(event: Event, state: RuleState) -> Alert | None:
+    """A run of cycles that decided nothing, for one of the reasons worth counting.
+
+    Fires **once per streak**, at the moment the limit is reached, because a dependency that
+    stays down would otherwise alert on every cycle for hours. Any cycle with a *readable*
+    outcome clears every streak it is not, so the next outage alerts again.
+
+    An outcome this build cannot read leaves the streaks exactly as they were. It is not evidence
+    that anything recovered, and treating it as such would silence the alert on the strength of a
+    payload nobody could parse.
+    """
+    outcome = _outcome(event)
+    if outcome is None:
+        return None
+    fired: tuple[StreakRule, int] | None = None
+    for candidate, rule in OUTCOME_STREAKS.items():
+        count = state.advance(rule.field, hit=outcome is candidate)
+        if count == state.streak_limit:
+            fired = (rule, count)
+    if fired is None:
+        return None
+    rule, count = fired
+    return Alert(
+        kind=rule.kind,
+        at=event.ts,
+        scope=event.basket_id or "",
+        title=rule.title.format(count=count),
+        body=rule.body,
     )
 
 
@@ -155,7 +206,7 @@ RULES: dict[EventType, Callable[[Event, RuleState], Alert | None]] = {
     EventType.KILL_SWITCH_CHANGED: kill_switch,
     EventType.BASKET_STATUS_CHANGED: basket_halted,
     EventType.RECONCILED: recon_mismatch,
-    EventType.CYCLE_COMPLETED: provider_failure,
+    EventType.CYCLE_COMPLETED: cycle_streak,
 }
 
 

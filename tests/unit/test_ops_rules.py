@@ -128,6 +128,61 @@ class TestProviderFailure:
         assert alert is not None
 
 
+class TestStaleData:
+    """Live refuses to *start* on holed data; this is that fault appearing mid-run (ADR 0020)."""
+
+    def _starve(self, clock: ManualClock, state: RuleState, times: int) -> list[object]:
+        events = events_for(clock)
+        return [
+            evaluate(events.cycle_completed(CycleOutcome.DATA_STALE, Decimal(0)), state)
+            for _ in range(times)
+        ]
+
+    def test_one_stale_cycle_is_not_an_outage(self, clock: ManualClock) -> None:
+        assert self._starve(clock, RuleState(), 2) == [None, None]
+
+    def test_the_streak_limit_alerts_exactly_once(self, clock: ManualClock) -> None:
+        alerts = self._starve(clock, RuleState(), 5)
+
+        fired = [alert for alert in alerts if alert is not None]
+        assert len(fired) == 1
+        assert fired[0].kind is AlertKind.DATA_STALE  # type: ignore[attr-defined]
+
+    def test_the_body_says_positions_can_be_neither_entered_nor_exited(
+        self, clock: ManualClock
+    ) -> None:
+        """That is what decides whether the operator gets out of bed."""
+        alert = self._starve(clock, RuleState(), 3)[-1]
+
+        assert alert is not None
+        assert "exited" in alert.body  # type: ignore[attr-defined]
+
+    def test_a_healthy_cycle_clears_it(self, clock: ManualClock) -> None:
+        state = RuleState()
+        self._starve(clock, state, 2)
+
+        evaluate(events_for(clock).cycle_completed(CycleOutcome.NO_ACTION, Decimal(0)), state)
+
+        assert state.stale_streak == 0
+
+    def test_the_two_streaks_do_not_feed_each_other(self, clock: ManualClock) -> None:
+        """Alternating faults are two intermittent problems, not one sustained outage."""
+        state = RuleState()
+        events = events_for(clock)
+        alerts = [
+            evaluate(events.cycle_completed(outcome, Decimal(0)), state)
+            for outcome in (
+                CycleOutcome.DATA_STALE,
+                CycleOutcome.PANEL_DEGRADED,
+                CycleOutcome.DATA_STALE,
+                CycleOutcome.PANEL_DEGRADED,
+            )
+        ]
+
+        assert alerts == [None, None, None, None]
+        assert (state.stale_streak, state.degraded_streak) == (0, 1)
+
+
 class TestDefensiveReading:
     def test_an_unreadable_outcome_leaves_the_streak_exactly_as_it_was(
         self, clock: ManualClock

@@ -81,6 +81,19 @@
   </div>
   {{ f.flag("risk_policy.long_only", "Long only (SELL is reduce-only)", risk.get("long_only"), hint="v1 cannot be turned off: shorting ripples through every other rule") }}
 
+  <h3>Quarantine</h3>
+  <p class="muted small">
+    Excludes a scope from <em>automated</em> trading. The cycle keeps running — market data,
+    indicators and the panel's view are untouched — and only the order is refused, so the evidence
+    for putting it back keeps arriving. A held position is left exactly where it is; you can still
+    close it by hand from Control. Toggle either of these from Control too, without opening this
+    form.
+  </p>
+  {{ f.flag("risk_policy.quarantined", "Quarantine the whole basket", risk.get("quarantined"), hint="also skips the panel: nothing to spend a model call on when every order is vetoed") }}
+  <div class="grid">
+    {{ f.multi("risk_policy.quarantined_instruments", "Quarantined instruments", risk.get("quarantined_instruments") or [], instrument_keys, hint="only instruments this basket holds; a key it does not hold excludes nothing and is refused") }}
+  </div>
+
   <h2>Panel</h2>
   <p class="muted small">The panel that trades. Its decisions go through Tier-1, Tier-2 and execution.</p>
   {{ panel_editor.editor("panel", draft.get("panel") or {}, providers, errors, draft_action, protocols, provider_kinds, evidence_slices) }}
