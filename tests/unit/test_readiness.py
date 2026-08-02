@@ -11,7 +11,7 @@ together — an operator fixing them one refusal per start is an operator who st
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import timedelta
 from decimal import Decimal
 from typing import Any
@@ -168,6 +168,11 @@ def live_basket(instrument: Instrument) -> Basket:
     return Basket(basket_id="live", name="live basket", instruments=(instrument,), panel=REAL_PANEL)
 
 
+#: What `REAL_PANEL` needs to be reachable. Injected rather than read from the developer's own
+#: machine, so these gates are tested against a stated environment and not an ambient one.
+KEYED = {"OPENROUTER_API_KEY": "sk-configured"}
+
+
 async def readiness(
     configs: ConfigStore,
     basket: Basket,
@@ -179,6 +184,7 @@ async def readiness(
     probe: FakeProbe | None = None,
     sinks: Sequence[FakeSink] | None = None,
     venue: str = VENUE,
+    environ: Mapping[str, str] | None = None,
 ) -> LiveReadiness:
     await configs.put(basket.basket_id, basket, actor="test")
     return LiveReadiness(
@@ -190,6 +196,7 @@ async def readiness(
         venue=venue,
         alert_sinks=(FakeSink(),) if sinks is None else sinks,
         panel_probe=probe or FakeProbe(),
+        environ=KEYED if environ is None else environ,
     )
 
 
@@ -277,6 +284,45 @@ class TestPanel:
         basket = live_basket.model_copy(update={"panel": STUB_BACKED_PANEL})
         gates = await readiness(
             configs, basket, clock, ledger, market_data=market(clock, instrument), probe=probe
+        )
+        await gates.run()
+        assert probe.calls == []
+
+    async def test_a_provider_with_no_key_refuses(
+        self,
+        configs: ConfigStore,
+        live_basket: Basket,
+        clock: ManualClock,
+        ledger: Ledger,
+        instrument: Instrument,
+    ) -> None:
+        """Sim and paper degrade to `WAIT` on this; live is the mode where a panel short a voice
+        is deciding about real positions, so it refuses to begin (ADR 0023)."""
+        gates = await readiness(
+            configs, live_basket, clock, ledger, market_data=market(clock, instrument), environ={}
+        )
+        failures = await gates.run()
+        assert any("OPENROUTER_API_KEY" in failure for failure in failures)
+
+    async def test_a_provider_with_no_key_is_named_before_it_is_probed(
+        self,
+        configs: ConfigStore,
+        live_basket: Basket,
+        clock: ManualClock,
+        ledger: Ledger,
+        instrument: Instrument,
+    ) -> None:
+        """Probing an endpoint already known to have no key spends latency to report the same
+        defect as a 401, three steps further from its cause."""
+        probe = FakeProbe()
+        gates = await readiness(
+            configs,
+            live_basket,
+            clock,
+            ledger,
+            market_data=market(clock, instrument),
+            probe=probe,
+            environ={},
         )
         await gates.run()
         assert probe.calls == []

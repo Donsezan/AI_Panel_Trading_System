@@ -70,6 +70,112 @@
   {% endif %}
 {% endif %}
 
+<h2>Supervision</h2>
+<p class="muted small">
+  Whether this process is cycling baskets. <strong>Stop</strong> pauses exactly that and nothing
+  else: it cancels no order at the venue and needs no phrase — that is the kill switch below, and
+  the two are never the same button. While stopped, nothing polls open orders, so no order may be
+  placed either.
+</p>
+<section class="figures">
+  <div class="figure">
+    <span class="label">Trading</span>
+    <span class="value">{{ m.pill("running" if trading else "stopped") }}</span>
+  </div>
+  <div class="figure">
+    <span class="label">Baskets in service</span>
+    <span class="value">{{ baskets | length }}</span>
+  </div>
+</section>
+
+{% if not trading and working %}
+  <div class="banner warn">
+    <strong>{{ working | length }} order(s) still working at the venue, and nothing is polling
+    them.</strong>
+    They stay exactly as they are — a stop cancels nothing — but no fill will be booked and no TTL
+    enforced until supervision starts again. Use the kill switch if they must be cancelled.
+    <table>
+      <thead><tr><th>Order</th><th>Instrument</th><th>Side</th><th>Qty</th><th>State</th></tr></thead>
+      <tbody>
+      {% for order in working %}
+        <tr>
+          <td><code>{{ order.client_order_id }}</code></td>
+          <td><code>{{ order.instrument_key }}</code></td>
+          <td>{{ order.side }}</td>
+          <td class="num">{{ order.qty | quantity }}</td>
+          <td>{{ m.pill(order.state) }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+{% endif %}
+
+{% if trading %}
+  <form method="post" action="/control/stop" class="inline-form">
+    <button type="submit">Stop trading</button>
+  </form>
+{% else %}
+  {% if blockers %}
+    <div class="banner warn">
+      <strong>Before trading can start:</strong>
+      <ul>{% for blocker in blockers %}<li>{{ blocker }}</li>{% endfor %}</ul>
+    </div>
+  {% endif %}
+  <form method="post" action="/control/start" class="inline-form">
+    {% if mode == "live" %}
+      <label for="start-confirm">Type <code>{{ live_phrase }}</code></label>
+      <input id="start-confirm" name="confirm" type="text" autocomplete="off" required>
+    {% endif %}
+    <button type="submit">Start trading</button>
+  </form>
+{% endif %}
+
+{% if mode == "live" %}
+<h2>Live arming</h2>
+<p class="muted small">
+  Live's <em>permission</em>, and only permission — arming starts nothing, and starting demands the
+  phrase again. Disarming also stops supervision, so a basket can never keep cycling against a cap
+  that has just been revoked. Permission is not readiness: the alerting, panel, data and
+  configuration checks ran once at startup and are not re-run from here.
+</p>
+<section class="figures">
+  <div class="figure">
+    <span class="label">Arming</span>
+    <span class="value">{{ m.pill("armed" if arming.armed else "not armed") }}</span>
+  </div>
+  <div class="figure">
+    <span class="label">Max notional per order</span>
+    <span class="value">{{ arming.max_live_notional | money }}</span>
+  </div>
+  <div class="figure">
+    <span class="label">By</span>
+    <span class="value">{{ arming.armed_by or absent }}</span>
+  </div>
+</section>
+{% if arming.note %}<p class="muted">{{ arming.note }}</p>{% endif %}
+
+{% if arming.armed %}
+  <form method="post" action="/control/live/disarm" class="inline-form">
+    <input name="reason" type="text" placeholder="why (recorded on the row)">
+    <button type="submit">Disarm live</button>
+  </form>
+{% else %}
+  <form method="post" action="/control/live/arm" class="danger-zone">
+    <p class="muted small">
+      The cap is the largest notional one live order may carry, in {{ quote_currency }}. It is a
+      hard Tier-2 limit, applied on top of a ceiling no dashboard edit can raise.
+    </p>
+    <label for="arm-notional">Max notional per order</label>
+    <input id="arm-notional" name="max_notional" type="text" inputmode="decimal" required>
+    <label for="arm-confirm">Type <code>{{ live_phrase }}</code></label>
+    <input id="arm-confirm" name="confirm" type="text" autocomplete="off" required>
+    <input name="note" type="text" placeholder="why (recorded on the row)">
+    <button type="submit" class="danger-button">Arm live trading</button>
+  </form>
+{% endif %}
+{% endif %}
+
 <h2>Kill switch</h2>
 <section class="figures">
   <div class="figure">
@@ -211,7 +317,8 @@
 </p>
 {% if observe_only %}
   <p class="empty warn">
-    Serving in observe-only mode: nothing is polling open orders, so no order may be placed.
+    Supervision is stopped: nothing is polling open orders, so no order may be placed. Start it
+    above first.
   </p>
 {% endif %}
 <table>

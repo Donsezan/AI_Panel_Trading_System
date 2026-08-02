@@ -1,6 +1,6 @@
 # ADR 0021 — Live arming and supervision move to a runtime gate, controllable from the GUI
 
-**Status:** proposed (2026-08-01) · **Phase:** 9 (planned) · **Depends on:** [ADR 0012](0012-live-is-four-independent-preconditions.md), [ADR 0020](0020-live-is-the-paper-wiring-minus-headroom.md)
+**Status:** accepted (2026-08-02) · **Phase:** 9 · **Depends on:** [ADR 0012](0012-live-is-four-independent-preconditions.md), [ADR 0020](0020-live-is-the-paper-wiring-minus-headroom.md)
 
 ## Context
 
@@ -103,3 +103,21 @@ independent statuses rather than only in the log.
   plainly so it is never discovered mid-incident.
 - Nothing about *what* is required to trade live changes — all four facts of ADR 0012 still have to
   hold, together, exactly as before. Only *when* they are checked moves.
+
+## As built (2026-08-02)
+
+Three refinements the implementation forced, none of them weakening a precondition:
+
+- **Credentials could not move.** A venue transport cannot be constructed without a key, so
+  `build_live` still refuses one that is missing. This is not a gap: keys are environment-only
+  (PLAN §3.2), so there is nothing a dashboard could have done about it anyway. The other three
+  facts moved to the start, which is what the feature needed.
+- **The confirmation phrase left `build()` altogether**, rather than being carried unused. A
+  parameter that once gated something and now gates nothing is precisely the argument a later
+  reader assumes is still a control.
+- **`Application.policy` became computed, and the `live_ceiling` clamp event moved to
+  `record_limits()` at each start.** Once the cap can be armed mid-process, a policy held from boot
+  is a number the CLI and the dashboard would report while the runners enforced another — and the
+  clamp event, which exists so "what were the limits at 04:12" is answerable from the log alone,
+  would name limits that had since changed. One function, `app.enforced_policy`, is now the single
+  answer for the wiring, every runner rebuild, `risk status` and the dashboard.

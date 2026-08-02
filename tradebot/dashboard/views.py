@@ -23,6 +23,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 
 from tradebot.app import Application
+from tradebot.control.supervision import SupervisionController
 from tradebot.core.enums import Mode
 from tradebot.core.money import to_decimal
 from tradebot.dashboard.auth import Session
@@ -50,9 +51,24 @@ class DashboardState:
     queries: Queries
     templates: Jinja2Templates
     session: Session
-    #: Serving without the supervisor: the system is inspectable but nothing cycles, so anything
-    #: that would create an order is refused rather than left with nobody to monitor it.
-    observe_only: bool
+    #: Owns the supervisor's task. Asked rather than remembered, so a page never reports a
+    #: boot-time decision that a Start or a Stop has since changed (ADR 0021).
+    controller: SupervisionController
+
+    @property
+    def trading(self) -> bool:
+        """Whether baskets are cycling right now."""
+        return self.controller.running
+
+    @property
+    def observe_only(self) -> bool:
+        """Nothing is cycling, so nothing is polling open orders.
+
+        Which is why nothing may *create* one: an order placed now would rest at the venue
+        unmonitored until supervision starts again. The operator's way out of a position is to
+        start supervision first, not to place an order nobody is watching.
+        """
+        return not self.controller.running
 
 
 def state_of(request: Request) -> DashboardState:
@@ -75,17 +91,21 @@ def build_templates(application: Application) -> Jinja2Templates:
 def render(request: Request, template: str, **context: Any) -> HTMLResponse:
     """Render a page with the context every page needs. The only place templates are called.
 
-    The kill switch and the halted baskets are on *every* page deliberately: an operator reading
-    a cycle history must not have to navigate elsewhere to discover that nothing is trading.
+    The kill switch, the halted baskets and an unreachable panel are on *every* page deliberately:
+    an operator reading a cycle history must not have to navigate elsewhere to discover that
+    nothing is trading, or that every cycle in front of them decided nothing because a seat had no
+    key (ADR 0023).
     """
     state = state_of(request)
     return state.templates.TemplateResponse(
         request,
         template,
         {
+            "trading": state.trading,
             "observe_only": state.observe_only,
             "risk_state": state.application.states.load(),
             "halted": state.application.states.halted_baskets(),
+            "panel_warnings": state.application.panel_warnings,
             **context,
         },
     )

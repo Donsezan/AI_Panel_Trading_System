@@ -1,4 +1,16 @@
-"""Control: pause/resume, un-halt, manual close, and the kill switch (DESIGN §6.10 job 3).
+"""Control: start/stop, arming, pause/resume, un-halt, manual close, and the kill switch.
+
+DESIGN §6.10 job 3, plus Phase 9's operator control. Four mechanisms live on this page and the UI
+must not conflate any of them:
+
+* **Start / Stop** is whether this process cycles baskets at all. Stop is the GUI equivalent of
+  `--observe`: it cancels nothing at the venue and needs no phrase. It does end the only thing
+  polling open orders, so the page says so, listing whatever is still working (ADR 0021).
+* **Arm / Disarm** is live's *permission*, and only live's — three of the four facts of ADR 0012
+  live here, with the fourth, the phrase, retyped at both arming and starting and never cached.
+  Disarming also stops supervision, deliberately diverging from the CLI's `disarm-live`, which has
+  no running process to reach into: a basket left cycling against a cap that was just revoked is
+  the one silent state this must never produce.
 
 The distinction this module exists to keep visible is **pause versus halt**, which the UI must
 not conflate:
@@ -41,11 +53,13 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from starlette.datastructures import FormData
 from starlette.responses import Response
 
+from tradebot.control.arming import LIVE_CONFIRMATION_PHRASE, assert_live_confirmation
 from tradebot.control.manual_close import CloseOutcome
 from tradebot.core.config import Basket
 from tradebot.core.enums import BasketStatus, ConfigKind
-from tradebot.core.errors import TradebotError
+from tradebot.core.errors import ModeConfusionError, TradebotError
 from tradebot.core.logging import get_logger
+from tradebot.core.money import to_decimal
 from tradebot.dashboard.views import ACTOR, render, state_of
 from tradebot.risk.state import REARM_PHRASE, assert_rearm_phrase
 
@@ -67,6 +81,73 @@ QUARANTINE_CONFIRM = "quarantine-anyway"
 @router.get("", response_class=HTMLResponse)
 async def index(request: Request) -> HTMLResponse:
     return _page(request)
+
+
+@router.post("/start")
+async def start(request: Request) -> Response:
+    """Begin cycling baskets. In live, every precondition is re-checked at this exact moment."""
+    form = await request.form()
+    unmet = await state_of(request).controller.start(confirmation=_field(form, "confirm"))
+    if unmet:
+        return _page(request, error="nothing was started; missing: " + "; ".join(unmet))
+    return RedirectResponse("/control", status_code=303)
+
+
+@router.post("/stop")
+async def stop(request: Request) -> Response:
+    """Pause supervision. Never refused — an operator reaches for this during an incident."""
+    await state_of(request).controller.stop()
+    return RedirectResponse("/control", status_code=303)
+
+
+@router.post("/live/arm")
+async def arm_live(request: Request) -> Response:
+    """Record that a human armed live trading, with an explicit per-order cap (ADR 0012).
+
+    Permission only: arming does not start anything, and the phrase is demanded again by Start.
+    """
+    form = await request.form()
+    application = state_of(request).application
+    try:
+        _assert_live_mode(request)
+        assert_live_confirmation(_field(form, "confirm"))
+        arming = await application.arming.arm(
+            actor=ACTOR,
+            max_live_notional=to_decimal(_field(form, "max_notional")),
+            note=_field(form, "note"),
+        )
+    except TradebotError as exc:
+        return _page(request, error=str(exc))
+    logger.warning(
+        "LIVE TRADING ARMED from the dashboard",
+        extra={"max_live_notional": str(arming.max_live_notional), "note": arming.note},
+    )
+    return RedirectResponse("/control", status_code=303)
+
+
+@router.post("/live/disarm")
+async def disarm_live(request: Request) -> Response:
+    """Withdraw live permission — and stop supervision, which the CLI cannot do (ADR 0021)."""
+    form = await request.form()
+    state = state_of(request)
+    try:
+        _assert_live_mode(request)
+    except TradebotError as exc:
+        return _page(request, error=str(exc))
+    reason = _field(form, "reason") or "disarmed from the dashboard"
+    await state.application.arming.disarm(actor=ACTOR, reason=reason)
+    await state.controller.stop()
+    logger.warning("live trading disarmed from the dashboard", extra={"reason": reason})
+    return RedirectResponse("/control", status_code=303)
+
+
+def _assert_live_mode(request: Request) -> None:
+    """Arming is per-database, and only the live one has anything to arm (ADR 0012)."""
+    mode = state_of(request).application.mode
+    if not mode.is_live:
+        raise ModeConfusionError(
+            f"live arming applies to the live database only; this process is in {mode.value} mode"
+        )
 
 
 @router.post("/baskets/{basket_id}/status")
@@ -211,8 +292,8 @@ async def close_position(request: Request) -> Response:
         return _page(
             request,
             error=(
-                "this process is serving in observe-only mode, so nothing is polling open "
-                "orders; an order placed now would rest at the venue unmonitored"
+                "supervision is stopped, so nothing is polling open orders; an order placed now "
+                "would rest at the venue unmonitored. Start supervision above, then close"
             ),
         )
     form = await request.form()
@@ -245,8 +326,16 @@ def _page(
         error=error,
         outcome=outcome,
         pending=pending,
+        arming=application.arming.load(),
+        # Shown whether or not they are met, so the operator reads the whole list rather than
+        # discovering it one refused Start at a time. The phrase is always among them: it is
+        # typed into the form below, never held anywhere (ADR 0021).
+        blockers=state.controller.blockers(),
+        # Left resting by a Stop, and polled by nothing until supervision starts again.
+        working=state.queries.open_orders() if not state.trading else (),
         kill_phrase=KILL_PHRASE,
         rearm_phrase=REARM_PHRASE,
+        live_phrase=LIVE_CONFIRMATION_PHRASE,
         quarantine_confirm=QUARANTINE_CONFIRM,
         statuses=[BasketStatus.ACTIVE.value, BasketStatus.PAUSED.value],
     )

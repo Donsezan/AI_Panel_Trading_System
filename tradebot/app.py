@@ -12,14 +12,15 @@ Mode safety (PLAN §2.4) is enforced at construction:
   paper run (`venues/credentials.py`);
 * every venue transport asserts its resolved host against the mode before the first call;
 * live additionally requires a typed confirmation phrase, an armed database row, a positive
-  notional cap, and credentials — enumerated in `control/arming.py`. Any one missing and the
-  process refuses to start.
+  notional cap, and credentials — enumerated in `control/arming.py` and evaluated by
+  `control/supervision.py` at the moment supervision is asked to start (ADR 0021). Any one missing
+  and nothing cycles.
 
-Live is wired (PLAN Phase 8) and ships **disarmed**: `build_live` is reachable only by someone who
-has typed the phrase, armed this database, set a cap, and put live keys in the environment under
-their own names. It is the paper wiring with the same objects and two subtractions — Tier-2 limits
-clamped to `control/live.py`'s ceiling, and `control/readiness.py` refusing to start unless
-alerting, the panel, the market data and every stored configuration are actually working. See
+Live is wired (PLAN Phase 8) and ships **disarmed**. Wiring it produces a system that can be
+*looked at*; only a stop→start transition satisfying all four facts makes it trade. It is the paper
+wiring with the same objects and two subtractions — Tier-2 limits clamped to `control/live.py`'s
+ceiling, and `control/readiness.py` refusing to start unless alerting, the panel, the market data
+and every stored configuration are actually working. See
 [docs/OPERATIONS.md](../docs/OPERATIONS.md) for the checklist, the arming procedure, and the
 incident runbook.
 
@@ -46,11 +47,7 @@ from pathlib import Path
 import httpx
 from sqlalchemy import Engine
 
-from tradebot.control.arming import (
-    LIVE_CONFIRMATION_PHRASE,
-    ArmingStore,
-    assert_live_preconditions,
-)
+from tradebot.control.arming import ArmingStore, LivePermission, live_permission
 from tradebot.control.basket_runner import BasketRunner
 from tradebot.control.config_store import SINGLETON_ID, ConfigRecord, ConfigStore
 from tradebot.control.context_builder import ContextBuilder
@@ -80,7 +77,7 @@ from tradebot.core.money import ZERO
 from tradebot.decision.engine import DecisionEngine
 from tradebot.decision.presets import PANELS, STUB_PANEL
 from tradebot.decision.probe import PanelProbeResult, probe_panel
-from tradebot.decision.providers.registry import ProviderPool, build_providers
+from tradebot.decision.providers.registry import ProviderPool, build_providers, reach_of
 from tradebot.decision.seat import SeatRunner
 from tradebot.decision.shadow import ShadowEvaluator
 from tradebot.execution.brokers.alpaca import AlpacaAnnouncements, AlpacaBroker, AlpacaCalendar
@@ -130,11 +127,15 @@ from tradebot.venues.credentials import credentials, has_credentials
 
 logger = get_logger(__name__)
 
-__all__ = ["LIVE_CONFIRMATION_PHRASE", "Application", "BrokerChoice", "build", "database_path"]
+__all__ = ["Application", "BrokerChoice", "build", "database_path"]
 
 #: Who the composition root records as the author of the configuration it publishes. Distinct
 #: from `cli` and from a dashboard user, so the audit trail says whether a human chose a limit.
 ACTOR = "composition_root"
+
+#: The panel a fresh database is seeded with when none is named: offline, free, and keyless, so a
+#: zero-configuration run neither reaches the internet nor demands an API key.
+DEFAULT_PANEL_ID = "stub"
 
 
 @dataclass(slots=True)
@@ -142,6 +143,7 @@ class Application:
     """A wired system for one mode. Owns the resources it created."""
 
     mode: Mode
+    clock: Clock
     store: EventStore
     ledger: Ledger
     supervisor: Supervisor
@@ -149,12 +151,12 @@ class Application:
     startup: StartupSequence
     watchdog: Watchdog
     states: RiskStateStore
+    #: Which venue takes the orders. Held because live permission asks whether *this* venue's
+    #: credentials are present, and only the composition root knows which venue was wired.
+    broker: BrokerChoice
     #: The live arming row for *this* mode's database. Read by `risk status`, so an operator can
     #: see what live is permitted to do without opening the database (ADR 0012).
     arming: ArmingStore
-    #: The Tier-2 limits actually in force, after the arming cap and — in live — the ceiling.
-    #: Held rather than recomputed, so the CLI and the dashboard report what was wired.
-    policy: EffectivePolicy
     #: The operator's "close this position" action, wired to the same Tier-1 → Tier-2 →
     #: execution path a cycle uses. Exposed here because the dashboard may not build one.
     manual_close: ManualCloser
@@ -173,6 +175,44 @@ class Application:
     def baskets(self) -> tuple[Basket, ...]:
         """The baskets currently in service, read from the ConfigStore."""
         return tuple(record.document for record in self.configs.baskets())
+
+    @property
+    def panel_warnings(self) -> tuple[str, ...]:
+        """Panels that cannot be fully reached with the keys in this environment (ADR 0023).
+
+        Read fresh rather than held: an operator fixes this either by setting a key and restarting
+        or by editing the panel in the dashboard, and the second takes effect without a restart.
+        Empty is the healthy answer, and in sim and paper a non-empty one is a *warning* — those
+        modes are allowed to run degraded, and a seat that cannot be reached abstains. In live it
+        is a refusal, applied by `control/readiness.py` at startup and by `SupervisionController`
+        at every Start.
+        """
+        return panel_findings(self.baskets)
+
+    @property
+    def policy(self) -> EffectivePolicy:
+        """The Tier-2 limits in force *now*: published, capped by arming, clamped in live.
+
+        Read fresh rather than held, because arming can change while the process runs (ADR 0021):
+        a cap fixed at boot would be a number the CLI and the dashboard reported while the runners
+        enforced another.
+        """
+        return enforced_policy(self.configs, self.arming, self.mode)
+
+    def live_permission(self, confirmation: str | None = None) -> LivePermission:
+        """The four facts of ADR 0012, evaluated against this process's venue and database."""
+        return live_permission(
+            self.mode,
+            confirmation=confirmation,
+            arming=self.arming.load(),
+            credentials=self.broker.is_venue and has_credentials(self.broker.value, self.mode),
+        )
+
+    async def record_limits(self) -> EffectivePolicy:
+        """Put the limits about to be enforced in the log, and return them."""
+        effective = self.policy
+        await _record_effective_policy(self.store, self.clock, self.mode, effective)
+        return effective
 
     async def recover(self) -> Recovery:
         """Run DESIGN §8.2 before anything trades. Nothing else may be called first."""
@@ -473,6 +513,29 @@ _STACKS: dict[BrokerChoice, Callable[[StackRequest], VenueStack]] = {
 }
 
 
+def enforced_policy(configs: ConfigStore, arming: ArmingStore, mode: Mode) -> EffectivePolicy:
+    """The one answer to "which Tier-2 limits apply", for everything that needs to know.
+
+    The wiring, each runner rebuild, `risk status` and the dashboard all read this, so none of
+    them can report a limit another is enforcing. Both inputs are re-read on every call: the
+    published policy is versioned configuration and the cap is the arming row, and either can move
+    while the process is up.
+    """
+    return effective_policy(
+        global_risk(configs).document, mode=mode, max_order_notional=arming.load().cap
+    )
+
+
+def global_risk(configs: ConfigStore) -> ConfigRecord[GlobalRiskPolicy]:
+    """The published Tier-2 policy, or a refusal. A basket with no global limits does not run."""
+    record = configs.global_risk()
+    if record is None:
+        raise ConfigError(
+            "no Tier-2 policy is published; refusing to run a basket with no global limits"
+        )
+    return record
+
+
 class RunnerBuilder:
     """Turns a stored basket into a running `BasketRunner` (`supervisor.RunnerFactory`).
 
@@ -482,10 +545,11 @@ class RunnerBuilder:
     Giving each basket its own ledger would give two baskets two views of one account, which is
     precisely the concentration failure Tier-2 exists to prevent.
 
-    Each build re-reads the Tier-2 policy from the store and re-applies the mode's limits — the
-    arming row's notional cap, and in live the ceiling of `control/live.py`. So a policy edited in
-    the dashboard takes effect at the next cycle boundary, and neither the cap nor the ceiling can
-    be edited away from underneath it (PLAN §2.4, DESIGN §9 rung 6).
+    Each build re-reads the Tier-2 policy from the store *and the arming row*, then re-applies the
+    mode's limits — the cap, and in live the ceiling of `control/live.py`. So a policy edited in the
+    dashboard takes effect at the next cycle boundary, a cap armed while the process is up is
+    picked up at the next stop→start, and neither can be edited away from underneath a runner
+    (PLAN §2.4, DESIGN §9 rung 6, ADR 0021).
     """
 
     def __init__(
@@ -494,6 +558,7 @@ class RunnerBuilder:
         clock: Clock,
         mode: Mode,
         configs: ConfigStore,
+        arming: ArmingStore,
         stack: VenueStack,
         store: EventStore,
         ledger: Ledger,
@@ -502,12 +567,12 @@ class RunnerBuilder:
         watchdog: Watchdog,
         history: HistoryReader,
         news_feed: NewsFeed | None,
-        live_cap: Decimal,
         quote_currency: str,
     ) -> None:
         self._clock = clock
         self._mode = mode
         self._configs = configs
+        self._arming = arming
         self._stack = stack
         self._store = store
         self._ledger = ledger
@@ -516,7 +581,6 @@ class RunnerBuilder:
         self._watchdog = watchdog
         self._history = history
         self._news_feed = news_feed
-        self._live_cap = live_cap
         self._quote_currency = quote_currency
         self._pools: dict[str, ProviderPool] = {}
 
@@ -526,14 +590,8 @@ class RunnerBuilder:
 
     async def build(self, record: ConfigRecord[Basket]) -> BasketRunner:
         basket = record.document
-        policy_record = self._configs.global_risk()
-        if policy_record is None:
-            raise ConfigError(
-                "no Tier-2 policy is published; refusing to run a basket with no global limits"
-            )
-        policy = effective_policy(
-            policy_record.document, mode=self._mode, max_order_notional=self._live_cap
-        ).policy
+        policy_record = global_risk(self._configs)
+        policy = enforced_policy(self._configs, self._arming, self._mode).policy
         self._watchdog.use_policy(policy)
 
         decision_engine = DecisionEngine(SeatRunner(self._providers(record), self._clock))
@@ -614,16 +672,20 @@ async def _publish(
     baskets: tuple[Basket, ...] | None,
     global_policy: GlobalRiskPolicy | None,
     default_basket: Basket,
-) -> None:
+) -> bool:
     """Put configuration in the store: what the caller stated, or a default on first run.
 
     Configuration lives in the database, so the composition root *publishes* it rather than
     holding it. A caller that states a basket or a policy explicitly is publishing a new
     version of it, which is why an existing row does not suppress the write — the alternative
     would silently ignore an argument, and a silently ignored risk policy is the worst kind.
+
+    Returns whether the default basket was seeded, which is the only case in which `panel_id`
+    chose anything: on a database that already holds baskets, the stored panel is what runs.
     """
+    seeded = baskets is None and not configs.baskets()
     if baskets is None:
-        baskets = () if configs.baskets() else (default_basket,)
+        baskets = (default_basket,) if seeded else ()
     for basket in baskets:
         await configs.put(basket.basket_id, basket, actor=ACTOR, note="published at startup")
     if global_policy is not None or configs.global_risk() is None:
@@ -633,6 +695,7 @@ async def _publish(
             actor=ACTOR,
             note="published at startup",
         )
+    return seeded
 
 
 def _quote_currency(instruments: tuple[Instrument, ...]) -> str:
@@ -649,6 +712,22 @@ def _quote_currency(instruments: tuple[Instrument, ...]) -> str:
             "portfolio equity and every Tier-2 percentage are denominated in it"
         )
     return quotes.pop()
+
+
+def panel_findings(baskets: Sequence[Basket]) -> tuple[str, ...]:
+    """Every panel-reachability finding across the baskets that may cycle, named by basket.
+
+    One rule (`reach_of`), one prefix, three readers: the wiring's warning, the dashboard's banner,
+    and — in live only — `SupervisionController.blockers`, which refuses Start on it. A paused
+    basket is skipped for the same reason readiness skips it: it cannot cycle, so a panel it
+    cannot reach is not a fact about what this process is going to do (ADR 0023).
+    """
+    return tuple(
+        f"basket {basket.basket_id!r}: {finding}"
+        for basket in baskets
+        if basket.status.may_trade
+        for finding in reach_of(basket.panel).findings
+    )
 
 
 def declared_providers(basket: Basket) -> tuple[ProviderSettings, ...]:
@@ -679,16 +758,20 @@ async def _assemble(
     market_data: MarketDataProvider | None,
     news_sources: tuple[str, ...],
     panel_id: str,
-    confirmation: str | None = None,
 ) -> Application:
-    """Wire one mode. Everything above the venue is identical for all of them (DESIGN §5)."""
+    """Wire one mode. Everything above the venue is identical for all of them (DESIGN §5).
+
+    Wiring live no longer asserts the arming preconditions: they are evaluated when supervision is
+    asked to start, so an unarmed live process comes up able to *show* what is missing instead of
+    refusing before there is anything to show it with (ADR 0021).
+    """
     engine = create_database(db_path)
     writer = SingleWriter(engine)
     store = EventStore(engine, writer)
     states = RiskStateStore(engine, writer, clock)
     configs = ConfigStore(engine, writer, store, clock)
 
-    await _publish(
+    seeded = await _publish(
         configs,
         baskets=baskets,
         global_policy=global_policy,
@@ -698,22 +781,13 @@ async def _assemble(
     if not records:
         raise ConfigError("no baskets are configured; nothing to run")
     configured = tuple(record.document for record in records)
+    _warn_unused_panel(panel_id, seeded=seeded, records=records)
+    await _record_panel_reach(store, clock, configured)
     instruments = _instruments_of(configured)
     quote_currency = _quote_currency(instruments)
 
-    # Unconditional, and a no-op for every mode but live. Having the gate *inside* the assembly is
-    # what makes it structurally impossible to wire live without evaluating it (PLAN §2.4).
     arming = ArmingStore(engine, writer, clock)
-    live_cap = assert_live_preconditions(
-        mode,
-        confirmation=confirmation,
-        arming=arming.load(),
-        credentials=broker_choice.is_venue and has_credentials(broker_choice.value, mode),
-    )
-    policy_record = configs.global_risk()
-    assert policy_record is not None  # `_publish` guarantees one exists
-    effective = effective_policy(policy_record.document, mode=mode, max_order_notional=live_cap)
-    policy = effective.policy
+    policy = enforced_policy(configs, arming, mode).policy
 
     stack = _STACKS[broker_choice](
         StackRequest(instruments, clock, mode, market_data, start_equity, quote_currency)
@@ -750,6 +824,7 @@ async def _assemble(
         clock=clock,
         mode=mode,
         configs=configs,
+        arming=arming,
         stack=stack,
         store=store,
         ledger=ledger,
@@ -758,12 +833,11 @@ async def _assemble(
         watchdog=watchdog,
         history=history,
         news_feed=news_feed,
-        live_cap=live_cap,
         quote_currency=quote_currency,
     )
-    await _record_effective_policy(store, clock, mode, effective)
     return Application(
         mode=mode,
+        clock=clock,
         store=store,
         ledger=ledger,
         supervisor=Supervisor(builder, configs, Scheduler(clock), watchdog, states, clock),
@@ -795,8 +869,8 @@ async def _assemble(
         ),
         watchdog=watchdog,
         states=states,
+        broker=broker_choice,
         arming=arming,
-        policy=effective,
         manual_close=ManualCloser(
             clock=clock,
             mode=mode,
@@ -853,6 +927,52 @@ def _readiness_for(
     )
 
 
+def _warn_unused_panel(
+    panel_id: str, *, seeded: bool, records: Sequence[ConfigRecord[Basket]]
+) -> None:
+    """Say so when `--panel` chose nothing, because a stored basket already carried one.
+
+    A seeded panel is a *default for a fresh database*, not an override: a CLI flag that rewrote a
+    panel edited in the dashboard would discard the operator's own configuration on the next run.
+    So the flag is ignored and named as ignored — a silently inert flag is how someone concludes
+    the panel is broken when it was simply never selected.
+    """
+    if seeded or panel_id == DEFAULT_PANEL_ID:
+        return
+    logger.warning(
+        "--panel had no effect: this database already holds baskets, and a stored basket's own "
+        "panel is what runs. Edit it on the dashboard's Configure page",
+        extra={
+            "requested_panel": panel_id,
+            "panels_in_service": [record.document.panel.panel_id for record in records],
+        },
+    )
+
+
+async def _record_panel_reach(store: EventStore, clock: Clock, baskets: Sequence[Basket]) -> None:
+    """Put a panel that cannot be fully reached in the log, once, at wiring (ADR 0023).
+
+    Once rather than per cycle: a cycle that decided nothing because seats abstained already
+    records `PANEL_DEGRADED`, and an event repeated every cycle saying the same thing is an event
+    nobody reads. What this adds is the *cause* — a key absent from this machine's environment —
+    which no cycle event carries, and which is the difference between "the vendor was down" and
+    "this was never configured" when the log is read months later.
+    """
+    findings = panel_findings(baskets)
+    if not findings:
+        return
+    logger.warning("a configured panel cannot be fully reached", extra={"findings": list(findings)})
+    await store.append(
+        EventFactory(clock=clock, basket_id="global", cycle_id="startup").risk_event(
+            tier=RiskTier.PANEL,
+            rule="panel_unconfigured",
+            scope="panel",
+            action="degraded",
+            detail="; ".join(findings),
+        )
+    )
+
+
 async def _record_effective_policy(
     store: EventStore, clock: Clock, mode: Mode, effective: EffectivePolicy
 ) -> None:
@@ -894,7 +1014,7 @@ async def build_sim(
     global_policy: GlobalRiskPolicy | None = None,
     market_data: MarketDataProvider | None = None,
     news_sources: tuple[str, ...] = (),
-    panel_id: str = "stub",
+    panel_id: str = DEFAULT_PANEL_ID,
     broker: BrokerChoice = BrokerChoice.SIM,
 ) -> Application:
     """Wire the simulation stack: replayed data, a panel, and `SimBroker`.
@@ -932,7 +1052,7 @@ async def build_paper(
     global_policy: GlobalRiskPolicy | None = None,
     market_data: MarketDataProvider | None = None,
     news_sources: tuple[str, ...] = (),
-    panel_id: str = "stub",
+    panel_id: str = DEFAULT_PANEL_ID,
     broker: BrokerChoice = BrokerChoice.SIM,
 ) -> Application:
     """Wire the paper stack. Default: **live market data with `SimBroker`** (DESIGN §9 rung 5).
@@ -979,9 +1099,8 @@ async def build_live(
     global_policy: GlobalRiskPolicy | None = None,
     market_data: MarketDataProvider | None = None,
     news_sources: tuple[str, ...] = (),
-    panel_id: str = "stub",
+    panel_id: str = DEFAULT_PANEL_ID,
     broker: BrokerChoice = BrokerChoice.BINANCE,
-    confirmation: str | None = None,
     start_equity: Decimal = ZERO,
 ) -> Application:
     """Wire the live stack. Real venue, real money, and five ways it will refuse.
@@ -996,9 +1115,11 @@ async def build_live(
     `start_equity` is ignored beyond its signature: a real venue's balances are *discovered* by the
     startup reconciliation. Seeding a live ledger would invent funds and hide the first discrepancy.
 
-    Arming is a human act and is never done here. This function can only ever be reached by
-    someone who has already typed the phrase, armed the database, set a cap, and put live keys in
-    the environment under their own names.
+    Arming is a human act and is never done here. What this returns is a live system that can be
+    inspected, not one that trades: `SupervisionController.start` still demands the phrase, the
+    armed row and the cap before a single cycle runs (ADR 0021). Credentials are the one
+    precondition that must hold *here*, because a transport cannot be constructed without a key —
+    and no dashboard could supply one, since keys are environment-only (PLAN §3.2).
     """
     if not broker.is_venue:
         raise ConfigError(
@@ -1018,7 +1139,6 @@ async def build_live(
         market_data=market_data or _live_market_data(broker, clock),
         news_sources=news_sources,
         panel_id=panel_id,
-        confirmation=confirmation,
     )
 
 
@@ -1034,7 +1154,7 @@ def _live_market_data(broker: BrokerChoice, clock: Clock) -> MarketDataProvider 
     return provider
 
 
-async def build(mode: Mode, *, confirmation: str | None = None, **kwargs: object) -> Application:
+async def build(mode: Mode, **kwargs: object) -> Application:
     """Wire the stack for `mode`. One dispatch, no defaults, nothing that degrades quietly.
 
     A mode that quietly does something other than what was asked is the mode confusion PLAN §2.4
@@ -1044,4 +1164,4 @@ async def build(mode: Mode, *, confirmation: str | None = None, **kwargs: object
         return await build_sim(**kwargs)  # type: ignore[arg-type]
     if mode is Mode.PAPER:
         return await build_paper(**kwargs)  # type: ignore[arg-type]
-    return await build_live(confirmation=confirmation, **kwargs)  # type: ignore[arg-type]
+    return await build_live(**kwargs)  # type: ignore[arg-type]

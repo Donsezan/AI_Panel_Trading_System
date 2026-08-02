@@ -15,11 +15,15 @@ from typing import Any
 
 import httpx
 import pytest
+from tests.conftest import idle_supervision, publish_keyed_panel
 
 from tradebot.app import Application
+from tradebot.control.arming import LIVE_CONFIRMATION_PHRASE
 from tradebot.control.config_store import SINGLETON_ID
+from tradebot.control.supervision import SupervisionController
 from tradebot.core.enums import BasketStatus, ConfigKind, CycleOutcome, KillSwitchState
 from tradebot.core.events import EventType
+from tradebot.dashboard.queries import Queries
 from tradebot.dashboard.routes.control import KILL_PHRASE, QUARANTINE_CONFIRM
 from tradebot.risk.rules import STOOD_ASIDE
 from tradebot.risk.state import REARM_PHRASE
@@ -46,6 +50,49 @@ def risk_events(application: Application, rule: str) -> list[Any]:
 
 async def test_control_page_renders(client: httpx.AsyncClient) -> None:
     assert (await client.get("/control")).status_code == 200
+
+
+# ---------------------------------------------------------------- unreachable panel
+
+
+async def test_a_panel_with_no_key_is_a_banner_and_not_a_refusal(
+    sim_application: Application, client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ADR 0023, the sim/paper half: the process is up and says what is wrong, because that is
+    what an operator needs in order to fix it. The banner is on every page, like the switch."""
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    await publish_keyed_panel(sim_application)
+
+    page = (await client.get("/control")).text
+
+    assert "cannot be fully reached" in page
+    assert "OPENROUTER_API_KEY" in page
+    assert "/configure" in page
+
+
+async def test_the_banner_names_the_environment_and_not_a_place_to_type_a_key(
+    sim_application: Application, client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Keys are environment-only (PLAN §3.2), so the page must not imply it can accept one."""
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    await publish_keyed_panel(sim_application)
+
+    page = (await client.get("/control")).text
+
+    assert "the dashboard cannot accept" in page
+
+
+async def test_an_unreachable_panel_does_not_block_starting_outside_live(
+    sim_application: Application, client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Running degraded is what sim and paper are *for*: the seats abstain and the cycle waits."""
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    await publish_keyed_panel(sim_application)
+    await sim_application.recover()
+    controller = SupervisionController(sim_application, serve=idle_supervision)
+
+    assert await controller.start() == ()
+    await controller.stop()
 
 
 # ---------------------------------------------------------------- pause / resume
@@ -521,7 +568,7 @@ async def test_closing_when_flat_is_refused(
     assert "nothing to close" in response.text
 
 
-async def test_observe_only_refuses_to_place_an_order(
+async def test_a_stopped_process_refuses_to_place_an_order(
     sim_application: Application, dashboard_observing: httpx.AsyncClient
 ) -> None:
     """Nothing is polling open orders, so an order placed now would rest unmonitored."""
@@ -532,7 +579,7 @@ async def test_observe_only_refuses_to_place_an_order(
     )
 
     assert response.status_code == 200
-    assert "observe-only" in response.text
+    assert "supervision is stopped" in response.text
     assert not risk_events(sim_application, "manual_close")
 
 
@@ -567,3 +614,76 @@ async def test_no_cycle_ever_records_a_stand_aside(cycled: Application) -> None:
 
     assert cycle_checks, "the cycle recorded no risk checks; this test would pass vacuously"
     assert not [check for check in cycle_checks if check["detail"] == STOOD_ASIDE]
+
+
+# ---------------------------------------------------------------- start / stop
+
+
+async def test_stop_then_start_toggles_cycling(
+    supervision: SupervisionController, client: httpx.AsyncClient
+) -> None:
+    """The GUI equivalent of `--observe`, and back again, without restarting the process."""
+    assert (await client.post("/control/stop")).status_code == 303
+    assert not supervision.running
+
+    assert (await client.post("/control/start")).status_code == 303
+    assert supervision.running
+
+
+async def test_the_page_reports_what_the_controller_is_doing(
+    supervision: SupervisionController, client: httpx.AsyncClient
+) -> None:
+    assert "Stop trading" in (await client.get("/control")).text
+
+    await supervision.stop()
+
+    body = (await client.get("/control")).text
+    assert "Start trading" in body
+    assert "not trading" in body
+
+
+async def test_a_start_that_cannot_be_granted_says_why(
+    sim_application: Application, supervision: SupervisionController, client: httpx.AsyncClient
+) -> None:
+    """A refused action re-renders the page with the reason and changes nothing."""
+    await client.post("/control/stop")
+    await sim_application.watchdog.trip("manual", "tripped by hand")
+
+    response = await client.post("/control/start")
+
+    assert response.status_code == 200
+    assert "nothing was started" in response.text
+    assert not supervision.running
+
+
+async def test_stopping_warns_about_orders_left_working(
+    cycled: Application, supervision: SupervisionController, client: httpx.AsyncClient
+) -> None:
+    """Stop is never refused, but the orders it leaves unpolled are named on the page."""
+    assert Queries(cycled.store).open_orders(), "no order is working; this would pass vacuously"
+
+    assert (await client.post("/control/stop")).status_code == 303
+    body = (await client.get("/control")).text
+
+    assert "still working at the venue" in body
+    assert not supervision.running
+
+
+# ---------------------------------------------------------------- live arming
+
+
+async def test_a_sim_process_has_nothing_to_arm(
+    sim_application: Application, client: httpx.AsyncClient
+) -> None:
+    """Arming is per-database, and only the live one has anything to arm (ADR 0012)."""
+    response = await client.post(
+        "/control/live/arm", data={"confirm": LIVE_CONFIRMATION_PHRASE, "max_notional": "50"}
+    )
+
+    assert response.status_code == 200
+    assert "live database only" in response.text
+    assert not sim_application.arming.load().armed
+
+
+async def test_the_arming_form_is_absent_outside_live(client: httpx.AsyncClient) -> None:
+    assert "Live arming" not in (await client.get("/control")).text

@@ -9,9 +9,11 @@ before the first cycle. Four gates, each a documented way a live run goes wrong 
   someone". Live starting with nothing configured means the telling never happens, and a halted
   live account with open positions is discovered by whoever looks first (DESIGN §8.3, ADR 0019).
 * **The panel is real and can be reached.** No seat may bind the offline stub — not even as a
-  fallback, which would put a real order one outage away from canned text — and the probe is a
-  real sixteen-token completion down each seat's chain, the only thing that proves a model id
-  still resolves and a key is still accepted (`decision/probe.py`, R11).
+  fallback, which would put a real order one outage away from canned text — no declared endpoint
+  may be missing the key it names, and the probe is a real sixteen-token completion down each
+  seat's chain, the only thing that proves a model id still resolves and a key is still accepted
+  (`decision/probe.py`, R11). The missing-key check is what makes live differ from sim and paper,
+  where the same fault degrades the panel and is only warned about (ADR 0023).
 * **Market data arrives complete.** Fresh, deep enough for the indicators, and **without gaps**.
   ATR sizes every position, and an ATR computed across a hole in the tape is a stop distance
   derived from a bar the venue never published (DESIGN §6.2, §6.6).
@@ -34,7 +36,7 @@ only state from which an operator can ask what went wrong (DESIGN §8.2 step 5).
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 
 from tradebot.control.config_store import ConfigRecord, ConfigStore
 from tradebot.control.context_builder import ContextBuilder
@@ -47,6 +49,7 @@ from tradebot.core.instrument import Instrument
 from tradebot.core.logging import get_logger
 from tradebot.core.market import CandleSeries
 from tradebot.decision.probe import PanelProbeResult
+from tradebot.decision.providers.registry import reach_of
 from tradebot.indicators.library import required_history
 from tradebot.interfaces.alerts import AlertSink
 from tradebot.interfaces.market_data import MarketDataProvider
@@ -73,6 +76,7 @@ class LiveReadiness:
         venue: str,
         alert_sinks: Sequence[AlertSink] = (),
         panel_probe: PanelProbe | None = None,
+        environ: Mapping[str, str] | None = None,
     ) -> None:
         self._configs = configs
         self._factory = factory
@@ -82,6 +86,9 @@ class LiveReadiness:
         self._venue = venue
         self._alert_sinks = tuple(alert_sinks)
         self._panel_probe = panel_probe
+        #: Where the panel's keys are read from. Injected for the same reason the clock is: a gate
+        #: that reads ambient state is a gate whose refusals cannot be tested.
+        self._environ = environ
 
     async def run(self) -> tuple[str, ...]:
         """Every finding, so an operator fixes the whole list rather than one refusal per start."""
@@ -147,6 +154,9 @@ class LiveReadiness:
                 f"({', '.join(scripted)}); the stub returns canned JSON, so live would place real "
                 "orders from a script. Publish a panel of real providers before arming live",
             )
+        unreachable = self._check_reach(record)
+        if unreachable:
+            return unreachable
         if self._panel_probe is None:
             return ()
         try:
@@ -162,6 +172,19 @@ class LiveReadiness:
                 },
             )
         return result.failures
+
+    def _check_reach(self, record: ConfigRecord[Basket]) -> tuple[str, ...]:
+        """A key absent from the environment, named as such rather than as a probe failure.
+
+        Before the probe, and returned instead of it: probing an endpoint we already know has no
+        key spends latency to report the same defect as a 401, three steps further from its cause.
+        Sim and paper let such a seat fall back or abstain, which is what those modes are for; live
+        is the mode where a panel short a voice is deciding about real positions (ADR 0023).
+        """
+        return tuple(
+            f"basket {record.ref.config_id!r}: {finding}"
+            for finding in reach_of(record.document.panel, self._environ).findings
+        )
 
     async def _check_data(self, basket: Basket) -> tuple[str, ...]:
         """Fetch what this basket decides on, and refuse anything short, stale, or holed.

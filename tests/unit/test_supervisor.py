@@ -24,7 +24,7 @@ from tradebot.control.supervisor import Backoff, BasketWorker, Supervisor
 from tradebot.core.clock import ManualClock
 from tradebot.core.config import Basket, GlobalRiskPolicy, Schedule
 from tradebot.core.enums import BasketStatus, ConfigKind, CycleOutcome
-from tradebot.core.errors import FailClosedError
+from tradebot.core.errors import ConfigError, FailClosedError
 from tradebot.execution.brokers.calendars import ContinuousCalendar
 from tradebot.persistence.store import EventStore
 from tradebot.risk.state import RiskStateStore
@@ -76,8 +76,12 @@ class ScriptedFactory:
         #: Awaited at the end of every scripted cycle, so a test can change the world mid-loop
         #: without polling for the loop to get there.
         self.on_cycle: CycleHook | None = None
+        #: Raised instead of building, standing in for a panel that cannot be wired.
+        self.build_error: Exception | None = None
 
     async def build(self, record: ConfigRecord[Basket]) -> ScriptedRunner:
+        if self.build_error is not None:
+            raise self.build_error
         self.built.append(record.ref.version)
         runner = ScriptedRunner(record.document, self.on_cycle)
         self.runners[record.ref.config_id] = runner
@@ -299,6 +303,36 @@ class TestFailureHandling:
         await publish(configs, basket)
         await worker.cycle()
         factory.runners["b1"].outcomes = [CycleOutcome.FAILED, CycleOutcome.FAILED]
+
+        await worker.cycle()
+        await worker.cycle()
+
+        assert states.status_of("b1") is BasketStatus.HALTED
+        assert worker.stopped
+
+    async def test_a_runner_that_cannot_be_built_counts_as_a_failed_cycle(
+        self, worker: BasketWorker, configs: ConfigStore, basket: Basket, factory: ScriptedFactory
+    ) -> None:
+        """Building is as fallible as cycling — an unwireable panel, an unknown indicator, an
+        absent Tier-2 policy. Escaping here would kill the worker's task, which `serve` silently
+        recreates every resync: a crash loop with no backoff and never the auto-halt below."""
+        await publish(configs, basket)
+        factory.build_error = ConfigError("panel cannot be wired")
+
+        assert await worker.cycle() is None
+        assert worker.failures == 1
+        assert not worker.stopped
+
+    async def test_repeated_build_failures_halt_the_basket_like_any_other(
+        self,
+        worker: BasketWorker,
+        configs: ConfigStore,
+        basket: Basket,
+        factory: ScriptedFactory,
+        states: RiskStateStore,
+    ) -> None:
+        await publish(configs, basket)
+        factory.build_error = ConfigError("panel cannot be wired")
 
         await worker.cycle()
         await worker.cycle()

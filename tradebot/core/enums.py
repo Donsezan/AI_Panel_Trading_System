@@ -282,6 +282,9 @@ class RiskTier(StrEnum):
     TIER2 = "tier2"
     EXECUTION = "execution"
     RECONCILIATION = "reconciliation"
+    #: The decision layer. Not a limit and never a veto — what it records is a panel that cannot
+    #: be fully reached, which is why a run of cycles decided nothing (ADR 0023).
+    PANEL = "panel"
 
 
 class ReconcileClass(StrEnum):

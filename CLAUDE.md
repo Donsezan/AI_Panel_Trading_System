@@ -25,7 +25,7 @@ the server **refuses to start** without a token ([ADR 0014](docs/adr/0014-the-da
 ```powershell
 $env:TRADEBOT_DASHBOARD_TOKEN = "at-least-sixteen-characters"
 .venv\Scripts\python.exe -m tradebot serve --mode sim                 # dashboard + supervisor
-.venv\Scripts\python.exe -m tradebot serve --mode sim --observe       # dashboard only; nothing cycles
+.venv\Scripts\python.exe -m tradebot serve --mode sim --observe       # comes up stopped; Start from Control
 ```
 
 Rotating `TRADEBOT_DASHBOARD_TOKEN` and restarting invalidates every session — the cookie's
@@ -83,6 +83,11 @@ disarmed**; the whole procedure is [docs/OPERATIONS.md](docs/OPERATIONS.md):
     --panel free --confirm "I ACCEPT REAL MONEY RISK" --once
 .venv\Scripts\python.exe -m tradebot risk disarm-live --mode live --reason "..."
 ```
+
+The same procedure is on the dashboard's Control page, with the phrase retyped for each act.
+`serve --mode live` comes up unarmed rather than refusing, so there is something to arm from
+([ADR 0021](docs/adr/0021-live-arming-and-supervision-move-to-a-runtime-gate.md)); `run --mode
+live` still refuses on the spot.
 
 Schema changes go through Alembic — never `create_all`. After editing
 [persistence/schema.py](tradebot/persistence/schema.py):
@@ -166,7 +171,29 @@ DESIGN §8.1 there should be a test asserting the documented response.
 ### Phase 9 — operator control
 
 Two slices, planned together in [docs/PHASE_9_OPERATOR_CONTROL.md](docs/PHASE_9_OPERATOR_CONTROL.md).
-**Quarantine has shipped; GUI arm/start/stop has not.**
+**Both have shipped.**
+
+**Start/stop and live arming are runtime actions** ([ADR 0021](docs/adr/0021-live-arming-and-supervision-move-to-a-runtime-gate.md)).
+`SupervisionController` owns the supervisor's task, so "is anything cycling" has one answer:
+
+- **Live's four facts are checked when supervision starts**, not when the process is wired, so
+  `serve --mode live` comes up unarmed and *says so* instead of refusing before there is a
+  dashboard to arm it from. `run --mode live` still refuses immediately — there is no GUI for a
+  headless process to be armed from. Credentials are the one precondition that stayed at build
+  time, because a transport cannot be constructed without a key and no dashboard could supply one.
+- **The phrase is retyped at every arm and every start**, never cached in the session — an armed
+  database alone must not be enough to start (ADR 0012).
+- **`app.enforced_policy` is the single answer to "which Tier-2 limits apply"**, read fresh by the
+  wiring, every runner rebuild, `risk status` and the dashboard. A cap armed mid-process reaches
+  the runners at the next stop→start and can never be enforced by one caller while another reports
+  the boot-time number. The `live_ceiling` clamp is written at each start, for the same reason.
+- **Stop is not the kill switch.** It pauses cycling, cancels nothing, needs no phrase, and is
+  never refused — an operator reaches for it during an incident. It does end the only thing polling
+  open orders, so the page lists what is still working and *no order may be placed while stopped*,
+  manual close included. `--observe` is the state a process starts in, not a lock.
+- **The GUI's Disarm also stops supervision**, deliberately diverging from the CLI's `disarm-live`,
+  which has no running process to reach into. A basket cycling against a revoked cap is the one
+  silent state this must never produce.
 
 Quarantine is an operator excluding one instrument, or a whole basket, from *automated* trading —
 "I have doubts about this one, keep watching it but don't trade it". Four rules that are easy to
@@ -290,11 +317,11 @@ asserted end to end in `tests/scenario/test_dashboard_lifecycle.py`.
 ### Phase 6 dashboard layering
 
 ```
-create_dashboard(application, *, token, observe_only)   takes a wired Application; never builds one
+create_dashboard(application, *, token, controller)   takes a wired Application; never builds one
   SessionMiddleware   auth by construction — a new route is protected without being told to
     routes/monitor    reads projections; the drill-down reads one cycle's events
     routes/configure  forms.py → pydantic → configs.put(); the models are the only validation
-    routes/control    pause/resume, un-halt, kill switch, manual close
+    routes/control    start/stop, live arm/disarm, pause/resume, un-halt, kill switch, manual close
 ```
 
 Five rules that are easy to get backwards:
@@ -358,10 +385,11 @@ validated. A separate live path would mean the thing that was tested is not the 
 
 ```
 build_live                refuses --broker sim; otherwise the paper wiring, with Mode.LIVE
-  assert_live_preconditions   the four facts of ADR 0012 — phrase, armed row, cap, credentials
   effective_policy            min(published, LIVE_CEILING) per limit, then the arming row's cap
     StartupSequence           …preflight, reconcile, resolve orders, and then:
       LiveReadiness           alerting · panel real+reachable · data complete · configs build
+  SupervisionController.start the four facts of ADR 0012 — phrase, armed row, cap, credentials —
+                              re-evaluated here, every start (ADR 0021)
 ```
 
 Five rules that are easy to get backwards:
@@ -445,6 +473,16 @@ enforced at construction, not at runtime: a chain may not repeat a binding, and 
 name a declared provider. Seeded chains leave the vendor entirely and end at a local runtime, and
 each seat gets a *different* backup so one outage cannot collapse heterogeneity — see
 [ADR 0009](docs/adr/0009-llm-providers-over-plain-http.md).
+
+**A provider whose `secret_ref` names an env var that is not set is *unreachable*, not *invalid***
+([ADR 0023](docs/adr/0023-a-missing-provider-key-degrades-the-panel.md)). It is left unwired and
+reported by `reach_of`; the seats bound to it fall back, and a seat whose whole chain is unwired
+abstains, so the cycle resolves `WAIT (PANEL_DEGRADED)` — the DESIGN §8.1 response to a provider
+being down. Sim and paper run on and *say so* (a warning, one `RISK_EVENT` at wiring, and a banner
+on every dashboard page); **live refuses**, at startup in `control/readiness.py` and again at every
+Start in `SupervisionController.blockers`. Refusing to boot would cost the operator the dashboard,
+the log and the ledger view — the three things needed to fix it. The banner names the variable to
+set: keys are environment-only, so no GUI field may ever accept one.
 
 Model ids in `decision/presets.py` need verifying against openrouter.ai/models before a real run;
 free slots churn (R11), which is what the fallback chains are for.

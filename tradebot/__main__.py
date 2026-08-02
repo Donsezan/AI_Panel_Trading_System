@@ -29,6 +29,7 @@ import uvicorn
 from fastapi import FastAPI
 
 from tradebot.app import (
+    DEFAULT_PANEL_ID,
     Application,
     BrokerChoice,
     backtest_database_path,
@@ -45,6 +46,7 @@ from tradebot.control.arming import (
 )
 from tradebot.control.basket_runner import CycleResult
 from tradebot.control.config_store import ConfigStore
+from tradebot.control.supervision import SupervisionController
 from tradebot.core.clock import ManualClock, SystemClock, ensure_utc
 from tradebot.core.enums import ConfigKind, Mode
 from tradebot.core.errors import TradebotError
@@ -193,7 +195,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     replay.add_argument("--since", default=None, help="window start; defaults to the data's")
     replay.add_argument("--until", default=None, help="window end; defaults to the data's")
     replay.add_argument("--every", type=int, default=3600, help="cycle interval in seconds")
-    replay.add_argument("--panel", default="stub", choices=sorted(PANELS))
+    replay.add_argument("--panel", default=DEFAULT_PANEL_ID, choices=sorted(PANELS))
     replay.add_argument("--equity", type=Decimal, default=Decimal(10_000))
     replay.add_argument("--out", type=Path, default=None, help="report path (.md)")
 
@@ -255,14 +257,15 @@ def _add_wiring(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--panel",
-        default="stub",
+        default=DEFAULT_PANEL_ID,
         choices=sorted(PANELS),
         help=(
-            "which agent panel to run. Defaults to 'stub': the offline scripted panel, which "
-            "costs nothing and needs no API key. 'free' uses hosted free slots with per-seat "
-            "cross-vendor fallbacks; 'local' runs entirely on your own machine. Each panel "
-            "declares its own providers and each seat its own fallback chain — see "
-            "tradebot/decision/presets.py"
+            "which agent panel to seed a *fresh* database with. Defaults to 'stub': the offline "
+            "scripted panel, which costs nothing and needs no API key. 'free' uses hosted free "
+            "slots with per-seat cross-vendor fallbacks; 'local' runs entirely on your own "
+            "machine. Once a basket is stored its own panel is what runs and this flag is "
+            "ignored — edit it in the dashboard. Each panel declares its own providers and each "
+            "seat its own fallback chain; see tradebot/decision/presets.py"
         ),
     )
     parser.add_argument(
@@ -295,18 +298,23 @@ async def _open(args: argparse.Namespace) -> Application:
     configure_logging(mode=mode.value, level=logging.DEBUG if args.verbose else logging.INFO)
     return await build(
         mode,
-        confirmation=getattr(args, "confirm", None),
         db_path=database_path(mode, args.data_dir),
         news_sources=tuple(getattr(args, "news", None) or ()),
-        panel_id=getattr(args, "panel", None) or "stub",
+        panel_id=getattr(args, "panel", None) or DEFAULT_PANEL_ID,
         broker=BrokerChoice(getattr(args, "broker", None) or BrokerChoice.SIM.value),
     )
 
 
 async def run_command(args: argparse.Namespace) -> int:
-    """Recover, then cycle — once, or on each basket's schedule until interrupted."""
+    """Recover, then cycle — once, or on each basket's schedule until interrupted.
+
+    The headless path keeps refusing an unarmed live run *immediately*: there is no dashboard here
+    for an operator to arm it from, so an idle, unusable process would be strictly worse than a
+    refusal (ADR 0021).
+    """
     application = await _open(args)
     try:
+        application.live_permission(getattr(args, "confirm", None)).require()
         recovery = await application.recover()
         if recovery.halted:
             logger.error(
@@ -314,6 +322,7 @@ async def run_command(args: argparse.Namespace) -> int:
                 extra={"failures": list(recovery.failures), "reason": recovery.state.reason},
             )
             return EXIT_RECOVERY_HALTED
+        await application.record_limits()
         if args.once:
             results = await application.supervisor.run_once()
             # One flush before exiting: a single cycle that halted a basket still has to reach
@@ -330,10 +339,14 @@ async def serve_command(args: argparse.Namespace) -> int:
     """Run the dashboard, and the baskets alongside it unless `--observe`.
 
     The token and the bind address are checked **before anything is wired**, so a refusal costs
-    nothing and reports the same way `run` does. Note what happens when startup recovery halts:
-    the dashboard still serves and the supervisor does not start. That is DESIGN §8.2 step 5
-    exactly — the process stays up, the dashboard shows why, and nothing trades. Refusing to
-    serve would leave the operator with no way to see the reason.
+    nothing and reports the same way `run` does. Note what happens when startup recovery halts, or
+    when live is not armed: the dashboard still serves and supervision does not start. That is
+    DESIGN §8.2 step 5 exactly — the process stays up, the dashboard shows why, and nothing trades.
+    Refusing to serve would leave the operator with no way to see the reason, and — since Phase 9 —
+    no way to fix it (ADR 0021).
+
+    `--observe` is the *initial* state, not a lock: it comes up stopped, and an operator can start
+    it from the Control page. Live still demands the phrase retyped there, every time.
     """
     token = require_token()
     assert_bind_allowed(args.host, allow_remote=args.allow_remote)
@@ -345,17 +358,24 @@ async def serve_command(args: argparse.Namespace) -> int:
                 "startup recovery halted the process; serving the dashboard, nothing will trade",
                 extra={"failures": list(recovery.failures), "reason": recovery.state.reason},
             )
-        trading = not recovery.halted and not args.observe
+        controller = SupervisionController(application, recovery=recovery)
+        if not args.observe:
+            unmet = await controller.start(confirmation=args.confirm)
+            if unmet:
+                logger.error(
+                    "supervision did not start; the dashboard will show why",
+                    extra={"unmet": list(unmet)},
+                )
         logger.warning(
             "dashboard listening",
-            extra={"host": args.host, "port": args.port, "supervising": trading},
+            extra={"host": args.host, "port": args.port, "supervising": controller.running},
         )
         await _run_server(
-            create_dashboard(application, token=token, observe_only=not trading),
+            create_dashboard(application, token=token, controller=controller),
             application,
+            controller,
             host=args.host,
             port=args.port,
-            supervising=trading,
         )
     finally:
         await application.shutdown()
@@ -363,30 +383,32 @@ async def serve_command(args: argparse.Namespace) -> int:
 
 
 async def _run_server(
-    dashboard: FastAPI, application: Application, *, host: str, port: int, supervising: bool
+    dashboard: FastAPI,
+    application: Application,
+    controller: SupervisionController,
+    *,
+    host: str,
+    port: int,
 ) -> None:
-    """Serve HTTP and — unless observing — cycle baskets, on one event loop.
+    """Serve HTTP, and let the controller own whether baskets cycle, on one event loop.
 
     One loop rather than two processes because the dashboard reads the same in-memory ledger and
     supervisor the runners use; a second process would be reading a second, staler view of an
     account that only one of them is allowed to write (PLAN §2.6).
 
-    Whichever task finishes first stops the others: a supervisor still cycling after the operator
-    has stopped the server would trade with nobody watching. The alert tail runs even when
-    observing — an operator watching an incident is exactly who wants to be told about the next one.
+    The dashboard is what the process's lifetime is measured by, and stopping it stops supervision:
+    a supervisor still cycling after the operator has stopped the server would trade with nobody
+    watching. The alert tail runs whether or not anything is cycling — an operator watching an
+    incident is exactly who wants to be told about the next one.
     """
     server = uvicorn.Server(
         uvicorn.Config(dashboard, host=host, port=port, log_config=None, access_log=False)
     )
-    supervisor = application.supervisor.serve() if supervising else None
     try:
-        await _race(
-            application,
-            ("dashboard", server.serve()),
-            *((("supervisor", supervisor),) if supervisor is not None else ()),
-        )
+        await _race(application, ("dashboard", server.serve()))
     finally:
         server.should_exit = True
+        await controller.stop()
 
 
 async def _serve(application: Application) -> int:
@@ -407,20 +429,24 @@ async def _serve(application: Application) -> int:
 async def _race(application: Application, *named: tuple[str, Coroutine[Any, Any, Any]]) -> None:
     """Run these alongside the alert tail until the first of them finishes, then stop them all.
 
-    The tail is added here rather than by each caller so there is exactly one answer to "is
+    The tail is started here rather than by each caller so there is exactly one answer to "is
     alerting running?" — it runs whenever the process is doing anything long-lived, and it is a
     no-op when no destination is configured (ADR 0019).
+
+    It is a **companion, not a racer**: that no-op returns immediately, so a process whose lifetime
+    the tail helped decide would exit the moment it started with alerting off — which is the
+    default for sim and paper.
     """
     tasks = [asyncio.create_task(coro, name=name) for name, coro in named]
-    tasks.append(asyncio.create_task(application.alerts.run(), name="alerts"))
+    tail = asyncio.create_task(application.alerts.run(), name="alerts")
     try:
         await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
     except (KeyboardInterrupt, asyncio.CancelledError):
         logger.warning("interrupted; stopping")
     finally:
-        for task in tasks:
+        for task in (*tasks, tail):
             task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(*tasks, tail, return_exceptions=True)
 
 
 def _report(application: Application, results: Sequence[CycleResult]) -> int:

@@ -6,6 +6,7 @@ deterministic and free — which is what lets it run on every commit (PLAN §7).
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator, Iterator
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -16,9 +17,16 @@ from fastapi import FastAPI
 from sqlalchemy import Engine
 
 from tradebot.app import Application, build_sim
+from tradebot.control.supervision import SupervisionController
 from tradebot.core.clock import ManualClock
-from tradebot.core.config import Basket, PanelConfig, RiskPolicy, SeatConfig
-from tradebot.core.enums import AssetClass
+from tradebot.core.config import (
+    Basket,
+    PanelConfig,
+    ProviderSettings,
+    RiskPolicy,
+    SeatConfig,
+)
+from tradebot.core.enums import AssetClass, ProviderKind
 from tradebot.core.instrument import Instrument
 from tradebot.core.market import Quote
 from tradebot.core.snapshot import (
@@ -94,6 +102,40 @@ def panel(seat: SeatConfig) -> PanelConfig:
     return PanelConfig(panel_id="p1", seats=(seat,))
 
 
+#: A panel that needs a key, unlike the offline stub everything else here runs on. Shared, because
+#: what an absent key does differs by mode — a warning in sim and paper, a refusal in live (ADR
+#: 0023) — and both halves must be asserted against the same configuration.
+KEYED_PANEL = PanelConfig(
+    panel_id="keyed",
+    providers=(
+        ProviderSettings(
+            provider_id="openrouter",
+            kind=ProviderKind.OPENAI_COMPAT,
+            base_url="https://openrouter.ai/api/v1",
+            secret_ref="OPENROUTER_API_KEY",
+        ),
+    ),
+    seats=(
+        SeatConfig(
+            seat_id="technical",
+            role="Technical Analyst",
+            provider_id="openrouter",
+            model="a-real-model",
+        ),
+    ),
+)
+
+
+async def publish_keyed_panel(application: Application) -> None:
+    """Give every basket in service a panel that needs a key it may or may not have."""
+    for record in application.configs.baskets():
+        await application.configs.put(
+            record.ref.config_id,
+            record.document.model_copy(update={"panel": KEYED_PANEL}),
+            actor="test",
+        )
+
+
 @pytest.fixture
 def basket(instrument: Instrument, panel: PanelConfig) -> Basket:
     return Basket(
@@ -163,9 +205,33 @@ async def sim_application(clock: ManualClock) -> AsyncIterator[Application]:
     await application.shutdown()
 
 
+async def idle_supervision() -> None:
+    """Stands in for `Supervisor.serve()` so a test dashboard can be *running* without cycling.
+
+    The controller's job is task lifetime, not the work inside the task; substituting the work is
+    what keeps `ManualClock` — whose `sleep` returns immediately — from turning a started
+    supervisor into an unbounded cycling loop underneath a dashboard test.
+    """
+    await asyncio.Event().wait()
+
+
 @pytest.fixture
-def dashboard(sim_application: Application) -> FastAPI:
-    return create_dashboard(sim_application, token=DASHBOARD_TOKEN)
+async def supervision(sim_application: Application) -> AsyncIterator[SupervisionController]:
+    """A started controller: the ordinary case, where the dashboard is watching a running bot.
+
+    Recovery first, because supervision can never precede it: a database that has not been through
+    DESIGN §8.2 reads as "never armed", and the controller refuses to start against one.
+    """
+    await sim_application.recover()
+    controller = SupervisionController(sim_application, serve=idle_supervision)
+    assert await controller.start() == ()
+    yield controller
+    await controller.stop()
+
+
+@pytest.fixture
+def dashboard(sim_application: Application, supervision: SupervisionController) -> FastAPI:
+    return create_dashboard(sim_application, token=DASHBOARD_TOKEN, controller=supervision)
 
 
 @pytest.fixture
@@ -190,8 +256,8 @@ async def client(http: httpx.AsyncClient) -> httpx.AsyncClient:
 
 @pytest.fixture
 async def dashboard_observing(sim_application: Application) -> AsyncIterator[httpx.AsyncClient]:
-    """A signed-in client against a dashboard serving without the supervisor."""
-    observing = create_dashboard(sim_application, token=DASHBOARD_TOKEN, observe_only=True)
+    """A signed-in client against a dashboard whose supervision has never been started."""
+    observing = create_dashboard(sim_application, token=DASHBOARD_TOKEN)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=observing), base_url="http://dashboard"
     ) as connected:

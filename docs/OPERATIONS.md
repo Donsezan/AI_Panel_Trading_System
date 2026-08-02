@@ -73,6 +73,7 @@ prompt — enforced by the redaction filter and its test.
 | # | Requirement | Asserted? |
 |---|---|---|
 | 9 | The basket's panel uses **real** providers — no stub binding, not even as a fallback | **yes** — live readiness refuses |
+| 9a | Every provider the panel declares has its `secret_ref` key set in the environment | **yes** — live readiness refuses, and so does every Start ([ADR 0023](adr/0023-a-missing-provider-key-degrades-the-panel.md)) |
 | 10 | Every seat can actually reach a model right now | **yes** — a real 16-token probe per seat at startup |
 | 11 | Market data arrives fresh, deep enough, and **without gaps** | **yes** — live readiness refuses |
 | 12 | Every stored basket builds: secrets present, indicators known, Tier-2 policy published | **yes** — built through the real factory at startup |
@@ -83,6 +84,15 @@ A **fresh** live database seeds a two-instrument demo basket on the `sim` venue.
 placeholder, not a suggestion: publish your real basket in the dashboard first, or readiness will
 refuse it by name. Item 9 has the same shape — the default panel is the offline stub, which must
 never be what decides a live order.
+
+Item 9a is the one gate that behaves *differently* by mode, and deliberately. In sim and paper a
+missing key leaves that endpoint unwired: the seats bound to it fall back, a seat with nothing left
+abstains, and the cycle resolves `WAIT` — the process runs, warns on every dashboard page, and can
+be fixed from the GUI. Live never does that, because a panel deciding with fewer voices than it was
+configured with would be deciding about real positions. Note what the fix *is*: set the named
+variable and restart, or edit the panel so no seat binds that provider. The dashboard cannot take
+an API key — keys are environment-only, and a field that accepted one would put a credential in the
+database.
 
 ### 1.5 Jurisdiction — yours alone
 
@@ -104,7 +114,9 @@ Five things must be true at once. Four are yours; the fifth the system checks fo
 ### 2.1 Record the arming decision
 
 The arming row lives in the **live database** (`data/live.db`), which paper and sim never share. It
-survives a reboot, records who set it, and carries the per-order cap.
+survives a reboot, records who set it, and carries the per-order cap. Arm it from the CLI, or from
+the dashboard's Control page (§2.5) — the two write the same row and differ only in the recorded
+actor.
 
 ```powershell
 .venv\Scripts\python.exe -m tradebot risk arm-live --mode live `
@@ -145,6 +157,15 @@ database alone must not be enough to start.
 
 `--broker sim` refuses in live: an order not sent to a venue is not a live order.
 
+`serve --mode live` **no longer refuses when unarmed**. It comes up showing "not armed / not
+trading", so it can be armed and started from the dashboard (§2.5). `run --mode live` is
+unchanged and still refuses immediately: there is no GUI for an unarmed headless process to be
+armed from, and an idle unusable process is worse than a refusal.
+
+The one precondition that must still hold before `serve` starts at all is **credentials**: a venue
+transport cannot be constructed without a key, and no dashboard could supply one, since keys are
+environment-only.
+
 ### 2.3 What live enforces that paper does not
 
 Tier-2 limits are clamped to a ceiling that can only tighten — `min(published, ceiling)`, so a
@@ -172,7 +193,34 @@ edit can do at 03:00. Every clamp is logged and written to the event log as a `R
 .venv\Scripts\python.exe -m tradebot risk disarm-live --mode live --reason "week one over"
 ```
 
-Disarming does not stop a running process — stop that yourself. It prevents the **next** start.
+Disarming **from the CLI** does not stop a running process — stop that yourself. It prevents the
+**next** start. Disarming **from the dashboard** also stops supervision, because it is issued from
+inside the process that might be trading; leaving a basket cycling against a cap that was just
+revoked is the one silent state this must never produce. The divergence is deliberate.
+
+### 2.5 The same procedure from the dashboard
+
+Everything above is on the Control page, and nothing about it is weaker there. The phrase is typed
+into the Arm form *and* again into the Start form, never remembered between them and never held in
+the session.
+
+1. `serve --mode live --broker binance` — the dashboard comes up, "not armed", nothing cycling.
+   Any unmet precondition is listed under **Supervision** before you click anything.
+2. **Arm live trading** — a per-order cap and the phrase. Writes the same row `risk arm-live`
+   writes, with `dashboard` as the actor.
+3. **Start trading** — the phrase again. All four facts are re-checked at this exact moment;
+   runners are built here, so the cap they enforce is the one on the row right now.
+4. **Stop trading** — pauses cycling, the equivalent of `--observe`. It cancels nothing at the
+   venue and needs no phrase. What it *does* stop is the polling of open orders, so any order still
+   working is listed on the page while stopped, and no new order may be placed — including a manual
+   close. Start again first, or use the kill switch if the orders must be cancelled.
+
+Start is refused, with the reason on the page, while the kill switch is tripped or startup recovery
+halted the process. Neither is cleared by starting; both are cleared the way they always were.
+
+**Permission is not readiness.** The readiness gates — alerting configured, panel reachable, market
+data complete, every configuration building — run once at startup, before the dashboard listens,
+and are not re-run from the GUI. An operator who fixes one of them restarts the process.
 
 ---
 
@@ -190,9 +238,13 @@ Disarming does not stop a running process — stop that yourself. It prevents th
 Read the system without letting it trade:
 
 ```powershell
-.venv\Scripts\python.exe -m tradebot serve --mode live --observe --confirm "I ACCEPT REAL MONEY RISK"
+.venv\Scripts\python.exe -m tradebot serve --mode live --observe
 .venv\Scripts\python.exe -m tradebot risk status --mode live
 ```
+
+`--observe` is the state it *starts* in, not a lock: it can be started from the Control page (with
+the phrase, in live) once you have decided it should trade again. If it must stay stopped, do not
+click Start — nothing else can.
 
 Exit codes: `1` refused to start · `2` misuse · `3` recovery halted, nothing trades · `4` a `--once`
 cycle failed · `5` a promotion gate failed.
@@ -268,8 +320,13 @@ a banned IP extends the ban. Wait it out; do not restart into it.
 1. Trip the kill switch from the dashboard — halts everything, cancels working orders.
 2. Close positions through the dashboard's manual close (same Tier-1/Tier-2 path, no side doors),
    or at the venue if this process cannot reach it.
-3. `risk disarm-live --mode live --reason "..."` so nothing starts again by habit.
+3. Disarm — from the dashboard, which also stops supervision, or
+   `risk disarm-live --mode live --reason "..."` so nothing starts again by habit.
 4. Revoke the API key at the exchange if the cause is not understood.
+
+Do **not** reach for Stop first if you intend to close a position from here: stopping ends the
+polling of open orders, so a manual close is refused while stopped. Kill switch, close, *then*
+disarm.
 
 ---
 
@@ -286,4 +343,9 @@ a banned IP extends the ban. Wait it out; do not restart into it.
   injection via a news headline can flip a marginal decision and nothing more (R7).
 * **Alerting is at-least-once.** A repeated alert is an annoyance; a missed one is what the design
   spends a database row to prevent.
-* **`--observe` is the safe way to look.** Dashboard up, supervisor down, nothing cycles.
+* **`--observe` is the safe way to look.** Dashboard up, supervision stopped, nothing cycles — and
+  it stays that way until someone clicks Start.
+* **Stop is not the kill switch.** Stop pauses cycling and cancels nothing; the kill switch halts
+  everything, cancels working orders, and needs the typed re-arm phrase to clear.
+* **Nothing polls open orders while stopped.** That is why a manual close is refused there, and why
+  the Control page lists whatever is still working at the venue.

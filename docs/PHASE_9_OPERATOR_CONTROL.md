@@ -11,11 +11,11 @@ control from the dashboard without loosening anything the CLI already guarantees
 
 | Deliverable | State |
 |---|---|
-| Live arming, and start/stop of supervision, from the GUI | **planned** — Part A, not started |
+| Live arming, and start/stop of supervision, from the GUI | **built** (2026-08-02) |
 | Quarantine: exclude one instrument or a whole basket from automated trading | **built** (2026-08-02) |
 
 Part B shipped first and alone, as the sequencing below intended: it is self-contained, does not
-touch the composition root, and Part A's refactor is worth its own review pass afterwards.
+touch the composition root, and Part A's refactor got its own review pass afterwards.
 
 ## Why now
 
@@ -76,7 +76,7 @@ expensive:
    dashboard has today. Readiness stays boot-only, exactly as it is now; an operator who fixes
    something (e.g. adds an alert webhook) restarts the process to re-validate it.
 
-## Part A — GUI arm/start/stop for live, plus start/stop everywhere
+## Part A — GUI arm/start/stop for live, plus start/stop everywhere · **built**
 
 ### Mechanism
 
@@ -118,22 +118,45 @@ Once arming becomes a runtime gate, `Start` itself is a database read, an enviro
 `asyncio.create_task` — nothing slow enough to block a request. No route handler in this plan does
 real I/O in the request path.
 
-### Files (once built)
+### Files (as built)
 
 ```
-tradebot/control/arming.py         live_permission(), LivePermission
+tradebot/control/arming.py         live_permission(), LivePermission, LiveArming.cap;
+                                     assert_live_preconditions is now `.require()` over it
 tradebot/control/supervision.py    SupervisionController (new)
-tradebot/app.py                    Application.broker / .live_permission(); _assemble no longer
-                                    raises for live; RunnerBuilder reads arming fresh per build
-tradebot/__main__.py               _run_server, serve_command, run_command's live refusal
-tradebot/dashboard/views.py        DashboardState becomes mutable; `trading` property
-tradebot/dashboard/app.py          wires the controller into dashboard state
-tradebot/dashboard/routes/control.py   POST /control/live/arm, /control/live/disarm,
-                                        /control/start, /control/stop
-tradebot/dashboard/templates/control/index.html   armed / trading / readiness sections + forms
-docs/OPERATIONS.md                 both CLI and GUI paths described; the disarm/stop divergence
-                                    stated explicitly
+tradebot/app.py                    Application.clock / .broker / .live_permission() /
+                                     .record_limits(), .policy computed rather than held;
+                                     enforced_policy() as the single answer to "which limits";
+                                     _assemble no longer gates live and no longer takes a
+                                     confirmation; RunnerBuilder reads arming fresh per build
+tradebot/__main__.py               serve_command builds the controller, _run_server races the
+                                     dashboard alone, run_command keeps the headless refusal
+tradebot/dashboard/views.py        DashboardState holds the controller; `trading` /
+                                     `observe_only` derived from it
+tradebot/dashboard/app.py          create_dashboard takes the controller (never `observe_only`)
+tradebot/dashboard/routes/control.py   POST /control/start, /control/stop, /control/live/arm,
+                                        /control/live/disarm
+tradebot/dashboard/templates/control/index.html   supervision + live arming sections; the
+                                                    working-orders warning while stopped
+tradebot/dashboard/templates/base.html            the header pill is "not trading", not
+                                                    "observe-only" — a runtime fact now
+docs/OPERATIONS.md                 §2.5 the GUI procedure; the disarm/stop divergence stated
+                                     explicitly; §3.8 ordered so Stop cannot strand a close
 ```
+
+Three things came out differently from the plan, each recorded because a reader would otherwise
+wonder:
+
+- **The confirmation phrase left `build()` entirely.** With the gate at the start, nothing about
+  wiring needs it, and a `confirmation=` parameter that no longer gates anything is exactly the
+  argument someone later assumes is a control.
+- **Credentials stay a build-time precondition.** A venue transport cannot be constructed without a
+  key, and keys are environment-only — so no dashboard could have supplied one anyway. Live's other
+  three facts moved; this one could not, and `docs/OPERATIONS.md` §2.2 says so.
+- **`Application.policy` became a computed property**, and the `live_ceiling` clamp event moved
+  from wiring to `record_limits()` at each start. A cap armed after boot would otherwise be
+  enforced by the runners while the CLI, the dashboard and the event log all reported the boot-time
+  number.
 
 Decisions: [ADR 0021](adr/0021-live-arming-and-supervision-move-to-a-runtime-gate.md).
 
@@ -215,12 +238,12 @@ Decisions: [ADR 0022](adr/0022-quarantine-is-a-tier-1-veto-rule.md).
 
 ## Sequencing
 
-Two mostly-independent slices, buildable and testable separately:
+Two mostly-independent slices, built and tested separately:
 
 1. **Quarantine (Part B)** first — smaller, self-contained (one config change, one risk rule, two
    templates), doesn't touch the composition root. **Done 2026-08-02.**
-2. **GUI arm/start/stop (Part A)** second — the composition-root refactor, worth its own review
-   pass once B has landed. **Not started.**
+2. **GUI arm/start/stop (Part A)** second — the composition-root refactor, reviewed on its own once
+   B had landed. **Done 2026-08-02.**
 
 ## Verification
 
@@ -238,21 +261,40 @@ Part B, done:
   for both scopes.
 - `.\check.ps1` green.
 
-Part A, once built:
+Part A, done:
 
-- `SupervisionController`, the new dashboard routes, and a rewritten `test_live_wiring.py` whose
-  `TestRefusals` moves from asserting `build()` raises to asserting `live_permission()`'s `unmet`
-  tuple and the controller's runtime refusal.
-- Manual walkthrough: `serve --mode sim` → Stop → Start from the GUI, confirm cycling actually
-  pauses/resumes. `serve --mode live` unarmed → dashboard shows "NOT ARMED" → arm from GUI → Start
-  from GUI → confirm a basket picks up the cap without a restart → Disarm → confirm supervision
-  stops automatically.
-- One decision still open, raised while scoping Part B and **not yet settled**: `Stop` ends the
-  only thing that polls open orders (`ExecutionMonitor` is driven from `BasketRunner._settle`), so
-  an order working at the venue when Stop is clicked rests unpolled until Start or a restart. The
-  intended behaviour is *allow, and warn prominently* — Stop must work during an incident, which is
-  precisely when it must not be refused — with the working orders listed on the Control page. This
-  mirrors why `--observe` already refuses a manual close.
+- `tests/unit/test_supervision.py` — start/stop lifetime (one task per start, a restart is a new
+  task, stop is never refused), and the three refusals: an unrecovered process, a halted recovery,
+  and a tripped kill switch, with a re-arm clearing it.
+- `tests/unit/test_live_wiring.py` — `TestRefusals` moved from asserting `build()` raises to
+  asserting `live_permission()`'s `unmet` tuple; `TestTheRuntimeGate` proves arming in the same
+  process is enough to start, that the phrase is demanded at *every* start, and that a cap armed
+  after boot is the one in force; `TestTheLiveControlPage` drives the real HTTP walkthrough —
+  unarmed dashboard → arm → start → disarm-also-stops.
+- `tests/unit/test_dashboard_control.py` — the Stop/Start routes, the refusal that names its
+  reason, the working-orders warning, and arming refused outside live.
+- `tests/scenario/test_full_cycle.py::TestModeSafety` — a wired live process still will not cycle
+  unarmed.
+- `tests/unit/test_cli.py::TestTheAlertTailDoesNotEndTheProcess` — see below.
+- `.\check.ps1` green, plus the manual walkthrough over a real socket: `serve --mode sim` → Stop →
+  the working-orders warning appears and a manual close is refused → Start → cycling resumes, all
+  without restarting the process; arming refused in sim mode.
+
+**One pre-existing bug the walkthrough found, and fixed here.** `_race` waited for the *first* of
+its tasks to finish, and the alert tail is one of them — but `AlertDispatcher.run` returns
+immediately when no destination is configured, which is the default for sim and paper (ADR 0019).
+So `tradebot serve` exited before a browser could reach it and `tradebot run` exited before a
+basket cycled: both documented commands were unusable with alerting off. The tail is now a
+companion rather than a racer — started and cancelled with the rest, but never deciding the
+process's lifetime. It predates this phase; it surfaced here because Part A is the first work whose
+verification requires the dashboard to actually stay up.
+
+The open decision was settled with the operator before building: **Stop is allowed, warns, and
+lists the working orders.** Stop must work during an incident, which is precisely when it must not
+be refused. Its consequence — nothing polls open orders — is carried consistently: `observe_only`
+became "supervision is not running", so a manual close is refused while stopped for exactly the
+reason `--observe` already refused one, and `docs/OPERATIONS.md` §3.8 orders the getting-out steps
+so that Stop cannot strand a close. `--observe` is the state the process *starts* in, not a lock.
 
 ## Deferred, not forgotten
 

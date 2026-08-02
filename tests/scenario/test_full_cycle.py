@@ -18,6 +18,7 @@ from tests.scenario.harness import Harness
 
 from tradebot.app import BrokerChoice, build, build_sim
 from tradebot.control.arming import LIVE_CONFIRMATION_PHRASE
+from tradebot.control.supervision import SupervisionController
 from tradebot.core.clock import ManualClock
 from tradebot.core.config import Basket, PanelConfig, SeatConfig
 from tradebot.core.decision import Decision
@@ -399,18 +400,36 @@ class TestModeSafety:
         with pytest.raises(ConfigError, match="offline and reproducible"):
             await build(Mode.SIM, db_path=tmp_path / "sim.db", broker=BrokerChoice.BINANCE)
 
-    async def test_live_refuses_without_the_typed_confirmation(self, tmp_path: Path) -> None:
-        with pytest.raises(ConfigError, match="typed confirmation"):
+    async def test_live_needs_its_own_named_credentials(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Live reads `BINANCE_API_KEY`, so a testnet key in the environment is unreachable."""
+        for name in ("BINANCE_API_KEY", "BINANCE_API_SECRET"):
+            monkeypatch.delenv(name, raising=False)
+
+        with pytest.raises(ConfigError, match="BINANCE_API_KEY"):
             await build(Mode.LIVE, db_path=tmp_path / "live.db")
 
-    async def test_live_still_refuses_with_the_confirmation_alone(self, tmp_path: Path) -> None:
-        """Every unmet precondition is listed at once, not one refusal at a time (PLAN §2.4)."""
-        with pytest.raises(ConfigError, match="an armed row in the live database"):
-            await build(
-                Mode.LIVE,
-                db_path=tmp_path / "live.db",
-                confirmation=LIVE_CONFIRMATION_PHRASE,
-            )
+    async def test_a_wired_live_process_still_will_not_cycle_unarmed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Since ADR 0021 live wires so it can be *armed*; the gate moved to the start.
+
+        Every unmet precondition is listed at once, not one refusal at a time (PLAN §2.4), and the
+        phrase alone is never enough — an armed row is a separate fact in a separate place.
+        """
+        monkeypatch.setenv("BINANCE_API_KEY", "a-live-key")
+        monkeypatch.setenv("BINANCE_API_SECRET", "a-live-secret")
+        application = await build(Mode.LIVE, db_path=tmp_path / "live.db")
+
+        try:
+            controller = SupervisionController(application)
+            unmet = await controller.start(confirmation=LIVE_CONFIRMATION_PHRASE)
+
+            assert not controller.running
+            assert any("an armed row in the live database" in reason for reason in unmet)
+        finally:
+            await application.shutdown()
 
     def test_each_mode_uses_its_own_database_file(self) -> None:
         from tradebot.app import database_path

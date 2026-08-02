@@ -21,7 +21,15 @@ import httpx
 import pytest
 
 from tradebot.core.clock import ManualClock
-from tradebot.core.config import FREE, ModelPricing, PriceList, ProviderSettings
+from tradebot.core.config import (
+    FREE,
+    ModelPricing,
+    PanelConfig,
+    PriceList,
+    ProviderBinding,
+    ProviderSettings,
+    SeatConfig,
+)
 from tradebot.core.enums import ProviderKind
 from tradebot.core.errors import ConfigError, ProviderError
 from tradebot.core.logging import REDACTED, SECRETS
@@ -35,7 +43,9 @@ from tradebot.decision.providers.registry import (
     build_provider,
     build_providers,
     preset,
+    reach_of,
     resolve_secret,
+    unconfigured_providers,
 )
 from tradebot.interfaces.llm import CompletionRequest
 
@@ -372,13 +382,13 @@ class TestRegistry:
         with pytest.raises(ConfigError, match="unknown provider"):
             preset("psychic-friends-network")
 
-    def test_a_missing_key_refuses_to_start_rather_than_degrading_every_cycle(self) -> None:
-        with pytest.raises(ConfigError, match="OPENROUTER_API_KEY"):
-            resolve_secret(preset("openrouter"), {})
+    def test_a_missing_key_reads_as_absent_rather_than_raising(self) -> None:
+        """ADR 0023: an endpoint with no key is unreachable, which is a runtime fact every
+        fallback chain already survives — not a malformed panel that must kill the process."""
+        assert resolve_secret(preset("openrouter"), {}) is None
 
     def test_a_blank_key_is_treated_as_missing(self) -> None:
-        with pytest.raises(ConfigError):
-            resolve_secret(preset("openrouter"), {"OPENROUTER_API_KEY": "   "})
+        assert resolve_secret(preset("openrouter"), {"OPENROUTER_API_KEY": "   "}) is None
 
     def test_a_resolved_key_is_registered_with_the_log_redactor(self) -> None:
         SECRETS.clear()
@@ -406,6 +416,117 @@ class TestRegistry:
         assert set(pool.providers) == {"lmstudio"}
         await pool.close()
         await pool.close()  # idempotent: shutdown runs after a failed startup too
+
+
+class TestUnconfiguredProviders:
+    """A declared endpoint whose key is absent is left unwired, never fatal (ADR 0023).
+
+    The whole point is that the process comes up: refusing to start costs an operator the
+    dashboard, the log and the ledger view, which are the things they need to fix it with.
+    """
+
+    def test_an_endpoint_with_no_key_is_named_with_the_variable_to_set(self) -> None:
+        absent = unconfigured_providers((preset("openrouter"), preset("lmstudio")), {})
+        assert [(entry.provider_id, entry.secret_ref) for entry in absent] == [
+            ("openrouter", "OPENROUTER_API_KEY")
+        ]
+        assert "OPENROUTER_API_KEY" in str(absent[0])
+
+    def test_a_keyless_provider_is_never_reported(self) -> None:
+        """Local runtimes need no key, so their absence from the environment means nothing."""
+        assert unconfigured_providers((preset("lmstudio"), preset("stub")), {}) == ()
+
+    async def test_wiring_leaves_it_out_instead_of_raising(self, clock: ManualClock) -> None:
+        pool = build_providers((preset("openrouter"), preset("lmstudio")), clock, environ={})
+        try:
+            assert set(pool.providers) == {"lmstudio"}
+            assert [entry.provider_id for entry in pool.unconfigured] == ["openrouter"]
+        finally:
+            await pool.close()
+
+    def test_a_panel_with_no_reachable_endpoint_opens_no_client(self, clock: ManualClock) -> None:
+        """No socket is held for endpoints that were never wired — the same invariant an
+        all-stub panel relies on."""
+        pool = build_providers((preset("openrouter"),), clock, environ={})
+        assert pool.providers == {}
+        assert not pool.owns_client
+
+    async def test_the_key_is_read_when_it_is_present(self, clock: ManualClock) -> None:
+        SECRETS.clear()
+        pool = build_providers(
+            (preset("openrouter"),), clock, environ={"OPENROUTER_API_KEY": "sk-present"}
+        )
+        try:
+            assert set(pool.providers) == {"openrouter"}
+            assert pool.unconfigured == ()
+        finally:
+            await pool.close()
+            SECRETS.clear()
+
+    def test_building_one_directly_still_refuses(self, clock: ManualClock) -> None:
+        """`build_providers` filters first, so this is unreachable from the composition root. It
+        exists so a direct caller cannot get a provider that calls a paid endpoint with no key."""
+        with pytest.raises(ConfigError, match="OPENROUTER_API_KEY"):
+            build_provider(
+                preset("openrouter"),
+                client_for(lambda _: httpx.Response(200)),
+                clock,
+                environ={},
+            )
+
+
+def _seat(seat_id: str, provider_id: str, *fallbacks: str) -> SeatConfig:
+    return SeatConfig(
+        seat_id=seat_id,
+        role=seat_id,
+        provider_id=provider_id,
+        model=f"{provider_id}-model",
+        fallbacks=tuple(
+            ProviderBinding(provider_id=pid, model=f"{pid}-model") for pid in fallbacks
+        ),
+    )
+
+
+#: One seat that keeps a binding when `gemini` is gone, and one that loses its only one.
+MIXED_PANEL = PanelConfig(
+    panel_id="mixed",
+    providers=(preset("lmstudio"), preset("gemini")),
+    seats=(_seat("technical", "lmstudio", "gemini"), _seat("news", "gemini")),
+)
+
+
+class TestPanelReach:
+    """Which seats can still reach a model — the question every consumer of ADR 0023 asks.
+
+    Answered from configuration and the environment alone, so it costs nothing and the dashboard
+    can ask it on every page render. `decision/probe.py` is the expensive question of whether a
+    *reachable* model id still resolves.
+    """
+
+    def test_every_key_present_is_healthy(self) -> None:
+        assert reach_of(MIXED_PANEL, {"GEMINI_API_KEY": "k"}).healthy
+        assert reach_of(MIXED_PANEL, {"GEMINI_API_KEY": "k"}).findings == ()
+
+    def test_a_seat_keeping_a_binding_is_degraded_not_silenced(self) -> None:
+        reach = reach_of(MIXED_PANEL, {})
+        assert reach.degraded == ("technical",)
+        assert "technical" not in reach.silenced
+
+    def test_a_seat_losing_its_whole_chain_is_silenced(self) -> None:
+        """It abstains on every cycle, so the panel is permanently short a voice rather than
+        transiently — a different fact from a shortened chain, and reported as one."""
+        reach = reach_of(MIXED_PANEL, {})
+        assert reach.silenced == ("news",)
+        assert any("abstain on every cycle" in finding for finding in reach.findings)
+
+    def test_the_findings_name_the_variable_to_set(self) -> None:
+        assert any("GEMINI_API_KEY" in finding for finding in reach_of(MIXED_PANEL, {}).findings)
+
+    def test_a_panel_declaring_no_providers_is_healthy(self) -> None:
+        """Its providers are supplied by the composition root, so there is nothing to be missing —
+        the same exemption `PanelConfig._check_bindings_resolve` makes."""
+        panel = PanelConfig(panel_id="injected", seats=(_seat("technical", "somewhere"),))
+        assert reach_of(panel, {}).healthy
 
 
 async def test_anthropic_wiring_sends_the_key_as_x_api_key(clock: ManualClock) -> None:

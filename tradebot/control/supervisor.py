@@ -151,9 +151,13 @@ class BasketWorker:
             self._running = False
 
     async def _cycle(self, record: ConfigRecord[Basket]) -> CycleResult | None:
-        runner = await self._runner_for(record)
         with correlate(basket_id=self.basket_id):
             try:
+                # Inside the guard, because building is as fallible as cycling — a panel that
+                # cannot be wired or an unknown indicator would otherwise escape as a dead task,
+                # which `serve` silently recreates every resync: a crash loop with no backoff,
+                # no failure count, and never the auto-halt this exists to reach.
+                runner = await self._runner_for(record)
                 result = await runner.run_once()
             # An unclassified defect must not kill the loop: a dead supervisor leaves
             # working orders with nobody polling them.

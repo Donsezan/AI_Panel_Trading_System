@@ -7,11 +7,13 @@ load-bearing as its actions.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
 
-from tradebot.__main__ import main, parse_args
+from tradebot.__main__ import _race, main, parse_args
+from tradebot.app import Application
 from tradebot.core.enums import Mode
 from tradebot.dashboard.auth import TOKEN_ENV
 from tradebot.risk.state import REARM_PHRASE
@@ -181,6 +183,39 @@ class TestServe:
         """A `--host` typo must not put the kill switch on a LAN (PLAN §3.3)."""
         monkeypatch.setenv(TOKEN_ENV, "a-token-long-enough-to-pass")
         assert main(["serve", "--mode", "sim", "--host", "0.0.0.0", *data_dir]) == 1
+
+
+class TestTheAlertTailDoesNotEndTheProcess:
+    """Alerting is off unless a destination is configured, and off must mean *quiet*, not *over*.
+
+    `AlertDispatcher.run` returns immediately when nothing is configured — the default for sim and
+    paper. Racing it against the long-lived tasks made that return the end of the process: `serve`
+    exited before a browser could reach it and `run` exited before a basket cycled.
+    """
+
+    async def test_a_disabled_tail_does_not_stop_what_it_runs_beside(
+        self, sim_application: Application
+    ) -> None:
+        assert not sim_application.alerts.enabled
+        served = asyncio.Event()
+        race = asyncio.create_task(_race(sim_application, ("long-lived", served.wait())))
+
+        for _ in range(5):  # more than enough turns for the tail to log and return
+            await asyncio.sleep(0)
+
+        assert not race.done(), "the disabled alert tail ended the process"
+        served.set()
+        await race
+
+    async def test_the_first_long_lived_task_to_finish_still_stops_the_rest(
+        self, sim_application: Application
+    ) -> None:
+        """The other half of the contract: a stopped server must not leave a supervisor cycling."""
+        survivor = asyncio.Event()
+
+        await _race(sim_application, ("first", asyncio.sleep(0)), ("second", survivor.wait()))
+
+        assert not survivor.is_set()
 
 
 class TestValidationCommands:

@@ -21,6 +21,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.responses import Response
 
 from tradebot.app import Application
+from tradebot.control.supervision import SupervisionController
 from tradebot.core.logging import get_logger
 from tradebot.dashboard.auth import (
     SESSION_COOKIE,
@@ -40,12 +41,20 @@ __all__ = ["create_dashboard"]
 
 
 def create_dashboard(
-    application: Application, *, token: str | None = None, observe_only: bool = False
+    application: Application,
+    *,
+    token: str | None = None,
+    controller: SupervisionController | None = None,
 ) -> FastAPI:
     """Build the dashboard over an already-wired application.
 
     `token` is read from the environment when not supplied, and its absence is a refusal to
     start — the dashboard has no anonymous mode (ADR 0014).
+
+    `controller` is the process's one supervision owner, so Start and Stop on the Control page act
+    on the same task the CLI started. A dashboard given none gets its own, **stopped**: a page
+    without a controller cannot be trading, and claiming otherwise would be the one lie an
+    operator would act on.
     """
     session = Session(token if token is not None else require_token())
     app = FastAPI(title=f"tradebot — {application.mode.value}", docs_url=None, redoc_url=None)
@@ -54,7 +63,7 @@ def create_dashboard(
         queries=Queries(application.store),
         templates=build_templates(application),
         session=session,
-        observe_only=observe_only,
+        controller=controller or SupervisionController(application),
     )
     app.add_middleware(SessionMiddleware, session=session)
     app.mount("/static", StaticFiles(directory=PACKAGE / "static"), name="static")

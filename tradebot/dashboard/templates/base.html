@@ -25,7 +25,7 @@
     <a href="/control">Control</a>
   </nav>
   <span class="spacer"></span>
-  {% if observe_only %}<span class="pill warn" title="serving without the supervisor">observe-only</span>{% endif %}
+  {% if not trading %}<span class="pill warn" title="supervision is stopped; no basket is cycling">not trading</span>{% endif %}
   <a class="logout" href="/logout">Log out</a>
 </header>
 
@@ -41,6 +41,25 @@
   {% for basket_id, reason in halted.items() %}
     <span class="detail"><code>{{ basket_id }}</code> — {{ reason or "no reason recorded" }}</span>
   {% endfor %}
+</div>
+{% endif %}
+{# On every page, like the kill switch: this is why a run of cycles decided nothing, and reading a
+   cycle history without it is reading a symptom with the cause one click away (ADR 0023). #}
+{% if panel_warnings %}
+<div class="banner warn">
+  <strong>A configured panel cannot be fully reached.</strong>
+  {% if mode == "live" %}
+    Live refuses to start on this — fix it before arming.
+  {% else %}
+    Cycles keep running: seats fall back down their chains, and a seat with nothing left abstains,
+    so the cycle decides <code>WAIT</code> and trades nothing.
+  {% endif %}
+  <ul>{% for warning in panel_warnings %}<li>{{ warning }}</li>{% endfor %}</ul>
+  <span class="detail">
+    API keys are read from the environment and never stored here, so the dashboard cannot accept
+    one. Either set the variable named above and restart, or edit the panel in
+    <a href="/configure">Configure</a> so no seat binds that provider.
+  </span>
 </div>
 {% endif %}
 

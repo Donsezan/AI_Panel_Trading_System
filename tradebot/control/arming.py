@@ -17,13 +17,20 @@ Two further preconditions are asserted elsewhere, because only the adapter can k
 resolved endpoint must match the mode (`venues/`), and the venue's own report must say withdrawals
 are disabled on the key (`control/preflight.py`, PLAN §3.2).
 
-Failure semantics: `assert_live_preconditions` raises `ConfigError` listing **every** unmet
-precondition rather than the first, because an operator fixing them one refusal at a time is an
-operator who eventually stops reading. Nothing here ever arms anything implicitly.
+The four facts are evaluated **when supervision is asked to start**, not when the process is wired
+(ADR 0021), so `live_permission` reports rather than raises: a live dashboard has to be able to
+come up unarmed and say so, which is impossible if the check kills the process first.
+`assert_live_preconditions` is that same predicate for the headless path, where there is no GUI to
+arm anything from and failing fast is strictly better.
+
+Failure semantics: a refusal lists **every** unmet precondition rather than the first, because an
+operator fixing them one refusal at a time is an operator who eventually stops reading. Nothing
+here ever arms anything implicitly.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from decimal import Decimal
 
 from sqlalchemy import Engine, select
@@ -55,8 +62,18 @@ class LiveArming(DomainModel):
     updated_at: UtcDatetime
 
     @property
+    def cap(self) -> Decimal:
+        """The per-order cap actually in force — zero unless a human armed a positive one.
+
+        Zero rather than `None` because that is what `capped` treats as "no cap of mine to apply",
+        so an unarmed row cannot loosen a limit on its way through the policy.
+        """
+        notional = self.max_live_notional
+        return notional if self.armed and notional is not None else ZERO
+
+    @property
     def ready(self) -> bool:
-        return self.armed and self.max_live_notional is not None and self.max_live_notional > ZERO
+        return self.cap > ZERO
 
 
 class ArmingStore:
@@ -143,6 +160,56 @@ def assert_live_confirmation(phrase: str | None) -> None:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class LivePermission:
+    """Whether live trading is permitted right now, and what is missing when it is not."""
+
+    unmet: tuple[str, ...] = ()
+    #: The cap the Tier-2 policy must enforce. Meaningful only when the permission is granted.
+    cap: Decimal = ZERO
+
+    @property
+    def granted(self) -> bool:
+        return not self.unmet
+
+    def require(self) -> Decimal:
+        """The cap, or a refusal naming every unmet precondition rather than only the first."""
+        if self.unmet:
+            raise ConfigError(
+                "refusing to trade in live mode; missing: " + "; ".join(self.unmet) + ". "
+                "Live mode cannot be reached by a default, a typo, or a missing env var "
+                "(PLAN §2.4)."
+            )
+        return self.cap
+
+
+def live_permission(
+    mode: Mode,
+    *,
+    confirmation: str | None,
+    arming: LiveArming,
+    credentials: bool,
+) -> LivePermission:
+    """Evaluate the four preconditions without raising (ADR 0021).
+
+    Non-live modes are granted unconditionally and carry no cap: the whole point of these gates is
+    that they exist only on the one path that can lose real money.
+    """
+    if not mode.is_live:
+        return LivePermission()
+
+    unmet: list[str] = []
+    if confirmation != LIVE_CONFIRMATION_PHRASE:
+        unmet.append(f"the typed confirmation phrase ({LIVE_CONFIRMATION_PHRASE!r})")
+    if not arming.armed:
+        unmet.append("an armed row in the live database (see `tradebot risk arm-live`)")
+    if arming.cap <= ZERO:
+        unmet.append("a positive max_live_notional cap on that row")
+    if not credentials:
+        unmet.append("venue credentials in the environment")
+    return LivePermission(tuple(unmet), arming.cap)
+
+
 def assert_live_preconditions(
     mode: Mode,
     *,
@@ -150,30 +217,10 @@ def assert_live_preconditions(
     arming: LiveArming,
     credentials: bool,
 ) -> Decimal:
-    """Refuse live unless every precondition holds. Returns the cap the policy must enforce.
-
-    Non-live modes return zero and assert nothing: the whole point is that these gates exist only
-    on the one path that can lose real money.
-    """
-    if not mode.is_live:
-        return ZERO
-
-    unmet: list[str] = []
-    if confirmation != LIVE_CONFIRMATION_PHRASE:
-        unmet.append(f"the typed confirmation phrase ({LIVE_CONFIRMATION_PHRASE!r})")
-    if not arming.armed:
-        unmet.append("an armed row in the live database (see `tradebot risk arm-live`)")
-    if arming.max_live_notional is None or arming.max_live_notional <= ZERO:
-        unmet.append("a positive max_live_notional cap on that row")
-    if not credentials:
-        unmet.append("venue credentials in the environment")
-    if unmet:
-        raise ConfigError(
-            "refusing to start in live mode; missing: " + "; ".join(unmet) + ". "
-            "Live mode cannot be reached by a default, a typo, or a missing env var (PLAN §2.4)."
-        )
-    assert arming.max_live_notional is not None  # narrowed by the checks above
-    return arming.max_live_notional
+    """The same predicate, for the headless path that has no dashboard to be armed from."""
+    return live_permission(
+        mode, confirmation=confirmation, arming=arming, credentials=credentials
+    ).require()
 
 
 def capped(policy: GlobalRiskPolicy, max_order_notional: Decimal) -> GlobalRiskPolicy:
