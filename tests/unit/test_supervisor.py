@@ -477,3 +477,60 @@ class TestScheduling:
 
         assert timedelta() < clock.now() - started <= timedelta(seconds=600)
         assert clock.now().second == 0
+
+
+class TestNextFireExposure:
+    """What the blotter reads to say when a basket next cycles (PHASE_10 pane ②).
+
+    Recorded by the loop that computes it rather than recomputed by the reader: `next_fire`
+    consults the venue calendar, and a page render must neither await that nor answer a slightly
+    different question than the one the worker is actually waiting on.
+    """
+
+    async def test_a_waiting_worker_publishes_when_it_next_fires(
+        self, worker: BasketWorker, configs: ConfigStore, basket: Basket, clock: ManualClock
+    ) -> None:
+        await publish(configs, basket.model_copy(update={"schedule": Schedule(every_seconds=600)}))
+        seen: list[object] = []
+
+        original = worker._scheduler.wait_until
+
+        async def capture(when: object) -> None:
+            seen.append(worker.next_due)
+            await original(when)  # type: ignore[arg-type]
+
+        worker._scheduler.wait_until = capture  # type: ignore[method-assign]
+        await worker._wait_until_due()
+
+        assert seen and seen[0] == clock.now()
+
+    async def test_a_worker_that_is_not_waiting_publishes_nothing(
+        self, worker: BasketWorker, configs: ConfigStore, basket: Basket
+    ) -> None:
+        """ "Not waiting" and "not soon" are different facts, and only one of them is a time."""
+        await publish(configs, basket)
+        assert worker.next_due is None
+
+        await worker._wait_until_due()
+        assert worker.next_due is None
+
+    async def test_a_stopped_worker_forgets_its_next_fire(
+        self, worker: BasketWorker, configs: ConfigStore, basket: Basket
+    ) -> None:
+        await publish(configs, basket)
+        await worker.stop()
+        assert worker.next_due is None
+
+    async def test_the_supervisor_answers_for_a_basket_it_has_a_worker_for(
+        self, supervisor: Supervisor, configs: ConfigStore, basket: Basket
+    ) -> None:
+        await publish(configs, basket)
+        assert supervisor.next_due("b1") is None
+
+        supervisor.worker_for("b1")
+        assert supervisor.next_due("b1") is None
+
+    def test_asking_never_creates_a_worker(self, supervisor: Supervisor) -> None:
+        """A page render must not bring a worker into being for a basket nothing is running."""
+        assert supervisor.next_due("never-heard-of-it") is None
+        assert supervisor.workers == ()

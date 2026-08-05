@@ -15,7 +15,10 @@ other unauthenticated request is refused outright.
 
 from __future__ import annotations
 
-from fastapi import FastAPI, Form, Request
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, Form, Request, WebSocket
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.responses import Response
@@ -32,7 +35,8 @@ from tradebot.dashboard.auth import (
     set_session,
 )
 from tradebot.dashboard.queries import Queries
-from tradebot.dashboard.routes import configure, control, monitor
+from tradebot.dashboard.routes import configure, control, monitor, workspace
+from tradebot.dashboard.updates import UpdateHub
 from tradebot.dashboard.views import PACKAGE, DashboardState, build_templates, render, state_of
 
 logger = get_logger(__name__)
@@ -57,21 +61,62 @@ def create_dashboard(
     operator would act on.
     """
     session = Session(token if token is not None else require_token())
-    app = FastAPI(title=f"tradebot — {application.mode.value}", docs_url=None, redoc_url=None)
+    app = FastAPI(
+        title=f"tradebot — {application.mode.value}",
+        docs_url=None,
+        redoc_url=None,
+        lifespan=_lifespan,
+    )
     app.state.dashboard = DashboardState(
         application=application,
         queries=Queries(application.store),
         templates=build_templates(application),
         session=session,
         controller=controller or SupervisionController(application),
+        updates=UpdateHub(application.store),
     )
     app.add_middleware(SessionMiddleware, session=session)
     app.mount("/static", StaticFiles(directory=PACKAGE / "static"), name="static")
+    app.include_router(workspace.router)
     app.include_router(monitor.router)
     app.include_router(configure.router)
     app.include_router(control.router)
     _add_session_routes(app)
+    _add_update_socket(app)
     return app
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Nothing to start — the tail is lazy — and one thing to stop.
+
+    A tail left running past shutdown would hold the event loop open behind a process the
+    operator has already asked to exit.
+    """
+    yield
+    await app.state.dashboard.updates.stop()
+
+
+def _add_update_socket(app: FastAPI) -> None:
+    @app.websocket("/ws/updates")
+    async def updates(socket: WebSocket) -> None:
+        """Tells this page which panes went stale. Carries nothing else, in either direction.
+
+        Authenticated by the same middleware as every other route — a socket opened without a
+        session never reaches this function (ADR 0024). Inbound frames are read only so that a
+        disconnect is noticed promptly, and are discarded unparsed: there is no command surface
+        here to validate, because there are no commands.
+
+        The hub completes the handshake rather than this route, so that accepting and starting to
+        watch cannot drift apart into a window where notices are lost.
+        """
+        hub = state_of(socket).updates
+        await hub.register(socket)
+        try:
+            while (await socket.receive())["type"] != "websocket.disconnect":
+                pass
+        finally:
+            await hub.unregister(socket)
 
 
 def _add_session_routes(app: FastAPI) -> None:

@@ -124,6 +124,11 @@ These are the prime directives from PLAN §1. Code that violates one is wrong ev
 - **Money is `Decimal`, always.** Use `tradebot.core.money`; never `float`, never
   `Decimal(some_float)`. The one sanctioned crossing is `money.from_measurement`, for indicator
   output. Enforced by `tests/unit/test_money_discipline.py` (see [ADR 0001](docs/adr/0001-decimal-only-money-arithmetic.md)).
+  A money field fails in two ways that need opposite handling, and `schema.parse_money` is where
+  they part: a `float` raises `MoneyError`, because only our own code can put one there, while
+  unreadable *text* — an operator typing `0,5` into a limit — is re-raised as a `ValueError`.
+  pydantic converts only `ValueError`, so a validator raising `MoneyError` escapes the model
+  entirely and reaches the operator as a 500 that names no field and loses their draft.
 - **Time is UTC-aware `datetime`, from an injected `Clock`.** Naive datetimes are rejected at
   the model boundary. Never call `datetime.now()` directly in library code — `freezegun` cannot
   freeze `loop.time()`, so a component that reads the ambient clock cannot be tested.
@@ -167,6 +172,110 @@ Coverage gates are CI-enforced by `scripts/coverage_gate.py`: `core/`, `risk/`, 
 
 Tests assert *behaviour under failure*, not just the happy path. For every failure row in
 DESIGN §8.1 there should be a test asserting the documented response.
+
+**Never write to the database while a background task reads it in a test.** `create_database(None)`
+— the in-memory engine the suite runs on — uses `StaticPool`, so every connection *is* one shared
+SQLite connection. A reader returning it to the pool issues a `ROLLBACK` that discards the writer
+thread's open transaction: `await store.append(...)` returns having written nothing, silently. A
+file database gives each checkout its own connection and is unaffected, so this is a harness trap,
+not a production one — but a test that races it is testing the harness. Drive the reader
+explicitly (`hub.drain()`, `hub.broadcast()`) instead of waiting for its loop to notice.
+
+### Phase 10 — the blotter workspace
+
+Planned in [docs/PHASE_10_BLOTTER_WORKSPACE.md](docs/PHASE_10_BLOTTER_WORKSPACE.md); three passes,
+**all shipped** — transport, the read side, then the control dock.
+
+`/` is the workspace: a CSS grid of six panes over one selection, and the only screen the bot is
+run from. Configure survives as Parameters/Settings, and the cycle drill-down, risk history, costs
+and the realized equity curve live under Analytics (`/analytics/portfolio`, which `/portfolio`
+redirects to). Four rules:
+
+- **A pane is a template fragment with its own GET route**, refreshed in place by htmx on a custom
+  `refresh` event that `static/workspace.js` dispatches when the socket names it. First paint and
+  every later paint go through the *same* partial, so there is one rendering path and one set of
+  filters however the request arrived. The chart pane is the one exception and carries no
+  `hx-get`: an htmx swap would destroy and rebuild its canvas once a second, so it listens for the
+  same event and re-fetches its own JSON.
+- **Selection is a navigation, not client state.** A blotter row is `<a href="/?scope=…">`. htmx
+  refreshes panes; it never selects. Reload, bookmark and socket-triggered refresh then land on
+  the same view by construction rather than by keeping two copies of the selection in step.
+- **Only the chart data route awaits the venue**, through the shared cache, under an explicit
+  timeout, and it answers a failure with the reason and a `503` — a failed pane is information, a
+  spinner that never resolves is not. Everything else is SQLite reads and configuration in memory.
+- **The dashboard reads `VenueStack.read_only_prices`, never `prices`.** In the sim stack — which
+  is also the *primary paper venue* — `prices` is a bridge: reading it feeds the tick to
+  `SimBroker`, matching resting orders and setting the reference price of the next market order.
+  An observer must never do that, so `Application.market_data` is the source *under* the bridge.
+  Venue stacks set both to the same provider, because reading a real venue changes nothing.
+
+**Control is the view.** `/control` is a 303 to `/`; the dock (⑤) and the risk-control pane (⑥)
+carry every act the page did, and the `/control/*` **POSTs kept their URLs** — they are control
+actions, not view fragments. Three rules follow:
+
+- **A refusal re-renders the workspace**, through `workspace.page`, with the reason on it and the
+  selection intact; a success 303s back to `/?scope=…`. Every form posts its scope in a hidden
+  field, so an operator mid-incident never loses the screen they were acting from.
+- **A typed phrase is a `<details>` drawer, not a modal**, and the phrase field lives inside it —
+  so the only way to submit is to have opened it and typed, and the dock works with scripting off.
+  The phrases are unchanged and there are four of them, because four different acts must not share
+  one word. `dashboard/dock.py` owns the two the dashboard defines; `views.py` puts all four in the
+  template globals, since a phrase passed per route is one some route forgets.
+- **`dock.py` is pure assembly**, like `blotter.py`: a button's label is the current state
+  reversed, an instrument excluded *through its basket* offers no release of its own (it would
+  publish a version changing nothing), and a pause toggle never reverses a halt — that is the
+  system's own doing and has its own typed act.
+
+Floats exist in exactly one module, `dashboard/chart.py`, and only as coordinates: candle OHLC and
+one marker price. Every quantity a human reads is the server's exact `Decimal` as a string.
+`dashboard/` is outside the packages `test_money_discipline.py` walks, so `test_dashboard_chart.py`
+asserts the boundary directly — the set of modules calling `float(` must be exactly `{chart.py}`.
+
+Live updates are **read-only pane invalidation over a WebSocket** ([ADR 0024](docs/adr/0024-live-updates-are-read-only-pane-invalidation.md)).
+`WS /ws/updates` carries `{"panes": [...]}` outward and accepts nothing:
+
+- **The auth middleware is pure ASGI and guards `http` *and* `websocket`.** `BaseHTTPMiddleware`
+  only ever sees HTTP, so a socket route behind it would have been unauthenticated by construction
+  — ADR 0014's rule arriving through the door it did not cover. `lifespan` is the only exempt
+  scope. `test_dashboard_auth.py` walks WebSocket routes too, and asserts every guarded scope has
+  a refusal.
+- **No data on the wire, so there is no second rendering path.** The refresh is an ordinary
+  authenticated GET through the same templates and filters. Inbound frames are read only to notice
+  a disconnect promptly, and discarded unparsed — nothing to validate because nothing is accepted.
+- **No cursor to resume**, deliberately unlike `AlertDispatcher` (ADR 0019): a reconnecting page
+  re-renders everything, so the tail anchors at the log's end and a missed notice costs nothing.
+  A missed *alert* is not recoverable by looking at the screen, which is why that one persists.
+- **`UpdateHub.register` completes the handshake**, and its order is load-bearing: anchor the
+  cursor *before* accepting, so nothing appended once the client is told it is live is missed;
+  join the fan-out *after*, because a notice sent mid-handshake raises and a socket that raises is
+  dropped. Either half alone is a page that quietly stops updating.
+- **The tail paces on `asyncio.sleep`, not the injected `Clock`** — the one sanctioned departure
+  from that rule. It is a transport interval, not domain time; nothing here timestamps or ages
+  anything. On a simulated clock it would be wrong twice over: a backtest stepping a month forward
+  would spin it a million times, and `ManualClock.sleep` returns immediately, making it a busy
+  loop. The poll interval **is** the debounce window — one tick, one notice, the union of what
+  changed.
+- **The tail is lazy.** No socket connected means no task and no polling, so a headless `run`, a
+  closed tab and the whole suite pay nothing for it.
+
+Selection lives in the URL (`/?scope=basket:demo`, `/?scope=instrument:demo:binance:BTC/USDT`),
+never in JavaScript, so a reload, a bookmark and a socket-triggered refresh land on the same view.
+Every scope carries its kind; an unparseable one is *no selection*, never a guess.
+
+**Pane sizes are the one exception, and the only client-side state on the screen.** The workspace is
+two columns of stacked panes with a draggable splitter between every neighbour — not one grid,
+whose shared row tracks would make "pull the blotter taller" also move the chart. Three rules:
+
+- **A size is a display preference, so it is not in the URL.** A bookmark reproduces a *view*; it
+  must not reproduce someone's monitor. Sizes persist in `localStorage`, and an absent or junk
+  entry leaves the stylesheet's defaults in place.
+- **Sizes are `--size-*` custom properties on the container, never inline styles on a pane.** htmx
+  replaces a pane's whole `<section>` on every refresh and would swap an inline style away within
+  the second. The value is the pane's pixel extent at drag time, used as a flex-grow ratio.
+- **The stylesheet carries the defaults and consumes the variables**, so a browser that never ran
+  `workspace.js` still gets the designed layout. `test_dashboard_workspace.py` asserts that
+  three-way contract: every name a splitter publishes is a region on the page, is defaulted in
+  `app.css`, and is read back by it.
 
 ### Phase 9 — operator control
 

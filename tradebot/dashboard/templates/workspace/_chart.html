@@ -1,0 +1,36 @@
+{% import "workspace/_pane.html" as p %}
+{# No `hx-get`: the canvas is owned by workspace.js, which re-fetches the JSON on the same
+   `refresh` event the other panes swap on. Letting htmx replace this subtree would tear down a
+   live chart once a second. #}
+<section class="pane pane-chart" id="pane-chart" data-pane="chart">
+  <h2 class="pane-title">
+    Chart{% if scope %} — <code>{{ scope }}</code>{% endif %}
+    <span class="timeframes">
+      {% for offered in timeframes %}
+        <a class="{{ 'on' if offered == timeframe }}" href="{{ p.select(scope, offered) }}">{{ offered }}</a>
+      {% endfor %}
+    </span>
+  </h2>
+  <div class="pane-body scroll">
+    {% for instrument in charts %}
+      {# One figure per instrument, each fetching its own data: a basket renders as a
+         small-multiple stack, never an overlay — mixed quote currencies make a shared price axis
+         a lie. One instrument failing therefore fails one figure. #}
+      <figure class="chart" data-chart
+              data-url="/workspace/chart/data?scope={{ ('instrument:' ~ scope.basket_id ~ ':' ~ instrument.key) | urlencode }}&amp;tf={{ timeframe }}">
+        <figcaption>
+          <strong>{{ instrument.symbol }}</strong>
+          <span class="muted small">{{ instrument.key }} · {{ timeframe }}</span>
+          <span class="chart-note muted small"></span>
+        </figcaption>
+        <div class="chart-canvas"></div>
+        <p class="chart-error" hidden></p>
+      </figure>
+    {% else %}
+      <p class="empty">
+        {% if scope %}That selection names nothing this process trades.
+        {% else %}Select a basket or an instrument in the blotter.{% endif %}
+      </p>
+    {% endfor %}
+  </div>
+</section>

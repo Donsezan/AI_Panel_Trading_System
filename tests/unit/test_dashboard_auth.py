@@ -1,8 +1,11 @@
 """Authentication is the dashboard's only gate, so it is tested as one (ADR 0014).
 
-The load-bearing test here is `test_every_route_is_protected`: it walks the registered routes
-rather than asserting a hand-written list, so a route added in a later pass is covered by this
-test the day it lands. That is the whole reason auth is middleware and not a dependency.
+The load-bearing tests here are the two route walks — `test_every_route_is_protected` and
+`test_every_websocket_route_is_protected`. They walk the registered routes rather than asserting a
+hand-written list, so a route added in a later pass is covered the day it lands. That is the whole
+reason auth is middleware and not a dependency, and the reason the middleware is pure ASGI: an
+HTTP-only middleware would have left the WebSocket walk with nothing to find and the socket
+unauthenticated (ADR 0024).
 """
 
 from __future__ import annotations
@@ -10,13 +13,20 @@ from __future__ import annotations
 import httpx
 import pytest
 from fastapi import FastAPI
+from starlette.routing import WebSocketRoute
 from tests.conftest import DASHBOARD_TOKEN as TOKEN
+from tests.conftest import ASGIWebSocket
 
+from tradebot.app import Application
 from tradebot.core.errors import ConfigError
+from tradebot.dashboard.app import create_dashboard
 from tradebot.dashboard.auth import (
+    GUARDED_SCOPES,
     LOOPBACK,
+    REFUSALS,
     SESSION_COOKIE,
     TOKEN_ENV,
+    WS_POLICY_VIOLATION,
     Session,
     assert_bind_allowed,
     is_public,
@@ -148,6 +158,56 @@ async def test_every_route_is_protected(dashboard: FastAPI, http: httpx.AsyncCli
 async def test_unauthenticated_post_is_refused_not_redirected(http: httpx.AsyncClient) -> None:
     """Redirecting a POST would report success for a state change that never happened."""
     assert (await http.post("/")).status_code == 401
+
+
+# ---------------------------------------------------------------- the websocket gate
+
+
+def test_every_guarded_scope_has_a_refusal() -> None:
+    """A scope the middleware guards but cannot refuse would fall through it, unauthenticated."""
+    assert set(REFUSALS) == set(GUARDED_SCOPES)
+
+
+def websocket_paths(dashboard: FastAPI) -> list[str]:
+    return [route.path for route in dashboard.routes if isinstance(route, WebSocketRoute)]
+
+
+def signed_cookie() -> str:
+    return f"{SESSION_COOKIE}={Session(TOKEN).issue()}"
+
+
+def test_the_app_registers_a_websocket_route_to_protect(dashboard: FastAPI) -> None:
+    """Guards the walks below: an empty walk asserts nothing, and would pass silently."""
+    assert websocket_paths(dashboard)
+
+
+@pytest.mark.parametrize("cookie", ["", f"{SESSION_COOKIE}=operator.forged-signature"])
+async def test_every_websocket_route_is_protected(dashboard: FastAPI, cookie: str) -> None:
+    """An upgrade without a valid session is closed before the route function is entered.
+
+    Walked rather than listed, exactly like the HTTP routes: this is the assertion that makes the
+    ASGI rewrite load-bearing rather than incidental. A forged cookie is walked beside an absent
+    one because presence and validity are different questions.
+    """
+    for path in websocket_paths(dashboard):
+        async with ASGIWebSocket(dashboard, path, cookie=cookie) as socket:
+            assert not socket.accepted, path
+            assert socket.close_code == WS_POLICY_VIOLATION, path
+
+
+async def test_a_signed_in_websocket_is_accepted(dashboard: FastAPI) -> None:
+    """The gate must admit as well as refuse, or it is untested in the direction that matters."""
+    for path in websocket_paths(dashboard):
+        async with ASGIWebSocket(dashboard, path, cookie=signed_cookie()) as socket:
+            assert socket.accepted, path
+
+
+async def test_rotating_the_token_shuts_the_socket_too(sim_application: Application) -> None:
+    """The revocation lever reaches every transport, not only the pages."""
+    rotated = create_dashboard(sim_application, token="a-different-token-entirely")
+    for path in websocket_paths(rotated):
+        async with ASGIWebSocket(rotated, path, cookie=signed_cookie()) as socket:
+            assert not socket.accepted, path
 
 
 async def test_login_with_the_wrong_token_is_401(http: httpx.AsyncClient) -> None:

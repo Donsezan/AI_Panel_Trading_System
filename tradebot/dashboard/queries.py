@@ -32,12 +32,13 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import Engine, Row, Select, select
+from sqlalchemy import ColumnElement, Engine, Row, Select, func, select
 
 from tradebot.core.config import ConfigRef
-from tradebot.core.enums import ConfigKind, OrderState
+from tradebot.core.enums import ConfigKind, OrderRole, OrderState
 from tradebot.core.events import Event, EventType
 from tradebot.core.money import ZERO, divide
+from tradebot.dashboard.scope import Scope
 from tradebot.persistence.schema import (
     cycles,
     decisions,
@@ -59,6 +60,24 @@ DEFAULT_LIMIT = 100
 Rows = tuple[Row[Any], ...]
 
 _OPEN_STATES = tuple(state.value for state in OrderState if state.is_open)
+
+#: What the operation log shows of a decision beside its cycle. Named rather than `decisions.*`
+#: because `cycle_id` appears on both sides of the join and one row may not carry it twice.
+_DECISION_COLUMNS = (
+    decisions.c.instrument_key,
+    decisions.c.action,
+    decisions.c.conviction,
+    decisions.c.size_hint,
+    decisions.c.reasoning_summary,
+)
+
+
+def _decision_join(scope: Scope | None) -> ColumnElement[bool]:
+    """The join condition for `activity`, narrowed to one instrument when one is selected."""
+    condition = decisions.c.cycle_id == cycles.c.cycle_id
+    if scope is None or scope.instrument_key is None:
+        return condition
+    return condition & (decisions.c.instrument_key == scope.instrument_key)
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,6 +193,58 @@ class Queries:
             for basket_id, (count, spent) in sorted(totals.items())
         )
 
+    def latest_decisions(self) -> Rows:
+        """The most recent decision for each instrument, per basket — the blotter's rows.
+
+        Partitioned by basket *and* instrument, not by instrument alone: two baskets may hold the
+        same instrument, and each row must show what *its* panel last concluded. Ranked in SQL so
+        one query returns one row per blotter line, rather than reading the whole decision history
+        to throw most of it away.
+
+        `cycle_id` breaks a tie on `decided_at`. Two decisions can only share an instant when the
+        clock did not move between cycles — a replay or a frozen test clock — and then there is no
+        fact about which is newer. A total order at least makes the blotter show the *same* row on
+        every render, rather than one that changes under a refresh.
+        """
+        joined = (
+            select(decisions, cycles.c.basket_id)
+            .join_from(decisions, cycles, decisions.c.cycle_id == cycles.c.cycle_id)
+            .subquery()
+        )
+        ranked = select(
+            joined,
+            func.row_number()
+            .over(
+                partition_by=(joined.c.basket_id, joined.c.instrument_key),
+                order_by=(joined.c.decided_at.desc(), joined.c.cycle_id.desc()),
+            )
+            .label("recency"),
+        ).subquery()
+        return self._rows(
+            select(ranked)
+            .where(ranked.c.recency == 1)
+            .order_by(ranked.c.basket_id, ranked.c.instrument_key)
+        )
+
+    def activity(self, scope: Scope | None = None, *, limit: int = DEFAULT_LIMIT) -> Rows:
+        """Cycles with the decision each reached, newest first — the operation log's rows.
+
+        An **outer** join, and the instrument filter sits in the join rather than the `WHERE`.
+        That is what keeps a cycle that decided nothing — `DATA_STALE`, `QUARANTINED`, a degraded
+        panel — in the log with an empty decision, instead of vanishing from it. A basket that
+        stops appearing is a basket nobody can audit (ADR 0022), and the same reasoning applies to
+        the operator's own view of it.
+        """
+        query = (
+            select(cycles, *_DECISION_COLUMNS)
+            .select_from(cycles.outerjoin(decisions, _decision_join(scope)))
+            .order_by(cycles.c.started_at.desc())
+            .limit(limit)
+        )
+        if scope is not None:
+            query = query.where(cycles.c.basket_id == scope.basket_id)
+        return self._rows(query)
+
     # ------------------------------------------------------------------ portfolio
 
     def positions(self) -> Rows:
@@ -189,6 +260,82 @@ class Queries:
 
     def round_trips(self, *, limit: int = DEFAULT_LIMIT) -> Rows:
         return self._rows(select(round_trips).order_by(round_trips.c.event_seq.desc()).limit(limit))
+
+    def day_realized(self, day_start: datetime) -> Decimal:
+        """Realized PnL booked since the daily-loss boundary — the workspace's "today".
+
+        Takes the boundary rather than computing one, so the number the operator watches is
+        measured from the same flow-adjusted instant the daily-loss rule uses (DESIGN §6.6). A
+        figure with its own idea of when the day started would drift from the limit it is meant to
+        preview.
+
+        Totalled **in Python, not in SQL**, for the reason `cost_by_basket` documents: `SUM` over a
+        money TEXT column rounds through an IEEE-754 double.
+        """
+        rows = self._rows(
+            select(round_trips.c.realized_pnl).where(round_trips.c.closed_at >= day_start)
+        )
+        return sum((row.realized_pnl for row in rows), ZERO)
+
+    def cycles_since(self, moment: datetime) -> dict[str, int]:
+        """Cycles started per basket since `moment` — the blotter's "cycles today".
+
+        `COUNT` in SQL rather than in Python, unlike every money total here: a count is an
+        integer, and integers do not round through a double.
+        """
+        return self._counts(
+            select(cycles.c.basket_id, func.count())
+            .where(cycles.c.started_at >= moment)
+            .group_by(cycles.c.basket_id)
+        )
+
+    def entry_orders_since(self, moment: datetime) -> dict[str, int]:
+        """Entry orders placed per basket since `moment` — the blotter's "trades today".
+
+        Entries only, and that is the same rule `HistoryReader` meters the daily cap with: a
+        protective leg belongs to the decision that placed it, not to a second trade. A blotter
+        counting legs would show a basket at its cap while the rule still let it trade.
+        """
+        return self._counts(
+            select(orders.c.basket_id, func.count())
+            .where(orders.c.role == OrderRole.ENTRY.value, orders.c.created_at >= moment)
+            .group_by(orders.c.basket_id)
+        )
+
+    # ------------------------------------------------------------------ chart windows
+
+    def decisions_in(self, scope: Scope, *, since: datetime) -> Rows:
+        """One instrument's decisions from `since`, for the basket that made them.
+
+        Scoped by basket as well as instrument: two baskets may hold the same instrument, and a
+        chart of one basket's reasoning must not carry the other's marks.
+        """
+        return self._rows(
+            select(decisions)
+            .join_from(decisions, cycles, decisions.c.cycle_id == cycles.c.cycle_id)
+            .where(
+                decisions.c.instrument_key == scope.instrument_key,
+                cycles.c.basket_id == scope.basket_id,
+                decisions.c.decided_at >= since,
+            )
+            .order_by(decisions.c.decided_at)
+        )
+
+    def orders_in(self, instrument_key: str, *, since: datetime) -> Rows:
+        """One instrument's orders from `since` — the chart's decision and cancellation marks."""
+        return self._rows(
+            select(orders)
+            .where(orders.c.instrument_key == instrument_key, orders.c.created_at >= since)
+            .order_by(orders.c.created_at)
+        )
+
+    def fills_in(self, instrument_key: str, *, since: datetime) -> Rows:
+        """One instrument's fills from `since` — marks at the price that actually happened."""
+        return self._rows(
+            select(fills)
+            .where(fills.c.instrument_key == instrument_key, fills.c.filled_at >= since)
+            .order_by(fills.c.filled_at)
+        )
 
     def equity_curve(self, *, opening_equity: Decimal = ZERO) -> tuple[EquityPoint, ...]:
         """Realized PnL accumulated over closed round trips, oldest first.
@@ -226,6 +373,11 @@ class Queries:
     def _rows(self, query: Select[Any]) -> Rows:
         with self._engine.connect() as connection:
             return tuple(connection.execute(query).all())
+
+    def _counts(self, query: Select[Any]) -> dict[str, int]:
+        """A grouped count as `key → n`. Absent keys are absent, never a fabricated zero."""
+        with self._engine.connect() as connection:
+            return dict(connection.execute(query).all())  # type: ignore[arg-type]
 
     def _one(self, query: Select[Any]) -> Row[Any] | None:
         with self._engine.connect() as connection:

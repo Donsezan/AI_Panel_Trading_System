@@ -1,0 +1,42 @@
+{# Every mutation on this screen, in one shape.
+
+   Three properties this macro exists to guarantee, none of which a hand-written form would keep
+   on its own:
+
+   * **One form per action.** The button's meaning is one act, and nothing on the page can submit a
+     second one by accident — the same rule the retired Control page kept for quarantine toggles.
+   * **The selection travels with the act**, so a refusal re-renders this screen still showing what
+     the operator was looking at, and a success returns them to it (`routes/control.py`).
+   * **A typed phrase is a drawer, not a modal.** `details` needs no JavaScript, which is the point:
+     an incident is the worst moment to discover a script did not load, and the header menu already
+     chose the same disclosure over a scripted dropdown. The phrase field lives *inside* the drawer,
+     so the only way to submit is to have opened it and typed. #}
+
+{% macro action(url, scope, timeframe='', phrase='', summary='', tone='') %}
+<form method="post" action="{{ url }}" class="dock-form">
+  <input type="hidden" name="scope" value="{{ scope or '' }}">
+  {% if timeframe %}<input type="hidden" name="tf" value="{{ timeframe }}">{% endif %}
+  {% if phrase %}
+    <details class="confirm {{ tone }}">
+      <summary>{{ summary }}…</summary>
+      <div class="confirm-body">
+        <label>Type <code>{{ phrase }}</code></label>
+        <input name="confirm" type="text" autocomplete="off" required>
+        {{ caller() }}
+      </div>
+    </details>
+  {% else %}
+    {{ caller() }}
+  {% endif %}
+</form>
+{% endmacro %}
+
+{# The quarantine toggle, whose label is the current state reversed. An empty key is the whole
+   basket — the convention the form, `dock.py` and `RiskPolicy.with_quarantine` all share. #}
+{% macro quarantine(basket_id, instrument_key, on, scope, timeframe='') %}
+  {% call action("/control/baskets/" ~ basket_id ~ "/quarantine", scope, timeframe) %}
+    <input type="hidden" name="instrument_key" value="{{ instrument_key }}">
+    <input type="hidden" name="excluded" value="{{ 'false' if on else 'true' }}">
+    <button type="submit" class="ghost">{{ "release" if on else "quarantine" }}</button>
+  {% endcall %}
+{% endmacro %}

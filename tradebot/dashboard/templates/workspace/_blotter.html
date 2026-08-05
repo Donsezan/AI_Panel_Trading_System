@@ -1,0 +1,57 @@
+{% import "_macros.html" as m %}
+{% import "workspace/_pane.html" as p %}
+<section class="pane pane-blotter" {{ p.attrs("blotter", "/workspace/blotter" ~ p.query(scope, timeframe)) }}>
+  <h2 class="pane-title">
+    Trades
+    {% if scope %}<a class="clear" href="{{ p.select(none, timeframe) }}">clear selection</a>{% endif %}
+  </h2>
+  <div class="pane-body scroll">
+    <table class="blotter">
+      <thead><tr>
+        <th>Basket / instrument</th><th>State</th><th class="num">Qty</th><th class="num">Avg entry</th>
+        <th class="num">Realized</th><th>Last decision</th><th class="num">Cycles</th>
+        <th class="num">Trades</th><th>Next cycle</th>
+      </tr></thead>
+      <tbody>
+      {% for row in baskets %}
+        <tr class="basket-row{% if row.selected %} selected{% endif %}">
+          <td>
+            <a href="{{ p.select(row.scope, timeframe) }}">{{ row.basket.name }}</a>
+            <code>{{ row.basket_id }}</code>
+          </td>
+          <td>{{ m.pill(row.state) }}</td>
+          <td class="num" colspan="4">
+            {% if row.halted_reason %}<span class="detail small danger">{{ row.halted_reason }}</span>{% endif %}
+          </td>
+          <td class="num">{{ row.cycles_today }}</td>
+          {# The cap the DailyTradeCapRule actually enforces, so an operator sees a basket's day
+             ending before it silently stops trading. #}
+          <td class="num {{ 'warn' if row.at_cap }}">{{ row.trades_today }} / {{ row.trade_cap }}</td>
+          <td class="mono small">{{ row.next_due | moment }}</td>
+        </tr>
+        {% for line in row.instruments %}
+          <tr class="instrument-row{% if line.selected %} selected{% endif %}">
+            <td class="indent">
+              <a href="{{ p.select(line.scope, timeframe) }}">{{ line.instrument.symbol }}</a>
+              <span class="muted small">{{ line.instrument.venue }}</span>
+            </td>
+            <td>{% if line.quarantined %}{{ m.pill("quarantined") }}{% endif %}</td>
+            <td class="num">{{ line.position.qty | quantity if line.position else absent }}</td>
+            <td class="num">{{ line.position.avg_entry | money if line.position else absent }}</td>
+            <td class="num">{{ m.signed(line.position.realized_pnl if line.position else none) }}</td>
+            <td class="decision">
+              {% if line.decision %}
+                {{ m.pill(line.decision.action) }}
+                <span class="muted small">{{ line.decision.conviction | money }} · {{ line.decision.decided_at | moment }}</span>
+              {% else %}<span class="muted small">not yet decided</span>{% endif %}
+            </td>
+            <td class="num" colspan="3"></td>
+          </tr>
+        {% endfor %}
+      {% else %}
+        {{ m.empty(9, "No baskets configured. Create one in Settings.") }}
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>

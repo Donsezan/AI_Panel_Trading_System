@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}Workspace{% endblock %}
+{% block body_class %}fills-viewport{% endblock %}
+{% block main_class %}workspace{% endblock %}
+
+{% import "workspace/_pane.html" as p %}
+{% block content %}
+{% include "workspace/_notices.html" %}
+{# Every pane's first paint is server-rendered by the same partial a refresh re-renders, so there
+   is one rendering path and one set of filters whether a number arrived by navigation or by a
+   socket nudge (ADR 0024).
+
+   Two stacked columns rather than one grid, so every boundary between neighbours is its own
+   draggable splitter — an operator pulling the blotter taller to see more orders must not also be
+   moving the chart. Sizes live on this container, in `--size-*`, and are the one thing this screen
+   keeps client-side (`workspace.js`). #}
+<div class="workspace-split" data-layout>
+  <div class="pane-column" data-column="left">
+    {% include "workspace/_portfolio.html" %}
+    {{ p.splitter("h", "portfolio", "blotter") }}
+    {% include "workspace/_blotter.html" %}
+    {{ p.splitter("h", "blotter", "log") }}
+    {% include "workspace/_log.html" %}
+  </div>
+  {{ p.splitter("v", "left", "right") }}
+  <div class="pane-column" data-column="right">
+    {% include "workspace/_chart.html" %}
+    {{ p.splitter("h", "chart", "controls") }}
+    {% include "workspace/_controls.html" %}
+    {{ p.splitter("h", "controls", "rc") }}
+    {% include "workspace/_rc.html" %}
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/lightweight-charts.standalone.production.js"
+        integrity="sha384-q1KYLSKHgBnW5tWYGGR8+6YV4/iPy31dILoF2I1OD7XiVUvHEp/TaxIQVmB0j3R2"
+        defer></script>
+{# First-party, so there is no upstream release to pin it against — the repository is its
+   provenance. Only vendored dependencies carry an `integrity` hash (ADR 0014). #}
+<script src="/static/workspace.js" defer></script>
+{% endblock %}

@@ -21,13 +21,18 @@ from typing import Any, cast
 from fastapi import Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
+from starlette.requests import HTTPConnection
 
 from tradebot.app import Application
+from tradebot.control.arming import LIVE_CONFIRMATION_PHRASE
 from tradebot.control.supervision import SupervisionController
 from tradebot.core.enums import Mode
 from tradebot.core.money import to_decimal
 from tradebot.dashboard.auth import Session
+from tradebot.dashboard.dock import KILL_PHRASE, QUARANTINE_CONFIRM
 from tradebot.dashboard.queries import Queries
+from tradebot.dashboard.updates import UpdateHub
+from tradebot.risk.state import REARM_PHRASE
 
 PACKAGE = Path(__file__).parent
 
@@ -42,6 +47,15 @@ MODE_TONE: dict[Mode, str] = {Mode.SIM: "sim", Mode.PAPER: "paper", Mode.LIVE: "
 #: Rendered where a value is genuinely absent, so an empty cell is never read as a zero.
 ABSENT = "—"
 
+#: What a template must retype in front of the operator to authorise an act. Four different acts,
+#: four different phrases: one phrase that did two of them could be typed for the wrong one.
+PHRASES = {
+    "kill_phrase": KILL_PHRASE,
+    "rearm_phrase": REARM_PHRASE,
+    "live_phrase": LIVE_CONFIRMATION_PHRASE,
+    "quarantine_confirm": QUARANTINE_CONFIRM,
+}
+
 
 @dataclass(frozen=True, slots=True)
 class DashboardState:
@@ -54,6 +68,9 @@ class DashboardState:
     #: Owns the supervisor's task. Asked rather than remembered, so a page never reports a
     #: boot-time decision that a Start or a Stop has since changed (ADR 0021).
     controller: SupervisionController
+    #: The live-update transport. Idle until a page opens a socket, and it carries pane names
+    #: outward and nothing inward (ADR 0024).
+    updates: UpdateHub
 
     @property
     def trading(self) -> bool:
@@ -71,8 +88,13 @@ class DashboardState:
         return not self.controller.running
 
 
-def state_of(request: Request) -> DashboardState:
-    return cast(DashboardState, request.app.state.dashboard)
+def state_of(connection: HTTPConnection) -> DashboardState:
+    """Everything the running system exposes, for a request or a socket.
+
+    Typed on `HTTPConnection` — `Request`'s and `WebSocket`'s common base — so the update socket
+    reaches the same state through the same accessor, with no second way in.
+    """
+    return cast(DashboardState, connection.app.state.dashboard)
 
 
 def build_templates(application: Application) -> Jinja2Templates:
@@ -84,6 +106,10 @@ def build_templates(application: Application) -> Jinja2Templates:
         mode=application.mode.value,
         mode_tone=MODE_TONE[application.mode],
         absent=ABSENT,
+        # The words that authorise an act, available to every template that renders one. Globals
+        # rather than per-route context: a phrase a route forgot to pass would render as an empty
+        # `<code>` beside a field the operator then cannot fill (PHASE_10 decision 5).
+        **PHRASES,
     )
     return templates
 

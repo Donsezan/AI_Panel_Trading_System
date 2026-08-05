@@ -29,6 +29,10 @@ dependencies = [
     # and works offline (ADR 0014).
     "fastapi>=0.115,<1",
     "uvicorn>=0.30,<1",
+    # The WebSocket protocol implementation uvicorn dispatches to. Plain `uvicorn` ships none, so
+    # without this the live-update socket fails its handshake at runtime while every test passes
+    # — Starlette's test client speaks ASGI directly and never needs it (ADR 0024).
+    "wsproto>=1.2,<2",
     "jinja2>=3.1,<4",
     "python-multipart>=0.0.9,<1",
     # Signs the session cookie. The key is derived from the dashboard token, so rotating the

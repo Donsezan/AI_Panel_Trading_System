@@ -18,7 +18,12 @@ from tradebot.app import Application
 from tradebot.core.enums import ConfigKind
 from tradebot.core.events import EventType
 from tradebot.dashboard.forms import draft_of
-from tradebot.dashboard.routes.configure import LOOSEN_PHRASE, fold_prices, unfold_prices
+from tradebot.dashboard.routes.configure import (
+    LOOSEN_PHRASE,
+    blank_basket_draft,
+    fold_prices,
+    unfold_prices,
+)
 
 
 def as_form(pairs: list[tuple[str, str]]) -> dict[str, list[str]]:
@@ -48,6 +53,27 @@ def flat(draft: dict[str, Any], prefix: str = "doc") -> list[tuple[str, str]]:
         elif value is not None:
             pairs.append((path, str(value)))
     return pairs
+
+
+def new_basket_form(*, lot_size: str) -> list[tuple[str, str]]:
+    """The blank new-basket form, filled in as an operator would — `lot_size` is theirs to type.
+
+    Built from the route's own blank draft rather than from a literal, so it stays the form the
+    operator is actually served.
+    """
+    draft = blank_basket_draft()
+    draft["basket_id"] = "alpha"
+    draft["name"] = "Alpha"
+    draft["panel"]["panel_id"] = "alpha-panel"
+    draft["timeframes"] = ["1h"]
+    draft["instruments"][0].update(
+        symbol="BTC/USDT",
+        base_currency="BTC",
+        quote_currency="USDT",
+        lot_size=lot_size,
+        tick_size="0.01",
+    )
+    return flat(draft)
 
 
 @pytest.fixture
@@ -121,6 +147,53 @@ async def test_an_invalid_limit_is_refused_with_the_models_own_message(
     assert response.status_code == 200
     assert "0–1 scale" in response.text
     assert sim_application.configs.latest(ConfigKind.BASKET, "demo").ref.version == 1  # type: ignore[union-attr]
+
+
+async def test_a_number_that_is_not_a_number_is_refused_and_not_a_crash(
+    sim_application: Application, client: httpx.AsyncClient
+) -> None:
+    """The new-basket form is where an operator types raw decimals: `lot_size` has no default.
+
+    A decimal comma is the likeliest typo there, and `MoneyError` is not a `ValueError` — so it
+    used to leave the form handler unconverted and reach the operator as a 500 that named no
+    field and lost the whole draft.
+    """
+    typed = new_basket_form(lot_size="0,001")
+    typed = _replace(typed, "doc.name", "Alpha, still typed")
+
+    response = await client.post("/configure/baskets/alpha", data=as_form(typed))
+
+    assert response.status_code == 200
+    assert "instruments[0].lot_size" in response.text
+    assert "not a valid decimal amount" in response.text
+    assert "Alpha, still typed" in response.text
+    assert {r.ref.config_id for r in sim_application.configs.baskets()} == {"demo"}
+
+
+async def test_the_same_new_basket_publishes_once_the_decimal_is_readable(
+    sim_application: Application, client: httpx.AsyncClient
+) -> None:
+    response = await client.post(
+        "/configure/baskets/alpha", data=as_form(new_basket_form(lot_size="0.001"))
+    )
+
+    assert response.status_code == 303
+    assert {r.ref.config_id for r in sim_application.configs.baskets()} == {"demo", "alpha"}
+
+
+async def test_a_tier2_limit_that_is_not_a_number_is_refused_and_not_a_crash(
+    sim_application: Application, client: httpx.AsyncClient
+) -> None:
+    """The same hole on the Tier-2 form, where a 500 would also hide whether anything published."""
+    policy = sim_application.configs.global_risk()
+    assert policy is not None
+    broken = _replace(flat(draft_of(policy.document)), "doc.max_drawdown_pct", "0,5")
+
+    response = await client.post("/configure/risk", data=as_form(broken))
+
+    assert response.status_code == 200
+    assert "not a valid decimal amount" in response.text
+    assert sim_application.configs.global_risk().document.max_drawdown_pct == Decimal(10)  # type: ignore[union-attr]
 
 
 async def test_a_cross_field_rule_on_a_nested_model_is_still_shown(

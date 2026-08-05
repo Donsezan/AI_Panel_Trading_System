@@ -33,10 +33,31 @@ header {
   border-bottom: 3px solid var(--line);
 }
 header .spacer { flex: 1; }
-header nav { display: flex; gap: 1rem; }
+header nav { display: flex; align-items: center; gap: 1rem; }
 header a { color: var(--text); text-decoration: none; }
 header a:hover { text-decoration: underline; }
 header a.logout { color: var(--muted); }
+
+/* Native disclosure rather than a scripted dropdown: one less thing that can fail on the screen
+   an incident is read from. */
+nav details.menu { position: relative; }
+nav details.menu > summary { cursor: pointer; list-style: none; }
+nav details.menu > summary::-webkit-details-marker { display: none; }
+nav details.menu > summary::after { content: " ▾"; color: var(--muted); }
+nav .menu-items {
+  position: absolute;
+  z-index: 20;
+  top: 1.6rem;
+  left: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  min-width: 13rem;
+  padding: 0.6rem 0.8rem;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
 
 .mode-badge {
   font: 600 12px/1 var(--mono);
@@ -65,6 +86,7 @@ header a.logout { color: var(--muted); }
 
 main { max-width: 1400px; margin: 0 auto; padding: 1.2rem; }
 h1 { font-size: 1.4rem; margin: 0.4rem 0 1rem; }
+h1:empty { display: none; }
 h2 { font-size: 1.05rem; margin: 2rem 0 0.6rem; color: var(--accent); font-weight: 600; }
 
 .figures { display: flex; flex-wrap: wrap; gap: 0.8rem; margin-bottom: 0.5rem; }
@@ -236,3 +258,166 @@ form.retire { display: flex; align-items: center; gap: 0.6rem; margin-top: 2rem;
   background: var(--panel);
 }
 .danger-zone p { flex-basis: 100%; margin: 0; }
+
+/* ------------------------------------------------------------------ workspace
+   The blotter workspace: a dense master–detail grid where selection drives the dependent panes.
+   Modelled on a trading blotter, so rows are tight and numbers are monospaced and right-aligned
+   — an operator scans this screen rather than reading it. Desktop only, by declaration. */
+
+body.fills-viewport { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+body.fills-viewport main.workspace {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  flex: 1;
+  min-height: 0;
+  max-width: none;
+  padding: 0.5rem;
+}
+
+/* Two columns of stacked panes, each neighbour pair separated by a draggable splitter — not one
+   grid. A grid's row tracks are shared by both columns, so dragging the blotter taller would have
+   moved the chart's bottom edge with it; stacked columns give every boundary its own handle.
+
+   Every size is a flex-grow ratio held in a custom property **on the container**, which is what
+   makes it survive: htmx replaces a pane's whole `<section>` on every refresh, so a size written
+   as an inline style on the pane would be swapped away within the second. The defaults below are
+   the designed layout, so a browser with no JavaScript — or an operator who has never dragged
+   anything — gets exactly the screen the plan describes (PHASE_10 §The screen). */
+.workspace-split {
+  --size-left: 42;
+  --size-right: 58;
+  --size-portfolio: 1;
+  --size-blotter: 3;
+  --size-log: 2;
+  --size-chart: 5;
+  --size-controls: 2;
+  --size-rc: 2;
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+.pane-column { display: flex; flex-direction: column; min-width: 18rem; min-height: 0; }
+.pane-column[data-column="left"] { flex: var(--size-left) 1 0; }
+.pane-column[data-column="right"] { flex: var(--size-right) 1 0; }
+
+.pane-portfolio { flex: var(--size-portfolio) 1 0; }
+.pane-blotter { flex: var(--size-blotter) 1 0; }
+.pane-log { flex: var(--size-log) 1 0; }
+.pane-chart { flex: var(--size-chart) 1 0; }
+.pane-controls { flex: var(--size-controls) 1 0; }
+.pane-rc { flex: var(--size-rc) 1 0; }
+
+/* Thick enough to grab, drawn as a hairline. `touch-action` because a drag on a trackpad or touch
+   screen must resize the pane rather than scroll the page under it. */
+.splitter { position: relative; flex: 0 0 0.5rem; touch-action: none; }
+.splitter::after { content: ""; position: absolute; background: var(--line); }
+.splitter-h { cursor: row-resize; }
+.splitter-h::after { left: 0; right: 0; top: 50%; height: 2px; transform: translateY(-1px); }
+.splitter-v { cursor: col-resize; }
+.splitter-v::after { top: 0; bottom: 0; left: 50%; width: 2px; transform: translateX(-1px); }
+.splitter:focus { outline: none; }
+.splitter:hover::after,
+.splitter:focus-visible::after,
+.splitter.dragging::after { background: var(--accent); }
+
+.pane {
+  display: flex;
+  flex-direction: column;
+  /* Never draggable below its own title bar: a pane an operator cannot see is a pane they cannot
+     drag back, and the workspace has no other way to restore one. */
+  min-height: 2.2rem;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.pane-title {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin: 0;
+  padding: 0.35rem 0.7rem;
+  background: #0b0e12;
+  border-bottom: 1px solid var(--line);
+  font: 600 11px/1.6 var(--mono);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--accent);
+}
+.pane-title .clear, .pane-title .timeframes { margin-left: auto; }
+.pane-title code { text-transform: none; letter-spacing: 0; }
+.pane-body { min-height: 0; padding: 0.5rem 0.7rem; }
+.pane-body.scroll { overflow: auto; padding: 0; }
+.pane-body.scroll > table { border: none; border-radius: 0; }
+.pane-body.scroll thead th { position: sticky; top: 0; z-index: 1; background: #0b0e12; }
+
+.timeframes { display: flex; gap: 0.5rem; }
+.timeframes a { color: var(--muted); text-decoration: none; }
+.timeframes a.on { color: var(--accent); text-decoration: underline; }
+
+dl.ledger-lines { display: grid; grid-template-columns: 1fr max-content; gap: 0.2rem 1rem; margin: 0; }
+dl.ledger-lines dt { color: var(--muted); font-size: 13px; }
+dl.ledger-lines dd { margin: 0; text-align: right; font-family: var(--mono); }
+dl.ledger-lines dd.total { font-size: 1.15rem; font-weight: 600; }
+
+ul.venues { list-style: none; margin: 0.5rem 0 0; padding: 0.5rem 0 0; border-top: 1px solid var(--line); }
+ul.venues li { display: flex; justify-content: space-between; font-size: 13px; }
+ul.venues .venue { color: var(--muted); font-family: var(--mono); }
+
+table.blotter, table.log { font-size: 13px; }
+table.blotter th, table.log th { padding: 0.3rem 0.6rem; }
+table.blotter td, table.log td { padding: 0.25rem 0.6rem; }
+table.blotter a, table.log a { color: var(--text); text-decoration: none; }
+table.blotter a:hover, table.log a:hover { color: var(--accent); text-decoration: underline; }
+tr.basket-row { background: #12171d; }
+tr.basket-row td { font-weight: 600; }
+tr.instrument-row td.indent { padding-left: 1.7rem; }
+/* The blotter's whole job: one selection, unmistakable, driving every dependent pane. */
+tr.selected > td { background: #1c2c44; box-shadow: inset 2px 0 0 var(--accent); }
+
+figure.chart { margin: 0; padding: 0.5rem 0.7rem; border-bottom: 1px solid var(--line); }
+figure.chart:last-child { border-bottom: none; }
+figure.chart figcaption { display: flex; align-items: baseline; gap: 0.5rem; margin-bottom: 0.3rem; }
+figure.chart .chart-note { margin-left: auto; color: var(--warn); }
+.chart-canvas { height: 16rem; }
+.pane-chart .pane-body.scroll > figure.chart:only-child { height: 100%; padding-bottom: 1.5rem; }
+.pane-chart .pane-body.scroll > figure.chart:only-child .chart-canvas { height: calc(100% - 1.5rem); }
+.chart-error { margin: 0.4rem 0 0; color: var(--danger); font-size: 13px; }
+
+/* ------------------------------------------------------------------ the dock
+   Panes ⑤ and ⑥. Every act is its own form, and a typed phrase is a closed drawer rather than a
+   modal: the phrase field only exists once the operator has opened it, and nothing here depends on
+   a script having loaded — the header menu made the same choice for the same reason. */
+
+.dock { display: flex; flex-direction: column; gap: 0.4rem; padding: 0.5rem 0.7rem; font-size: 13px; }
+.dock-group { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; }
+.dock-label { min-width: 7rem; color: var(--muted); font: 600 11px/1.6 var(--mono); text-transform: uppercase; letter-spacing: 0.06em; }
+.dock-note { margin: 0; font-size: 12px; }
+.dock-list { margin: 0; padding-left: 1.2rem; font-size: 12px; color: var(--muted); }
+.dock-basket { padding-top: 0.4rem; border-top: 1px solid var(--line); }
+.dock-form { display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem; margin: 0; }
+.dock-form button { padding: 0.2rem 0.6rem; font-size: 12px; }
+.dock-form input[type="text"] { padding: 0.2rem 0.4rem; font-size: 12px; }
+
+.dock-table { background: none; border: none; font-size: 12px; }
+.dock-table td { padding: 0.2rem 0.4rem; border-bottom: 1px solid var(--line); }
+.dock-table tr:last-child td { border-bottom: none; }
+
+details.confirm > summary { color: var(--accent); font-size: 12px; }
+details.confirm.danger > summary { color: var(--danger); }
+details.confirm[open] > summary { margin-bottom: 0.4rem; }
+.confirm-body {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.5rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #0b0e12;
+}
+details.confirm.danger .confirm-body { border-color: var(--danger); }
+.confirm-body .muted { flex-basis: 100%; }
+
+details.banner-detail { padding: 0.4rem 1.2rem; }

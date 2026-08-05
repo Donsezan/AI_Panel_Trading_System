@@ -7,9 +7,11 @@ deterministic and free — which is what lets it run on every commit (PLAN §7).
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator, Iterator
 from datetime import UTC, datetime
 from decimal import Decimal
+from typing import Any, cast
 
 import httpx
 import pytest
@@ -263,6 +265,79 @@ async def dashboard_observing(sim_application: Application) -> AsyncIterator[htt
     ) as connected:
         await connected.post("/login", data={"token": DASHBOARD_TOKEN})
         yield connected
+
+
+class ASGIWebSocket:
+    """One raw ASGI websocket against an app, with no test client in between.
+
+    Starlette's `TestClient` now wants httpx 2 (see the `http` fixture), and a websocket needs
+    only a receive queue and a send queue anyway. Driving the protocol directly also means the
+    auth tests assert the ASGI contract the middleware actually implements — `websocket.close`
+    before `websocket.accept` — rather than a client's interpretation of it.
+    """
+
+    def __init__(self, app: FastAPI, path: str, *, cookie: str = "") -> None:
+        self._app = app
+        self._path = path
+        self._cookie = cookie
+        self._inbound: asyncio.Queue[dict[str, object]] = asyncio.Queue()
+        self._outbound: asyncio.Queue[dict[str, object]] = asyncio.Queue()
+        self._task: asyncio.Task[None] | None = None
+        self.handshake: dict[str, object] = {}
+
+    @property
+    def accepted(self) -> bool:
+        return self.handshake.get("type") == "websocket.accept"
+
+    @property
+    def close_code(self) -> int | None:
+        return cast("int | None", self.handshake.get("code"))
+
+    async def receive_json(self, within: float = 2.0) -> Any:
+        """The next frame the server sent, decoded. Times out rather than hanging the suite."""
+        message = await asyncio.wait_for(self._outbound.get(), within)
+        return json.loads(cast(str, message["text"]))
+
+    async def send_text(self, text: str) -> None:
+        """Push a frame at the server, so a test can prove it is ignored."""
+        await self._inbound.put({"type": "websocket.receive", "text": text})
+
+    async def __aenter__(self) -> ASGIWebSocket:
+        self._task = asyncio.create_task(self._app(self._scope(), self._receive, self._send))
+        await self._inbound.put({"type": "websocket.connect"})
+        self.handshake = await asyncio.wait_for(self._outbound.get(), 2.0)
+        return self
+
+    async def __aexit__(self, *_exc: object) -> None:
+        await self._inbound.put({"type": "websocket.disconnect", "code": 1000})
+        if self._task is not None:
+            await asyncio.wait_for(asyncio.shield(self._task), 2.0)
+
+    def _scope(self) -> dict[str, Any]:
+        headers = [(b"host", b"dashboard")]
+        if self._cookie:
+            headers.append((b"cookie", self._cookie.encode()))
+        return {
+            "type": "websocket",
+            "asgi": {"version": "3.0", "spec_version": "2.3"},
+            "http_version": "1.1",
+            "scheme": "ws",
+            "path": self._path,
+            "raw_path": self._path.encode(),
+            "query_string": b"",
+            "root_path": "",
+            "headers": headers,
+            "client": ("127.0.0.1", 51234),
+            "server": ("dashboard", 80),
+            "subprotocols": [],
+            "state": {},
+        }
+
+    async def _receive(self) -> dict[str, object]:
+        return await self._inbound.get()
+
+    async def _send(self, message: dict[str, object]) -> None:
+        await self._outbound.put(message)
 
 
 @pytest.fixture

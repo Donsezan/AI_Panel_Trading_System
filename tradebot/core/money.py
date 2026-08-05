@@ -46,17 +46,27 @@ ONE: Final = Decimal(1)
 _PRICE_ROUNDING: Final[dict[Side, str]] = {Side.BUY: ROUND_DOWN, Side.SELL: ROUND_UP}
 
 
-def to_decimal(value: Decimal | int | str) -> Decimal:
-    """Convert to `Decimal`, refusing `float`.
+def refuse_float(value: object) -> None:
+    """Refuse a `float` in a money path.
 
-    Venue payloads and config carry numbers as strings for exactly this reason; accepting a
-    float here would reintroduce binary rounding error into the one place it must not exist.
+    Its own function because the two ways `to_decimal` fails need opposite handling at the model
+    boundary (`core/schema.py`): a `float` is a defect in our code and must be loud, while text
+    that is not a number is what an operator typed and belongs on the field they typed it in.
     """
     if isinstance(value, float):
         raise MoneyError(
             f"float is not accepted in money paths: {value!r}. "
             "Pass the original string or Decimal instead."
         )
+
+
+def to_decimal(value: Decimal | int | str) -> Decimal:
+    """Convert to `Decimal`, refusing `float`.
+
+    Venue payloads and config carry numbers as strings for exactly this reason; accepting a
+    float here would reintroduce binary rounding error into the one place it must not exist.
+    """
+    refuse_float(value)
     try:
         return Decimal(value)
     except (InvalidOperation, ValueError, TypeError) as exc:

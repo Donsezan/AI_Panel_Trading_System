@@ -1,0 +1,35 @@
+{% import "_macros.html" as m %}
+{% import "workspace/_pane.html" as p %}
+<section class="pane pane-log" {{ p.attrs("log", "/workspace/log" ~ p.query(scope)) }}>
+  <h2 class="pane-title">
+    Operation log{% if scope %} — <code>{{ scope }}</code>{% endif %}
+  </h2>
+  <div class="pane-body scroll">
+    <table class="log">
+      <thead><tr>
+        <th>Started</th><th>Basket</th><th>Outcome</th><th>Instrument</th>
+        <th>Decision</th><th class="num">Conviction</th><th class="num">Cost</th>
+      </tr></thead>
+      <tbody>
+      {# One row per cycle, including the cycles that decided nothing: `activity` outer-joins its
+         decisions so a DATA_STALE or QUARANTINED cycle stays in the log rather than vanishing
+         from it. A basket that stops appearing is a basket nobody can audit (ADR 0022). #}
+      {% for row in activity %}
+        <tr>
+          <td class="mono">
+            <a href="/cycles/{{ row.cycle_id }}" title="open the decision drill-down">{{ row.started_at | moment }}</a>
+          </td>
+          <td><code>{{ row.basket_id }}</code></td>
+          <td>{{ m.pill(row.outcome or "running") }}</td>
+          <td class="small">{{ row.instrument_key or absent }}</td>
+          <td>{% if row.action %}{{ m.pill(row.action) }}{% else %}<span class="muted">{{ absent }}</span>{% endif %}</td>
+          <td class="num">{{ row.conviction | money if row.conviction is not none else absent }}</td>
+          <td class="num">{{ row.cost_usd | money(4) }}</td>
+        </tr>
+      {% else %}
+        {{ m.empty(7, "Nothing has cycled yet.") }}
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>

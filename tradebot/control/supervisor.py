@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Protocol
 
 from tradebot.control.basket_runner import BasketRunner, CycleResult
@@ -120,11 +121,22 @@ class BasketWorker:
         self._failures = 0
         self._stopped = False
         self._running = False
+        self._next_due: datetime | None = None
 
     @property
     def failures(self) -> int:
         """Consecutive failed cycles. Reset by any cycle that completes."""
         return self._failures
+
+    @property
+    def next_due(self) -> datetime | None:
+        """When this worker is currently sleeping until, or `None` if it is not sleeping.
+
+        Recorded by the loop that computes it rather than recomputed by a reader: `next_fire`
+        consults the venue calendar and would otherwise be an `await` on a page render, answering
+        a slightly different question than the one the worker is actually waiting on.
+        """
+        return self._next_due
 
     @property
     def stopped(self) -> bool:
@@ -184,6 +196,7 @@ class BasketWorker:
         """Retire this worker and release what its basket owned."""
         self._stopped = True
         self._runner = None
+        self._next_due = None
         await self._factory.release(self.basket_id)
 
     async def _wait_until_due(self) -> None:
@@ -200,7 +213,13 @@ class BasketWorker:
         except TradebotError as exc:
             await self._halt(f"schedule cannot be satisfied: {exc}")
             return
-        await self._scheduler.wait_until(due)
+        self._next_due = due
+        try:
+            await self._scheduler.wait_until(due)
+        finally:
+            # Cleared on the way out, including on cancellation: a time this worker is no longer
+            # waiting for would read on the blotter as a cycle that is still coming.
+            self._next_due = None
 
     def _runnable(self) -> ConfigRecord[Basket] | None:
         """This basket's current version, if it may cycle right now.
@@ -296,6 +315,15 @@ class Supervisor:
     def baskets(self) -> tuple[ConfigRecord[Basket], ...]:
         """Baskets in service, newest version of each."""
         return self._configs.baskets()
+
+    def next_due(self, basket_id: str) -> datetime | None:
+        """When this basket next cycles, or `None` if nothing is waiting to cycle it.
+
+        Reads the workers that exist; deliberately not `worker_for`, which *creates* one. A page
+        render must not bring a worker into being for a basket the supervisor is not running.
+        """
+        worker = self._workers.get(basket_id)
+        return worker.next_due if worker is not None else None
 
     def worker_for(self, basket_id: str) -> BasketWorker:
         """The worker owning `basket_id`.

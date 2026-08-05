@@ -1,0 +1,66 @@
+{% import "_macros.html" as m %}
+{% import "workspace/_actions.html" as a %}
+{# What an action just did, above the grid rather than inside a pane: a pane refresh must not wipe
+   the answer an operator is still reading. Rendered by `page` on the same screen the action was
+   taken from, with the selection intact (`routes/control.py`). #}
+
+{% if error %}<div class="banner danger"><strong>Not done.</strong> {{ error }}</div>{% endif %}
+
+{% if pending %}
+  <div class="banner warn">
+    <strong>{{ pending.scope }} holds a position.</strong>
+    Quarantining stops the bot acting on {{ pending.held | join(", ") }} at all — no entry, and no
+    exit either. The position stays exactly where it is until you close it by hand, and doing
+    nothing with a position can compound a loss as readily as trading it can cause one.
+    {% call a.action("/control/baskets/" ~ pending.basket_id ~ "/quarantine", scope, timeframe) %}
+      <input type="hidden" name="instrument_key" value="{{ pending.instrument_key }}">
+      <input type="hidden" name="excluded" value="true">
+      <input type="hidden" name="confirm" value="{{ quarantine_confirm }}">
+      <button type="submit">Quarantine anyway</button>
+    {% endcall %}
+  </div>
+{% endif %}
+
+{% if outcome %}
+  {% if outcome.partial %}
+    <div class="banner warn">
+      <strong>Partial close submitted — you are not flat.</strong>
+      <code>{{ outcome.order.client_order_id }}</code> closes {{ outcome.order.qty | quantity }}
+      of {{ outcome.held_qty | quantity }} {{ outcome.instrument_key }} at
+      {{ outcome.order.limit_price | money }}. A Tier-2 limit shrank it; the provenance below says
+      which.
+    </div>
+  {% elif outcome.submitted %}
+    <div class="banner ok-banner">
+      <strong>Close submitted.</strong>
+      <code>{{ outcome.order.client_order_id }}</code> — {{ outcome.order.qty | quantity }}
+      {{ outcome.instrument_key }} at {{ outcome.order.limit_price | money }}.
+    </div>
+  {% else %}
+    <div class="banner warn">
+      <strong>Close refused by risk.</strong> {{ outcome.reason }}
+      <span class="detail">
+        The close went through the ordinary Tier-1 → Tier-2 path and a rule declined it. Nothing
+        here bypasses a limit: raise it in Parameters, which is itself a versioned, attributable
+        act, or use the kill switch to stop everything.
+      </span>
+    </div>
+  {% endif %}
+  {% if outcome.checks %}
+    <details class="banner-detail">
+      <summary>Risk provenance for this request</summary>
+      <table class="checks">
+        <thead><tr><th>Rule</th><th>Decision</th><th>Detail</th></tr></thead>
+        <tbody>
+        {% for check in outcome.checks %}
+          <tr>
+            <td><code>{{ check.rule }}</code></td>
+            <td>{{ m.pill(check.decision.value) }}</td>
+            <td class="detail-cell">{{ check.detail }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </details>
+  {% endif %}
+{% endif %}

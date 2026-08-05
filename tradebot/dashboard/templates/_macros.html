@@ -11,9 +11,14 @@
   "cancelled": "muted", "expired": "muted", "rejected": "warn",
   "submit_unknown": "danger",
   "BUY": "ok", "SELL": "warn", "HOLD": "muted", "WAIT": "muted", "ABSTAIN": "muted",
+  "active": "ok", "paused": "muted", "retired": "muted", "halted": "danger",
 } %}
 
 {% macro pill(value) %}<span class="pill {{ TONE.get(value, 'muted') }}">{{ value }}</span>{% endmacro %}
+
+{# A signed amount, toned by direction. `money` already renders an absent value as the em dash,
+   so a missing figure is never coloured as a flat one. #}
+{% macro signed(value, places=2) %}<span class="num {{ 'muted' if value is none else ('ok' if value > 0 else ('danger' if value < 0 else 'muted')) }}">{{ value | money(places) }}</span>{% endmacro %}
 
 {% macro empty(colspan, message) %}
   <tr class="empty"><td colspan="{{ colspan }}">{{ message }}</td></tr>

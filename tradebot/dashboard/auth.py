@@ -4,7 +4,7 @@ Stricter than DESIGN §6.10, which only demands auth off-loopback. Auth here is 
 because anything that can reach localhost otherwise gets the kill switch and config CRUD for
 free (ADR 0014).
 
-Three properties, each defending against a specific way this goes wrong:
+Four properties, each defending against a specific way this goes wrong:
 
 * **The server refuses to start without a token**, the same way live mode refuses without its
   preconditions (PLAN §2.4). There is no flag that disables auth: a control that can be turned
@@ -12,13 +12,18 @@ Three properties, each defending against a specific way this goes wrong:
 * **Enforcement is middleware, not a per-route dependency.** A dependency someone forgets to add
   to a new route is an unauthenticated route. `test_dashboard_auth.py` walks every registered
   route and asserts only the login, logout and static paths are exempt.
+* **The middleware is pure ASGI, so it sees every scope a client can open** — `http` *and*
+  `websocket`. `BaseHTTPMiddleware` only ever sees HTTP requests, which would have made the
+  first WebSocket route unauthenticated by construction: the exact failure the
+  middleware-not-a-dependency rule exists to prevent (ADR 0024).
 * **The cookie's signing key is derived from the token.** The session does not expire, so
   rotating `TRADEBOT_DASHBOARD_TOKEN` and restarting is the revocation lever — it invalidates
   every live session at once.
 
 Failure semantics: an absent or unverifiable session is never treated as anonymous access. A
 navigation is redirected to the login form; anything else is refused with `401`, because
-silently redirecting a POST would swallow a state change the operator believes they made.
+silently redirecting a POST would swallow a state change the operator believes they made. A
+WebSocket is closed before it is accepted, which an ASGI server reports as a refused handshake.
 """
 
 from __future__ import annotations
@@ -28,9 +33,9 @@ import os
 from collections.abc import Awaitable, Callable, Mapping
 
 from itsdangerous import BadSignature, Signer
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request
-from starlette.responses import RedirectResponse, Response
+from starlette.requests import HTTPConnection
+from starlette.responses import PlainTextResponse, RedirectResponse, Response
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from tradebot.core.errors import ConfigError
 from tradebot.core.logging import SECRETS, get_logger
@@ -112,33 +117,76 @@ def is_public(path: str) -> bool:
     return path in PUBLIC_PATHS or path.startswith(STATIC_PREFIX)
 
 
-class SessionMiddleware(BaseHTTPMiddleware):
-    """Refuses every request without a valid session, except the public paths."""
+#: The ASGI scope types that carry a client, and therefore a principal to check. `lifespan` is
+#: the server talking to the application about its own startup: no client, no cookie, nothing to
+#: authenticate. Every type in here has an entry in `REFUSALS`, asserted by the auth suite — a
+#: guarded scope with no way to refuse would fail open on the one path that must not.
+GUARDED_SCOPES = frozenset({"http", "websocket"})
 
-    def __init__(self, app: Callable[..., Awaitable[None]], session: Session) -> None:
-        super().__init__(app)
+#: Sent when a socket is opened without a session. RFC 6455 "policy violation" — an ASGI server
+#: turns a close sent before `websocket.accept` into a refused handshake.
+WS_POLICY_VIOLATION = 1008
+
+
+class SessionMiddleware:
+    """Refuses every request without a valid session, except the public paths.
+
+    Pure ASGI rather than `BaseHTTPMiddleware` so the `websocket` scope is covered by the same
+    gate as `http`, without the socket route knowing it is being guarded (ADR 0024).
+    """
+
+    def __init__(self, app: ASGIApp, session: Session) -> None:
+        self._app = app
         self._session = session
 
-    async def dispatch(
-        self, request: Request, call_next: Callable[[Request], Awaitable[Response]]
-    ) -> Response:
-        if is_public(request.url.path) or self._session.verifies(
-            request.cookies.get(SESSION_COOKIE)
-        ):
-            return await call_next(request)
-        return _refuse(request)
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] not in GUARDED_SCOPES or self._admits(scope):
+            await self._app(scope, receive, send)
+            return
+        await REFUSALS[scope["type"]](scope, receive, send)
+
+    def _admits(self, scope: Scope) -> bool:
+        """A public path, or a cookie this server signed. Identical for HTTP and WebSocket.
+
+        An upgrade request is an ordinary HTTP request until the handshake completes, so it
+        carries the same cookies and needs no second code path to check them.
+        """
+        return is_public(scope["path"]) or self._session.verifies(
+            HTTPConnection(scope).cookies.get(SESSION_COOKIE)
+        )
 
 
-def _refuse(request: Request) -> Response:
+async def _refuse_http(scope: Scope, receive: Receive, send: Send) -> None:
     """Send a browser to the login form; refuse anything else outright.
 
     A GET is a navigation and a redirect is the helpful answer. A POST is an operator asking for
     a state change, and redirecting it would report success for something that never happened —
     on a surface where "something" includes the kill switch.
     """
-    if request.method == "GET":
-        return RedirectResponse("/login", status_code=303)
-    return Response("authentication required", status_code=401, media_type="text/plain")
+    response: Response = (
+        RedirectResponse("/login", status_code=303)
+        if scope["method"] == "GET"
+        else PlainTextResponse("authentication required", status_code=401)
+    )
+    await response(scope, receive, send)
+
+
+async def _refuse_websocket(_scope: Scope, _receive: Receive, send: Send) -> None:
+    """Close before accepting, which the server reports to the browser as a failed handshake.
+
+    There is no redirect to offer a socket and no body it would render. Nothing is lost by the
+    terse refusal: this transport only ever asks the page to refresh, and the page itself is one
+    unauthenticated navigation away from the login form.
+    """
+    await send({"type": "websocket.close", "code": WS_POLICY_VIOLATION})
+
+
+#: How a refusal is delivered, per scope type. Dispatch rather than a branch, so adding a scope
+#: means adding its refusal (CLAUDE.md conventions).
+REFUSALS: dict[str, Callable[[Scope, Receive, Send], Awaitable[None]]] = {
+    "http": _refuse_http,
+    "websocket": _refuse_websocket,
+}
 
 
 def set_session(response: Response, session: Session, *, secure: bool) -> None:

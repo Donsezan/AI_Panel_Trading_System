@@ -1,9 +1,12 @@
-"""The Monitor pages, driven over real HTTP against a real wired sim application.
+"""The Analytics pages, driven over real HTTP against a real wired sim application.
 
 Rendered, not mocked: a template that references a column the projection does not have is a
 runtime failure on a page an operator reads during an incident, and the only way to catch that
 is to render it. The suite stays offline — `SimBroker`, the scripted panel, an in-memory
 database, and an ASGI transport with no socket.
+
+The workspace at `/` has its own suite (`test_dashboard_workspace.py`); what is left here is the
+record of what happened, which the workspace links out to rather than duplicating.
 """
 
 from __future__ import annotations
@@ -14,7 +17,7 @@ import pytest
 from tradebot.app import Application
 from tradebot.core.enums import ConfigKind, CycleOutcome
 
-MONITOR_PAGES = ["/", "/portfolio", "/cycles", "/risk", "/costs"]
+MONITOR_PAGES = ["/analytics/portfolio", "/cycles", "/risk", "/costs"]
 
 
 @pytest.fixture
@@ -43,15 +46,16 @@ async def test_pages_render_after_a_cycle(
 
 async def test_the_mode_is_unmissable(client: httpx.AsyncClient) -> None:
     """Mode confusion is a catastrophic failure class, so the banner is a control (PLAN §2.4)."""
-    body = (await client.get("/")).text
+    body = (await client.get("/cycles")).text
     assert "mode-sim" in body
     assert "SIM" in body
 
 
-async def test_overview_shows_the_configured_basket(client: httpx.AsyncClient) -> None:
-    body = (await client.get("/")).text
-    assert "demo" in body
-    assert "Demo crypto basket" in body
+async def test_the_replaced_portfolio_page_redirects(client: httpx.AsyncClient) -> None:
+    """A redirect, never a second copy: two pages showing positions is two places to disagree."""
+    response = await client.get("/portfolio", follow_redirects=False)
+    assert response.status_code == 303
+    assert response.headers["location"] == "/analytics/portfolio"
 
 
 async def test_cycle_history_lists_a_completed_cycle(
@@ -146,7 +150,7 @@ async def test_kill_switch_banner_appears_when_tripped(
 async def test_halted_basket_banner_appears(cycled: Application, client: httpx.AsyncClient) -> None:
     await cycled.watchdog.halt_basket("demo", "three consecutive failed cycles")
 
-    body = (await client.get("/")).text
+    body = (await client.get("/costs")).text
     assert "Halted baskets" in body
     assert "three consecutive failed cycles" in body
 
@@ -154,7 +158,7 @@ async def test_halted_basket_banner_appears(cycled: Application, client: httpx.A
 async def test_portfolio_shows_holdings_and_the_realized_curve(
     cycled: Application, client: httpx.AsyncClient
 ) -> None:
-    body = (await client.get("/portfolio")).text
+    body = (await client.get("/analytics/portfolio")).text
     assert "Equity curve (realized)" in body
     assert "BTC/USDT" in body
     assert "not mark-to-market" in body  # the honesty note is part of the artifact

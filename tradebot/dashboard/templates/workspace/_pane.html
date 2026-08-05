@@ -1,0 +1,25 @@
+{# Pane chrome, in one place. Every pane is refreshed by the same custom `refresh` event, which
+   workspace.js dispatches when the socket names it — so the transport knows pane *names* and
+   nothing about how a pane is built (ADR 0024). #}
+
+{% macro query(scope, timeframe='') %}
+  {%- if scope %}?scope={{ scope | string | urlencode }}{% if timeframe %}&amp;tf={{ timeframe }}{% endif %}
+  {%- elif timeframe %}?tf={{ timeframe }}
+  {%- endif -%}
+{% endmacro %}
+
+{# A selection is a plain navigation, never client state: reload, bookmark and socket-triggered
+   refresh then land on the same view by construction (scope.py). #}
+{% macro select(scope, timeframe='') %}/{{ query(scope, timeframe) }}{% endmacro %}
+
+{% macro attrs(name, url) %}id="pane-{{ name }}" data-pane="{{ name }}" hx-get="{{ url }}" hx-trigger="refresh" hx-swap="outerHTML"{% endmacro %}
+
+{# A draggable boundary between two neighbours. The names it carries are the ones `workspace.js`
+   writes as `--size-<name>` and the stylesheet reads — and the stylesheet also carries the
+   default, so an operator who never drags anything, or a browser that never ran the script, still
+   gets the designed layout. #}
+{% macro splitter(axis, before, after) %}
+<div class="splitter splitter-{{ axis }}" data-axis="{{ axis }}" data-resize="{{ before }}:{{ after }}"
+     role="separator" tabindex="0" aria-orientation="{{ 'horizontal' if axis == 'h' else 'vertical' }}"
+     title="drag to resize · arrow keys to nudge · double-click to reset"></div>
+{% endmacro %}

@@ -1,0 +1,29 @@
+{% import "_macros.html" as m %}
+{% import "workspace/_pane.html" as p %}
+<section class="pane pane-portfolio" {{ p.attrs("portfolio", "/workspace/portfolio") }}>
+  <h2 class="pane-title">Portfolio</h2>
+  <div class="pane-body">
+    <dl class="ledger-lines">
+      <dt>Balance total ({{ quote_currency }})</dt>
+      <dd class="total">{{ equity | money }}</dd>
+
+      {# The same flow-adjusted baseline the daily-loss rule measures against (DESIGN §6.6), so
+         this figure and that limit can never disagree. A deposit moves both. #}
+      <dt>Today
+        <span class="muted small">since {{ day_boundary | moment }} UTC</span>
+      </dt>
+      <dd>{{ m.signed(day_move) }}</dd>
+
+      <dt>Realized today <span class="muted small">closed round trips</span></dt>
+      <dd>{{ m.signed(day_realized) }}</dd>
+    </dl>
+
+    {# A list from day one, though one process wires one venue portfolio in v1: the cross-venue
+       PortfolioAggregate (DESIGN §4) drops in here without a layout change. #}
+    <ul class="venues">
+      {% for venue, amount in venues %}
+        <li><span class="venue">{{ venue }}</span><span class="num">{{ amount | money }}</span></li>
+      {% endfor %}
+    </ul>
+  </div>
+</section>

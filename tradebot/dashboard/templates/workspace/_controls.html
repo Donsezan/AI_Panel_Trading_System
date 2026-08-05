@@ -1,0 +1,139 @@
+{% import "_macros.html" as m %}
+{% import "workspace/_pane.html" as p %}
+{% import "workspace/_actions.html" as a %}
+<section class="pane pane-controls" {{ p.attrs("controls", "/workspace/controls" ~ p.query(scope, timeframe)) }}>
+  <h2 class="pane-title">Controls</h2>
+  <div class="pane-body scroll dock">
+
+    {# Whether this process cycles baskets at all. Stop cancels nothing at the venue and needs no
+       phrase — that is the kill switch below, and the two are never the same button (ADR 0021). #}
+    <div class="dock-group">
+      <span class="dock-label">Trading</span>
+      {{ m.pill("running" if trading else "stopped") }}
+      {% if trading %}
+        {% call a.action("/control/stop", scope, timeframe) %}
+          <button type="submit">Stop trading</button>
+        {% endcall %}
+      {% elif mode == "live" %}
+        {# Live re-checks all four facts at this exact moment, and the phrase is retyped here
+           because an armed database alone must never be enough to start (ADR 0012, ADR 0021). #}
+        {% call a.action("/control/start", scope, timeframe, live_phrase, "Start trading", "danger") %}
+          <button type="submit" class="danger-button">Start trading</button>
+        {% endcall %}
+      {% else %}
+        {% call a.action("/control/start", scope, timeframe) %}
+          <button type="submit">Start trading</button>
+        {% endcall %}
+      {% endif %}
+    </div>
+
+    {% if not trading and blockers %}
+      <p class="dock-note warn">Before trading can start:</p>
+      <ul class="dock-list warn">{% for blocker in blockers %}<li>{{ blocker }}</li>{% endfor %}</ul>
+    {% endif %}
+
+    {% if working %}
+      {# A stop ends the only thing polling open orders. What it leaves resting is named, because
+         no fill will be booked and no TTL enforced until supervision starts again. #}
+      <p class="dock-note warn">
+        <strong>{{ working | length }} order(s) still working at the venue</strong>, and nothing is
+        polling them. They stay exactly as they are; use the kill switch to cancel them.
+      </p>
+      <ul class="dock-list">
+        {% for order in working %}
+          <li><code>{{ order.instrument_key }}</code> {{ order.side }} {{ order.qty | quantity }} {{ m.pill(order.state) }}</li>
+        {% endfor %}
+      </ul>
+    {% endif %}
+
+    {% if mode == "live" %}
+      <div class="dock-group">
+        <span class="dock-label">Live</span>
+        {{ m.pill("armed" if arming.armed else "not armed") }}
+        <span class="muted small">cap {{ arming.max_live_notional | money }} / order</span>
+        {% if arming.armed %}
+          {# Disarming also stops supervision, deliberately unlike the CLI's `disarm-live`: a basket
+             cycling against a cap that was just revoked is the one silent state to never produce. #}
+          {% call a.action("/control/live/disarm", scope, timeframe) %}
+            <input name="reason" type="text" placeholder="why (recorded on the row)">
+            <button type="submit">Disarm live</button>
+          {% endcall %}
+        {% else %}
+          {% call a.action("/control/live/arm", scope, timeframe, live_phrase, "Arm live trading", "danger") %}
+            <label>Max notional per order ({{ quote_currency }})</label>
+            <input name="max_notional" type="text" inputmode="decimal" required>
+            <input name="note" type="text" placeholder="why (recorded on the row)">
+            <button type="submit" class="danger-button">Arm live trading</button>
+          {% endcall %}
+        {% endif %}
+      </div>
+    {% endif %}
+
+    {% if risk_state.may_trade %}
+      <div class="dock-group">
+        <span class="dock-label">Kill switch</span>
+        {% call a.action("/control/kill", scope, timeframe, kill_phrase, "Trip the kill switch", "danger") %}
+          <span class="muted small">
+            Cancels working orders and halts every runner. It does <strong>not</strong> liquidate:
+            flattening into a broken market is often worse, and that call is yours.
+          </span>
+          <input name="note" type="text" placeholder="why (recorded on the event)">
+          <button type="submit" class="danger-button">Trip the kill switch</button>
+        {% endcall %}
+      </div>
+    {% endif %}
+
+    {# The selection's own actions. Narrowed to what is selected; clearing the selection is always
+       the way back to every basket, so no exit from a position is ever hidden (`dock.py`). #}
+    {% for row in controls %}
+      <div class="dock-basket">
+        <div class="dock-group">
+          <span class="dock-label"><code>{{ row.basket_id }}</code></span>
+          {{ m.pill(row.basket.status.value) }}
+          {% if row.halted_reason %}{{ m.pill("halted") }}{% endif %}
+          {% call a.action("/control/baskets/" ~ row.basket_id ~ "/status", scope, timeframe) %}
+            <input type="hidden" name="status" value="{{ row.next_status }}">
+            <button type="submit">{{ "Resume" if row.paused else "Pause" }}</button>
+          {% endcall %}
+          {{ a.quarantine(row.basket_id, "", row.quarantined, scope, timeframe) }}
+        </div>
+
+        <table class="dock-table">
+          <tbody>
+          {% for line in row.instruments %}
+            <tr>
+              <td><code>{{ line.key }}</code></td>
+              <td>{% if line.excluded %}{{ m.pill("quarantined") }}{% endif %}</td>
+              <td class="num">{{ line.position.qty | quantity if line.position else absent }}</td>
+              <td>
+                {% if line.inherited %}
+                  <span class="muted small">excluded with its basket</span>
+                {% else %}
+                  {{ a.quarantine(row.basket_id, line.key, line.named, scope, timeframe) }}
+                {% endif %}
+              </td>
+              <td>
+                {% if line.closable %}
+                  {# Goes through the ordinary OrderIntent → Tier-1 → Tier-2 → execution path,
+                     exactly as a panel decision would. A metering rule stands aside and says so
+                     (ADR 0015); correctness and venue legality never do. #}
+                  {% call a.action("/control/close", scope, timeframe) %}
+                    <input type="hidden" name="basket_id" value="{{ row.basket_id }}">
+                    <input type="hidden" name="instrument_key" value="{{ line.key }}">
+                    <button type="submit" {% if observe_only %}disabled title="supervision is stopped: nothing would poll this order"{% endif %}>close</button>
+                  {% endcall %}
+                {% endif %}
+              </td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% else %}
+      <p class="empty">
+        {% if scope %}That selection names no basket in service.
+        {% else %}No baskets configured. Create one in Settings.{% endif %}
+      </p>
+    {% endfor %}
+  </div>
+</section>

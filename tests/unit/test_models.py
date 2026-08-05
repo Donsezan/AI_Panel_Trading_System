@@ -63,6 +63,21 @@ class TestMoneyFields:
                 {**instrument.model_dump(), "lot_size": 0.001}
             )
 
+    @pytest.mark.parametrize("typed", ["0,5", "10%", "1 000", "abc", ""])
+    def test_unreadable_text_is_a_located_validation_error(
+        self, instrument: Instrument, typed: str
+    ) -> None:
+        """The opposite of a float: an operator typed it, so it must be catchable and located.
+
+        pydantic converts only `ValueError`, and `MoneyError` is not one — before `parse_money`
+        this escaped the model and reached the dashboard as a 500 naming no field.
+        """
+        with pytest.raises(ValidationError) as caught:
+            Instrument.model_validate({**instrument.model_dump(), "lot_size": typed})
+
+        assert [error["loc"] for error in caught.value.errors()] == [("lot_size",)]
+        assert "not a valid decimal amount" in caught.value.errors()[0]["msg"]
+
     def test_decimal_survives_a_json_round_trip_exactly(self, instrument: Instrument) -> None:
         restored = Instrument.model_validate_json(instrument.model_dump_json())
         assert restored.lot_size == instrument.lot_size

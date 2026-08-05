@@ -1,4 +1,9 @@
-"""Monitor: portfolio, cycle history, decision drill-down, cost (DESIGN §6.10 job 2).
+"""Analytics: cycle history, decision drill-down, risk history, cost (DESIGN §6.10 job 2).
+
+These are the pages an operator reads *about* the bot rather than the screen they run it from.
+The running screen is the workspace at `/` (`workspace.py`); what stayed here is what the
+workspace deliberately does not carry — history, provenance and totals, reached from a log row or
+from the Analytics menu.
 
 Read-only, and reads **projections** — the log is the audit artifact, not the query surface
 (DESIGN §6.9). The exception is the drill-down, which is *about* the log: seat responses, the
@@ -18,7 +23,8 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
+from starlette.responses import Response
 
 from tradebot.control.config_store import ConfigRecord, ConfigStore
 from tradebot.core.config import ConfigRef
@@ -26,24 +32,6 @@ from tradebot.core.errors import ConfigError
 from tradebot.dashboard.views import render, state_of
 
 router = APIRouter(tags=["monitor"])
-
-
-@router.get("/", response_class=HTMLResponse)
-async def overview(request: Request) -> HTMLResponse:
-    """Portfolio, equity, and what has happened lately — the page an operator leaves open."""
-    state = state_of(request)
-    application, queries = state.application, state.queries
-    return render(
-        request,
-        "monitor/overview.html",
-        equity=application.equity(),
-        quote_currency=application.quote_currency,
-        positions=queries.positions(),
-        open_orders=queries.open_orders(),
-        recent_cycles=queries.cycles(limit=10),
-        risk_events=queries.risk_events(limit=5),
-        baskets=application.configs.baskets(),
-    )
 
 
 @router.get("/cycles", response_class=HTMLResponse)
@@ -73,7 +61,18 @@ async def cycle_detail(request: Request, cycle_id: str) -> HTMLResponse:
     )
 
 
-@router.get("/portfolio", response_class=HTMLResponse)
+@router.get("/portfolio")
+async def portfolio_moved() -> Response:
+    """Replaced by the workspace, so it redirects rather than being kept as a second copy.
+
+    Two pages showing positions is two places for them to disagree (PHASE_10 decision 3). What the
+    workspace does *not* carry — the realized curve and the closed round trips — is analysis
+    rather than operation, and lives under Analytics.
+    """
+    return RedirectResponse("/analytics/portfolio", status_code=303)
+
+
+@router.get("/analytics/portfolio", response_class=HTMLResponse)
 async def portfolio(request: Request) -> HTMLResponse:
     """Holdings, the realized equity curve, and every closed round trip."""
     state = state_of(request)

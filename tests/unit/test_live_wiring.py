@@ -336,7 +336,7 @@ class TestOtherModesAreUnaffected:
         assert (gates is not None) is gated
 
 
-class TestTheLiveControlPage:
+class TestTheLiveControlDock:
     """Arming and starting from the GUI — the capability ADR 0021 exists to deliver.
 
     The phrase is typed into both forms, every time. Nothing here reads it back out of a session:
@@ -362,7 +362,7 @@ class TestTheLiveControlPage:
     async def test_an_unarmed_live_dashboard_serves_and_says_so(
         self, client: httpx.AsyncClient
     ) -> None:
-        body = (await client.get("/control")).text
+        body = (await client.get("/")).text
 
         assert "not armed" in body
         assert "Arm live trading" in body

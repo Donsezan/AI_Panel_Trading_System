@@ -12,6 +12,8 @@ truthful claim rather than an aspiration (PLAN §4).
 
 Failure semantics: a `float` in a money field, or a naive datetime, raises immediately rather
 than being collected as a validation error. Both are programming defects that must be loud.
+Unreadable *text* in a money field is the opposite — an operator typed it — and is collected as
+an ordinary validation error located on its field (`parse_money`).
 """
 
 from __future__ import annotations
@@ -24,12 +26,34 @@ from typing import Annotated, Any
 from pydantic import AfterValidator, BaseModel, BeforeValidator, ConfigDict, PlainSerializer
 
 from tradebot.core.clock import ensure_utc
-from tradebot.core.money import to_decimal
+from tradebot.core.errors import MoneyError
+from tradebot.core.money import refuse_float, to_decimal
+
+
+def parse_money(value: Any) -> Decimal:
+    """`to_decimal`, with its two failures separated by who caused them.
+
+    pydantic converts only `ValueError` into a located `ValidationError`; anything else escapes
+    the model. `MoneyError` is not a `ValueError`, so text that is not a number — an operator
+    typing `0,5` into a limit — used to leave the dashboard's form handler as an unhandled
+    exception and reach the browser as a 500, losing the draft and naming no field. It is
+    ordinary bad input and belongs on the field it was typed in.
+
+    A `float` still raises `MoneyError` unconverted: nothing but our own code can put one here,
+    and a binary rounding error listed among a form's validation messages is a defect made to
+    look like a typo.
+    """
+    refuse_float(value)
+    try:
+        return to_decimal(value)
+    except MoneyError as exc:
+        raise ValueError(str(exc)) from exc
+
 
 #: A money-semantic quantity: `Decimal` in Python, a string in JSON, never a `float`.
 Money = Annotated[
     Decimal,
-    BeforeValidator(to_decimal),
+    BeforeValidator(parse_money),
     PlainSerializer(str, return_type=str, when_used="json"),
 ]
 

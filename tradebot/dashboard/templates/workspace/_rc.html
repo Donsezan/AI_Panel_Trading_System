@@ -1,0 +1,94 @@
+{% import "_macros.html" as m %}
+{% import "workspace/_pane.html" as p %}
+{% import "workspace/_actions.html" as a %}
+{# The safety states and the acts that clear them — the sketch's "RC" pane. Everything here is
+   something the *system* is doing to itself or something an operator asked it to stop doing, and
+   each is cleared by its own act: a halt and the kill switch by a typed phrase, a quarantine by
+   one click, because it is reversible configuration and nothing else here is (ADR 0022). #}
+<section class="pane pane-rc" {{ p.attrs("rc", "/workspace/rc" ~ p.query(scope, timeframe)) }}>
+  <h2 class="pane-title">Risk controls</h2>
+  <div class="pane-body scroll dock">
+
+    <div class="dock-group">
+      <span class="dock-label">Kill switch</span>
+      {{ m.pill(risk_state.kill_switch.value) }}
+      <span class="muted small">
+        equity {{ equity | money }} {{ quote_currency }} · high-water {{ risk_state.high_water_mark | money }}
+      </span>
+    </div>
+    {% if risk_state.reason %}<p class="dock-note danger">{{ risk_state.reason }}</p>{% endif %}
+    {% if not risk_state.may_trade %}
+      {% call a.action("/control/rearm", scope, timeframe, rearm_phrase, "Re-arm trading") %}
+        <span class="muted small">
+          Re-arming restarts the drawdown and daily-loss baselines from current equity — it asserts
+          that you have looked at what happened and accept this as the new starting point.
+        </span>
+        <button type="submit">Re-arm trading</button>
+      {% endcall %}
+    {% endif %}
+
+    <div class="dock-group">
+      <span class="dock-label">Halted baskets</span>
+      {% if not halted %}<span class="muted small">none</span>{% endif %}
+    </div>
+    {% for basket_id, reason in halted.items() %}
+      {# A halt is the system stopping a basket for cause: database state, not configuration, so
+         resuming it in the dock above leaves it halted and only this typed act clears it. #}
+      <div class="dock-group">
+        <code>{{ basket_id }}</code>
+        <span class="muted small">{{ reason or "no reason recorded" }}</span>
+        {% call a.action("/control/baskets/" ~ basket_id ~ "/unhalt", scope, timeframe, rearm_phrase, "Un-halt " ~ basket_id) %}
+          <button type="submit">Un-halt {{ basket_id }}</button>
+        {% endcall %}
+      </div>
+    {% endfor %}
+
+    <div class="dock-group">
+      <span class="dock-label">Quarantines</span>
+      {% if not quarantines %}<span class="muted small">none in force</span>{% endif %}
+    </div>
+    {% for row in quarantines %}
+      <div class="dock-group">
+        <code>{{ row.basket_id }}</code>
+        <span class="small">{{ row.label }}</span>
+        {% if row.held %}
+          <span class="warn small" title="the bot is hands-off these until you release or close them">
+            holds {{ row.held | join(", ") }}
+          </span>
+        {% endif %}
+        {{ a.quarantine(row.basket_id, row.instrument_key, true, scope, timeframe) }}
+      </div>
+    {% endfor %}
+
+    {% if clamps %}
+      {# Live only: the ceiling tightens what a dashboard edit published, and only tightens. Shown
+         as what is *enforced*, because that is the number the runners use (ADR 0021). #}
+      <div class="dock-group">
+        <span class="dock-label">Live ceiling</span>
+        <span class="muted small">{{ clamps | length }} limit(s) tightened below the published policy</span>
+      </div>
+      <ul class="dock-list">
+        {% for clamp in clamps %}<li><code>{{ clamp.field }}</code> {{ clamp }}</li>{% endfor %}
+      </ul>
+    {% endif %}
+
+    <div class="dock-group">
+      <span class="dock-label">Recent risk events</span>
+      <a class="small" href="/risk">full history</a>
+    </div>
+    <table class="dock-table">
+      <tbody>
+      {% for row in risk_events %}
+        <tr>
+          <td class="mono small">{{ row.ts | moment }}</td>
+          <td><code>{{ row.rule }}</code></td>
+          <td class="small">{{ row.scope }}</td>
+          <td>{{ m.pill(row.action_taken) }}</td>
+        </tr>
+      {% else %}
+        {{ m.empty(4, "Nothing has been vetoed, halted or tripped.") }}
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>

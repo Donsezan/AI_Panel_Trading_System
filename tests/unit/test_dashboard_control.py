@@ -1,5 +1,9 @@
 """Control: the operator's safety surface, and what each action writes to the log.
 
+The actions kept their URLs when the Control *page* retired into the workspace's dock (Phase 10
+pass 3), so this suite is about what each POST does — and it now reads the answers off the
+workspace, which is the only screen there is.
+
 Three things are load-bearing here. **Pause and halt must stay distinct** — a config edit may
 never clear a halt the system imposed for cause. **Manual close has no side door**: it goes
 through Tier-1 and Tier-2, and every rule that stands aside for an operator's exit records that
@@ -23,8 +27,8 @@ from tradebot.control.config_store import SINGLETON_ID
 from tradebot.control.supervision import SupervisionController
 from tradebot.core.enums import BasketStatus, ConfigKind, CycleOutcome, KillSwitchState
 from tradebot.core.events import EventType
+from tradebot.dashboard.dock import KILL_PHRASE, QUARANTINE_CONFIRM
 from tradebot.dashboard.queries import Queries
-from tradebot.dashboard.routes.control import KILL_PHRASE, QUARANTINE_CONFIRM
 from tradebot.risk.rules import STOOD_ASIDE
 from tradebot.risk.state import REARM_PHRASE
 
@@ -48,8 +52,12 @@ def risk_events(application: Application, rule: str) -> list[Any]:
     return [e for e in events_of(application, EventType.RISK_EVENT) if e.payload["rule"] == rule]
 
 
-async def test_control_page_renders(client: httpx.AsyncClient) -> None:
-    assert (await client.get("/control")).status_code == 200
+async def test_the_control_page_redirects_to_the_workspace(client: httpx.AsyncClient) -> None:
+    """Two surfaces for the kill switch is two places for its state to disagree."""
+    response = await client.get("/control")
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/"
 
 
 # ---------------------------------------------------------------- unreachable panel
@@ -63,7 +71,7 @@ async def test_a_panel_with_no_key_is_a_banner_and_not_a_refusal(
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     await publish_keyed_panel(sim_application)
 
-    page = (await client.get("/control")).text
+    page = (await client.get("/")).text
 
     assert "cannot be fully reached" in page
     assert "OPENROUTER_API_KEY" in page
@@ -77,7 +85,7 @@ async def test_the_banner_names_the_environment_and_not_a_place_to_type_a_key(
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     await publish_keyed_panel(sim_application)
 
-    page = (await client.get("/control")).text
+    page = (await client.get("/")).text
 
     assert "the dashboard cannot accept" in page
 
@@ -331,14 +339,15 @@ async def test_a_manual_close_still_works_on_a_quarantined_instrument(
     assert [check["detail"] for check in stood_aside] == [STOOD_ASIDE]
 
 
-async def test_the_page_shows_what_is_excluded_and_why(client: httpx.AsyncClient) -> None:
-    """An instrument excluded by its basket rather than by name must read as excluded anyway."""
+async def test_the_dock_shows_what_is_excluded_and_why(client: httpx.AsyncClient) -> None:
+    """An instrument excluded by its basket rather than by name must read as excluded anyway —
+    and must not offer a release button that would publish a version changing nothing."""
     await quarantine(client)
 
-    body = (await client.get("/control")).text
+    body = (await client.get("/")).text
 
     assert "quarantined" in body
-    assert "via the basket" in body
+    assert "excluded with its basket" in body
     assert "release" in body
 
 
@@ -586,7 +595,7 @@ async def test_a_stopped_process_refuses_to_place_an_order(
 async def test_the_closable_list_offers_every_held_position(
     cycled: Application, client: httpx.AsyncClient
 ) -> None:
-    body = (await client.get("/control")).text
+    body = (await client.get("/")).text
     assert {key for _, key in cycled.manual_close.closable()} == {"sim:BTC/USDT", "sim:ETH/USDT"}
     assert "sim:BTC/USDT" in body
     assert "sim:ETH/USDT" in body
@@ -595,8 +604,9 @@ async def test_the_closable_list_offers_every_held_position(
 async def test_nothing_is_closable_before_a_position_exists(
     sim_application: Application, client: httpx.AsyncClient
 ) -> None:
+    """No holding, no close button — the dock offers an act only where there is one to take."""
     assert sim_application.manual_close.closable() == ()
-    assert "No position is held" in (await client.get("/control")).text
+    assert '"/control/close"' not in (await client.get("/")).text
 
 
 async def test_no_cycle_ever_records_a_stand_aside(cycled: Application) -> None:
@@ -633,11 +643,11 @@ async def test_stop_then_start_toggles_cycling(
 async def test_the_page_reports_what_the_controller_is_doing(
     supervision: SupervisionController, client: httpx.AsyncClient
 ) -> None:
-    assert "Stop trading" in (await client.get("/control")).text
+    assert "Stop trading" in (await client.get("/")).text
 
     await supervision.stop()
 
-    body = (await client.get("/control")).text
+    body = (await client.get("/")).text
     assert "Start trading" in body
     assert "not trading" in body
 
@@ -663,7 +673,7 @@ async def test_stopping_warns_about_orders_left_working(
     assert Queries(cycled.store).open_orders(), "no order is working; this would pass vacuously"
 
     assert (await client.post("/control/stop")).status_code == 303
-    body = (await client.get("/control")).text
+    body = (await client.get("/")).text
 
     assert "still working at the venue" in body
     assert not supervision.running
@@ -686,4 +696,4 @@ async def test_a_sim_process_has_nothing_to_arm(
 
 
 async def test_the_arming_form_is_absent_outside_live(client: httpx.AsyncClient) -> None:
-    assert "Live arming" not in (await client.get("/control")).text
+    assert "Live arming" not in (await client.get("/")).text

@@ -166,6 +166,13 @@ class Application:
     #: Ops alerting, off unless a destination is configured in the environment (ADR 0019). It
     #: tails the log beside the supervisor and can never reach the money path.
     alerts: AlertDispatcher
+    #: The shared price source an observer may read, exposed for the dashboard's chart (PHASE_10
+    #: decision 4). It is the same cache the runners read through, so a chart request spends the
+    #: same single-flight budget a cycle does (ADR 0008) and no candle is persisted for the UI —
+    #: but it is `VenueStack.read_only_prices`, never the simulated stack's bridge, so no amount
+    #: of looking at a chart can move the venue. `None` only where no provider was wired, which
+    #: the chart pane renders as a stated absence.
+    market_data: MarketDataProvider | None
     quote_currency: str
     _writer: SingleWriter
     #: Async resources that hold sockets — HTTP clients, exchange sessions. Closed by `shutdown`.
@@ -401,6 +408,15 @@ class VenueStack:
 
     broker: BrokerAdapter
     prices: MarketDataProvider
+    #: The same prices, minus any side effect — what an observer may read.
+    #:
+    #: Required rather than defaulted, because the difference between the two is invisible at the
+    #: call site and getting it wrong is silent. In the simulated stack `prices` is a *bridge*:
+    #: reading it feeds the tick to `SimBroker`, which matches resting orders and becomes the
+    #: reference price for the next market order. A dashboard reading that would let a chart
+    #: refresh fill a stop, and let a chart left open on the 1d timeframe set the price a manual
+    #: close executes at. Venue stacks read the venue, so for them the two are the same object.
+    read_only_prices: MarketDataProvider
     calendar: TradingCalendar
     announcements: CorporateActionSource | None = None
     preflight: VenuePreflight | None = None
@@ -449,6 +465,7 @@ def _sim_stack(request: StackRequest) -> VenueStack:
     return VenueStack(
         broker=broker,
         prices=SimulatedMarket(source, broker),
+        read_only_prices=source,
         calendar=ContinuousCalendar(broker.venue_id),
         venue_restore=broker,
     )
@@ -468,9 +485,11 @@ def _binance_stack(request: StackRequest) -> VenueStack:
         clock, credentials("binance", mode), mode=mode, limiter=data_transport.limiter
     )
     broker = BinanceSpotBroker(trading_transport, clock, instruments=request.instruments)
+    prices = request.market_data or binance_spot_market_data(data_transport, clock)
     return VenueStack(
         broker=broker,
-        prices=request.market_data or binance_spot_market_data(data_transport, clock),
+        prices=prices,
+        read_only_prices=prices,
         calendar=ContinuousCalendar(broker.venue_id),
         preflight=VenuePreflight(broker, clock, mode=mode),
         closers=(data_transport.close, trading_transport.close),
@@ -499,6 +518,7 @@ def _alpaca_stack(request: StackRequest) -> VenueStack:
     return VenueStack(
         broker=broker,
         prices=request.market_data,
+        read_only_prices=request.market_data,
         calendar=AlpacaCalendar(transport, clock),
         announcements=AlpacaAnnouncements(transport),
         preflight=VenuePreflight(broker, clock, mode=mode),
@@ -891,6 +911,7 @@ async def _assemble(
             clock,
             calendar=stack.calendar,
         ),
+        market_data=stack.read_only_prices,
         quote_currency=quote_currency,
         _writer=writer,
         _closers=(builder.close, *news_closers, *alert_closers, *stack.closers),

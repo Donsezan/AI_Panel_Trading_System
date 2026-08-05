@@ -7,15 +7,18 @@ TEXT columns money is stored in converts through an IEEE-754 double, which is ex
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
 
 from tradebot.app import Application
+from tradebot.core.clock import ManualClock
 from tradebot.core.config import ConfigRef
 from tradebot.core.enums import ConfigKind, CycleOutcome
 from tradebot.core.events import EventType
 from tradebot.dashboard.queries import Queries, parse_pins
+from tradebot.dashboard.scope import Scope
 
 
 @pytest.fixture
@@ -131,3 +134,173 @@ async def test_cycles_can_be_filtered_by_basket(cycled: Application) -> None:
     queries = Queries(cycled.store)
     assert queries.cycles(basket_id="demo")
     assert queries.cycles(basket_id="no-such-basket") == ()
+
+
+# ---------------------------------------------------------------- the workspace's reads
+
+
+def instrument_of(cycled: Application) -> str:
+    return Queries(cycled.store).positions()[0].instrument_key
+
+
+async def test_latest_decisions_returns_one_row_per_instrument(cycled: Application) -> None:
+    """The blotter draws one line per instrument, so this must not fan out over history."""
+    rows = Queries(cycled.store).latest_decisions()
+    keys = [(row.basket_id, row.instrument_key) for row in rows]
+    assert keys
+    assert len(keys) == len(set(keys))
+
+
+async def test_latest_decisions_keeps_only_the_newest(
+    cycled: Application, clock: ManualClock
+) -> None:
+    """A second cycle must move the blotter row, not add one beside it."""
+    before = Queries(cycled.store).latest_decisions()
+    clock.advance(3600)
+    await cycled.supervisor.run_once()
+    after = Queries(cycled.store).latest_decisions()
+
+    assert len(after) == len(before)
+    assert [row.decided_at for row in after] > [row.decided_at for row in before]
+    assert {row.cycle_id for row in after}.isdisjoint({row.cycle_id for row in before})
+
+
+async def test_latest_decisions_are_stable_when_the_clock_did_not_move(
+    cycled: Application,
+) -> None:
+    """A replay or a frozen clock can tie `decided_at`; a blotter row must not flicker."""
+    queries = Queries(cycled.store)
+    await cycled.supervisor.run_once()
+    assert queries.latest_decisions() == queries.latest_decisions()
+
+
+async def test_latest_decisions_carries_the_basket_that_decided(cycled: Application) -> None:
+    """Two baskets may hold one instrument; a row must say whose panel it reports."""
+    assert {row.basket_id for row in Queries(cycled.store).latest_decisions()} == {"demo"}
+
+
+def test_latest_decisions_of_a_system_that_never_cycled_is_empty(queries: Queries) -> None:
+    assert queries.latest_decisions() == ()
+
+
+async def test_activity_pairs_a_cycle_with_its_decision(cycled: Application) -> None:
+    rows = Queries(cycled.store).activity()
+    assert rows
+    assert all(row.cycle_id for row in rows)
+    assert any(row.action for row in rows)
+
+
+async def test_activity_narrows_to_a_basket(cycled: Application) -> None:
+    queries = Queries(cycled.store)
+    assert queries.activity(Scope("demo"))
+    assert queries.activity(Scope("no-such-basket")) == ()
+
+
+async def test_activity_narrows_to_an_instrument(cycled: Application) -> None:
+    rows = Queries(cycled.store).activity(Scope("demo", instrument_of(cycled)))
+    assert rows
+    assert {row.instrument_key for row in rows} == {instrument_of(cycled)}
+
+
+async def test_activity_keeps_a_cycle_that_decided_nothing_for_the_selection(
+    cycled: Application,
+) -> None:
+    """The instrument filter is in the join, not the `WHERE`: a cycle that reached no decision
+    here — `DATA_STALE`, `QUARANTINED`, a degraded panel — must still appear, with an empty
+    decision. A basket that stops appearing is a basket nobody can audit (ADR 0022)."""
+    queries = Queries(cycled.store)
+    rows = queries.activity(Scope("demo", "binance:NOTHING-HELD"))
+
+    assert len(rows) == len(queries.cycles(basket_id="demo"))
+    assert {row.instrument_key for row in rows} == {None}
+    assert all(row.outcome for row in rows), "the cycle's own columns are still populated"
+
+
+async def test_activity_is_newest_first(cycled: Application) -> None:
+    await cycled.supervisor.run_once()
+    started = [row.started_at for row in Queries(cycled.store).activity()]
+    assert started == sorted(started, reverse=True)
+
+
+async def test_day_realized_totals_only_what_closed_since_the_boundary(
+    cycled: Application,
+) -> None:
+    """Takes the boundary rather than computing one, so it matches the daily-loss rule's day."""
+    queries = Queries(cycled.store)
+    trips = queries.round_trips()
+
+    since_epoch = queries.day_realized(datetime(2000, 1, 1, tzinfo=UTC))
+    assert since_epoch == sum((row.realized_pnl for row in trips), Decimal(0))
+    assert isinstance(since_epoch, Decimal)
+
+    assert queries.day_realized(datetime(2100, 1, 1, tzinfo=UTC)) == Decimal(0)
+
+
+def test_day_realized_of_a_flat_day_is_zero_not_none(queries: Queries) -> None:
+    """A day with nothing closed is zero; an absent number would render as an empty cell."""
+    assert queries.day_realized(datetime(2000, 1, 1, tzinfo=UTC)) == Decimal(0)
+
+
+async def test_chart_windows_return_one_instrument_from_a_moment(cycled: Application) -> None:
+    queries = Queries(cycled.store)
+    key = instrument_of(cycled)
+    epoch = datetime(2000, 1, 1, tzinfo=UTC)
+
+    assert {row.instrument_key for row in queries.orders_in(key, since=epoch)} == {key}
+    assert {row.instrument_key for row in queries.fills_in(key, since=epoch)} == {key}
+
+
+async def test_chart_windows_exclude_what_happened_before_them(cycled: Application) -> None:
+    """The window is a filter, not a decoration: a chart must not draw off-screen markers."""
+    queries = Queries(cycled.store)
+    key = instrument_of(cycled)
+    future = datetime(2100, 1, 1, tzinfo=UTC)
+
+    assert queries.orders_in(key, since=future) == ()
+    assert queries.fills_in(key, since=future) == ()
+
+
+async def test_decisions_in_a_window_belong_to_the_basket_that_made_them(
+    cycled: Application,
+) -> None:
+    """Two baskets may hold one instrument; a chart of one must not carry the other's marks."""
+    queries = Queries(cycled.store)
+    key = instrument_of(cycled)
+    epoch = datetime(2000, 1, 1, tzinfo=UTC)
+
+    assert queries.decisions_in(Scope("demo", key), since=epoch)
+    assert queries.decisions_in(Scope("elsewhere", key), since=epoch) == ()
+
+
+async def test_decisions_in_a_window_exclude_what_came_before_it(cycled: Application) -> None:
+    future = datetime(2100, 1, 1, tzinfo=UTC)
+    assert (
+        Queries(cycled.store).decisions_in(Scope("demo", instrument_of(cycled)), since=future) == ()
+    )
+
+
+async def test_counters_are_per_basket_since_the_boundary(cycled: Application) -> None:
+    queries = Queries(cycled.store)
+    epoch = datetime(2000, 1, 1, tzinfo=UTC)
+
+    assert queries.cycles_since(epoch)["demo"] == 1
+    assert queries.entry_orders_since(epoch)["demo"] >= 1
+
+
+async def test_counters_count_entries_only(cycled: Application) -> None:
+    """The rule the daily cap meters by: a protective leg belongs to the decision that placed it,
+    not to a second trade (`HistoryReader`)."""
+    queries = Queries(cycled.store)
+    epoch = datetime(2000, 1, 1, tzinfo=UTC)
+    entries = queries.entry_orders_since(epoch)["demo"]
+
+    assert entries < len(queries.orders())
+
+
+async def test_counters_of_a_quiet_period_are_absent_not_zero(cycled: Application) -> None:
+    """An absent key is absent. A fabricated zero would be a claim nothing happened."""
+    queries = Queries(cycled.store)
+    future = datetime(2100, 1, 1, tzinfo=UTC)
+
+    assert queries.cycles_since(future) == {}
+    assert queries.entry_orders_since(future) == {}

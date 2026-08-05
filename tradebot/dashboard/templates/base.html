@@ -12,19 +12,32 @@
           integrity="sha384-ZBXiYtYQ6hJ2Y0ZNoYuI+Nq5MqWBr+chMrS/RkXpNzQCApHEhOt2aY8EJgqwHLkJ"
           defer></script>
 </head>
-<body>
+<body class="{% block body_class %}{% endblock %}">
 <header class="mode-{{ mode_tone }}">
   <span class="mode-badge">{{ mode | upper }}</span>
+  {# The sketch's four menus. "Parameters" is the risk limits, "Settings" is everything else
+     configurable, "Analytics" is the record of what happened. There is no Control entry: control
+     *is* the view, and a second surface for it would be a second place for it to disagree
+     (PHASE_10 decision 3). `details` rather than a scripted dropdown: one less thing that can fail
+     on the screen an incident is read from. #}
   <nav>
-    <a href="/">Overview</a>
-    <a href="/portfolio">Portfolio</a>
-    <a href="/cycles">Cycles</a>
-    <a href="/risk">Risk</a>
-    <a href="/costs">Costs</a>
-    <a href="/configure">Configure</a>
-    <a href="/control">Control</a>
+    <a href="/">View</a>
+    <a href="/configure/risk">Parameters</a>
+    <a href="/configure">Settings</a>
+    <details class="menu">
+      <summary>Analytics</summary>
+      <div class="menu-items">
+        <a href="/cycles">Cycles</a>
+        <a href="/analytics/portfolio">Portfolio &amp; round trips</a>
+        <a href="/risk">Risk history</a>
+        <a href="/costs">Costs</a>
+      </div>
+    </details>
   </nav>
   <span class="spacer"></span>
+  {# Loud by design: silent staleness is the failure the live transport exists to prevent, so
+     losing the transport may not itself be silent (ADR 0024). Shown by workspace.js only. #}
+  <span class="pill danger" id="live-pill" hidden>live updates lost — reconnecting</span>
   {% if not trading %}<span class="pill warn" title="supervision is stopped; no basket is cycling">not trading</span>{% endif %}
   <a class="logout" href="/logout">Log out</a>
 </header>
@@ -63,9 +76,12 @@
 </div>
 {% endif %}
 
-<main>
+<main class="{% block main_class %}{% endblock %}">
+  {# A page that states no heading renders an empty `h1`, which `h1:empty` then removes — so the
+     workspace's grid starts at the top of the viewport rather than below a blank line. #}
   <h1>{% block heading %}{% endblock %}</h1>
   {% block content %}{% endblock %}
 </main>
+{% block scripts %}{% endblock %}
 </body>
 </html>
