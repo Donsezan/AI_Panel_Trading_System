@@ -45,11 +45,12 @@ class TestModeSafety:
     def test_paper_will_not_price_a_sim_basket_off_a_real_venue(self, data_dir: list[str]) -> None:
         """The seeded basket names venue `sim`; paper wires real Binance data.
 
-        The mismatch is refused rather than papered over, and `--once` reports the failed cycle to
-        the shell instead of exiting clean — a supervised run would retry it, a single-shot one has
-        nothing to retry.
+        The mismatch is now caught by the startup reference-data check, which names it — "this
+        process is wired to 'binance'" — and halts the basket, rather than letting it surface a
+        step later as a data fault inside a cycle (ADR 0025). `--once` still reports it to the
+        shell: a run that cycled nothing must not look like a run that went fine.
         """
-        assert main(["run", "--mode", "paper", "--once", *data_dir]) == 4
+        assert main(["run", "--mode", "paper", "--once", *data_dir]) == 3
 
     def test_live_refuses_with_the_phrase_but_an_unarmed_database(
         self, data_dir: list[str]

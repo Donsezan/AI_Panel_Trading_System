@@ -35,6 +35,7 @@ from typing import Protocol
 
 from tradebot.control.basket_runner import BasketRunner, CycleResult
 from tradebot.control.config_store import ConfigRecord, ConfigStore
+from tradebot.control.reference import DriftWatch
 from tradebot.control.scheduler import Scheduler
 from tradebot.core.clock import Clock
 from tradebot.core.config import Basket
@@ -295,6 +296,7 @@ class Supervisor:
         *,
         backoff: Backoff = DEFAULT_BACKOFF,
         max_consecutive_failures: int = DEFAULT_MAX_CONSECUTIVE_FAILURES,
+        drift: DriftWatch | None = None,
     ) -> None:
         self._factory = factory
         self._configs = configs
@@ -304,6 +306,11 @@ class Supervisor:
         self._clock = clock
         self._backoff = backoff
         self._max_failures = max_consecutive_failures
+        #: Re-verifies instrument trading rules against the venue on each sweep, so a filter the
+        #: venue changes mid-soak is caught in minutes rather than at the next restart. It halts
+        #: baskets, which is the supervisor's own vocabulary, and it lives on the sweep because
+        #: that is the only loop in the process that outlives every cycle (ADR 0025).
+        self._drift = drift
         self._workers: dict[str, BasketWorker] = {}
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._serving = False
@@ -367,10 +374,25 @@ class Supervisor:
         self._serving = True
         try:
             while self._serving:
+                await self._check_drift()
                 self.sync()
                 await self._clock.sleep(resync_seconds)
         finally:
             await self.stop()
+
+    async def _check_drift(self) -> None:
+        """Halt any basket whose trading rules the venue has since changed. Never fatal.
+
+        Before `sync`, so a disagreement found on this sweep halts the basket before a worker is
+        (re)created for it. Guarded for the same reason a cycle is: a dead supervisor leaves
+        working orders with nobody polling them, and reference data is not worth that.
+        """
+        if self._drift is None:
+            return
+        try:
+            await self._drift.check()
+        except Exception:
+            logger.exception("the instrument reference-data check raised; supervision continues")
 
     def sync(self) -> None:
         """Start a task for every basket in service; forget the tasks that have finished."""

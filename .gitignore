@@ -31,3 +31,7 @@ htmlcov/
 # Editors
 .vscode/
 .idea/
+
+# Agent scratch: per-plan ledgers, task briefs, review packages. Recoverable from git history,
+# so it is never committed.
+.superpowers/

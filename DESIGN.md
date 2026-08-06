@@ -724,6 +724,7 @@ Serialized once, hashed, stored; every seat prompt embeds this same packet. [L7]
 | External deposit/withdrawal | reconciler `EXTERNAL_CHANGE` | absorb into ledger; flow-adjust HWM and day-start equity (§6.6) — never a phantom drawdown |
 | Equity corporate action (split/dividend) | reconciler classification vs. venue announcements | adjust ledger + log `CORPORATE_ACTION`; unmatched ⇒ halt affected instrument |
 | Venue reset (testnet) | reconciler: balances at defaults + open orders gone | `VENUE_RESET` → halt + notify; excluded from promotion-gate accounting (§9) |
+| Venue changes a trading filter (lot/tick/min) | startup preflight and the supervisor's resync sweep re-resolve every configured instrument against the venue catalogue | `RISK_EVENT` naming the field, the pinned value and the venue's; live and paper halt the affected basket (+ alert), sim records it and keeps cycling; cleared by re-publishing the basket, which re-resolves (ADR 0025) |
 | Drawdown breach | Tier-2 watchdog | kill switch (§6.6) |
 | Config edited mid-cycle | version pinning | cycle finishes on its pinned versions; next cycle uses new ones |
 | Clock skew | startup + periodic NTP-vs-exchange-time check | warn > 2 s, halt > 30 s (candle alignment and auth signatures both depend on it) |

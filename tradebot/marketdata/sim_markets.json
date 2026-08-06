@@ -1,0 +1,307 @@
+{
+  "source_venue": "binance",
+  "source": "spot exchangeInfo, public REST",
+  "as_of": "2026-08-05T23:57:59.942868Z",
+  "markets": [
+    {
+      "symbol": "AAVE/USDT",
+      "base_currency": "AAVE",
+      "quote_currency": "USDT",
+      "lot_size": "0.00100000",
+      "tick_size": "0.01000000",
+      "min_qty": "0.00100000",
+      "min_notional": "5.00000000",
+      "tradable": true
+    },
+    {
+      "symbol": "ADA/USDT",
+      "base_currency": "ADA",
+      "quote_currency": "USDT",
+      "lot_size": "0.10000000",
+      "tick_size": "0.00010000",
+      "min_qty": "0.10000000",
+      "min_notional": "5.00000000",
+      "tradable": true
+    },
+    {
+      "symbol": "APT/USDT",
+      "base_currency": "APT",
+      "quote_currency": "USDT",
+      "lot_size": "0.01000000",
+      "tick_size": "0.00100000",
+      "min_qty": "0.01000000",
+      "min_notional": "5.00000000",
+      "tradable": true
+    },
+    {
+      "symbol": "ARB/USDT",
+      "base_currency": "ARB",
+      "quote_currency": "USDT",
+      "lot_size": "0.10000000",
+      "tick_size": "0.00010000",
+      "min_qty": "0.10000000",
+      "min_notional": "5.00000000",
+      "tradable": true
+    },
+    {
+      "symbol": "ATOM/USDT",
+      "base_currency": "ATOM",
+      "quote_currency": "USDT",
+      "lot_size": "0.01000000",
+      "tick_size": "0.00100000",
+      "min_qty": "0.01000000",
+      "min_notional": "5.00000000",
+      "tradable": true
+    },
+    {
+      "symbol": "AVAX/USDT",
+      "base_currency": "AVAX",
+      "quote_currency": "USDT",
+      "lot_size": "0.01000000",
+      "tick_size": "0.00100000",
+      "min_qty": "0.01000000",
+      "min_notional": "5.00000000",
+      "tradable": true
+    },
+    {
+      "symbol": "BNB/USDT",
+      "base_currency": "BNB",
+      "quote_currency": "USDT",
+      "lot_size": "0.00100000",
+      "tick_size": "0.01000000",
+      "min_qty": "0.00100000",
+      "min_notional": "5.00000000",
+      "tradable": true
+    },
+    {
+      "symbol": "BTC/USDT",
+      "base_currency": "BTC",
+      "quote_currency": "USDT",
+      "lot_size": "0.00001000",
+      "tick_size": "0.01000000",
+      "min_qty": "0.00001000",
+      "min_notional": "5.00000000",
+      "tradable": true
+    },
+    {
+      "symbol": "DOGE/USDT",
+      "base_currency": "DOGE",
+      "quote_currency": "USDT",
+      "lot_size": "1.00000000",
+      "tick_size": "0.00001000",
+      "min_qty": "1.00000000",
+      "min_notional": "1.00000000",
+      "tradable": true
+    },
+    {
+      "symbol": "DOT/USDT",
+      "base_currency": "DOT",
+      "quote_currency": "USDT",
+      "lot_size": "0.01000000",
+      "tick_size": "0.00100000",
+      "min_qty": "0.01000000",
+      "min_notional": "5.00000000",
+      "tradable": true
+    },
+    {
+      "symbol": "ETC/USDT",
+      "base_currency": "ETC",
+      "quote_currency": "USDT",
+      "lot_size": "0.01000000",
+      "tick_size": "0.01000000",
+      "min_qty": "0.01000000",
+      "min_notional": "5.00000000",
+      "tradable": true
+    },
+    {
+      "symbol": "ETH/USDT",
+      "base_currency": "ETH",
+      "quote_currency": "USDT",
+      "lot_size": "0.00010000",
+      "tick_size": "0.01000000",
+      "min_qty": "0.00010000",
+      "min_notional": "5.00000000",
+      "tradable": true
+    },
+    {
+      "symbol": "FIL/USDT",
+      "base_currency": "FIL",
+      "quote_currency": "USDT",
+      "lot_size": "0.01000000",
+      "tick_size": "0.00010000",
+      "min_qty": "0.01000000",
+      "min_notional": "5.00000000",
+      "tradable": true
+    },
+    {
+      "symbol": "HBAR/USDT",
+      "base_currency": "HBAR",
+      "quote_currency": "USDT",
+      "lot_size": "1.00000000",
+      "tick_size": "0.00001000",
+      "min_qty": "1.00000000",
+      "min_notional": "5.00000000",
+      "tradable": true
+    },
+    {
+      "symbol": "ICP/USDT",
+      "base_currency": "ICP",
+      "quote_currency": "USDT",
+      "lot_size": "0.01000000",
+      "tick_size": "0.00100000",
+      "min_qty": "0.01000000",
+      "min_notional": "5.00000000",
+      "tradable": true
+    },
+    {
+      "symbol": "INJ/USDT",
+      "base_currency": "INJ",
+      "quote_currency": "USDT",
+      "lot_size": "0.01000000",
+      "tick_size": "0.00100000",
+      "min_qty": "0.01000000",
+      "min_notional": "5.00000000",
+      "tradable": true
+    },
+    {
+      "symbol": "LINK/USDT",
+      "base_currency": "LINK",
+      "quote_currency": "USDT",
+      "lot_size": "0.01000000",
+      "tick_size": "0.00100000",
+      "min_qty": "0.01000000",
+      "min_notional": "5.00000000",
+      "tradable": true
+    },
+    {
+      "symbol": "LTC/USDT",
+      "base_currency": "LTC",
+      "quote_currency": "USDT",
+      "lot_size": "0.00100000",
+      "tick_size": "0.01000000",
+      "min_qty": "0.00100000",
+      "min_notional": "5.00000000",
+      "tradable": true
+    },
+    {
+      "symbol": "NEAR/USDT",
+      "base_currency": "NEAR",
+      "quote_currency": "USDT",
+      "lot_size": "0.10000000",
+      "tick_size": "0.00100000",
+      "min_qty": "0.10000000",
+      "min_notional": "5.00000000",
+      "tradable": true
+    },
+    {
+      "symbol": "OP/USDT",
+      "base_currency": "OP",
+      "quote_currency": "USDT",
+      "lot_size": "0.01000000",
+      "tick_size": "0.00010000",
+      "min_qty": "0.01000000",
+      "min_notional": "5.00000000",
+      "tradable": true
+    },
+    {
+      "symbol": "RENDER/USDT",
+      "base_currency": "RENDER",
+      "quote_currency": "USDT",
+      "lot_size": "0.01000000",
+      "tick_size": "0.00100000",
+      "min_qty": "0.01000000",
+      "min_notional": "5.00000000",
+      "tradable": true
+    },
+    {
+      "symbol": "SEI/USDT",
+      "base_currency": "SEI",
+      "quote_currency": "USDT",
+      "lot_size": "0.10000000",
+      "tick_size": "0.00001000",
+      "min_qty": "0.10000000",
+      "min_notional": "5.00000000",
+      "tradable": true
+    },
+    {
+      "symbol": "SOL/USDT",
+      "base_currency": "SOL",
+      "quote_currency": "USDT",
+      "lot_size": "0.00100000",
+      "tick_size": "0.01000000",
+      "min_qty": "0.00100000",
+      "min_notional": "5.00000000",
+      "tradable": true
+    },
+    {
+      "symbol": "SUI/USDT",
+      "base_currency": "SUI",
+      "quote_currency": "USDT",
+      "lot_size": "0.10000000",
+      "tick_size": "0.00010000",
+      "min_qty": "0.10000000",
+      "min_notional": "5.00000000",
+      "tradable": true
+    },
+    {
+      "symbol": "TIA/USDT",
+      "base_currency": "TIA",
+      "quote_currency": "USDT",
+      "lot_size": "0.01000000",
+      "tick_size": "0.00010000",
+      "min_qty": "0.01000000",
+      "min_notional": "5.00000000",
+      "tradable": true
+    },
+    {
+      "symbol": "TRX/USDT",
+      "base_currency": "TRX",
+      "quote_currency": "USDT",
+      "lot_size": "0.10000000",
+      "tick_size": "0.00010000",
+      "min_qty": "0.10000000",
+      "min_notional": "5.00000000",
+      "tradable": true
+    },
+    {
+      "symbol": "UNI/USDT",
+      "base_currency": "UNI",
+      "quote_currency": "USDT",
+      "lot_size": "0.01000000",
+      "tick_size": "0.00100000",
+      "min_qty": "0.01000000",
+      "min_notional": "5.00000000",
+      "tradable": true
+    },
+    {
+      "symbol": "VET/USDT",
+      "base_currency": "VET",
+      "quote_currency": "USDT",
+      "lot_size": "0.10000000",
+      "tick_size": "0.00000100",
+      "min_qty": "0.10000000",
+      "min_notional": "5.00000000",
+      "tradable": true
+    },
+    {
+      "symbol": "XLM/USDT",
+      "base_currency": "XLM",
+      "quote_currency": "USDT",
+      "lot_size": "1.00000000",
+      "tick_size": "0.00010000",
+      "min_qty": "1.00000000",
+      "min_notional": "5.00000000",
+      "tradable": true
+    },
+    {
+      "symbol": "XRP/USDT",
+      "base_currency": "XRP",
+      "quote_currency": "USDT",
+      "lot_size": "0.10000000",
+      "tick_size": "0.00010000",
+      "min_qty": "0.10000000",
+      "min_notional": "5.00000000",
+      "tradable": true
+    }
+  ]
+}

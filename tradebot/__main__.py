@@ -37,6 +37,7 @@ from tradebot.app import (
     build_sim,
     database_path,
     dataset_basket,
+    dataset_catalogue,
     select_panel,
 )
 from tradebot.control.arming import (
@@ -54,6 +55,7 @@ from tradebot.core.logging import configure_logging, get_logger
 from tradebot.dashboard.app import create_dashboard
 from tradebot.dashboard.auth import assert_bind_allowed, require_token
 from tradebot.decision.presets import PANELS
+from tradebot.marketdata.catalogue import SIM_MARKETS, SIM_SYMBOLS, MarketSnapshot
 from tradebot.marketdata.factory import binance_spot_history
 from tradebot.marketdata.recorder import ReplayDataset
 from tradebot.marketdata.recorder import record as record_history
@@ -198,6 +200,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     replay.add_argument("--panel", default=DEFAULT_PANEL_ID, choices=sorted(PANELS))
     replay.add_argument("--equity", type=Decimal, default=Decimal(10_000))
     replay.add_argument("--out", type=Path, default=None, help="report path (.md)")
+
+    catalogue = subparsers.add_parser(
+        "catalogue", help="record the trading rules the simulated venue publishes"
+    )
+    catalogue_actions = catalogue.add_subparsers(dest="action", required=True)
+    capture = catalogue_actions.add_parser(
+        "fetch",
+        help=(
+            "re-record the simulated venue's rule set from a real venue. Unauthenticated and "
+            "read-only, like `backtest fetch`: no key is involved and no order can be placed"
+        ),
+    )
+    capture.add_argument(
+        "--symbol",
+        action="append",
+        default=[],
+        metavar="BASE/QUOTE",
+        help=f"repeatable; defaults to the {len(SIM_SYMBOLS)} pairs sim lists today",
+    )
+    capture.add_argument(
+        "--out", type=Path, default=SIM_MARKETS, help="where the capture is written"
+    )
+    capture.add_argument("--verbose", action="store_true")
 
     report = subparsers.add_parser("report", help="generate a validation report from the log")
     report_actions = report.add_subparsers(dest="action", required=True)
@@ -450,11 +475,16 @@ async def _race(application: Application, *named: tuple[str, Coroutine[Any, Any,
 
 
 def _report(application: Application, results: Sequence[CycleResult]) -> int:
-    """Log what each cycle did, and exit non-zero if any of them failed.
+    """Log what each cycle did, and exit non-zero if any failed — or if any never ran.
 
     A supervised run absorbs a failed cycle by design — it backs off and tries again. A `--once`
     run has no next attempt, so the failure has to reach the shell instead of being reported as a
     clean exit to whatever launched it.
+
+    A **halted** basket is the same problem wearing a quieter coat: nothing failed, because nothing
+    was attempted. Startup can halt a basket for cause — trading rules that no longer match the
+    venue, say (ADR 0025) — and a `--once` run that then cycled nothing and exited zero would tell
+    a supervisor script the soak is fine while it produces no evidence at all.
     """
     for result in results:
         logger.info(
@@ -471,6 +501,61 @@ def _report(application: Application, results: Sequence[CycleResult]) -> int:
     if failed:
         logger.error("cycles failed", extra={"baskets": failed})
         return EXIT_CYCLE_FAILED
+    halted = application.states.halted_baskets()
+    stopped = {basket.basket_id for basket in application.baskets} & set(halted)
+    if stopped:
+        logger.error(
+            "baskets are halted and did not cycle; only a human clears a halt",
+            extra={
+                "baskets": sorted(stopped),
+                "reasons": [halted[name] for name in sorted(stopped)],
+            },
+        )
+        return EXIT_RECOVERY_HALTED
+    return 0
+
+
+async def catalogue_command(args: argparse.Namespace) -> int:
+    return await _CATALOGUE_ACTIONS[args.action](args)
+
+
+async def _catalogue_fetch(args: argparse.Namespace) -> int:
+    """Re-record the trading rules the simulated venue publishes (ADR 0025).
+
+    The rules sim serves are a *capture* of a real venue's, not numbers someone wrote down, and a
+    capture ages — a venue changes a filter and the committed file quietly describes a market that
+    no longer exists. This is how it is refreshed, so the refresh is a reviewable diff rather than
+    a hand edit of the one file whose `min_notional` decides which orders exist at all.
+
+    Mode-less for the same reason `backtest fetch` is: it holds no credentials and reads a public
+    endpoint, and pretending recording reference data is an execution mode would make `--mode live`
+    a sensible thing to type here (PLAN §2.4).
+    """
+    configure_logging(mode="fetch", level=logging.DEBUG if args.verbose else logging.INFO)
+    clock = SystemClock()
+    symbols = tuple(args.symbol) or SIM_SYMBOLS
+    provider, transport = binance_spot_history(clock)
+    try:
+        markets = [await provider.catalogue.resolve(symbol) for symbol in symbols]
+    finally:
+        await transport.close()
+    snapshot = MarketSnapshot(
+        source_venue=provider.provider_id,
+        source="spot exchangeInfo, public REST",
+        as_of=clock.now(),
+        # Sorted so a refresh diffs as the rules that changed, not as the order they were asked for.
+        markets=tuple(sorted(markets, key=lambda market: market.symbol)),
+    )
+    args.out.write_text(snapshot.model_dump_json(indent=2) + "\n", encoding="utf-8")
+    logger.info(
+        "instrument catalogue recorded",
+        extra={
+            "path": str(args.out),
+            "source_venue": snapshot.source_venue,
+            "symbols": len(snapshot.markets),
+            "as_of": snapshot.as_of.isoformat(),
+        },
+    )
     return 0
 
 
@@ -481,9 +566,10 @@ async def backtest_command(args: argparse.Namespace) -> int:
 async def _backtest_fetch(args: argparse.Namespace) -> int:
     """Record public venue history into a replay dataset.
 
-    The one command that reaches the internet without a mode, because it holds no credentials and
-    reads a public endpoint: recording last year's Binance klines is not an execution mode and
-    pretending it is would make `--mode live` a sensible thing to type here (PLAN §2.4).
+    One of the two commands that reach the internet without a mode, because it holds no
+    credentials and reads a public endpoint: recording last year's Binance klines is not an
+    execution mode and pretending it is would make `--mode live` a sensible thing to type here
+    (PLAN §2.4).
     """
     configure_logging(mode="fetch", level=logging.DEBUG if args.verbose else logging.INFO)
     clock = SystemClock()
@@ -535,6 +621,7 @@ async def _backtest_run(args: argparse.Namespace) -> int:
         baskets=(dataset_basket(dataset, select_panel(args.panel), every_seconds=args.every),),
         start_equity=args.equity,
         market_data=dataset.market_data,
+        catalogue=dataset_catalogue(dataset),
     )
     try:
         harness = BacktestHarness(
@@ -823,6 +910,7 @@ _ARMING_ACTIONS = {"arm-live": _arm_live, "disarm-live": _disarm_live}
 _RISK_ACTIONS = {"status": _risk_status, "rearm": _risk_rearm, "unhalt": _risk_unhalt}
 _CONFIG_ACTIONS = {"list": _config_list, "history": _config_history}
 _BACKTEST_ACTIONS = {"fetch": _backtest_fetch, "run": _backtest_run}
+_CATALOGUE_ACTIONS = {"fetch": _catalogue_fetch}
 _REPORT_ACTIONS = {"promotion": _promotion_report, "shadow": _shadow_report}
 _COMMANDS = {
     "run": run_command,
@@ -830,6 +918,7 @@ _COMMANDS = {
     "risk": risk_command,
     "config": config_command,
     "backtest": backtest_command,
+    "catalogue": catalogue_command,
     "report": report_command,
 }
 

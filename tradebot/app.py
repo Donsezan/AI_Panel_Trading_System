@@ -55,6 +55,7 @@ from tradebot.control.live import EffectivePolicy, effective_policy
 from tradebot.control.manual_close import ManualCloser
 from tradebot.control.preflight import VenuePreflight
 from tradebot.control.readiness import LiveReadiness
+from tradebot.control.reference import DriftWatch
 from tradebot.control.scheduler import Scheduler
 from tradebot.control.startup import Recovery, StartupSequence
 from tradebot.control.supervisor import Supervisor
@@ -93,12 +94,21 @@ from tradebot.interfaces.broker import (
     RestorableVenue,
     TradingCalendar,
 )
+from tradebot.interfaces.exchange import InstrumentCatalogue
 from tradebot.interfaces.llm import LLMProvider
 from tradebot.interfaces.market_data import MarketDataProvider
 from tradebot.interfaces.news import NewsFeed
 from tradebot.ledger.history import HistoryReader
 from tradebot.ledger.portfolio import Ledger
 from tradebot.ledger.reconciler import Reconciler
+from tradebot.marketdata.binance import BinanceSpotGateway
+from tradebot.marketdata.catalogue import (
+    UnavailableCatalogue,
+    VenueCatalogue,
+    instrument_of,
+    replay_catalogue,
+    sim_catalogue,
+)
 from tradebot.marketdata.factory import binance_spot_market_data, live_binance_spot
 from tradebot.marketdata.recorder import ReplayDataset
 from tradebot.marketdata.replay import ReplayMarketData, synthetic_candles
@@ -173,6 +183,11 @@ class Application:
     #: of looking at a chart can move the venue. `None` only where no provider was wired, which
     #: the chart pane renders as a stated absence.
     market_data: MarketDataProvider | None
+    #: What this process's instruments are quantized against. **Not** optional: every mode has a
+    #: catalogue, because the simulated venue publishes one exactly as a real venue does, and the
+    #: parity that makes a paper result predictive is expressed in the type rather than promised
+    #: in a comment (ADR 0025). A venue that cannot answer refuses when asked, and is still one.
+    catalogue: InstrumentCatalogue
     quote_currency: str
     _writer: SingleWriter
     #: Async resources that hold sockets — HTTP clients, exchange sessions. Closed by `shutdown`.
@@ -266,36 +281,35 @@ def backtest_database_path(root: Path = Path("data")) -> Path:
     return root / "backtest.db"
 
 
-def demo_basket(panel: PanelConfig | None = None) -> Basket:
-    """The two-instrument basket a fresh database is seeded with.
+#: What the seeded basket trades. Two correlated instruments rather than one, so the Tier-2
+#: cluster limit is exercised by the demo instead of only by its tests.
+DEMO_SYMBOLS = ("BTC/USDT", "ETH/USDT")
+
+
+async def demo_basket(catalogue: InstrumentCatalogue, panel: PanelConfig | None = None) -> Basket:
+    """The two-instrument basket a fresh database is seeded with, on the *simulated* venue.
 
     Published into the ConfigStore as version 1 on first run and never consulted again: from then
-    on the stored basket is the truth, and editing it in the dashboard creates version 2. Two
-    correlated instruments rather than one, so the Tier-2 cluster limit is exercised by the demo
-    instead of only by its tests.
+    on the stored basket is the truth, and editing it in the dashboard creates version 2. It is
+    seeded from the simulated venue's catalogue in every mode, because that is what it is — a
+    demonstration. A fresh database wired to a real exchange gets a basket that names instruments
+    the process cannot trade, and `control/readiness.py` says so by name rather than letting it
+    surface as a data fault; publishing a basket for the venue is the operator's deliberate act.
+
+    **The trading rules come from the catalogue, not from literals here.** They used to be written
+    out — and were wrong: the demo quantized `BTC/USDT` against a `min_notional` of 10 where the
+    venue publishes 5, so the first thing a fresh database did was disagree with the venue about
+    which orders exist (ADR 0025). A default that is a second source of truth for a risk input is
+    a default that drifts.
 
     The panel defaults to the offline stub for the same reason news is off unless a source is
     named: a zero-configuration run that reaches the internet — and demands an API key to do it —
     is a surprise, not a default.
     """
-    instruments = tuple(
-        Instrument(
-            symbol=symbol,
-            venue="sim",
-            asset_class=AssetClass.CRYPTO,
-            base_currency=symbol.split("/")[0],
-            quote_currency="USDT",
-            lot_size=lot,
-            tick_size=Decimal("0.01"),
-            min_qty=lot,
-            min_notional=Decimal("10"),
-        )
-        for symbol, lot in (("BTC/USDT", Decimal("0.00001")), ("ETH/USDT", Decimal("0.0001")))
-    )
     return Basket(
         basket_id="demo",
         name="Demo crypto basket",
-        instruments=instruments,
+        instruments=tuple([await instrument_of(catalogue, symbol) for symbol in DEMO_SYMBOLS]),
         panel=panel or STUB_PANEL,
         risk_policy=RiskPolicy(),
     )
@@ -324,6 +338,18 @@ def dataset_basket(
         timeframes=dataset.timeframes,
         schedule=Schedule(every_seconds=every_seconds),
         ttl_buffer_seconds=min(60, every_seconds // 2),
+    )
+
+
+def dataset_catalogue(dataset: ReplayDataset) -> InstrumentCatalogue:
+    """The rules a dataset's prices were recorded under, as its venue's catalogue.
+
+    A replay is the one mode whose venue no longer exists to be asked, so the manifest *is* the
+    venue: verifying a backtest basket against today's Binance would compare last year's prices to
+    this year's filters and refuse a replay for having been recorded (ADR 0025).
+    """
+    return replay_catalogue(
+        dataset.instruments, source=f"recorded dataset — {dataset.manifest.source}"
     )
 
 
@@ -403,11 +429,32 @@ class BrokerChoice(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class PriceFeed:
+    """A mode's price source, the catalogue answering for it, and the socket both hold open.
+
+    The three travel together because they are one decision. Reading Binance's prices means
+    quantizing against *Binance's* published rules and closing *Binance's* session; splitting them
+    up is how a paper soak ends up sized against a rule set nobody fetched, or how an HTTP client
+    outlives the shutdown that was supposed to release it.
+    """
+
+    prices: MarketDataProvider | None = None
+    catalogue: InstrumentCatalogue | None = None
+    closers: tuple[Callable[[], Awaitable[None]], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class VenueStack:
     """Everything one venue contributes, so `_assemble` never branches on which venue it is."""
 
     broker: BrokerAdapter
     prices: MarketDataProvider
+    #: What this stack's instruments are quantized against — the venue whose *prices* are read,
+    #: which is not always the venue taking the orders. A paper soak is `SimBroker` fed by live
+    #: Binance data (DESIGN §9 rung 5): its orders go nowhere near a venue, but its lot sizes and
+    #: minimum notionals have to be Binance's or the fills it simulates are not the fills the live
+    #: system would get (ADR 0025).
+    catalogue: InstrumentCatalogue
     #: The same prices, minus any side effect — what an observer may read.
     #:
     #: Required rather than defaulted, because the difference between the two is invisible at the
@@ -437,7 +484,7 @@ class StackRequest:
     instruments: tuple[Instrument, ...]
     clock: Clock
     mode: Mode
-    market_data: MarketDataProvider | None
+    feed: PriceFeed
     start_equity: Decimal
     quote_currency: str
 
@@ -448,13 +495,16 @@ def _sim_stack(request: StackRequest) -> VenueStack:
     Live prices plus simulated fills is DESIGN §9's primary paper mode, and it is this same code:
     only the market-data provider changes, so nothing about the venue path differs between the
     simulation and the soak.
+
+    The catalogue comes with the prices and is only defaulted when there are none to come with:
+    unfed, this is the *simulated venue*, which publishes a recorded rule set of its own.
     """
     broker = SimBroker(
         request.clock,
         balances={request.quote_currency: request.start_equity},
         default_quote_currency=request.quote_currency,
     )
-    source = request.market_data or _synthetic_market(
+    source = request.feed.prices or _synthetic_market(
         request.instruments,
         request.clock,
         {
@@ -465,6 +515,7 @@ def _sim_stack(request: StackRequest) -> VenueStack:
     return VenueStack(
         broker=broker,
         prices=SimulatedMarket(source, broker),
+        catalogue=request.feed.catalogue or sim_catalogue(),
         read_only_prices=source,
         calendar=ContinuousCalendar(broker.venue_id),
         venue_restore=broker,
@@ -485,10 +536,13 @@ def _binance_stack(request: StackRequest) -> VenueStack:
         clock, credentials("binance", mode), mode=mode, limiter=data_transport.limiter
     )
     broker = BinanceSpotBroker(trading_transport, clock, instruments=request.instruments)
-    prices = request.market_data or binance_spot_market_data(data_transport, clock)
+    prices = request.feed.prices or binance_spot_market_data(data_transport, clock)
     return VenueStack(
         broker=broker,
         prices=prices,
+        # Always this venue's own, never the caller's: the orders go here, so the rules that decide
+        # whether they are legal are the ones this transport can be asked for.
+        catalogue=VenueCatalogue(BinanceSpotGateway(data_transport, clock), clock),
         read_only_prices=prices,
         calendar=ContinuousCalendar(broker.venue_id),
         preflight=VenuePreflight(broker, clock, mode=mode),
@@ -503,7 +557,8 @@ def _alpaca_stack(request: StackRequest) -> VenueStack:
     built the Binance stack only. Refusing here is the honest answer — silently substituting crypto
     candles for equity ones would produce indicators, decisions and orders that all look valid.
     """
-    if request.market_data is None:
+    prices = request.feed.prices
+    if prices is None:
         raise ConfigError(
             "the alpaca broker needs an equity market-data provider, and none is wired yet: "
             "Phase 3 delivered Binance spot data only. Pass `market_data=` explicitly, or run "
@@ -517,8 +572,17 @@ def _alpaca_stack(request: StackRequest) -> VenueStack:
     broker = AlpacaBroker(transport, clock, instruments=request.instruments)
     return VenueStack(
         broker=broker,
-        prices=request.market_data,
-        read_only_prices=request.market_data,
+        prices=prices,
+        # Alpaca publishes no rule set this system can read: Phase 3 built no equity gateway. The
+        # catalogue therefore refuses by naming that, which is what makes an equity basket's rules
+        # unverifiable *loudly* rather than accepted because nobody could check them (ADR 0025).
+        catalogue=request.feed.catalogue
+        or UnavailableCatalogue(
+            broker.venue_id,
+            AssetClass.EQUITY,
+            "there is no equity VenueGateway in v1, so nothing can be asked what alpaca lists",
+        ),
+        read_only_prices=prices,
         calendar=AlpacaCalendar(transport, clock),
         announcements=AlpacaAnnouncements(transport),
         preflight=VenuePreflight(broker, clock, mode=mode),
@@ -775,7 +839,7 @@ async def _assemble(
     start_equity: Decimal,
     baskets: tuple[Basket, ...] | None,
     global_policy: GlobalRiskPolicy | None,
-    market_data: MarketDataProvider | None,
+    feed: PriceFeed,
     news_sources: tuple[str, ...],
     panel_id: str,
 ) -> Application:
@@ -795,7 +859,7 @@ async def _assemble(
         configs,
         baskets=baskets,
         global_policy=global_policy,
-        default_basket=demo_basket(select_panel(panel_id)),
+        default_basket=await demo_basket(sim_catalogue(), select_panel(panel_id)),
     )
     records = configs.baskets()
     if not records:
@@ -810,7 +874,7 @@ async def _assemble(
     policy = enforced_policy(configs, arming, mode).policy
 
     stack = _STACKS[broker_choice](
-        StackRequest(instruments, clock, mode, market_data, start_equity, quote_currency)
+        StackRequest(instruments, clock, mode, feed, start_equity, quote_currency)
     )
     # A real venue's balances are *discovered*: the ledger starts empty and the startup
     # reconciliation adopts what the venue actually holds. Seeding it would invent funds and, worse,
@@ -840,6 +904,7 @@ async def _assemble(
         announcements=stack.announcements,
     )
 
+    drift = DriftWatch(stack.catalogue, configs, watchdog, states, store, clock, mode=mode)
     builder = RunnerBuilder(
         clock=clock,
         mode=mode,
@@ -860,7 +925,9 @@ async def _assemble(
         clock=clock,
         store=store,
         ledger=ledger,
-        supervisor=Supervisor(builder, configs, Scheduler(clock), watchdog, states, clock),
+        supervisor=Supervisor(
+            builder, configs, Scheduler(clock), watchdog, states, clock, drift=drift
+        ),
         configs=configs,
         startup=StartupSequence(
             store,
@@ -886,6 +953,7 @@ async def _assemble(
                 clock=clock,
                 alert_sinks=alert_sinks,
             ),
+            drift=drift,
         ),
         watchdog=watchdog,
         states=states,
@@ -912,9 +980,16 @@ async def _assemble(
             calendar=stack.calendar,
         ),
         market_data=stack.read_only_prices,
+        catalogue=stack.catalogue,
         quote_currency=quote_currency,
         _writer=writer,
-        _closers=(builder.close, *news_closers, *alert_closers, *stack.closers),
+        _closers=(
+            builder.close,
+            *news_closers,
+            *alert_closers,
+            *stack.closers,
+            *feed.closers,
+        ),
     )
 
 
@@ -1034,6 +1109,7 @@ async def build_sim(
     start_equity: Decimal = Decimal(10_000),
     global_policy: GlobalRiskPolicy | None = None,
     market_data: MarketDataProvider | None = None,
+    catalogue: InstrumentCatalogue | None = None,
     news_sources: tuple[str, ...] = (),
     panel_id: str = DEFAULT_PANEL_ID,
     broker: BrokerChoice = BrokerChoice.SIM,
@@ -1043,6 +1119,11 @@ async def build_sim(
     `market_data` overrides the synthetic series with any provider; `panel_id` swaps the scripted
     panel for real models. `SimBroker` still matches every fill, so no combination of the two can
     move real money.
+
+    `catalogue` travels with `market_data` and answers for the same venue — a backtest replaying
+    recorded Binance prices is quantized against the rules that dataset recorded, not against the
+    simulated venue's (`marketdata/recorder.py`). Left unset, the prices are synthetic and so is
+    the venue, which publishes its own recorded rule set.
     """
     if broker.is_venue:
         raise ConfigError(
@@ -1058,7 +1139,7 @@ async def build_sim(
         start_equity=start_equity,
         baskets=baskets,
         global_policy=global_policy,
-        market_data=market_data,
+        feed=PriceFeed(market_data, catalogue),
         news_sources=news_sources,
         panel_id=panel_id,
     )
@@ -1072,6 +1153,7 @@ async def build_paper(
     start_equity: Decimal = Decimal(10_000),
     global_policy: GlobalRiskPolicy | None = None,
     market_data: MarketDataProvider | None = None,
+    catalogue: InstrumentCatalogue | None = None,
     news_sources: tuple[str, ...] = (),
     panel_id: str = DEFAULT_PANEL_ID,
     broker: BrokerChoice = BrokerChoice.SIM,
@@ -1093,23 +1175,40 @@ async def build_paper(
         start_equity=start_equity,
         baskets=baskets,
         global_policy=global_policy,
-        market_data=market_data or _paper_market_data(broker, clock),
+        feed=_feed_for(broker, clock, market_data, catalogue),
         news_sources=news_sources,
         panel_id=panel_id,
     )
 
 
-def _paper_market_data(broker: BrokerChoice, clock: Clock) -> MarketDataProvider | None:
-    """Real Binance prices for the crypto paths; nothing to offer for equities yet.
+def _feed_for(
+    broker: BrokerChoice,
+    clock: Clock,
+    market_data: MarketDataProvider | None,
+    catalogue: InstrumentCatalogue | None,
+) -> PriceFeed:
+    """The prices a venue-backed mode reads, and the catalogue that answers for the same venue.
 
-    A paper run reaching the internet for prices is the point of paper — unlike simulation, where
-    it would be a surprise. The testnet's own book is used when the testnet is also taking the
-    orders, so an order and the prices it was sized from describe the same market.
+    Only the **simulated broker** needs a feed built here: it takes the orders itself, so nothing
+    else in its stack is going to open a connection to a venue, and DESIGN §9 rung 5's primary
+    paper shape is exactly that — real Binance prices, deterministic fills. Production prices, not
+    the testnet's: nothing is being sent to a venue, so there is no book to agree with.
+
+    A *venue* broker gets an empty feed on purpose. Its own stack builds one transport and hands
+    the trading side that transport's limiter, so a feed built here would give one IP a second,
+    independent rate budget — the failure ADR 0010 exists to prevent — plus an HTTP session nobody
+    registers for shutdown. Alpaca gets nothing either way, and `_alpaca_stack` refuses by name.
     """
-    if broker is BrokerChoice.ALPACA:
-        return None
-    provider, _ = live_binance_spot(clock, sandbox=broker is BrokerChoice.BINANCE)
-    return provider
+    if market_data is not None:
+        return PriceFeed(market_data, catalogue)
+    if broker is not BrokerChoice.SIM:
+        return PriceFeed(catalogue=catalogue)
+    provider, transport = live_binance_spot(clock, sandbox=False)
+    return PriceFeed(
+        provider,
+        catalogue or VenueCatalogue(BinanceSpotGateway(transport, clock), clock),
+        (transport.close,),
+    )
 
 
 async def build_live(
@@ -1119,6 +1218,7 @@ async def build_live(
     baskets: tuple[Basket, ...] | None = None,
     global_policy: GlobalRiskPolicy | None = None,
     market_data: MarketDataProvider | None = None,
+    catalogue: InstrumentCatalogue | None = None,
     news_sources: tuple[str, ...] = (),
     panel_id: str = DEFAULT_PANEL_ID,
     broker: BrokerChoice = BrokerChoice.BINANCE,
@@ -1157,22 +1257,12 @@ async def build_live(
         start_equity=start_equity,
         baskets=baskets,
         global_policy=global_policy,
-        market_data=market_data or _live_market_data(broker, clock),
+        # Live refuses the simulated broker above, so the feed is always empty here and the venue
+        # stack builds its own prices, catalogue and transport — one connection, one rate budget.
+        feed=_feed_for(broker, clock, market_data, catalogue),
         news_sources=news_sources,
         panel_id=panel_id,
     )
-
-
-def _live_market_data(broker: BrokerChoice, clock: Clock) -> MarketDataProvider | None:
-    """The real exchange's own book. `None` for Alpaca, which `_alpaca_stack` then refuses.
-
-    Refusing there rather than here keeps one message for one defect: there is no equity
-    market-data provider in v1, so an equities basket cannot go live whatever the mode asks for.
-    """
-    if broker is BrokerChoice.ALPACA:
-        return None
-    provider, _ = live_binance_spot(clock, sandbox=False)
-    return provider
 
 
 async def build(mode: Mode, **kwargs: object) -> Application:

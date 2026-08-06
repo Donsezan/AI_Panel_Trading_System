@@ -170,12 +170,33 @@ async def test_a_number_that_is_not_a_number_is_refused_and_not_a_crash(
     assert {r.ref.config_id for r in sim_application.configs.baskets()} == {"demo"}
 
 
-async def test_the_same_new_basket_publishes_once_the_decimal_is_readable(
+async def test_a_readable_number_the_venue_disagrees_with_is_still_refused(
     sim_application: Application, client: httpx.AsyncClient
 ) -> None:
+    """The number parses; it is simply not the venue's. That used to publish (ADR 0025).
+
+    `sim` publishes `BTC/USDT` at a lot size of 0.00001, recorded from a real `exchangeInfo`.
+    A basket pinning 0.001 would quantize every order against a floor the venue never set.
+    """
     response = await client.post(
         "/configure/baskets/alpha", data=as_form(new_basket_form(lot_size="0.001"))
     )
+
+    assert response.status_code == 200
+    assert "the venue publishes 0.00001" in response.text
+    assert {r.ref.config_id for r in sim_application.configs.baskets()} == {"demo"}
+
+
+async def test_the_same_basket_publishes_with_the_venues_own_rules(
+    sim_application: Application, client: httpx.AsyncClient
+) -> None:
+    """What the Look up button will fill in for the operator — the venue's published answer."""
+    market = await sim_application.catalogue.resolve("BTC/USDT")
+    typed = new_basket_form(lot_size=str(market.lot_size))
+    for field in ("tick_size", "min_qty", "min_notional"):
+        typed = _replace(typed, f"doc.instruments[0].{field}", str(getattr(market, field)))
+
+    response = await client.post("/configure/baskets/alpha", data=as_form(typed))
 
     assert response.status_code == 303
     assert {r.ref.config_id for r in sim_application.configs.baskets()} == {"demo", "alpha"}

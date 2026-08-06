@@ -115,6 +115,9 @@ class FakeGateway:
         self.book = book
         self.markets = tuple(markets)
         self.requests: list[tuple[str, str, int, datetime | None]] = []
+        #: How many times the rule set was actually fetched — what proves a catalogue cached it
+        #: rather than re-asking the venue once per symbol (ADR 0008).
+        self.market_fetches = 0
         self.closed = False
         self._timeframes = timeframes
         self._max_history = max_history
@@ -134,6 +137,7 @@ class FakeGateway:
         return self.book
 
     async def fetch_markets(self) -> tuple[VenueMarket, ...]:
+        self.market_fetches += 1
         return self.markets
 
     async def server_time(self) -> datetime:

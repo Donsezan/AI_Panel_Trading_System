@@ -28,31 +28,11 @@ from tradebot.core.errors import ConfigError, DataStaleError
 from tradebot.core.instrument import Instrument
 from tradebot.core.logging import get_logger
 from tradebot.core.market import Candle, CandleSeries, Quote
-from tradebot.interfaces.exchange import VenueGateway, VenueMarket
+from tradebot.interfaces.exchange import VenueGateway
 from tradebot.interfaces.market_data import DataCapabilities
+from tradebot.marketdata.catalogue import VenueCatalogue, instrument_of
 
 logger = get_logger(__name__)
-
-
-def instrument_for(market: VenueMarket, venue_id: str, asset_class: AssetClass) -> Instrument:
-    """Build an `Instrument` from venue-published trading rules.
-
-    Precision comes from the venue on every start rather than from a config file, because a
-    stale `min_notional` or `lot_size` silently changes what the risk layer is allowed to size.
-    """
-    if not market.tradable:
-        raise ConfigError(f"{venue_id}:{market.symbol} is not tradable on this venue")
-    return Instrument(
-        symbol=market.symbol,
-        venue=venue_id,
-        asset_class=asset_class,
-        base_currency=market.base_currency,
-        quote_currency=market.quote_currency,
-        lot_size=market.lot_size,
-        tick_size=market.tick_size,
-        min_qty=market.min_qty,
-        min_notional=market.min_notional,
-    )
 
 
 class VenueMarketData:
@@ -63,7 +43,9 @@ class VenueMarketData:
     ) -> None:
         self._gateway = gateway
         self._clock = clock
-        self._asset_class = asset_class
+        #: The same gateway's published rule set. Symbol resolution is a catalogue question, and
+        #: answering it here as well would be a second opinion about what a venue lists.
+        self.catalogue = VenueCatalogue(gateway, clock, asset_class=asset_class)
         self.provider_id = gateway.venue_id
 
     async def get_candles(
@@ -109,15 +91,12 @@ class VenueMarketData:
         return self._gateway.capabilities()
 
     async def instruments(self, *symbols: str) -> tuple[Instrument, ...]:
-        """Resolve symbols against the venue's own precision and minimums."""
-        markets = {market.symbol: market for market in await self._gateway.fetch_markets()}
-        missing = [symbol for symbol in symbols if symbol not in markets]
-        if missing:
-            raise ConfigError(f"{self.provider_id} does not list {', '.join(sorted(missing))}")
-        return tuple(
-            instrument_for(markets[symbol], self.provider_id, self._asset_class)
-            for symbol in symbols
-        )
+        """Resolve symbols against the venue's own precision and minimums.
+
+        One catalogue fetch serves the whole list: the first call populates its cache and the rest
+        read it, so recording a ten-symbol dataset still spends one `exchangeInfo` weight.
+        """
+        return tuple([await instrument_of(self.catalogue, symbol) for symbol in symbols])
 
     async def close(self) -> None:
         await self._gateway.close()

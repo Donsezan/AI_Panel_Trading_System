@@ -19,7 +19,8 @@ from tradebot.core.instrument import Instrument
 from tradebot.core.market import Candle
 from tradebot.interfaces.exchange import TopOfBook
 from tradebot.marketdata.binance import parse_market
-from tradebot.marketdata.venue import VenueMarketData, instrument_for
+from tradebot.marketdata.catalogue import instrument_for
+from tradebot.marketdata.venue import VenueMarketData
 
 START = datetime(2026, 3, 1, 12, 0, tzinfo=UTC)
 HOUR = timedelta(hours=1)
@@ -204,8 +205,23 @@ class TestInstrumentResolution:
 
     async def test_an_unlisted_symbol_is_a_config_error(self, clock: ManualClock) -> None:
         gateway = FakeGateway(bars(1), markets=[parse_market(symbol_entry())])
-        with pytest.raises(ConfigError, match="does not list DOGE/USDT"):
+        with pytest.raises(ConfigError, match="does not list 'DOGE/USDT'"):
             await provider(gateway, clock).instruments("DOGE/USDT")
+
+    async def test_resolving_many_symbols_spends_one_catalogue_fetch(
+        self, clock: ManualClock
+    ) -> None:
+        """Recording a ten-symbol dataset must not be ten `exchangeInfo` calls (ADR 0008)."""
+        gateway = FakeGateway(
+            bars(1),
+            markets=[
+                parse_market(symbol_entry()),
+                parse_market(symbol_entry("ETHUSDT", "ETH")),
+            ],
+        )
+        resolved = await provider(gateway, clock).instruments("BTC/USDT", "ETH/USDT")
+        assert [i.symbol for i in resolved] == ["BTC/USDT", "ETH/USDT"]
+        assert gateway.market_fetches == 1
 
     def test_an_untradable_market_cannot_become_an_instrument(self) -> None:
         market = parse_market(symbol_entry(status="BREAK"))

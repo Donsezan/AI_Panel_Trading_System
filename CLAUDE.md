@@ -48,6 +48,7 @@ The validation ladder is two commands, and both write a Markdown file under `rep
 than printing — a promotion report is filed with the decision it justified:
 
 ```powershell
+.venv\Scripts\python.exe -m tradebot catalogue fetch          # re-record the sim venue's rules
 .venv\Scripts\python.exe -m tradebot backtest fetch --symbol BTC/USDT `
     --since 2026-01-01 --until 2026-06-01 --out data\history   # public, read-only, no key
 .venv\Scripts\python.exe -m tradebot backtest run --mode sim --data data\history
@@ -180,6 +181,43 @@ thread's open transaction: `await store.append(...)` returns having written noth
 file database gives each checkout its own connection and is unaffected, so this is a harness trap,
 not a production one — but a test that races it is testing the harness. Drive the reader
 explicitly (`hub.drain()`, `hub.broadcast()`) instead of waiting for its loop to notice.
+
+### Phase 11 — the instrument master
+
+Planned in [docs/PHASE_11_INSTRUMENT_MASTER_AND_SETTINGS.md](docs/PHASE_11_INSTRUMENT_MASTER_AND_SETTINGS.md);
+four slices. **A (the catalogue) and B (verification) have shipped**; C (the settings workspace) and
+D (quarantine leaves Settings) have not.
+
+**An instrument's trading rules are venue reference data, never operator input** ([ADR 0025](docs/adr/0025-instrument-trading-rules-are-venue-reference-data.md)).
+`lot_size`, `tick_size`, `min_qty` and `min_notional` decide what `quantize_order` rounds to and,
+through `min_notional`, whether an order exists at all — so they come from `InstrumentCatalogue`
+and nowhere else. `Application.catalogue` is **not** optional:
+
+- **The simulated venue publishes a catalogue exactly as a real venue does.** `SimCatalogue` serves
+  `marketdata/sim_markets.json`, a real `exchangeInfo` capture of thirty pairs carrying its `as_of`,
+  refreshed by `tradebot catalogue fetch`. `tests/contract/test_catalogue_contract.py` runs one
+  suite over every implementation, because a sim that quietly accepted what Binance refuses would
+  mean the thing a soak validated is not the thing that trades (ADR 0020).
+- **The catalogue answers for the venue whose *prices* are read**, not the one taking the orders. A
+  paper soak is `SimBroker` fed by live Binance data: its orders reach no venue, but its lot sizes
+  must be Binance's or the fills it simulates are not the ones live would get.
+- **`control/reference.store_basket` is the only path that writes a basket**, and it re-resolves
+  the instruments the edit *changed*. Changed-only is what keeps fail-closed from meaning
+  fail-useless: a pause, a quarantine toggle or a tightened stop touches no instrument, so it costs
+  no venue call and survives an outage. An unreachable venue while an instrument *did* change is a
+  refusal naming the venue — a basket whose rules cannot be checked is not one that gets stored.
+- **Drift after publish scales with whether the cycles are evidence.** Startup and the supervisor's
+  resync sweep re-verify everything; live and paper halt the affected *basket* (which alerts, via
+  `BASKET_STATUS_CHANGED`), sim records one `RISK_EVENT` and runs on. Not because one is called
+  "sim": the soak's primary venue **is** `SimBroker`, and those cycles stamp `venue: sim` and are
+  what `report promotion` reads. An unreachable venue is **not** drift and halts nothing.
+- **ISIN is declared and deliberately unserved.** `resolve` takes an `IdType`, validates an ISIN's
+  check digit locally so a typo is caught first, then refuses with the venue's actual limitation.
+  Faking a mapping would invent the identity of a tradable thing.
+
+Two things collapsed into this seam rather than sitting beside it: `VenueMarketData.instruments`
+delegates to a catalogue instead of holding a second opinion about what a venue lists, and
+`--broker binance` no longer builds a second Binance transport with its own rate budget (ADR 0010).
 
 ### Phase 10 — the blotter workspace
 

@@ -7,15 +7,18 @@
 3. For each venue: fetch open orders and `AccountState`, adopt orders carrying our
    `client_order_id` prefix, and reconcile the ledger.
 4. Resolve every non-terminal order in the database to a terminal or monitored state.
-5. In **live only**, check readiness: alerting configured, panels reachable, market data complete,
+5. **Re-verify every configured instrument's trading rules against the venue** — a filter changed
+   under a stopped process is a lot size the risk layer would size against and the venue would
+   reject (`control/reference.py`, ADR 0025). This one halts *baskets*, not the process.
+6. In **live only**, check readiness: alerting configured, panels reachable, market data complete,
    every stored basket building (`control/readiness.py`). Last, because it spends provider calls
    and venue weight on a system the cheaper steps have already agreed is sound.
-6. Restore persisted risk state — kill switch, halted baskets, high-water mark, day-start
+7. Restore persisted risk state — kill switch, halted baskets, high-water mark, day-start
    equity — and arm the watchdog. Only then may runners start.
-7. **Any step failing leaves the process up and halted.** Nothing trades, and the reason is in
+8. **Any step failing leaves the process up and halted.** Nothing trades, and the reason is in
    the log.
 
-Step 6 is the point of the whole module. The tempting alternative — crash on a failed recovery —
+Step 7 is the point of the whole module. The tempting alternative — crash on a failed recovery —
 loses the one thing an operator needs, which is a running system that can be asked what went
 wrong. The tempting *other* alternative — carry on and hope — is how a process resumes trading
 against a position it has already lost track of.
@@ -33,6 +36,7 @@ from sqlalchemy import select
 
 from tradebot.control.preflight import VenuePreflight
 from tradebot.control.readiness import LiveReadiness
+from tradebot.control.reference import DriftWatch
 from tradebot.core.clock import Clock
 from tradebot.core.config import Basket
 from tradebot.core.enums import KillSwitchState, OrderState, RiskTier
@@ -94,6 +98,7 @@ class StartupSequence:
         venue_restore: RestorableVenue | None = None,
         preflight: VenuePreflight | None = None,
         readiness: LiveReadiness | None = None,
+        drift: DriftWatch | None = None,
     ) -> None:
         self._store = store
         self._ledger = ledger
@@ -111,6 +116,9 @@ class StartupSequence:
         self._preflight = preflight
         #: Live only. Sim and paper are allowed to run degraded — that is what they are for.
         self._readiness = readiness
+        #: Every mode. Unlike the gates above, it halts *baskets* rather than the process, and
+        #: only in the modes whose cycles are evidence (ADR 0025).
+        self._drift = drift
 
     async def recover(self) -> Recovery:
         """Bring the process to a known state, or to a halted one."""
@@ -142,6 +150,12 @@ class StartupSequence:
                 resolved = await self._resolve_open_orders()
             except TradebotError as exc:
                 failures.append(f"open-order resolution failed: {exc}")
+
+        # A basket whose trading rules have moved under it is halted, not a process failure: the
+        # rest of the system is sound and the other baskets keep their evidence coming (ADR 0025).
+        # Before readiness, so live does not spend provider calls probing a basket it will refuse.
+        if not failures and self._drift is not None:
+            await self._drift.check()
 
         # Last, and only in live: it spends provider calls and venue weight, so it runs once the
         # cheaper steps have agreed there is a system worth checking.

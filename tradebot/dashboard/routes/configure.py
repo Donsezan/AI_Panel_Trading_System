@@ -8,7 +8,9 @@ cycle boundary. There is no other write path.
 Three rules this module exists to honour:
 
 * **Validation is the engine's own pydantic models, unchanged.** The form surfaces their
-  messages; it never restates a rule (`forms.py`).
+  messages; it never restates a rule (`forms.py`). The one thing the models cannot check is
+  whether an instrument's trading rules are the venue's, because that needs the venue —
+  `control/reference.py` asks it on the way to the store, for every basket write path (ADR 0025).
 * **Loosening a Tier-2 limit needs a second typed act** (DESIGN §6.10). Which edits count as
   loosening is decided by `risk/loosening.py`, so tightening is never made to feel like a risk.
 * **A fallback binding is picked, never typed.** The seat editor's selects are built from the
@@ -37,6 +39,7 @@ from starlette.datastructures import FormData
 from starlette.responses import Response
 
 from tradebot.control.config_store import SINGLETON_ID
+from tradebot.control.reference import store_basket
 from tradebot.core.config import (
     Basket,
     GlobalRiskPolicy,
@@ -147,10 +150,14 @@ async def publish_basket(request: Request) -> Response:
     if basket is None:
         return _basket_form(request, draft, existing=_version_field(form), errors=errors)
 
-    configs = state_of(request).application.configs
+    application = state_of(request).application
     try:
-        record = await configs.put(
-            basket.basket_id, basket, actor=ACTOR, note=_note(form, "edited in the dashboard")
+        record = await store_basket(
+            application.configs,
+            application.catalogue,
+            basket,
+            actor=ACTOR,
+            note=_note(form, "edited in the dashboard"),
         )
     except ConfigError as exc:
         return _basket_form(request, draft, existing=_version_field(form), errors=_refusal(exc))

@@ -62,9 +62,10 @@ from starlette.datastructures import FormData
 from starlette.responses import Response
 
 from tradebot.control.arming import assert_live_confirmation
+from tradebot.control.reference import store_basket
 from tradebot.core.config import Basket
 from tradebot.core.enums import BasketStatus, ConfigKind
-from tradebot.core.errors import ModeConfusionError, TradebotError
+from tradebot.core.errors import ConfigError, ModeConfusionError, TradebotError
 from tradebot.core.logging import get_logger
 from tradebot.core.money import to_decimal
 from tradebot.dashboard.dock import (
@@ -171,12 +172,16 @@ async def set_status(request: Request, basket_id: str) -> Response:
         return _refused(request, form, f"no basket {basket_id} is in service")
 
     basket: Basket = record.document
-    await configs.put(
-        basket_id,
-        basket.model_copy(update={"status": status}),
-        actor=ACTOR,
-        note=_field(form, "note") or f"{status.value} from the dashboard",
-    )
+    try:
+        await store_basket(
+            configs,
+            state_of(request).application.catalogue,
+            basket.model_copy(update={"status": status}),
+            actor=ACTOR,
+            note=_field(form, "note") or f"{status.value} from the dashboard",
+        )
+    except ConfigError as exc:
+        return _refused(request, form, str(exc))
     logger.warning(
         "basket status published from the dashboard",
         extra={"basket_id": basket_id, "status": status.value},
@@ -212,12 +217,16 @@ async def set_quarantine(request: Request, basket_id: str) -> Response:
         )
 
     policy = basket.risk_policy.with_quarantine(instrument_key, excluded=excluded)
-    published = await configs.put(
-        basket_id,
-        basket.model_copy(update={"risk_policy": policy}),
-        actor=ACTOR,
-        note=_field(form, "note") or _quarantine_note(instrument_key, excluded=excluded),
-    )
+    try:
+        published = await store_basket(
+            configs,
+            state.application.catalogue,
+            basket.model_copy(update={"risk_policy": policy}),
+            actor=ACTOR,
+            note=_field(form, "note") or _quarantine_note(instrument_key, excluded=excluded),
+        )
+    except ConfigError as exc:
+        return _refused(request, form, str(exc))
     logger.warning(
         "quarantine published from the dashboard",
         extra={

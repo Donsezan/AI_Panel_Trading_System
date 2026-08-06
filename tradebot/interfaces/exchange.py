@@ -25,8 +25,10 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from datetime import datetime
+from enum import StrEnum
 from typing import Any, Protocol, runtime_checkable
 
+from tradebot.core.enums import AssetClass
 from tradebot.core.market import Candle
 from tradebot.core.schema import DomainModel, Money, UtcDatetime
 from tradebot.interfaces.market_data import DataCapabilities
@@ -144,4 +146,53 @@ class VenueGateway(Protocol):
 
     async def close(self) -> None:
         """Release the transport. Safe to call more than once."""
+        ...
+
+
+class IdType(StrEnum):
+    """How an operator named an instrument.
+
+    `ISIN` is declared and deliberately unserved. Neither Binance nor Alpaca's free API publishes
+    an ISIN→symbol mapping, so a resolver that guessed would be inventing the identity of a
+    tradable thing. Naming the id type here means a catalogue can refuse with the venue's actual
+    limitation — after checking the ISIN's own check digit, so a typo is never hidden behind it.
+    """
+
+    SYMBOL = "symbol"
+    ISIN = "isin"
+
+
+@runtime_checkable
+class InstrumentCatalogue(Protocol):
+    """What a venue lists, and the precision it lists it at.
+
+    Reference data, never operator input: `VenueMarket` above already states that a trading rule
+    is fetched and not hand-configured, and this is the seam that makes the fetched answer
+    reachable from everywhere the rules are needed — the composition root that seeds a basket, the
+    publish path that verifies one, and the drift check that re-verifies it while the system runs
+    (ADR 0025).
+
+    A **simulated venue implements this exactly as a real one does.** Sim simulates a venue; it is
+    not a mode with a second data path. A flow that fetched rules from Binance but fell back to
+    hand-typing under sim would mean the thing that was tested is not the thing that trades — the
+    failure ADR 0020 exists to prevent — so `tests/contract/test_catalogue_contract.py` runs one
+    suite over every implementation.
+
+    Failure semantics: an identifier the venue does not list, one it lists as delisted, and an id
+    type it cannot resolve all raise `ConfigError`. Asking for an instrument a venue does not
+    publish is a configuration defect, not a market condition.
+    """
+
+    venue_id: str
+    #: What this venue deals in. A property of the venue rather than of the operator's typing: an
+    #: `Instrument` needs an asset class, and someone naming a symbol must not also have to
+    #: classify it — which is how `venue`/`asset_class` typos reach the risk layer today.
+    asset_class: AssetClass
+
+    async def list_markets(self) -> tuple[VenueMarket, ...]:
+        """Every symbol this venue publishes, including the ones it no longer trades."""
+        ...
+
+    async def resolve(self, identifier: str, id_type: IdType = IdType.SYMBOL) -> VenueMarket:
+        """One symbol's published trading rules, or a refusal in the venue's own terms."""
         ...
