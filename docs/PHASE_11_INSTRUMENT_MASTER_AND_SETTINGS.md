@@ -7,9 +7,11 @@
 > first. The reference the operator pointed at is again the Charles River IMS — this time its
 > *setup* workspaces rather than its trading blotter ([PHASE_10](PHASE_10_BLOTTER_WORKSPACE.md)).
 
-**Status: Slices A and B have shipped ([ADR 0025](adr/0025-instrument-trading-rules-are-venue-reference-data.md));
-C and D have not.** Three things were decided during implementation and are recorded at the end,
-under [What implementation changed](#what-implementation-changed).
+**Status: Slices A, B, C and D have shipped**, together with a **Slice E** discovered during
+Slice C's design pass ([ADR 0025](adr/0025-instrument-trading-rules-are-venue-reference-data.md),
+[ADR 0026](adr/0026-an-instrument-belongs-to-exactly-one-basket.md)). What was decided during
+implementation is recorded at the end, under
+[What implementation changed](#what-implementation-changed).
 
 ## Why now
 
@@ -369,13 +371,13 @@ DESIGN §8.1 row. *Exit: a basket whose `min_notional` disagrees with the venue 
 any mode, and a mid-run filter change halts the basket in live and paper while sim says so and runs
 on.*
 
-**Slice C — the settings workspace.** Tab shell and `ui.*` round-trip, section rail, Champion/
+**Slice C — the settings workspace** ✅ **shipped**. Tab shell and `ui.*` round-trip, section rail, Champion/
 Challenger and Seats/Providers tabs, seat master–detail, the Look up button and resolved read-only
 fields, htmx row buttons, sticky publish bar, homogeneity and provider-usage indicators. *Exit: a
 basket is created end to end by typing one identifier per instrument; no add/remove button moves the
 scroll position; `tests/scenario/test_dashboard_lifecycle.py` still passes unchanged.*
 
-**Slice D — cleanup.** Quarantine removal with carry-over and its five tests; checkbox groups; `f.multi`
+**Slice D — cleanup** ✅ **shipped**. Quarantine removal with carry-over and its five tests; checkbox groups; `f.multi`
 retired. *Exit: publishing from Settings can no longer change a quarantine in either direction.*
 
 Slice D's quarantine work is independent of A–C and can be pulled forward if the silent-release path
@@ -438,3 +440,37 @@ One behaviour changed outside the plan's scope, deliberately: **`run --once` now
 basket in service is halted.** The check moved a failure that used to surface as a failed cycle
 (exit 4) into a basket halt at startup, and a `--once` run that cycled nothing while exiting zero
 would tell a supervisor script the soak is fine while it produces no evidence at all.
+
+Four more from Slices C, E and D:
+
+4. **Exclusivity (Slice E) landed ahead of Slice C**, because the instrument picker had to be built
+   against the rule: a form that offers an instrument another basket already holds is a form whose
+   refusal arrives after the operator has finished typing. It is recorded as
+   [ADR 0026](adr/0026-an-instrument-belongs-to-exactly-one-basket.md), and it cost
+   `test_dashboard_lifecycle.py` its claim to passing *unchanged* — `alpha` had to be given its own
+   instruments rather than sharing `demo`'s.
+
+5. **The Look up button posts `lookup` to the existing `/draft` route** rather than the `/lookup`
+   route §1.2 proposed. It is the same stateless-draft round trip as add and remove, so a second
+   route would have been a second copy of "re-render the draft with what the operator typed".
+
+6. **The Challenger tab always renders its editor**, rather than §2.2's "no challenger configured"
+   placeholder with an **Add challenger** button. The placeholder would have been a tab that
+   conditionally renders its contents — precisely what §2.3 forbids — and would have deleted a
+   configured challenger on the next save. The tab label carries a `none` marker instead.
+
+7. **Quarantine carry-over reads the stored record outside `store_basket`'s lock, and that window is
+   still open.** `carry_quarantine` re-attaches quarantine from the latest stored version, but that
+   read happens in the route, while `store_basket` holds `configs.publishing()` across its own
+   read-check-write. A quarantine published on the workspace between the two is therefore still
+   overwritten — the window being one venue verification wide.
+
+   It is **not specific to quarantine**: `control.py`'s pause/resume and quarantine routes both read
+   the stored basket, modify it, and publish, so either can drop an edit the other made in the same
+   window. Publishing a basket is a read-modify-write with no version check, and the form already
+   carries the `existing` version it was rendered from without using it for concurrency.
+
+   The fix is a version-checked publish — `ConfigStore.put` rejecting a write whose base version has
+   moved, and the dashboard re-rendering the refusal with the newer document — which closes the class
+   rather than one instance of it. It belongs on `ConfigStore`, not in a dashboard route, and it is
+   **outstanding**, alongside the missing periodic reconciliation from note 1.

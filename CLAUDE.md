@@ -185,8 +185,9 @@ explicitly (`hub.drain()`, `hub.broadcast()`) instead of waiting for its loop to
 ### Phase 11 — the instrument master
 
 Planned in [docs/PHASE_11_INSTRUMENT_MASTER_AND_SETTINGS.md](docs/PHASE_11_INSTRUMENT_MASTER_AND_SETTINGS.md);
-four slices. **A (the catalogue) and B (verification) have shipped**; C (the settings workspace) and
-D (quarantine leaves Settings) have not.
+four slices, plus a fifth found while designing the third. **A (the catalogue), B (verification),
+C (the settings workspace), D (quarantine leaves Settings) and E (basket exclusivity) have all
+shipped.**
 
 **An instrument's trading rules are venue reference data, never operator input** ([ADR 0025](docs/adr/0025-instrument-trading-rules-are-venue-reference-data.md)).
 `lot_size`, `tick_size`, `min_qty` and `min_notional` decide what `quantize_order` rounds to and,
@@ -218,6 +219,36 @@ and nowhere else. `Application.catalogue` is **not** optional:
 Two things collapsed into this seam rather than sitting beside it: `VenueMarketData.instruments`
 delegates to a catalogue instead of holding a second opinion about what a venue lists, and
 `--broker binance` no longer builds a second Binance transport with its own rate budget (ADR 0010).
+
+**An instrument belongs to exactly one basket in service** ([ADR 0026](docs/adr/0026-an-instrument-belongs-to-exactly-one-basket.md)).
+Positions are the portfolio's and are keyed by `instrument_key` alone, and baskets cycle as
+concurrent tasks — so two baskets over one instrument both pass reduce-only against the same
+holding and oversell it, leave each other's protective legs resting over an exit that already
+happened, attribute the round trip to whichever closed it, and split the cooldown and daily cap in
+two. Refused by `store_basket` over the **same `changed()` set** the venue verification uses, so a
+pause or a quarantine of a basket that is *already* overlapping still publishes — which is exactly
+when an operator needs it. `DriftWatch` re-checks it and halts every basket involved **in every
+mode**, unlike venue drift: a committed sim capture cannot change under a running system, but an
+overlapping configuration is equally wrong everywhere and corrupts what `report promotion` reads.
+
+**A tab may hide inputs; it may never omit them.** The basket form round-trips the whole document
+and `nest()` drops absent fields, so a tab that conditionally renders its contents *deletes that
+part of the basket on save* — the `_panel.html` hazard, one level up. Tabs are
+`<input type="radio">` plus `:checked +` CSS: three generic rules over `radio, label, pane` triples,
+which is what lets the same mechanism serve the six-section rail and the unbounded seat list, and
+what makes the page degrade to one long form when the stylesheet is absent.
+`test_dashboard_configure.py` asserts it two-sidedly — every `doc.` path in the stored document is
+submitted, and the licensed omissions are *exactly* the two quarantine fields.
+
+**Quarantine is not a field of the basket form.** It is an operational act and lives on the
+workspace, which asks for a second deliberate click when the scope holds a position — a guard a
+settings form cannot offer (ADR 0022). Because the form is the whole document, *deleting* the two
+controls would have released every quarantine in force on the next publish, so `publish_basket`
+drops them from the draft before validation and `carry_quarantine` re-attaches them from the
+**stored** record: overwritten, never merged, so Settings cannot change a quarantine in either
+direction, and a key naming an instrument the edit removed is dropped and reported rather than
+refused. A multi-select is gone for the same class of reason — `f.checkboxes` replaced `f.multi`,
+whose stray-click failure mode was silent deselection of everything.
 
 ### Phase 10 — the blotter workspace
 

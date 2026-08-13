@@ -53,7 +53,7 @@
               {{ f.choice(s ~ ".provider_id", "Primary provider", panel["seats"][row.index].get("provider_id"), providers, errors) }}
               {{ f.field(s ~ ".model", "Primary model", panel["seats"][row.index].get("model"), errors) }}
               {{ f.field(s ~ ".temperature", "Temperature", panel["seats"][row.index].get("temperature"), errors) }}
-              {{ f.multi(s ~ ".evidence", "Evidence slice", panel["seats"][row.index].get("evidence") or [], evidence_slices, hint="different slices per seat manufacture genuine disagreement") }}
+              {{ f.checkboxes(s ~ ".evidence", "Evidence slice", panel["seats"][row.index].get("evidence") or [], evidence_slices, hint="different slices per seat manufacture genuine disagreement") }}
             </div>
             {{ f.flag(s ~ ".devils_advocate", "Devil's advocate", panel["seats"][row.index].get("devils_advocate"), hint="argues against the emerging majority every round") }}
 

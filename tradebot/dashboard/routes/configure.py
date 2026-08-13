@@ -32,6 +32,7 @@ at publish time and reported as such — configuration references secrets by env
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import urlencode
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -141,7 +142,12 @@ async def new_basket(request: Request) -> HTMLResponse:
 @router.get("/baskets/{basket_id}", response_class=HTMLResponse)
 async def edit_basket(request: Request, basket_id: str) -> HTMLResponse:
     record = _basket_record(request, basket_id)
-    return _basket_form(request, draft_of(record.document), existing=record.ref.version)
+    return _basket_form(
+        request,
+        draft_of(record.document),
+        existing=record.ref.version,
+        released=tuple(request.query_params.getlist("released")),
+    )
 
 
 @router.post("/baskets/{basket_id}/draft", response_class=HTMLResponse)
@@ -169,6 +175,56 @@ async def redraft_basket(request: Request, basket_id: str) -> HTMLResponse:
     )
 
 
+def carry_quarantine(basket: Basket, previous: Basket | None) -> tuple[Basket, tuple[str, ...]]:
+    """Re-attach the quarantine this form does not carry, from the *stored* basket.
+
+    Quarantine left Settings because it is an operational act with a held-position guard the
+    workspace has and a form cannot: from the moment a scope holding a position is excluded the bot
+    is hands-off it, and inaction compounds a loss as readily as action causes one (ADR 0022).
+
+    Deleting the two controls is not sufficient — it is actively dangerous. The form is the whole
+    document and `nest()` omits absent fields, so `quarantined` would fall back to `False` and
+    `quarantined_instruments` to `()`, and **every publish from Settings would silently release
+    every quarantine in force**, including one set on the workspace ten seconds earlier.
+
+    Three deliberate properties:
+
+    * It **overwrites unconditionally, never merges**, so a hand-crafted POST cannot set one either.
+      Publishing from Settings cannot change a quarantine in *either* direction.
+    * `previous is None` — a new basket, or an id renamed in this edit — forces an empty quarantine
+      rather than trusting the draft. Correct: it is a different basket.
+    * A carried key naming an instrument this edit removed is dropped and **returned**, because
+      `Basket._check_quarantine` would otherwise refuse the document over a key nobody typed.
+
+    Read at publish time rather than carried in a hidden field, so a quarantine set on the
+    workspace while this form was open survives.
+
+    Known gap: `previous` is read here, outside the `configs.publishing()` lock that `store_basket`
+    holds across its own read-check-write. A quarantine published on the workspace *after* this read
+    but before that write is therefore still overwritten. The window is one venue verification wide,
+    and it is not specific to quarantine — `control.py`'s pause and quarantine routes read the
+    stored basket the same way, so either can drop the other's edit. Closing it properly means a
+    version-checked publish (reject when the stored version moved under the editor), which belongs
+    on `ConfigStore` rather than here; it is recorded in the Phase 11 document as outstanding.
+
+    `model_copy` skips validation, which is safe here **by construction**: `named` is filtered to
+    keys the basket holds, so `_check_quarantine`'s invariant cannot be violated. `RiskPolicy.
+    with_quarantine` uses the same pattern.
+    """
+    policy = previous.risk_policy if previous else None
+    stored = policy.quarantined_instruments if policy else ()
+    held = {instrument.key for instrument in basket.instruments}
+    named = tuple(key for key in stored if key in held)
+    dropped = tuple(key for key in stored if key not in held)
+    carried = basket.risk_policy.model_copy(
+        update={
+            "quarantined": bool(policy and policy.quarantined),
+            "quarantined_instruments": named,
+        }
+    )
+    return basket.model_copy(update={"risk_policy": carried}), dropped
+
+
 @router.post("/baskets/{basket_id}", response_class=HTMLResponse)
 async def publish_basket(request: Request) -> Response:
     """Publish the submitted document. The id comes from the *form*, not from the path.
@@ -177,7 +233,7 @@ async def publish_basket(request: Request) -> Response:
     the URL would then publish version 2 of the old id carrying a document that names a new one.
     """
     form = await request.form()
-    draft = fold_prices(drop_blank_shadow(nest(form.multi_items())))
+    draft = fold_prices(drop_blank_shadow(drop_quarantine(nest(form.multi_items()))))
     basket, errors = validate(Basket, draft)
     if basket is None:
         return _basket_form(
@@ -185,6 +241,10 @@ async def publish_basket(request: Request) -> Response:
         )
 
     application = state_of(request).application
+    previous = application.configs.latest(ConfigKind.BASKET, basket.basket_id)
+    basket, released = carry_quarantine(
+        basket, previous.document if previous and previous.usable else None
+    )
     try:
         record = await store_basket(
             application.configs,
@@ -203,9 +263,15 @@ async def publish_basket(request: Request) -> Response:
         )
     logger.warning(
         "basket published from the dashboard",
-        extra={"basket_id": record.ref.config_id, "version": record.ref.version},
+        extra={
+            "basket_id": record.ref.config_id,
+            "version": record.ref.version,
+            "released": list(released),
+        },
     )
-    return RedirectResponse(f"/configure/baskets/{basket.basket_id}", status_code=303)
+    query = urlencode([("released", key) for key in released])
+    target = f"/configure/baskets/{basket.basket_id}"
+    return RedirectResponse(f"{target}?{query}" if query else target, status_code=303)
 
 
 @router.post("/baskets/{basket_id}/retire")
@@ -268,6 +334,7 @@ def _basket_form(
     errors: tuple[FieldError, ...] = (),
     basket_id: str = "",
     ui: dict[str, str] | None = None,
+    released: tuple[str, ...] = (),
 ) -> HTMLResponse:
     draft = unfold_prices(draft)
     application = state_of(request).application
@@ -281,6 +348,7 @@ def _basket_form(
         existing=existing,
         basket_id=basket_key,
         ui=ui or {},
+        released=released,
         instrument_keys=instrument_keys(draft),
         providers=declared_providers(draft, "panel"),
         shadow_providers=declared_providers(draft, SHADOW_PATH),
@@ -402,6 +470,22 @@ def drop_blank_shadow(draft: dict[str, Any]) -> dict[str, Any]:
     panel = draft.get(SHADOW_PATH)
     if isinstance(panel, dict) and not str(panel.get("panel_id", "")).strip():
         draft.pop(SHADOW_PATH)
+    return draft
+
+
+def drop_quarantine(draft: dict[str, Any]) -> dict[str, Any]:
+    """Quarantine is not a field of this form, so it is discarded before the draft is validated.
+
+    Dropped *before* validation rather than overwritten after it, which is what makes "Settings is
+    not a surface for this act" total. A hand-crafted POST naming an instrument this same edit
+    removed would otherwise be refused by `Basket._check_quarantine` — a refusal quoting a key the
+    operator never typed and cannot see anywhere on the page. `carry_quarantine` then re-attaches
+    what the *stored* basket says, which is the only answer this route will accept.
+    """
+    policy = draft.get("risk_policy")
+    if isinstance(policy, dict):
+        policy.pop("quarantined", None)
+        policy.pop("quarantined_instruments", None)
     return draft
 
 

@@ -59,32 +59,50 @@
   </div>
 {% endmacro %}
 
-{% macro multi(path, label, selected, options, hint="") %}
+{# Checkboxes rather than a `<select multiple>`, which is the control where one stray click
+   silently deselects everything the operator had chosen. For `indicators` that publishes a basket
+   computing nothing, and the page looks the same afterwards — the failure is invisible until a
+   cycle deliberates on an empty picture. A checkbox can only lose one value, and says which. #}
+{% macro checkboxes(path, label, selected, options, hint="") %}
   <div class="field">
-    <label for="doc.{{ path }}[]">{{ label }}</label>
-    {# The empty sentinel is how "nothing selected" reaches the server at all: an unselected
-       <select multiple> sends no key, which would read as "leave it as it was". #}
+    <span class="group-label">{{ label }}</span>
+    {# The empty sentinel is how "nothing selected" reaches the server at all: with every box
+       unticked the browser sends no key, which would read as "leave it as it was" rather than as
+       "clear it". `nest()` already handles the repeated `path[]` key, so the parser is untouched. #}
     <input type="hidden" name="doc.{{ path }}[]" value="">
-    <select id="doc.{{ path }}[]" name="doc.{{ path }}[]" multiple size="{{ options | length }}">
+    <div class="checkgroup">
       {% for option in options %}
-        <option value="{{ option }}" {% if option in selected %}selected{% endif %}>{{ option }}</option>
+        <label class="inline">
+          <input type="checkbox" name="doc.{{ path }}[]" value="{{ option }}"
+                 {% if option in selected %}checked{% endif %}>
+          {{ option }}
+        </label>
       {% endfor %}
-    </select>
+    </div>
     {% if hint %}<span class="muted small">{{ hint }}</span>{% endif %}
   </div>
 {% endmacro %}
 
 {# Add and remove re-post the whole form to the draft endpoint and publish nothing, so a row
-   change never loses what the operator has already typed elsewhere on the page. #}
+   change never loses what the operator has already typed elsewhere on the page.
+
+   `hx-*` and `formaction` both, deliberately: htmx swaps the form in place and does not scroll on a
+   swap, so the operator keeps their position mid-edit; with scripting off the button still performs
+   the full POST it always did. The server returns the whole page either way and `hx-select` picks
+   the form out of it — no new partial template and no second rendering path. #}
 {% macro row_buttons(add_path, remove_path, add_label, action) %}
   <div class="row-buttons">
     {% if remove_path %}
       <button type="submit" name="remove" value="{{ remove_path }}" class="ghost"
-              formaction="{{ action }}" formnovalidate>remove</button>
+              formaction="{{ action }}" formnovalidate
+              hx-post="{{ action }}" hx-target="#basket-form" hx-select="#basket-form"
+              hx-swap="outerHTML">remove</button>
     {% endif %}
     {% if add_path %}
       <button type="submit" name="add" value="{{ add_path }}" class="ghost"
-              formaction="{{ action }}" formnovalidate>{{ add_label }}</button>
+              formaction="{{ action }}" formnovalidate
+              hx-post="{{ action }}" hx-target="#basket-form" hx-select="#basket-form"
+              hx-swap="outerHTML">{{ add_label }}</button>
     {% endif %}
   </div>
 {% endmacro %}

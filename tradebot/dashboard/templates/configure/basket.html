@@ -7,6 +7,14 @@
 {% block heading %}{{ "Edit basket " ~ basket_id if basket_id else "New basket" }}{% endblock %}
 
 {% block content %}
+{% if released %}
+<div class="banner ok-banner">
+  <strong>Published.</strong> These instruments left the basket, so their quarantine was released
+  with them:
+  {% for key in released %}<code>{{ key }}</code>{% endfor %}
+</div>
+{% endif %}
+
 <p class="muted">
   Published as a new version; nothing is overwritten. The basket's worker re-reads it and rebuilds
   its runner at the next cycle boundary — never mid-cycle.
@@ -15,6 +23,23 @@
 
 <form method="post" action="{{ action }}" id="basket-form">
   <input type="hidden" name="existing" value="{{ existing or '' }}">
+
+  {# Publish stays in view. It used to sit sixty fields below the fold while `add instrument` and
+     `remove` sat at eye level looking like commits — an operator who edited a stop multiple, clicked
+     `add fallback`, then navigated away lost the edit silently. #}
+  <div class="publish-bar">
+    <span class="bar-title"><code>{{ basket_id or "new" }}</code></span>
+    <span class="pill {{ '' if existing else 'warn' }}">
+      {{ "version " ~ existing if existing else "draft — not published" }}
+    </span>
+    <input id="note" name="note" type="text" placeholder="why this changed">
+    <span class="spacer"></span>
+    {% if basket_id %}
+      <a class="ghost-link" href="/configure/history/basket/{{ basket_id }}">version history</a>
+    {% endif %}
+    <button type="submit">Publish new version</button>
+  </div>
+
   {{ f.error_summary(errors) }}
 
   <div class="tabs rail">
@@ -122,9 +147,9 @@
     <label class="tab-label" for="s-data">Data</label>
     <section class="tab-pane">
       <div class="grid">
-        {{ f.multi("timeframes", "Timeframes", draft.get("timeframes") or [], timeframes, hint="empty means the engine's default set") }}
-        {{ f.multi("indicators", "Indicators", draft.get("indicators") or [], indicators, hint="empty means the engine's default set") }}
-        {{ f.multi("news_sources", "News sources", draft.get("news_sources") or [], news_sources, hint="empty means no news, stated as such in the snapshot") }}
+        {{ f.checkboxes("timeframes", "Timeframes", draft.get("timeframes") or [], timeframes, hint="empty means the engine's default set") }}
+        {{ f.checkboxes("indicators", "Indicators", draft.get("indicators") or [], indicators, hint="empty means the engine's default set") }}
+        {{ f.checkboxes("news_sources", "News sources", draft.get("news_sources") or [], news_sources, hint="empty means no news, stated as such in the snapshot") }}
       </div>
     </section>
 
@@ -186,29 +211,15 @@
 
       <h3>Quarantine</h3>
       <p class="muted small">
-        Excludes a scope from <em>automated</em> trading. The cycle keeps running — market data,
-        indicators and the panel's view are untouched — and only the order is refused, so the evidence
-        for putting it back keeps arriving. A held position is left exactly where it is; you can still
-        close it by hand from Control. Toggle either of these from Control too, without opening this
-        form.
+        Excluding a scope from <em>automated</em> trading is an operational act and lives on the
+        <a href="/?scope=basket:{{ basket_id }}">workspace</a>, which asks for a second, deliberate
+        click when the scope holds a position — a guard this form has no way to offer (ADR 0022).
+        Publishing here never changes a quarantine in either direction; what is in force is shown
+        on the Instruments tab.
       </p>
-      {{ f.flag("risk_policy.quarantined", "Quarantine the whole basket", risk.get("quarantined"), hint="also skips the panel: nothing to spend a model call on when every order is vetoed") }}
-      <div class="grid">
-        {{ f.multi("risk_policy.quarantined_instruments", "Quarantined instruments", risk.get("quarantined_instruments") or [], instrument_keys, hint="only instruments this basket holds; a key it does not hold excludes nothing and is refused") }}
-      </div>
     </section>
   </div>
 
-  <div class="actions">
-    <div class="field">
-      <label for="note">Note (recorded on the version)</label>
-      <input id="note" name="note" type="text" placeholder="why this changed">
-    </div>
-    <button type="submit">Publish new version</button>
-    {% if basket_id %}
-      <a class="ghost-link" href="/configure/history/basket/{{ basket_id }}">version history</a>
-    {% endif %}
-  </div>
 </form>
 
 {% if basket_id and existing %}
@@ -218,4 +229,8 @@
   <span class="muted small">Stops it being run. Every version stays resolvable for the cycles that ran it.</span>
 </form>
 {% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/configure.js" defer></script>
 {% endblock %}

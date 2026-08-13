@@ -278,10 +278,35 @@ form.retire { display: flex; align-items: center; gap: 0.6rem; margin-top: 2rem;
 }
 .tab-label:hover { color: var(--text); }
 
-/* A left rail: labels stack down column 1, every pane occupies the same cell of column 2. */
-.tabs.rail { display: grid; grid-template-columns: max-content 1fr; column-gap: 1.4rem; align-items: start; }
-.tabs.rail > .tab-label { grid-column: 1; }
-.tabs.rail > .tab-pane  { grid-column: 2; grid-row: 1 / -1; min-width: 0; }
+/* A left rail: the labels stack in a column of known width and stay put whichever pane is open.
+
+   Three things are load-bearing here, and each replaces a spelling that looks right and is not.
+
+   `order` puts every label ahead of every pane in placement order, exactly as `.tabs.strip` below
+   does. Source order interleaves them — radio, label, pane, radio, label, pane — so without it any
+   label after the open pane is placed after that pane and lands below it. That is also why floats
+   cannot do this job: a float may never sit higher than the top of a preceding block box, so the
+   labels following the open pane drop past it however the column is styled.
+
+   The rows are explicit because `grid-row: 1 / -1` resolves `-1` against the *explicit* grid; with
+   none declared it collapses to line 1, the pane takes a single row, and that row grows to the
+   pane's height and shoves the labels apart. The count only has to exceed the labels any one rail
+   carries — six sections here, a few seats there — and unused `min-content` rows are zero-height.
+
+   The last row is `1fr` because a spanning item is only made to fit by growing the tracks it
+   crosses when it crosses **no flexible track**. Ending the span on one sends the pane's height
+   there instead of distributing it back across the label rows, which would space them out by a
+   fraction of the pane — the same jumping, arrived at from the other side. */
+.tabs.rail {
+  --rail-width: 9rem;
+  display: grid;
+  grid-template-columns: var(--rail-width) 1fr;
+  grid-template-rows: repeat(24, min-content) 1fr;
+  column-gap: 1.4rem;
+  align-items: start;
+}
+.tabs.rail > .tab-label { order: 0; grid-column: 1; }
+.tabs.rail > .tab-pane  { order: 1; grid-column: 2; grid-row: 1 / -1; min-width: 0; }
 
 /* A horizontal strip: `order` puts every label before every pane whatever the source order, and
    DOM adjacency — which is what the three rules above use — is unaffected by it. */
@@ -290,9 +315,39 @@ form.retire { display: flex; align-items: center; gap: 0.6rem; margin-top: 2rem;
 .tabs.strip > .tab-toggle:checked + .tab-label { border-bottom-color: var(--accent); }
 .tabs.strip > .tab-pane  { order: 1; flex-basis: 100%; min-width: 0; }
 
+/* A seat label carries an id, its provider·model binding and sometimes a warning pill, so its rail
+   is wider than the section rail's. Widened here rather than by letting the column size itself: the
+   pane clears a *known* width, so a rail that measured its widest label would move the pane every
+   time a seat was renamed. */
+.seat-master { --rail-width: 15rem; }
 .seat-master > .tab-label { display: flex; gap: 0.5rem; align-items: baseline; white-space: nowrap; }
 .seat-master .seat-id { font: 600 13px/1.4 var(--mono); }
 .seat-master .seat-binding { color: var(--muted); font-size: 0.8rem; }
+
+.checkgroup { display: flex; flex-wrap: wrap; gap: 0.2rem 0.9rem; }
+.checkgroup label.inline { display: flex; align-items: center; gap: 0.35rem; color: var(--text); }
+.checkgroup input[type="checkbox"] { width: auto; }
+.group-label { color: var(--muted); font-size: 0.85rem; }
+
+/* Publish stays on screen. It used to sit below sixty fields while `remove` sat at eye level, so
+   the destructive-looking controls were the reachable ones and the save was not. */
+.publish-bar {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.7rem;
+  padding: 0.6rem 0.8rem;
+  margin-bottom: 0.8rem;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+.publish-bar .spacer { flex: 1; }
+.publish-bar input[type="text"] { max-width: 22rem; }
+.bar-title { font: 600 14px/1 var(--mono); }
 
 /* ------------------------------------------------------------------ control */
 

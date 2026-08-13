@@ -26,6 +26,7 @@ from tradebot.dashboard.routes.configure import (
     fold_prices,
     unfold_prices,
 )
+from tradebot.dashboard.views import PACKAGE
 from tradebot.interfaces.exchange import IdType, VenueMarket
 
 
@@ -310,11 +311,10 @@ DOC_FIELD = re.compile(r'name="doc\.([^"]+)"')
 #: empty list, scalar or not, so `document_paths()` sees the same shape for both kinds. The
 #: distinction matters because only one of them is load-bearing:
 #:
-#: * A multi-select (`f.multi` — `timeframes`, `news_sources`,
-#:   `risk_policy.quarantined_instruments`, a seat's `evidence`) needs its sentinel:
-#:   `SeatConfig.evidence` defaults to a *non-empty* tuple, so an operator clearing every selection
-#:   must still submit something, or the absent field would silently revert to the default instead
-#:   of staying cleared.
+#: * A checkbox group (`f.checkboxes` — `timeframes`, `indicators`, `news_sources`, a seat's
+#:   `evidence`) needs its sentinel: `SeatConfig.evidence` defaults to a *non-empty* tuple, so an
+#:   operator clearing every box must still submit something, or the absent field would silently
+#:   revert to the default instead of staying cleared.
 #: * A row list (`instruments`, a panel's `providers`/`seats`, a provider's `price_rows`, a seat's
 #:   `fallbacks`) has no default to silently revert to — absence and empty are *the same document*.
 #:   Verified by round-tripping both shapes through `nest()` -> `fold_prices()` ->
@@ -345,9 +345,11 @@ def document_paths(draft: dict[str, Any]) -> set[str]:
     return {path for path in paths if path.rsplit(".", 1)[-1] not in ROW_MANAGED_LISTS}
 
 
-#: Fields the page deliberately does not submit. Empty until Slice D removes quarantine; the
-#: assertion below is two-sided, so this set is the *only* licence to omit anything.
-OMITTED_FROM_THE_FORM: set[str] = set()
+#: Fields the page deliberately does not submit. Quarantine is an operational act and lives on the
+#: workspace, which has the held-position guard this form does not (ADR 0022). `publish_basket`
+#: re-attaches it from the stored record, so this omission cannot release anything. The assertion
+#: below is two-sided, so this set is the *only* licence to omit anything.
+OMITTED_FROM_THE_FORM = {"risk_policy.quarantined", "risk_policy.quarantined_instruments"}
 
 
 async def test_every_document_field_is_still_submitted(
@@ -475,6 +477,58 @@ async def test_two_seats_on_one_binding_are_flagged_in_the_seat_list(
 async def test_a_provider_row_says_how_many_seats_use_it(client: httpx.AsyncClient) -> None:
     body = (await client.get("/configure/baskets/demo")).text
     assert "used by 1 seat" in body
+
+
+def button(body: str, name: str) -> str:
+    """The first `<button name="…">` tag, whitespace and attribute order irrelevant.
+
+    Asserted against the tag rather than the whole page on purpose: the **Look up** button already
+    carries these `hx-*` attributes, so a page-wide substring match would pass while `row_buttons`
+    still reloaded the page — a test that cannot fail for the reason it exists.
+    """
+    match = re.search(rf'<button[^>]*\bname="{re.escape(name)}"[^>]*>', body)
+    assert match is not None, f'no <button name="{name}"> in the rendered page'
+    return match.group(0)
+
+
+async def test_row_buttons_swap_the_form_rather_than_reload_the_page(
+    client: httpx.AsyncClient,
+) -> None:
+    """htmx does not scroll on a swap, so an add or remove keeps the operator where they were.
+
+    `formaction` stays beside it: with scripting off the button performs the full POST it always
+    did, so this is progressive enhancement and the no-JS path is unchanged. The server returns the
+    whole page either way and `hx-select` picks the form out of it — no second rendering path.
+    """
+    body = (await client.get("/configure/baskets/demo")).text
+
+    for name in ("add", "remove"):
+        tag = button(body, name)
+        assert 'hx-post="/configure/baskets/demo/draft"' in tag
+        assert 'hx-target="#basket-form"' in tag
+        assert 'hx-select="#basket-form"' in tag
+        assert 'formaction="/configure/baskets/demo/draft"' in tag
+
+
+def form_markup(body: str) -> str:
+    """Just the basket form's own markup.
+
+    Scoped deliberately: the retire form below it is a *separate* `<form>` with its own `note`
+    field, which is correct — only fields inside `#basket-form` are submitted by Publish.
+    """
+    match = re.search(r'id="basket-form".*?</form>', body, re.DOTALL)
+    assert match is not None, "no #basket-form in the rendered page"
+    return match.group(0)
+
+
+async def test_the_form_carries_exactly_one_note_field(client: httpx.AsyncClient) -> None:
+    """Publish moved into the sticky bar, and the note moved with it.
+
+    Two inputs named `note` inside one form are both submitted and `_note` reads the first, so
+    leaving the old one behind loses the operator's reason for the change without saying so.
+    """
+    body = form_markup((await client.get("/configure/baskets/demo")).text)
+    assert len(re.findall(r'<input[^>]*\bname="note"', body)) == 1
 
 
 # ---------------------------------------------------------------- tier 2
@@ -612,6 +666,187 @@ def _replace(pairs: list[tuple[str, str]], name: str, value: str) -> list[tuple[
     """Set one field, adding it if the form did not carry it."""
     replaced = [(key, value if key == name else current) for key, current in pairs]
     return replaced if any(key == name for key, _ in pairs) else [*replaced, (name, value)]
+
+
+# ---------------------------------------------------------------- the section rail
+
+
+def test_the_rail_places_every_label_ahead_of_the_open_pane() -> None:
+    """The section labels must not move when a different section is opened.
+
+    Source order interleaves labels and panes, so a label after the open pane is laid out after it
+    and lands below it — the rail's labels then shift with the selection. `order` is what decouples
+    placement from source order, and the rail is unusable without it, so it is worth an assertion
+    rather than a comment alone.
+
+    Asserted on the stylesheet because the layout lives nowhere else: the markup is the same
+    `radio, label, pane` triples either way, so no rendered page can show the difference.
+    """
+    css = (PACKAGE / "static" / "app.css").read_text(encoding="utf-8")
+    rail = css[css.index(".tabs.rail {") : css.index(".tabs.strip {")]
+
+    assert "--rail-width:" in rail
+    assert "var(--rail-width)" in rail
+    assert "order: 0" in rail and "order: 1" in rail
+    # `-1` resolves against the explicit grid, so the rows have to be declared for the pane to span
+    # them; and the span has to end on a flexible track or the pane's height is distributed back
+    # across the label rows.
+    assert "min-content) 1fr" in rail
+    assert "grid-row: 1 / -1" in rail
+
+
+# ---------------------------------------------------------------- checkbox groups
+
+
+async def test_multi_selects_are_gone_from_the_basket_form(client: httpx.AsyncClient) -> None:
+    """A `<select multiple>` deselects everything on a stray click. For `indicators` that means
+    quietly publishing a basket that computes nothing."""
+    body = (await client.get("/configure/baskets/demo")).text
+
+    assert "<select multiple" not in body
+    assert "multiple size=" not in body
+
+
+async def test_a_checkbox_group_still_reaches_the_server_as_nothing_selected(
+    sim_application: Application, client: httpx.AsyncClient, basket_form: list[tuple[str, str]]
+) -> None:
+    """The hidden empty sentinel is how "nothing selected" is expressible at all: with every box
+    unticked the browser sends no key, which would read as "leave it as it was"."""
+    cleared = [(k, v) for k, v in basket_form if not k.startswith("doc.timeframes")]
+    cleared.append(("doc.timeframes[]", ""))
+
+    response = await client.post("/configure/baskets/demo", data=as_form(cleared))
+
+    assert response.status_code == 303
+    record = sim_application.configs.latest(ConfigKind.BASKET, "demo")
+    assert record is not None
+    assert record.document.timeframes == ()
+
+
+def test_the_multi_macro_is_gone() -> None:
+    """One caller left behind keeps a control whose failure mode is silent deselection."""
+    source = (PACKAGE / "templates" / "_fields.html").read_text(encoding="utf-8")
+    assert "macro multi(" not in source
+
+
+# ---------------------------------------------------------------- quarantine carry-over
+
+
+async def _quarantine(client: httpx.AsyncClient, key: str, *, excluded: bool = True) -> None:
+    """Set or release a quarantine the way the workspace does — the only surface that may."""
+    response = await client.post(
+        "/control/baskets/demo/quarantine",
+        data={"instrument_key": key, "excluded": "true" if excluded else "false"},
+    )
+    assert response.status_code in (200, 303), response.text
+
+
+def _policy(application: Application) -> Any:
+    record = application.configs.latest(ConfigKind.BASKET, "demo")
+    assert record is not None
+    return record.document.risk_policy
+
+
+async def test_an_unrelated_edit_from_settings_leaves_an_instrument_quarantined(
+    sim_application: Application, client: httpx.AsyncClient
+) -> None:
+    """The form no longer carries quarantine, and `nest()` omits absent fields — so without
+    carry-over every publish from Settings would silently release every quarantine in force."""
+    await _quarantine(client, "sim:BTC/USDT")
+
+    edited = flat(unfold_prices(draft_of(_record(sim_application).document)))
+    response = await client.post(
+        "/configure/baskets/demo",
+        data=as_form(_replace(edited, "doc.risk_policy.min_conviction", "0.7")),
+    )
+
+    assert response.status_code == 303
+    assert _policy(sim_application).quarantined_instruments == ("sim:BTC/USDT",)
+    assert _policy(sim_application).min_conviction == Decimal("0.7")
+
+
+async def test_an_unrelated_edit_leaves_a_whole_basket_quarantine(
+    sim_application: Application, client: httpx.AsyncClient
+) -> None:
+    await _quarantine(client, "")
+
+    edited = flat(unfold_prices(draft_of(_record(sim_application).document)))
+    await client.post(
+        "/configure/baskets/demo",
+        data=as_form(_replace(edited, "doc.risk_policy.min_conviction", "0.7")),
+    )
+
+    assert _policy(sim_application).quarantined is True
+
+
+async def test_a_quarantine_set_after_the_form_was_opened_survives_the_publish(
+    sim_application: Application, client: httpx.AsyncClient, basket_form: list[tuple[str, str]]
+) -> None:
+    """Read at publish time, not carried in a hidden field. The form here is deliberately stale."""
+    stale = list(basket_form)
+
+    await _quarantine(client, "sim:ETH/USDT")
+    await client.post(
+        "/configure/baskets/demo",
+        data=as_form(_replace(stale, "doc.risk_policy.min_conviction", "0.65")),
+    )
+
+    assert _policy(sim_application).quarantined_instruments == ("sim:ETH/USDT",)
+
+
+async def test_removing_a_quarantined_instrument_publishes_and_reports_the_dropped_key(
+    sim_application: Application, client: httpx.AsyncClient
+) -> None:
+    """`Basket._check_quarantine` would otherwise refuse the document over a key nobody typed."""
+    await _quarantine(client, "sim:ETH/USDT")
+    edited = flat(unfold_prices(draft_of(_record(sim_application).document)))
+    edited = [(k, v) for k, v in edited if not k.startswith("doc.instruments[1]")]
+
+    response = await client.post("/configure/baskets/demo", data=as_form(edited))
+
+    assert response.status_code == 303
+    assert "released=sim%3AETH%2FUSDT" in response.headers["location"]
+    assert _policy(sim_application).quarantined_instruments == ()
+    body = (await client.get(response.headers["location"])).text
+    assert "sim:ETH/USDT" in body
+
+
+async def test_a_renamed_basket_starts_with_no_quarantine(
+    sim_application: Application, client: httpx.AsyncClient
+) -> None:
+    """No prior version under the new id, so it is a different basket and inherits nothing."""
+    await _quarantine(client, "sim:BTC/USDT")
+    renamed = flat(unfold_prices(draft_of(_record(sim_application).document)))
+    renamed = _replace(renamed, "doc.basket_id", "alpha")
+
+    response = await client.post("/configure/baskets/alpha", data=as_form(renamed))
+
+    # Refused by ADR 0026 — `alpha` would take demo's instruments — which is itself the assertion
+    # that carry-over did not invent a quarantine on a basket that does not exist yet.
+    assert response.status_code == 200
+    assert "already held by basket" in response.text
+
+
+async def test_settings_cannot_set_a_quarantine_even_if_the_fields_are_posted(
+    sim_application: Application, client: httpx.AsyncClient, basket_form: list[tuple[str, str]]
+) -> None:
+    """Overwritten, never merged: the form is not a surface for this act in either direction."""
+    forged = [
+        *basket_form,
+        ("doc.risk_policy.quarantined", "true"),
+        ("doc.risk_policy.quarantined_instruments[]", "sim:BTC/USDT"),
+    ]
+
+    await client.post("/configure/baskets/demo", data=as_form(forged))
+
+    assert _policy(sim_application).quarantined is False
+    assert _policy(sim_application).quarantined_instruments == ()
+
+
+def _record(application: Application) -> Any:
+    record = application.configs.latest(ConfigKind.BASKET, "demo")
+    assert record is not None
+    return record
 
 
 # ---------------------------------------------------------------- shadow panel
