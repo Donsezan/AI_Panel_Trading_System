@@ -1,12 +1,17 @@
 {# The panel editor, parameterized by the path it edits.
 
-   Rendered twice: once for `panel` (the champion, which trades) and once for `shadow_panel`
-   (the challenger, which never does). One macro rather than two copies, because a field that
-   exists in one copy and not the other is a field an operator silently loses on save. #}
+   Rendered twice: once for `panel` (the champion, which trades) and once for `shadow_panel` (the
+   challenger, which never does). One macro rather than two copies, because a field that exists in
+   one copy and not the other is a field an operator silently loses on save (ADR 0018).
+
+   Every input is in the DOM on every render. The Seats/Providers strip and the seat master–detail
+   are CSS `:checked` rules over hidden radios, so a tab hides inputs and never omits them; a tab
+   that conditionally rendered its contents would delete that part of the basket on save. #}
 
 {% import "_fields.html" as f %}
 
-{% macro editor(prefix, panel, providers, errors, draft_action, protocols, provider_kinds, evidence_slices) %}
+{% macro editor(prefix, panel, providers, errors, draft_action, protocols, provider_kinds,
+                evidence_slices, seats, provider_view, ui) %}
   <div class="grid">
     {{ f.field(prefix ~ ".panel_id", "Panel id", panel.get("panel_id"), errors) }}
     {{ f.choice(prefix ~ ".protocol", "Debate protocol", panel.get("protocol"), protocols, errors) }}
@@ -16,73 +21,97 @@
     {{ f.field(prefix ~ ".max_cost_usd_per_cycle", "Max cost per cycle (USD)", panel.get("max_cost_usd_per_cycle"), errors) }}
   </div>
 
-  <h3>Providers</h3>
-  <p class="muted small">
-    Endpoints this panel may reach. Nothing outside this list is ever constructed or contacted.
-    A key is referenced by <strong>environment-variable name</strong>; pasting a key value here is
-    refused at publish time.
-  </p>
-  {% for row in panel.get("providers") or [] %}
-    {% set p = prefix ~ ".providers[" ~ loop.index0 ~ "]" %}
-    <fieldset>
-      <legend>{{ row.get("provider_id") or "new provider" }}</legend>
-      <div class="grid">
-        {{ f.field(p ~ ".provider_id", "Provider id", row.get("provider_id"), errors) }}
-        {{ f.choice(p ~ ".kind", "Kind", row.get("kind"), provider_kinds, errors) }}
-        {{ f.field(p ~ ".base_url", "Base URL", row.get("base_url"), errors, hint="empty only for the offline stub") }}
-        {{ f.field(p ~ ".secret_ref", "Secret ref (env var NAME)", row.get("secret_ref"), errors, hint="e.g. OPENROUTER_API_KEY — never the key itself") }}
+  <div class="tabs strip">
+    <input type="radio" class="tab-toggle" name="ui.tab.{{ prefix }}" id="t-{{ prefix }}-seats"
+           value="seats" {% if (ui.get("tab." ~ prefix) or "seats") == "seats" %}checked{% endif %}>
+    <label class="tab-label" for="t-{{ prefix }}-seats">Seats</label>
+    <section class="tab-pane">
+      <p class="muted small">
+        Each seat picks its primary provider and builds its own ordered fallback chain
+        <strong>from the declared providers</strong> — a picker, never free text. A chain that stays
+        inside one vendor does not survive that vendor's outage, and a chain may not repeat a binding.
+      </p>
+      {% if not providers %}
+        <p class="empty warn">Declare a provider first, then bind a seat to it.</p>
+      {% endif %}
+
+      <div class="tabs rail seat-master">
+        {% for row in seats %}
+          {% set s = prefix ~ ".seats[" ~ row.index ~ "]" %}
+          <input type="radio" class="tab-toggle" name="ui.seat.{{ prefix }}"
+                 id="seat-{{ prefix }}-{{ row.index }}" value="{{ row.index }}"
+                 {% if (ui.get("seat." ~ prefix) or "0") == row.index | string %}checked{% endif %}>
+          <label class="tab-label" for="seat-{{ prefix }}-{{ row.index }}">
+            <span class="seat-id">{{ row.seat_id or "new seat" }}</span>
+            <span class="seat-binding">{{ row.binding or "unbound" }}</span>
+            {% if row.homogeneous %}<span class="pill warn" title="another seat resolves to the same provider and model; heterogeneity is a design control">homogeneous</span>{% endif %}
+          </label>
+          <section class="tab-pane">
+            <div class="grid">
+              {{ f.field(s ~ ".seat_id", "Seat id", panel["seats"][row.index].get("seat_id"), errors) }}
+              {{ f.field(s ~ ".role", "Role", panel["seats"][row.index].get("role"), errors, hint="what this seat reasons about") }}
+              {{ f.choice(s ~ ".provider_id", "Primary provider", panel["seats"][row.index].get("provider_id"), providers, errors) }}
+              {{ f.field(s ~ ".model", "Primary model", panel["seats"][row.index].get("model"), errors) }}
+              {{ f.field(s ~ ".temperature", "Temperature", panel["seats"][row.index].get("temperature"), errors) }}
+              {{ f.multi(s ~ ".evidence", "Evidence slice", panel["seats"][row.index].get("evidence") or [], evidence_slices, hint="different slices per seat manufacture genuine disagreement") }}
+            </div>
+            {{ f.flag(s ~ ".devils_advocate", "Devil's advocate", panel["seats"][row.index].get("devils_advocate"), hint="argues against the emerging majority every round") }}
+
+            <h4>Fallback chain</h4>
+            {% for binding in panel["seats"][row.index].get("fallbacks") or [] %}
+              {% set b = s ~ ".fallbacks[" ~ loop.index0 ~ "]" %}
+              <div class="grid tight">
+                {{ f.choice(b ~ ".provider_id", "Provider", binding.get("provider_id"), providers, errors) }}
+                {{ f.field(b ~ ".model", "Model", binding.get("model"), errors) }}
+                {{ f.row_buttons("", b, "", draft_action) }}
+              </div>
+            {% endfor %}
+            {{ f.row_buttons(s ~ ".fallbacks", s, "add fallback", draft_action) }}
+          </section>
+        {% endfor %}
       </div>
-      {{ f.flag(p ~ ".supports_json_mode", "Supports JSON mode", row.get("supports_json_mode"), hint="off for local servers that reject response_format") }}
+      {{ f.row_buttons(prefix ~ ".seats", "", "add seat", draft_action) }}
+    </section>
 
-      <h4>Prices (USD per million tokens)</h4>
-      {% for price in row.get("price_rows") or [] %}
-        {% set pr = p ~ ".price_rows[" ~ loop.index0 ~ "]" %}
-        <div class="grid tight">
-          {{ f.field(pr ~ ".model", "Model", price.get("model"), errors) }}
-          {{ f.field(pr ~ ".prompt_per_million", "Prompt", price.get("prompt_per_million"), errors) }}
-          {{ f.field(pr ~ ".completion_per_million", "Completion", price.get("completion_per_million"), errors) }}
-          {{ f.row_buttons("", pr, "", draft_action) }}
-        </div>
+    <input type="radio" class="tab-toggle" name="ui.tab.{{ prefix }}" id="t-{{ prefix }}-providers"
+           value="providers" {% if ui.get("tab." ~ prefix) == "providers" %}checked{% endif %}>
+    <label class="tab-label" for="t-{{ prefix }}-providers">Providers</label>
+    <section class="tab-pane">
+      <p class="muted small">
+        Endpoints this panel may reach. Nothing outside this list is ever constructed or contacted.
+        A key is referenced by <strong>environment-variable name</strong>; pasting a key value here
+        is refused at publish time.
+      </p>
+      {% for view in provider_view %}
+        {% set p = prefix ~ ".providers[" ~ view.index ~ "]" %}
+        {% set row = panel["providers"][view.index] %}
+        <fieldset>
+          <legend>
+            {{ view.provider_id or "new provider" }}
+            <span class="muted small">used by {{ view.used_by }} seat{{ "" if view.used_by == 1 else "s" }}</span>
+          </legend>
+          <div class="grid">
+            {{ f.field(p ~ ".provider_id", "Provider id", row.get("provider_id"), errors) }}
+            {{ f.choice(p ~ ".kind", "Kind", row.get("kind"), provider_kinds, errors) }}
+            {{ f.field(p ~ ".base_url", "Base URL", row.get("base_url"), errors, hint="empty only for the offline stub") }}
+            {{ f.field(p ~ ".secret_ref", "Secret ref (env var NAME)", row.get("secret_ref"), errors, hint="e.g. OPENROUTER_API_KEY — never the key itself") }}
+          </div>
+          {{ f.flag(p ~ ".supports_json_mode", "Supports JSON mode", row.get("supports_json_mode"), hint="off for local servers that reject response_format") }}
+
+          <h4>Prices (USD per million tokens)</h4>
+          {% for price in row.get("price_rows") or [] %}
+            {% set pr = p ~ ".price_rows[" ~ loop.index0 ~ "]" %}
+            <div class="grid tight">
+              {{ f.field(pr ~ ".model", "Model", price.get("model"), errors) }}
+              {{ f.field(pr ~ ".prompt_per_million", "Prompt", price.get("prompt_per_million"), errors) }}
+              {{ f.field(pr ~ ".completion_per_million", "Completion", price.get("completion_per_million"), errors) }}
+              {{ f.row_buttons("", pr, "", draft_action) }}
+            </div>
+          {% endfor %}
+          {{ f.row_buttons(p ~ ".price_rows", p, "add price", draft_action) }}
+        </fieldset>
       {% endfor %}
-      {{ f.row_buttons(p ~ ".price_rows", p, "add price", draft_action) }}
-    </fieldset>
-  {% endfor %}
-  {{ f.row_buttons(prefix ~ ".providers", "", "add provider", draft_action) }}
-
-  <h3>Seats</h3>
-  <p class="muted small">
-    Each seat picks its primary provider and builds its own ordered fallback chain
-    <strong>from the declared providers</strong> — a picker, never free text. A chain that stays
-    inside one vendor does not survive that vendor's outage, and a chain may not repeat a binding.
-  </p>
-  {% if not providers %}
-    <p class="empty warn">Declare a provider above, then add it to the draft, before binding a seat.</p>
-  {% endif %}
-  {% for row in panel.get("seats") or [] %}
-    {% set s = prefix ~ ".seats[" ~ loop.index0 ~ "]" %}
-    <fieldset>
-      <legend>{{ row.get("seat_id") or "new seat" }}</legend>
-      <div class="grid">
-        {{ f.field(s ~ ".seat_id", "Seat id", row.get("seat_id"), errors) }}
-        {{ f.field(s ~ ".role", "Role", row.get("role"), errors, hint="what this seat reasons about") }}
-        {{ f.choice(s ~ ".provider_id", "Primary provider", row.get("provider_id"), providers, errors) }}
-        {{ f.field(s ~ ".model", "Primary model", row.get("model"), errors) }}
-        {{ f.field(s ~ ".temperature", "Temperature", row.get("temperature"), errors) }}
-        {{ f.multi(s ~ ".evidence", "Evidence slice", row.get("evidence") or [], evidence_slices, hint="different slices per seat manufacture genuine disagreement") }}
-      </div>
-      {{ f.flag(s ~ ".devils_advocate", "Devil's advocate", row.get("devils_advocate"), hint="argues against the emerging majority every round") }}
-
-      <h4>Fallback chain</h4>
-      {% for binding in row.get("fallbacks") or [] %}
-        {% set b = s ~ ".fallbacks[" ~ loop.index0 ~ "]" %}
-        <div class="grid tight">
-          {{ f.choice(b ~ ".provider_id", "Provider", binding.get("provider_id"), providers, errors) }}
-          {{ f.field(b ~ ".model", "Model", binding.get("model"), errors) }}
-          {{ f.row_buttons("", b, "", draft_action) }}
-        </div>
-      {% endfor %}
-      {{ f.row_buttons(s ~ ".fallbacks", s, "add fallback", draft_action) }}
-    </fieldset>
-  {% endfor %}
-  {{ f.row_buttons(prefix ~ ".seats", "", "add seat", draft_action) }}
+      {{ f.row_buttons(prefix ~ ".providers", "", "add provider", draft_action) }}
+    </section>
+  </div>
 {% endmacro %}

@@ -188,6 +188,12 @@ class InstrumentCatalogue(Protocol):
     #: `Instrument` needs an asset class, and someone naming a symbol must not also have to
     #: classify it — which is how `venue`/`asset_class` typos reach the risk layer today.
     asset_class: AssetClass
+    #: Where these trading rules came from, and when — provenance, rendered beside the resolved
+    #: fields so an operator can see that a `min_notional` is somebody's published number and how
+    #: old it is. **Display only.** Nothing decides anything on these, and a catalogue that has not
+    #: fetched yet legitimately has neither.
+    source: str
+    as_of: datetime | None
 
     async def list_markets(self) -> tuple[VenueMarket, ...]:
         """Every symbol this venue publishes, including the ones it no longer trades."""

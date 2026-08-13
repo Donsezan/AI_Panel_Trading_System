@@ -7,6 +7,7 @@ that nothing is published without a `CONFIG_CHANGED` event naming the dashboard 
 
 from __future__ import annotations
 
+import re
 from decimal import Decimal
 from typing import Any
 
@@ -15,7 +16,8 @@ import pytest
 from tests.conftest import DASHBOARD_TOKEN
 
 from tradebot.app import Application
-from tradebot.core.enums import ConfigKind
+from tradebot.core.enums import AssetClass, ConfigKind
+from tradebot.core.errors import VenueError
 from tradebot.core.events import EventType
 from tradebot.dashboard.forms import draft_of
 from tradebot.dashboard.routes.configure import (
@@ -24,6 +26,7 @@ from tradebot.dashboard.routes.configure import (
     fold_prices,
     unfold_prices,
 )
+from tradebot.interfaces.exchange import IdType, VenueMarket
 
 
 def as_form(pairs: list[tuple[str, str]]) -> dict[str, list[str]]:
@@ -58,8 +61,8 @@ def flat(draft: dict[str, Any], prefix: str = "doc") -> list[tuple[str, str]]:
 def new_basket_form(*, lot_size: str) -> list[tuple[str, str]]:
     """The blank new-basket form, filled in as an operator would — `lot_size` is theirs to type.
 
-    Built from the route's own blank draft rather than from a literal, so it stays the form the
-    operator is actually served.
+    `SOL/USDT` rather than `BTC/USDT`: the seeded demo basket holds BTC and ETH, and an instrument
+    belongs to exactly one basket in service (ADR 0026).
     """
     draft = blank_basket_draft()
     draft["basket_id"] = "alpha"
@@ -67,8 +70,8 @@ def new_basket_form(*, lot_size: str) -> list[tuple[str, str]]:
     draft["panel"]["panel_id"] = "alpha-panel"
     draft["timeframes"] = ["1h"]
     draft["instruments"][0].update(
-        symbol="BTC/USDT",
-        base_currency="BTC",
+        symbol="SOL/USDT",
+        base_currency="SOL",
         quote_currency="USDT",
         lot_size=lot_size,
         tick_size="0.01",
@@ -175,15 +178,15 @@ async def test_a_readable_number_the_venue_disagrees_with_is_still_refused(
 ) -> None:
     """The number parses; it is simply not the venue's. That used to publish (ADR 0025).
 
-    `sim` publishes `BTC/USDT` at a lot size of 0.00001, recorded from a real `exchangeInfo`.
-    A basket pinning 0.001 would quantize every order against a floor the venue never set.
+    `sim` publishes `SOL/USDT` at a lot size of 0.00100000, recorded from a real `exchangeInfo`.
+    A basket pinning 0.01 would quantize every order against a floor the venue never set.
     """
     response = await client.post(
-        "/configure/baskets/alpha", data=as_form(new_basket_form(lot_size="0.001"))
+        "/configure/baskets/alpha", data=as_form(new_basket_form(lot_size="0.01"))
     )
 
     assert response.status_code == 200
-    assert "the venue publishes 0.00001" in response.text
+    assert "the venue publishes 0.00100000" in response.text
     assert {r.ref.config_id for r in sim_application.configs.baskets()} == {"demo"}
 
 
@@ -191,7 +194,7 @@ async def test_the_same_basket_publishes_with_the_venues_own_rules(
     sim_application: Application, client: httpx.AsyncClient
 ) -> None:
     """What the Look up button will fill in for the operator — the venue's published answer."""
-    market = await sim_application.catalogue.resolve("BTC/USDT")
+    market = await sim_application.catalogue.resolve("SOL/USDT")
     typed = new_basket_form(lot_size=str(market.lot_size))
     for field in ("tick_size", "min_qty", "min_notional"):
         typed = _replace(typed, f"doc.instruments[0].{field}", str(getattr(market, field)))
@@ -257,15 +260,31 @@ async def test_a_pasted_api_key_is_refused_at_publish_time(
 
 
 async def test_creating_a_basket_from_the_new_form(
-    sim_application: Application, client: httpx.AsyncClient, basket_form: list[tuple[str, str]]
+    sim_application: Application, client: httpx.AsyncClient
 ) -> None:
-    created = _replace(basket_form, "doc.basket_id", "alpha")
-    created = _replace(created, "doc.name", "Alpha basket")
+    """A second basket needs its own instruments (ADR 0026), so it is built from the blank form."""
+    market = await sim_application.catalogue.resolve("SOL/USDT")
+    typed = new_basket_form(lot_size=str(market.lot_size))
+    for field in ("tick_size", "min_qty", "min_notional"):
+        typed = _replace(typed, f"doc.instruments[0].{field}", str(getattr(market, field)))
 
-    response = await client.post("/configure/baskets/alpha", data=as_form(created))
+    response = await client.post("/configure/baskets/alpha", data=as_form(typed))
 
     assert response.status_code == 303
     assert {r.ref.config_id for r in sim_application.configs.baskets()} == {"demo", "alpha"}
+
+
+async def test_a_second_basket_may_not_take_an_instrument_demo_already_holds(
+    sim_application: Application, client: httpx.AsyncClient, basket_form: list[tuple[str, str]]
+) -> None:
+    """Two baskets over one instrument oversell the portfolio holding through reduce-only."""
+    cloned = _replace(basket_form, "doc.basket_id", "alpha")
+
+    response = await client.post("/configure/baskets/alpha", data=as_form(cloned))
+
+    assert response.status_code == 200
+    assert "already held by basket &#39;demo&#39;" in response.text
+    assert {r.ref.config_id for r in sim_application.configs.baskets()} == {"demo"}
 
 
 async def test_retiring_a_basket_removes_it_from_service_but_not_from_history(
@@ -280,6 +299,118 @@ async def test_retiring_a_basket_removes_it_from_service_but_not_from_history(
     versions = sim_application.configs.history(ConfigKind.BASKET, "demo")
     assert [v.retired for v in versions] == [False, True]
     assert versions[-1].note == "finished with it"
+
+
+# ---------------------------------------------------------------- the tab shell
+
+DOC_FIELD = re.compile(r'name="doc\.([^"]+)"')
+
+#: Row-managed lists: the operator adds/removes whole rows through `f.row_buttons`, never types a
+#: scalar list directly. `flat()` synthesises an empty-list sentinel path (`path[]`) for *any*
+#: empty list, scalar or not, so `document_paths()` sees the same shape for both kinds. The
+#: distinction matters because only one of them is load-bearing:
+#:
+#: * A multi-select (`f.multi` — `timeframes`, `news_sources`,
+#:   `risk_policy.quarantined_instruments`, a seat's `evidence`) needs its sentinel:
+#:   `SeatConfig.evidence` defaults to a *non-empty* tuple, so an operator clearing every selection
+#:   must still submit something, or the absent field would silently revert to the default instead
+#:   of staying cleared.
+#: * A row list (`instruments`, a panel's `providers`/`seats`, a provider's `price_rows`, a seat's
+#:   `fallbacks`) has no default to silently revert to — absence and empty are *the same document*.
+#:   Verified by round-tripping both shapes through `nest()` -> `fold_prices()` ->
+#:   `PanelConfig.model_validate()` and comparing the resulting models: `fold_prices` skips an
+#:   absent `price_rows` entirely, `ProviderSettings.prices` defaults to `PriceList()`, and
+#:   `SeatConfig.fallbacks` defaults to `()`. Demanding a literal submitted field here would fail a
+#:   perfectly round-trippable basket the moment a provider has no priced models or a seat has no
+#:   fallback chain configured — the common case, not an edge case.
+#:
+#: So `document_paths()` drops a bare path ending in one of these names — it is never a real field,
+#: only ever `flat()`'s sentinel for "this row list happens to be empty right now".
+ROW_MANAGED_LISTS = {"instruments", "providers", "seats", "price_rows", "fallbacks"}
+
+
+def submitted_paths(body: str) -> set[str]:
+    """Every document path the rendered page will post, with indices stripped."""
+    return {re.sub(r"\[\d*\]", "", name) for name in DOC_FIELD.findall(body)}
+
+
+def document_paths(draft: dict[str, Any]) -> set[str]:
+    """Every document path the stored basket carries, with indices and the `doc.` prefix stripped.
+
+    `flat` emits the browser's own field names (`doc.risk_policy.min_conviction`), which is what
+    makes this comparable to what the page renders. Excludes `ROW_MANAGED_LISTS`' bare container
+    paths — see the comment there for why those are never a field the page needs to submit.
+    """
+    paths = (re.sub(r"\[\d*\]", "", name).removeprefix("doc.") for name, _ in flat(draft))
+    return {path for path in paths if path.rsplit(".", 1)[-1] not in ROW_MANAGED_LISTS}
+
+
+#: Fields the page deliberately does not submit. Empty until Slice D removes quarantine; the
+#: assertion below is two-sided, so this set is the *only* licence to omit anything.
+OMITTED_FROM_THE_FORM: set[str] = set()
+
+
+async def test_every_document_field_is_still_submitted(
+    sim_application: Application, client: httpx.AsyncClient
+) -> None:
+    """A tab may hide inputs; it may never omit them.
+
+    The form round-trips the whole document and `nest()` drops absent fields, so a tab that
+    conditionally renders its contents deletes that part of the basket on save. This is the
+    concrete form of that rule, and it is two-sided on purpose: the first assertion catches a
+    dropped field, the second catches one quietly added to the licence.
+    """
+    record = sim_application.configs.latest(ConfigKind.BASKET, "demo")
+    assert record is not None
+    expected = document_paths(unfold_prices(draft_of(record.document)))
+
+    body = (await client.get("/configure/baskets/demo")).text
+    submitted = submitted_paths(body)
+
+    assert expected - submitted == OMITTED_FROM_THE_FORM
+    assert expected - OMITTED_FROM_THE_FORM <= submitted
+
+
+def tab_checked(body: str, tab_id: str) -> bool:
+    """Whether the tab radio `tab_id` renders `checked`, regardless of the tag's own whitespace.
+
+    The radio's `checked` attribute sits on a second, indented line in the template
+    (`configure/basket.html`), and this project's Jinja environment has neither `trim_blocks` nor
+    `lstrip_blocks` set — so the rendered tag is not one contiguous line. A literal substring match
+    would test the raw byte layout of the tag rather than whether the right radio is checked, and
+    would break on a re-indent or an added attribute with no behaviour change at all.
+    """
+    match = re.search(rf'<input[^>]*\bid="{re.escape(tab_id)}"[^>]*>', body)
+    assert match is not None, f"no <input id={tab_id!r}> in the rendered page"
+    return "checked" in match.group(0)
+
+
+async def test_the_tab_the_operator_was_on_survives_a_row_action(
+    client: httpx.AsyncClient, basket_form: list[tuple[str, str]]
+) -> None:
+    body = (
+        await client.post(
+            "/configure/baskets/demo/draft",
+            data=as_form([*basket_form, ("ui.section", "risk"), ("add", "instruments")]),
+        )
+    ).text
+
+    # The action wins over the posted tab: adding an instrument shows the operator the instrument.
+    assert tab_checked(body, "s-instruments")
+    assert not tab_checked(body, "s-risk")
+
+
+async def test_a_posted_tab_is_kept_when_no_row_action_happened(
+    client: httpx.AsyncClient, basket_form: list[tuple[str, str]]
+) -> None:
+    body = (
+        await client.post(
+            "/configure/baskets/demo/draft", data=as_form([*basket_form, ("ui.section", "risk")])
+        )
+    ).text
+
+    assert tab_checked(body, "s-risk")
+    assert not tab_checked(body, "s-identity")
 
 
 # ---------------------------------------------------------------- draft editing
@@ -320,6 +451,30 @@ async def test_a_provider_added_to_the_draft_appears_in_every_seat_picker(
     body = (await client.post("/configure/baskets/demo/draft", data=as_form(added))).text
 
     assert body.count('<option value="local"') >= 2  # the primary picker and the new seat's
+
+
+async def test_two_seats_on_one_binding_are_flagged_in_the_seat_list(
+    client: httpx.AsyncClient, basket_form: list[tuple[str, str]]
+) -> None:
+    """Heterogeneity is a design control; losing it should be visible while it is configured."""
+    # The seeded demo panel's one seat (`STUB_PANEL`) is bound to stub/stub-technical, so the
+    # added seat repeats that exact binding to be a true duplicate rather than a merely similar one.
+    doubled = [
+        *basket_form,
+        ("doc.panel.seats[1].seat_id", "twin"),
+        ("doc.panel.seats[1].role", "Analyst"),
+        ("doc.panel.seats[1].provider_id", "stub"),
+        ("doc.panel.seats[1].model", "stub-technical"),
+    ]
+
+    body = (await client.post("/configure/baskets/demo/draft", data=as_form(doubled))).text
+
+    assert "homogeneous" in body
+
+
+async def test_a_provider_row_says_how_many_seats_use_it(client: httpx.AsyncClient) -> None:
+    body = (await client.get("/configure/baskets/demo")).text
+    assert "used by 1 seat" in body
 
 
 # ---------------------------------------------------------------- tier 2
@@ -521,6 +676,25 @@ async def test_editing_a_basket_does_not_silently_drop_its_challenger(
     assert latest.document.shadow_panel.panel_id == "challenger"
 
 
+async def test_the_challenger_is_still_submitted_from_its_own_tab(
+    sim_application: Application, client: httpx.AsyncClient, basket_form: list[tuple[str, str]]
+) -> None:
+    """A tab may hide inputs; it may never omit them — the hazard the shared macro removes."""
+    await client.post("/configure/baskets/demo", data=as_form([*basket_form, *_shadow_fields()]))
+    record = sim_application.configs.latest(ConfigKind.BASKET, "demo")
+    assert record is not None
+    reposted = flat(unfold_prices(draft_of(record.document)))
+
+    await client.post(
+        "/configure/baskets/demo",
+        data=as_form(_replace(reposted, "doc.risk_policy.min_conviction", "0.75")),
+    )
+
+    latest = sim_application.configs.latest(ConfigKind.BASKET, "demo")
+    assert latest is not None
+    assert latest.document.shadow_panel is not None
+
+
 async def test_a_challenger_repeating_the_champions_id_is_refused(
     client: httpx.AsyncClient, basket_form: list[tuple[str, str]]
 ) -> None:
@@ -547,3 +721,97 @@ def _shadow_fields() -> list[tuple[str, str]]:
         ("doc.shadow_panel.seats[0].provider_id", "stub"),
         ("doc.shadow_panel.seats[0].model", "stub-contrarian"),
     ]
+
+
+# ---------------------------------------------------------------- look up
+
+
+async def test_look_up_fills_the_row_from_the_venue(
+    client: httpx.AsyncClient, basket_form: list[tuple[str, str]]
+) -> None:
+    """The operator names an identifier; the venue publishes the rest (ADR 0025)."""
+    typed = [*basket_form, ("doc.instruments[0].symbol", "SOL/USDT"), ("lookup", "0")]
+
+    body = (await client.post("/configure/baskets/demo/draft", data=as_form(typed))).text
+
+    assert "SOL/USDT" in body
+    assert 'value="SOL"' in body  # base_currency, resolved rather than typed
+
+
+async def test_look_up_refuses_a_symbol_the_venue_does_not_list(
+    client: httpx.AsyncClient, basket_form: list[tuple[str, str]]
+) -> None:
+    typed = [*basket_form, ("doc.instruments[0].symbol", "FOO/BAR"), ("lookup", "0")]
+
+    body = (await client.post("/configure/baskets/demo/draft", data=as_form(typed))).text
+
+    assert "does not list" in body
+    assert "instruments[0].symbol" in body
+
+
+# A delisted symbol is refused too, but the committed sim capture holds only tradable entries, so
+# that path is asserted where it belongs — `tests/contract/test_catalogue_contract.py`, over every
+# catalogue at once — rather than duplicated here against a fake.
+
+
+async def test_look_up_names_an_unreachable_venue_as_itself(
+    sim_application: Application, client: httpx.AsyncClient, basket_form: list[tuple[str, str]]
+) -> None:
+    """An outage is not "the venue does not list it". Sending the operator to check their spelling
+    when the real problem is the network is the wrong instruction at the worst moment."""
+
+    class Unreachable:
+        venue_id = "sim"
+        asset_class = AssetClass.CRYPTO
+        source = ""
+        as_of = None
+
+        async def list_markets(self) -> tuple[VenueMarket, ...]:
+            raise VenueError("connection reset")
+
+        async def resolve(self, identifier: str, id_type: IdType = IdType.SYMBOL) -> VenueMarket:
+            return (await self.list_markets())[0]
+
+    # `Application` is `@dataclass(slots=True)` and not frozen, so this is a plain assignment.
+    sim_application.catalogue = Unreachable()  # type: ignore[assignment]
+    typed = [*basket_form, ("doc.instruments[0].symbol", "SOL/USDT"), ("lookup", "0")]
+
+    body = (await client.post("/configure/baskets/demo/draft", data=as_form(typed))).text
+
+    assert "could not be reached" in body
+    assert "does not list" not in body
+
+
+async def test_look_up_publishes_nothing(
+    sim_application: Application, client: httpx.AsyncClient, basket_form: list[tuple[str, str]]
+) -> None:
+    await client.post(
+        "/configure/baskets/demo/draft",
+        data=as_form([*basket_form, ("doc.instruments[0].symbol", "SOL/USDT"), ("lookup", "0")]),
+    )
+
+    assert sim_application.configs.latest(ConfigKind.BASKET, "demo").ref.version == 1  # type: ignore[union-attr]
+
+
+async def test_the_instruments_pane_states_where_the_rules_came_from(
+    client: httpx.AsyncClient,
+) -> None:
+    body = (await client.get("/configure/baskets/demo")).text
+    assert "recorded from binance" in body
+
+
+async def test_an_instrument_another_basket_holds_is_named_on_the_row(
+    sim_application: Application, client: httpx.AsyncClient
+) -> None:
+    """ADR 0026's refusal, shown where the instrument is picked rather than at publish."""
+    market = await sim_application.catalogue.resolve("SOL/USDT")
+    typed = new_basket_form(lot_size=str(market.lot_size))
+    for field in ("tick_size", "min_qty", "min_notional"):
+        typed = _replace(typed, f"doc.instruments[0].{field}", str(getattr(market, field)))
+    await client.post("/configure/baskets/alpha", data=as_form(typed))
+
+    body = (await client.get("/configure/baskets/alpha")).text
+    body_demo = (await client.get("/configure/baskets/demo")).text
+
+    assert "held by basket" not in body  # alpha holds SOL alone
+    assert "held by basket" not in body_demo  # demo holds BTC and ETH alone

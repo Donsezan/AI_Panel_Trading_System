@@ -13,108 +13,197 @@
   {% if existing %}Currently at version {{ existing }}.{% endif %}
 </p>
 
-{{ f.error_summary(errors) }}
-
-<form method="post" action="{{ action }}">
+<form method="post" action="{{ action }}" id="basket-form">
   <input type="hidden" name="existing" value="{{ existing or '' }}">
+  {{ f.error_summary(errors) }}
 
-  <h2>Identity</h2>
-  <div class="grid">
-    {{ f.field("basket_id", "Basket id", draft.get("basket_id"), errors, hint="stable; used in every event and order id") }}
-    {{ f.field("name", "Name", draft.get("name"), errors) }}
-    {{ f.choice("status", "Status", draft.get("status"), statuses, errors, hint="pausing here is your intent; a halt is the system's") }}
-    {{ f.choice("decision_mode", "Decision mode", draft.get("decision_mode"), decision_modes, errors, hint="basket mode is one panel run for every instrument") }}
-  </div>
-
-  <h2>Schedule</h2>
-  {% set schedule = draft.get("schedule") or {} %}
-  <div class="grid">
-    {{ f.field("schedule.every_seconds", "Every (seconds)", schedule.get("every_seconds"), errors, type="number") }}
-    {{ f.field("schedule.offset_seconds", "Offset (seconds)", schedule.get("offset_seconds"), errors, type="number", hint="“every 1h at :05” is 3600 / 300") }}
-    {{ f.field("schedule.open_delay_seconds", "Open delay (seconds)", schedule.get("open_delay_seconds"), errors, type="number", hint="first cycle of a session, after the open") }}
-    {{ f.field("ttl_buffer_seconds", "Order TTL buffer (seconds)", draft.get("ttl_buffer_seconds"), errors, type="number", hint="order lifetime is the interval minus this") }}
-  </div>
-
-  <h2>Instruments</h2>
-  {% for row in draft.get("instruments") or [] %}
-    {% set i = "instruments[" ~ loop.index0 ~ "]" %}
-    <fieldset>
-      <legend>{{ row.get("symbol") or "new instrument" }}</legend>
+  <div class="tabs rail">
+    <input type="radio" class="tab-toggle" name="ui.section" id="s-identity" value="identity"
+           {% if (ui.get("section") or "identity") == "identity" %}checked{% endif %}>
+    <label class="tab-label" for="s-identity">Identity</label>
+    <section class="tab-pane">
       <div class="grid">
-        {{ f.field(i ~ ".symbol", "Symbol", row.get("symbol"), errors) }}
-        {{ f.field(i ~ ".venue", "Venue", row.get("venue"), errors) }}
-        {{ f.choice(i ~ ".asset_class", "Asset class", row.get("asset_class"), asset_classes, errors) }}
-        {{ f.field(i ~ ".base_currency", "Base currency", row.get("base_currency"), errors) }}
-        {{ f.field(i ~ ".quote_currency", "Quote currency", row.get("quote_currency"), errors, hint="every basket in one process must agree") }}
-        {{ f.field(i ~ ".lot_size", "Lot size", row.get("lot_size"), errors) }}
-        {{ f.field(i ~ ".tick_size", "Tick size", row.get("tick_size"), errors) }}
-        {{ f.field(i ~ ".min_qty", "Min qty", row.get("min_qty"), errors) }}
-        {{ f.field(i ~ ".min_notional", "Min notional", row.get("min_notional"), errors) }}
+        {{ f.field("basket_id", "Basket id", draft.get("basket_id"), errors, hint="stable; used in every event and order id") }}
+        {{ f.field("name", "Name", draft.get("name"), errors) }}
+        {{ f.choice("status", "Status", draft.get("status"), statuses, errors, hint="pausing here is your intent; a halt is the system's") }}
+        {{ f.choice("decision_mode", "Decision mode", draft.get("decision_mode"), decision_modes, errors, hint="basket mode is one panel run for every instrument") }}
       </div>
-      {{ f.row_buttons("", i, "", draft_action) }}
-    </fieldset>
-  {% endfor %}
-  {{ f.row_buttons("instruments", "", "add instrument", draft_action) }}
+    </section>
 
-  <h2>Data</h2>
-  <div class="grid">
-    {{ f.multi("timeframes", "Timeframes", draft.get("timeframes") or [], timeframes, hint="empty means the engine's default set") }}
-    {{ f.multi("indicators", "Indicators", draft.get("indicators") or [], indicators, hint="empty means the engine's default set") }}
-    {{ f.multi("news_sources", "News sources", draft.get("news_sources") or [], news_sources, hint="empty means no news, stated as such in the snapshot") }}
+    <input type="radio" class="tab-toggle" name="ui.section" id="s-instruments" value="instruments"
+           {% if ui.get("section") == "instruments" %}checked{% endif %}>
+    <label class="tab-label" for="s-instruments">Instruments</label>
+    <section class="tab-pane">
+      <p class="muted small">
+        Name an identifier and press <strong>Look up</strong>; the venue publishes the rest. Trading
+        rules are venue reference data and are never typed — a stale <code>min_notional</code> lets
+        through an order the risk layer sized against the wrong floor (ADR 0025). Publishing
+        re-resolves every instrument this edit changed, so a value edited some other way is refused
+        rather than stored.
+      </p>
+      {% if basket_quarantined %}
+        <p class="warn small">
+          <span class="pill warn">whole basket quarantined</span>
+          No instrument here is traded automatically. Released on the
+          <a href="/?scope=basket:{{ basket_id }}">workspace</a>.
+        </p>
+      {% endif %}
+      {% for row in instrument_rows %}
+        {% set i = "instruments[" ~ row.index ~ "]" %}
+        <fieldset>
+          <legend>{{ row.symbol or "new instrument" }}</legend>
+          <div class="grid tight">
+            {{ f.field(i ~ ".symbol", "Identifier", draft["instruments"][row.index].get("symbol"), errors, hint="the venue's own symbol, e.g. BTC/USDT") }}
+            <div class="field">
+              <span class="muted small">&nbsp;</span>
+              <button type="submit" name="lookup" value="{{ row.index }}" class="ghost"
+                      formaction="{{ draft_action }}" formnovalidate
+                      hx-post="{{ draft_action }}" hx-target="#basket-form"
+                      hx-select="#basket-form" hx-swap="outerHTML">Look up</button>
+            </div>
+          </div>
+          <div class="grid tight">
+            {{ f.resolved(i ~ ".venue", "Venue", draft["instruments"][row.index].get("venue"), errors) }}
+            {{ f.resolved(i ~ ".asset_class", "Asset class", draft["instruments"][row.index].get("asset_class"), errors) }}
+            {{ f.resolved(i ~ ".base_currency", "Base", draft["instruments"][row.index].get("base_currency"), errors) }}
+            {{ f.resolved(i ~ ".quote_currency", "Quote", draft["instruments"][row.index].get("quote_currency"), errors) }}
+            {{ f.resolved(i ~ ".lot_size", "Lot size", draft["instruments"][row.index].get("lot_size"), errors) }}
+            {{ f.resolved(i ~ ".tick_size", "Tick size", draft["instruments"][row.index].get("tick_size"), errors) }}
+            {{ f.resolved(i ~ ".min_qty", "Min qty", draft["instruments"][row.index].get("min_qty"), errors) }}
+            {{ f.resolved(i ~ ".min_notional", "Min notional", draft["instruments"][row.index].get("min_notional"), errors) }}
+          </div>
+          <p class="muted small">
+            Published by {{ catalogue.source or catalogue.venue_id }}{% if catalogue.as_of %}, {{ catalogue.as_of | moment }}{% endif %}.
+          </p>
+          {% if row.foreign %}
+            <p class="warn small">
+              This row names venue <code>{{ row.venue }}</code>; this process is wired to
+              <code>{{ catalogue.venue_id }}</code>. Its trading rules cannot be verified here, and
+              the prices it would be sized from come off a different book. <strong>Look up</strong>
+              would re-bind it to {{ catalogue.venue_id }} — a different tradable thing, with a
+              different position.
+            </p>
+          {% endif %}
+          {% if row.held_by %}
+            <p class="warn small">
+              Also held by basket <code>{{ row.held_by }}</code>. An instrument belongs to exactly
+              one basket in service, so publishing this will be refused (ADR 0026).
+            </p>
+          {% endif %}
+          {% if row.quarantined %}
+            <p class="muted small">
+              <span class="pill warn">quarantined</span>
+              Excluded from automated trading. Released on the
+              <a href="/?scope=instrument:{{ basket_id }}:{{ row.key }}">workspace</a>, which is
+              where the act lives.
+            </p>
+          {% endif %}
+          {{ f.row_buttons("", i, "", draft_action) }}
+        </fieldset>
+      {% endfor %}
+      {{ f.row_buttons("instruments", "", "add instrument", draft_action) }}
+    </section>
+
+    <input type="radio" class="tab-toggle" name="ui.section" id="s-schedule" value="schedule"
+           {% if ui.get("section") == "schedule" %}checked{% endif %}>
+    <label class="tab-label" for="s-schedule">Schedule</label>
+    <section class="tab-pane">
+      {% set schedule = draft.get("schedule") or {} %}
+      <div class="grid">
+        {{ f.field("schedule.every_seconds", "Every (seconds)", schedule.get("every_seconds"), errors, type="number") }}
+        {{ f.field("schedule.offset_seconds", "Offset (seconds)", schedule.get("offset_seconds"), errors, type="number", hint="“every 1h at :05” is 3600 / 300") }}
+        {{ f.field("schedule.open_delay_seconds", "Open delay (seconds)", schedule.get("open_delay_seconds"), errors, type="number", hint="first cycle of a session, after the open") }}
+        {{ f.field("ttl_buffer_seconds", "Order TTL buffer (seconds)", draft.get("ttl_buffer_seconds"), errors, type="number", hint="order lifetime is the interval minus this") }}
+      </div>
+    </section>
+
+    <input type="radio" class="tab-toggle" name="ui.section" id="s-data" value="data"
+           {% if ui.get("section") == "data" %}checked{% endif %}>
+    <label class="tab-label" for="s-data">Data</label>
+    <section class="tab-pane">
+      <div class="grid">
+        {{ f.multi("timeframes", "Timeframes", draft.get("timeframes") or [], timeframes, hint="empty means the engine's default set") }}
+        {{ f.multi("indicators", "Indicators", draft.get("indicators") or [], indicators, hint="empty means the engine's default set") }}
+        {{ f.multi("news_sources", "News sources", draft.get("news_sources") or [], news_sources, hint="empty means no news, stated as such in the snapshot") }}
+      </div>
+    </section>
+
+    <input type="radio" class="tab-toggle" name="ui.section" id="s-panel" value="panel"
+           {% if ui.get("section") == "panel" %}checked{% endif %}>
+    <label class="tab-label" for="s-panel">Panel</label>
+    <section class="tab-pane">
+      <div class="tabs strip">
+        <input type="radio" class="tab-toggle" name="ui.panel" id="p-panel" value="panel"
+               {% if (ui.get("panel") or "panel") == "panel" %}checked{% endif %}>
+        <label class="tab-label" for="p-panel">Champion</label>
+        <section class="tab-pane">
+          <p class="muted small">The panel that trades. Its decisions go through Tier-1, Tier-2 and execution.</p>
+          {{ panel_editor.editor("panel", draft.get("panel") or {}, providers, errors, draft_action,
+                                 protocols, provider_kinds, evidence_slices, panel_seats,
+                                 panel_providers_view, ui) }}
+        </section>
+
+        <input type="radio" class="tab-toggle" name="ui.panel" id="p-shadow" value="shadow_panel"
+               {% if ui.get("panel") == "shadow_panel" %}checked{% endif %}>
+        <label class="tab-label" for="p-shadow">
+          Challenger{% if not (draft.get("shadow_panel") or {}).get("panel_id") %}
+            <span class="muted small">none</span>{% endif %}
+        </label>
+        <section class="tab-pane">
+          <p class="muted small">
+            Optional. A challenger evaluated on the <strong>same frozen snapshot</strong> every
+            cycle and recorded for comparison — it never trades, its cost is accounted separately,
+            and a failure of it never affects the cycle. Leave the panel id blank to run no
+            challenger at all. Read the comparison with <code>tradebot report shadow</code>.
+          </p>
+          {{ panel_editor.editor("shadow_panel", draft.get("shadow_panel") or {}, shadow_providers,
+                                 errors, draft_action, protocols, provider_kinds, evidence_slices,
+                                 shadow_seats, shadow_providers_view, ui) }}
+        </section>
+      </div>
+    </section>
+
+    <input type="radio" class="tab-toggle" name="ui.section" id="s-risk" value="risk"
+           {% if ui.get("section") == "risk" %}checked{% endif %}>
+    <label class="tab-label" for="s-risk">Risk</label>
+    <section class="tab-pane">
+      {% set risk = draft.get("risk_policy") or {} %}
+      <div class="grid">
+        {{ f.field("risk_policy.max_basket_allocation_pct", "Max basket allocation (% equity)", risk.get("max_basket_allocation_pct"), errors) }}
+        {{ f.field("risk_policy.max_position_pct_of_basket", "Max position (% of basket)", risk.get("max_position_pct_of_basket"), errors) }}
+        {{ f.field("risk_policy.risk_per_trade_pct", "Risk per trade (% of basket)", risk.get("risk_per_trade_pct"), errors) }}
+        {{ f.field("risk_policy.stop_loss_atr_multiple", "Stop loss (× ATR)", risk.get("stop_loss_atr_multiple"), errors) }}
+        {{ f.field("risk_policy.take_profit_atr_multiple", "Take profit (× ATR)", risk.get("take_profit_atr_multiple"), errors, hint="must exceed the stop") }}
+        {{ f.field("risk_policy.protective_limit_offset_pct", "Protective limit offset (%)", risk.get("protective_limit_offset_pct"), errors) }}
+        {{ f.field("risk_policy.marketable_cross_pct", "Marketable cross (%)", risk.get("marketable_cross_pct"), errors) }}
+        {{ f.field("risk_policy.min_conviction", "Min conviction (0–1)", risk.get("min_conviction"), errors) }}
+        {{ f.field("risk_policy.cooldown_cycles", "Cooldown (cycles)", risk.get("cooldown_cycles"), errors, type="number") }}
+        {{ f.field("risk_policy.max_trades_per_day", "Max trades per day", risk.get("max_trades_per_day"), errors, type="number") }}
+        {{ f.field("risk_policy.max_consecutive_losses", "Max consecutive losses", risk.get("max_consecutive_losses"), errors, type="number", hint="the basket auto-pauses at this count") }}
+        {{ f.field("risk_policy.unprotected_haircut_pct", "Unprotected haircut (%)", risk.get("unprotected_haircut_pct"), errors, hint="applied where the venue cannot hold a stop") }}
+      </div>
+      {{ f.flag("risk_policy.long_only", "Long only (SELL is reduce-only)", risk.get("long_only"), hint="v1 cannot be turned off: shorting ripples through every other rule") }}
+
+      <h3>Quarantine</h3>
+      <p class="muted small">
+        Excludes a scope from <em>automated</em> trading. The cycle keeps running — market data,
+        indicators and the panel's view are untouched — and only the order is refused, so the evidence
+        for putting it back keeps arriving. A held position is left exactly where it is; you can still
+        close it by hand from Control. Toggle either of these from Control too, without opening this
+        form.
+      </p>
+      {{ f.flag("risk_policy.quarantined", "Quarantine the whole basket", risk.get("quarantined"), hint="also skips the panel: nothing to spend a model call on when every order is vetoed") }}
+      <div class="grid">
+        {{ f.multi("risk_policy.quarantined_instruments", "Quarantined instruments", risk.get("quarantined_instruments") or [], instrument_keys, hint="only instruments this basket holds; a key it does not hold excludes nothing and is refused") }}
+      </div>
+    </section>
   </div>
 
-  <h2>Tier-1 risk policy</h2>
-  {% set risk = draft.get("risk_policy") or {} %}
-  <div class="grid">
-    {{ f.field("risk_policy.max_basket_allocation_pct", "Max basket allocation (% equity)", risk.get("max_basket_allocation_pct"), errors) }}
-    {{ f.field("risk_policy.max_position_pct_of_basket", "Max position (% of basket)", risk.get("max_position_pct_of_basket"), errors) }}
-    {{ f.field("risk_policy.risk_per_trade_pct", "Risk per trade (% of basket)", risk.get("risk_per_trade_pct"), errors) }}
-    {{ f.field("risk_policy.stop_loss_atr_multiple", "Stop loss (× ATR)", risk.get("stop_loss_atr_multiple"), errors) }}
-    {{ f.field("risk_policy.take_profit_atr_multiple", "Take profit (× ATR)", risk.get("take_profit_atr_multiple"), errors, hint="must exceed the stop") }}
-    {{ f.field("risk_policy.protective_limit_offset_pct", "Protective limit offset (%)", risk.get("protective_limit_offset_pct"), errors) }}
-    {{ f.field("risk_policy.marketable_cross_pct", "Marketable cross (%)", risk.get("marketable_cross_pct"), errors) }}
-    {{ f.field("risk_policy.min_conviction", "Min conviction (0–1)", risk.get("min_conviction"), errors) }}
-    {{ f.field("risk_policy.cooldown_cycles", "Cooldown (cycles)", risk.get("cooldown_cycles"), errors, type="number") }}
-    {{ f.field("risk_policy.max_trades_per_day", "Max trades per day", risk.get("max_trades_per_day"), errors, type="number") }}
-    {{ f.field("risk_policy.max_consecutive_losses", "Max consecutive losses", risk.get("max_consecutive_losses"), errors, type="number", hint="the basket auto-pauses at this count") }}
-    {{ f.field("risk_policy.unprotected_haircut_pct", "Unprotected haircut (%)", risk.get("unprotected_haircut_pct"), errors, hint="applied where the venue cannot hold a stop") }}
-  </div>
-  {{ f.flag("risk_policy.long_only", "Long only (SELL is reduce-only)", risk.get("long_only"), hint="v1 cannot be turned off: shorting ripples through every other rule") }}
-
-  <h3>Quarantine</h3>
-  <p class="muted small">
-    Excludes a scope from <em>automated</em> trading. The cycle keeps running — market data,
-    indicators and the panel's view are untouched — and only the order is refused, so the evidence
-    for putting it back keeps arriving. A held position is left exactly where it is; you can still
-    close it by hand from Control. Toggle either of these from Control too, without opening this
-    form.
-  </p>
-  {{ f.flag("risk_policy.quarantined", "Quarantine the whole basket", risk.get("quarantined"), hint="also skips the panel: nothing to spend a model call on when every order is vetoed") }}
-  <div class="grid">
-    {{ f.multi("risk_policy.quarantined_instruments", "Quarantined instruments", risk.get("quarantined_instruments") or [], instrument_keys, hint="only instruments this basket holds; a key it does not hold excludes nothing and is refused") }}
-  </div>
-
-  <h2>Panel</h2>
-  <p class="muted small">The panel that trades. Its decisions go through Tier-1, Tier-2 and execution.</p>
-  {{ panel_editor.editor("panel", draft.get("panel") or {}, providers, errors, draft_action, protocols, provider_kinds, evidence_slices) }}
-
-  <h2>Shadow panel (A/B challenger)</h2>
-  <p class="muted small">
-    Optional. A challenger evaluated on the <strong>same frozen snapshot</strong> every cycle and
-    recorded for comparison — it never trades, its cost is accounted separately, and a failure of
-    it never affects the cycle. Leave the panel id blank to run no challenger at all.
-    Read the comparison with <code>tradebot report shadow</code>.
-  </p>
-  {{ panel_editor.editor("shadow_panel", draft.get("shadow_panel") or {}, shadow_providers, errors, draft_action, protocols, provider_kinds, evidence_slices) }}
-
-  <h2>Publish</h2>
-  <div class="grid">
+  <div class="actions">
     <div class="field">
       <label for="note">Note (recorded on the version)</label>
       <input id="note" name="note" type="text" placeholder="why this changed">
     </div>
-  </div>
-  <div class="actions">
     <button type="submit">Publish new version</button>
     {% if basket_id %}
       <a class="ghost-link" href="/configure/history/basket/{{ basket_id }}">version history</a>

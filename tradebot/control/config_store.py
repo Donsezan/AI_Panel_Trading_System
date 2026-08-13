@@ -23,6 +23,9 @@ cannot read one is exactly the bot that trades past a limit somebody set.
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Generic, TypeVar
@@ -82,6 +85,25 @@ class ConfigStore:
         self._writer = writer
         self._store = store
         self._clock = clock
+        #: Guards a caller's own read-check-write around a publish. `SingleWriter` already
+        #: serializes `put` itself, but a caller that reads configuration, decides something
+        #: from it, and only then calls `put` needs that whole sequence to be one unit — otherwise
+        #: two concurrent callers can each read the same pre-write state, each conclude their
+        #: check passed, and both write. General-purpose and private to this class: what any
+        #: particular caller checks is none of `ConfigStore`'s business — see `publishing`.
+        self._publish_lock = asyncio.Lock()
+
+    @asynccontextmanager
+    async def publishing(self) -> AsyncIterator[None]:
+        """Hold the publication lock for a read-check-write around one or more writes.
+
+        One asyncio process (DESIGN §5), so an `asyncio.Lock` is enough — no cross-process
+        concern. Only a caller that reads state, decides something from it, and would be wrong if
+        that state changed before its write lands needs this; a bare `put()` or `retire()` is
+        already atomic on its own.
+        """
+        async with self._publish_lock:
+            yield
 
     # ------------------------------------------------------------------ writes
 

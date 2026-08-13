@@ -151,6 +151,10 @@ class Catalogue:
 
     venue_id: str
     asset_class: AssetClass
+    #: Provenance, for display only (see `InstrumentCatalogue`). Defaulted here so a subclass that
+    #: has no answer — `UnavailableCatalogue` — needs no code to say so.
+    source: str = ""
+    as_of: datetime | None = None
 
     async def list_markets(self) -> tuple[VenueMarket, ...]:
         raise NotImplementedError
@@ -230,6 +234,8 @@ class VenueCatalogue(Catalogue):
     ) -> None:
         self.venue_id = gateway.venue_id
         self.asset_class = asset_class
+        self.source = f"{gateway.venue_id} exchangeInfo"
+        self.as_of = None
         self._gateway = gateway
         self._clock = clock
         self._ttl = ttl
@@ -248,6 +254,10 @@ class VenueCatalogue(Catalogue):
             markets = await self._gateway.fetch_markets()
             self._markets = markets
             self._expires_at = self._clock.now() + self._ttl
+            # The instant this fetch landed, not construction time: a catalogue that has never
+            # fetched genuinely has no as-of, and stamping "now" at __init__ would claim the
+            # numbers are as fresh as the object rather than as fresh as the last venue read.
+            self.as_of = self._clock.now()
             return markets
 
     def _fresh(self) -> bool:

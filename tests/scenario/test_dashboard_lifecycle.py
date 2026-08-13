@@ -44,11 +44,27 @@ async def test_a_basket_is_created_configured_run_paused_and_killed_from_the_wor
 ) -> None:
     await sim_application.recover()
 
-    # 1. Created — from the seeded basket's own form, renamed. The `new` form is a blank of the
-    #    same shape; reusing this one keeps the test about the lifecycle, not about typing.
+    # 1. Created — from the seeded basket's own form, renamed, and given its own instrument. An
+    #    instrument belongs to exactly one basket in service (ADR 0026), so `alpha` cannot simply
+    #    inherit demo's; the rest of the form is reused to keep the test about the lifecycle.
     source = sim_application.configs.latest(ConfigKind.BASKET, "demo")
     assert source is not None
-    form = flat(unfold_prices(draft_of(source.document)))
+    draft = unfold_prices(draft_of(source.document))
+    market = await sim_application.catalogue.resolve("SOL/USDT")
+    draft["instruments"] = [
+        {
+            "symbol": market.symbol,
+            "venue": "sim",
+            "asset_class": "crypto",
+            "base_currency": market.base_currency,
+            "quote_currency": market.quote_currency,
+            "lot_size": str(market.lot_size),
+            "tick_size": str(market.tick_size),
+            "min_qty": str(market.min_qty),
+            "min_notional": str(market.min_notional),
+        }
+    ]
+    form = flat(draft)
     created = _set(_set(form, "doc.basket_id", "alpha"), "doc.name", "Alpha basket")
 
     assert (await client.post("/configure/baskets/alpha", data=as_form(created))).status_code == 303

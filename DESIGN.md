@@ -190,10 +190,12 @@ Core entities (persisted; names are the ubiquitous language of the codebase):
 
 Relationships: a **Portfolio** (one per venue account) contains Positions; Baskets reference
 Instruments but *Positions belong to the Portfolio* — this is what makes Tier-2 risk
-meaningful when two baskets accidentally hold correlated exposure. A **PortfolioAggregate**
-(read-only, computed) sums all venue Portfolios into one USD-valued summary — USD-stablecoins
-valued at par with a depeg sanity check — and is what the cross-venue Tier-2 rules and the
-dashboard's equity view read.
+meaningful when two baskets accidentally hold correlated exposure. It is also why **an Instrument
+belongs to exactly one Basket in service** (ADR 0026): a position is keyed by instrument alone, so
+two baskets over one instrument would be two writers of one position, which principle 7 forbids. A
+**PortfolioAggregate** (read-only, computed) sums all venue Portfolios into one USD-valued summary
+— USD-stablecoins valued at par with a depeg sanity check — and is what the cross-venue Tier-2
+rules and the dashboard's equity view read.
 
 **Decision modes** (per basket, GUI-selected):
 
@@ -725,6 +727,7 @@ Serialized once, hashed, stored; every seat prompt embeds this same packet. [L7]
 | Equity corporate action (split/dividend) | reconciler classification vs. venue announcements | adjust ledger + log `CORPORATE_ACTION`; unmatched ⇒ halt affected instrument |
 | Venue reset (testnet) | reconciler: balances at defaults + open orders gone | `VENUE_RESET` → halt + notify; excluded from promotion-gate accounting (§9) |
 | Venue changes a trading filter (lot/tick/min) | startup preflight and the supervisor's resync sweep re-resolve every configured instrument against the venue catalogue | `RISK_EVENT` naming the field, the pinned value and the venue's; live and paper halt the affected basket (+ alert), sim records it and keeps cycling; cleared by re-publishing the basket, which re-resolves (ADR 0025) |
+| Instrument held by two baskets | publish-time check in `store_basket`; startup preflight and the supervisor's resync sweep | publish refused naming the other basket; at runtime a `RISK_EVENT` and **halt every basket involved, in every mode** — positions are the portfolio's, so two baskets would oversell one holding and split its cooldown; cleared by removing it from all but one and re-publishing (ADR 0026) |
 | Drawdown breach | Tier-2 watchdog | kill switch (§6.6) |
 | Config edited mid-cycle | version pinning | cycle finishes on its pinned versions; next cycle uses new ones |
 | Clock skew | startup + periodic NTP-vs-exchange-time check | warn > 2 s, halt > 30 s (candle alignment and auth signatures both depend on it) |

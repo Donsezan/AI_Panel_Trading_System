@@ -140,6 +140,16 @@ class TestOneContract:
         assert instrument.asset_class is AssetClass.CRYPTO
         assert instrument.trading_rules.min_notional == Decimal("5.00000000")
 
+    async def test_it_states_its_provenance(self, catalogue: Catalogue) -> None:
+        """Reference data is read-only and stamped with its source and as-of.
+
+        A `min_notional` decides whether an order exists at all, so a number of unknown origin is
+        one an operator cannot judge. Both may be empty — a gateway that has not fetched yet has no
+        as-of — but both must exist, because the form reads them without asking which kind it has.
+        """
+        assert isinstance(catalogue.source, str)
+        assert catalogue.as_of is None or catalogue.as_of.tzinfo is not None
+
 
 class TestIsinIsDeclaredAndUnserved:
     """Decision 6: designed for, deliberately not implemented, and refused in the venue's terms."""
@@ -217,6 +227,52 @@ class TestVenueCatalogueSpendsTheBudgetOnce:
             await catalogue.resolve("BTC/USDT")
 
         assert (await catalogue.resolve("BTC/USDT")).symbol == "BTC/USDT"
+
+    async def test_a_fresh_catalogue_has_no_as_of(self, clock: ManualClock) -> None:
+        """It has fetched nothing, so it has nothing to claim."""
+        gateway = FakeGateway([], markets=[parse_market(entry) for entry in ENTRIES])
+        catalogue = VenueCatalogue(gateway, clock)
+
+        assert catalogue.as_of is None
+
+    async def test_as_of_is_the_instant_of_the_fetch_not_of_construction(
+        self, clock: ManualClock
+    ) -> None:
+        """Stamping "now" at construction would claim the numbers are as fresh as the object
+        rather than as fresh as the last venue read — the exact defect the brief this test covers
+        forbids. Advancing the clock between construction and the fetch is what makes the two
+        instants distinguishable."""
+        gateway = FakeGateway([], markets=[parse_market(entry) for entry in ENTRIES])
+        catalogue = VenueCatalogue(gateway, clock)
+        clock.advance(60)
+
+        await catalogue.list_markets()
+
+        assert catalogue.as_of == clock.now()
+
+    async def test_a_failed_fetch_leaves_as_of_unchanged(self, clock: ManualClock) -> None:
+        """Sibling to `test_a_failed_fetch_is_not_cached`: a fetch that did not happen must not be
+        reported as a source of truth either."""
+        gateway = _FlakyGateway()
+        catalogue = VenueCatalogue(gateway, clock)
+
+        with pytest.raises(VenueError):
+            await catalogue.resolve("BTC/USDT")
+
+        assert catalogue.as_of is None
+
+    async def test_a_fetch_after_the_ttl_expires_advances_as_of(self, clock: ManualClock) -> None:
+        """The stamp tracks the newest fetch, not the first."""
+        gateway = FakeGateway([], markets=[parse_market(entry) for entry in ENTRIES])
+        catalogue = VenueCatalogue(gateway, clock)
+
+        await catalogue.list_markets()
+        first_as_of = catalogue.as_of
+        clock.advance(DEFAULT_CATALOGUE_TTL.total_seconds() + 1)
+        await catalogue.list_markets()
+
+        assert catalogue.as_of == clock.now()
+        assert catalogue.as_of != first_as_of
 
 
 class TestUnavailableCatalogueRefusesByName:

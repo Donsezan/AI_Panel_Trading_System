@@ -243,6 +243,57 @@ a.ghost-link { color: var(--accent); }
 form.retire { display: flex; align-items: center; gap: 0.6rem; margin-top: 2rem; }
 .loosened { margin: 0.4rem 0; }
 
+/* ------------------------------------------------------------------ setting tabs
+
+   A tab may hide inputs; it may never omit them. The form round-trips the whole document and the
+   parser drops absent fields, so a conditionally-rendered tab would delete that part of the basket
+   on save. Hence radios and CSS rather than JavaScript: every input stays in the DOM, and with this
+   stylesheet absent nothing is `display: none`, so the page degrades to one long form.
+
+   The markup is `radio, label, pane` triples, which is what makes three rules serve any number of
+   tabs — including the seat list, whose length the stylesheet cannot know. */
+
+.tabs > .tab-pane                                     { display: none; }
+.tabs > .tab-toggle:checked + .tab-label              { color: var(--accent); border-color: var(--accent); }
+.tabs > .tab-toggle:checked + .tab-label + .tab-pane  { display: block; }
+
+.tabs > .tab-toggle {
+  position: absolute;
+  opacity: 0;
+  width: 1px;
+  height: 1px;
+  /* Not `display: none`: that removes it from the tab order, and these are the only way to move
+     between sections without a pointer. */
+}
+.tabs > .tab-toggle:focus-visible + .tab-label { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.tab-label {
+  cursor: pointer;
+  color: var(--muted);
+  border: 1px solid transparent;
+  border-radius: 4px;
+  padding: 0.35rem 0.7rem;
+  font-size: 0.9rem;
+  user-select: none;
+}
+.tab-label:hover { color: var(--text); }
+
+/* A left rail: labels stack down column 1, every pane occupies the same cell of column 2. */
+.tabs.rail { display: grid; grid-template-columns: max-content 1fr; column-gap: 1.4rem; align-items: start; }
+.tabs.rail > .tab-label { grid-column: 1; }
+.tabs.rail > .tab-pane  { grid-column: 2; grid-row: 1 / -1; min-width: 0; }
+
+/* A horizontal strip: `order` puts every label before every pane whatever the source order, and
+   DOM adjacency — which is what the three rules above use — is unaffected by it. */
+.tabs.strip { display: flex; flex-wrap: wrap; column-gap: 0.3rem; row-gap: 0.6rem; }
+.tabs.strip > .tab-label { order: 0; border-bottom: 2px solid transparent; border-radius: 4px 4px 0 0; }
+.tabs.strip > .tab-toggle:checked + .tab-label { border-bottom-color: var(--accent); }
+.tabs.strip > .tab-pane  { order: 1; flex-basis: 100%; min-width: 0; }
+
+.seat-master > .tab-label { display: flex; gap: 0.5rem; align-items: baseline; white-space: nowrap; }
+.seat-master .seat-id { font: 600 13px/1.4 var(--mono); }
+.seat-master .seat-binding { color: var(--muted); font-size: 0.8rem; }
+
 /* ------------------------------------------------------------------ control */
 
 .banner.ok-banner { background: #12341c; color: #7ee787; border-bottom: 1px solid var(--ok); }
@@ -421,3 +472,15 @@ details.confirm.danger .confirm-body { border-color: var(--danger); }
 .confirm-body .muted { flex-basis: 100%; }
 
 details.banner-detail { padding: 0.4rem 1.2rem; }
+
+/* ------------------------------------------------------------------ resolved instrument fields
+   Reference data, not operator input (ADR 0025). Dashed and dimmed so a readonly rules field never
+   reads as an ordinary one the operator forgot to fill in. */
+
+.field.resolved input[readonly] {
+  background: color-mix(in srgb, var(--panel) 70%, transparent);
+  color: var(--muted);
+  border-style: dashed;
+  cursor: default;
+}
+.warn.small { color: var(--warn); margin: 0.3rem 0; }

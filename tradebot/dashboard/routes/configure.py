@@ -38,8 +38,8 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from starlette.datastructures import FormData
 from starlette.responses import Response
 
-from tradebot.control.config_store import SINGLETON_ID
-from tradebot.control.reference import store_basket
+from tradebot.control.config_store import SINGLETON_ID, ConfigStore
+from tradebot.control.reference import holders_of, store_basket
 from tradebot.core.config import (
     Basket,
     GlobalRiskPolicy,
@@ -50,12 +50,24 @@ from tradebot.core.config import (
     SeatConfig,
 )
 from tradebot.core.enums import AssetClass, BasketStatus, ConfigKind, DecisionMode, ProviderKind
-from tradebot.core.errors import ConfigError
+from tradebot.core.errors import ConfigError, TradebotError
 from tradebot.core.logging import get_logger
+from tradebot.dashboard.editor import (
+    PANEL_PATHS,
+    SHADOW_PATH,
+    declared_providers,
+    focus_for,
+    instrument_keys,
+    instrument_rows,
+    panel_providers,
+    provider_rows,
+    seat_rows,
+)
 from tradebot.dashboard.forms import FieldError, add_row, draft_of, nest, remove_row, validate
 from tradebot.dashboard.views import ACTOR, render, state_of
 from tradebot.decision.protocols import PROTOCOLS
 from tradebot.indicators.library import REGISTRY
+from tradebot.marketdata.catalogue import instrument_of
 from tradebot.news.rss import FEEDS
 from tradebot.risk.loosening import describe, looser_limits
 
@@ -74,10 +86,18 @@ TIMEFRAMES = ("15m", "1h", "4h", "1d")
 #: manufactures genuine disagreement, so it is editable rather than fixed (DESIGN §6.5).
 EVIDENCE_SLICES = ("indicators", "news", "position")
 
-#: The optional A/B challenger (ADR 0018). Edited by the same macro as the champion, so a field
-#: cannot exist on one panel's form and not the other's.
-SHADOW_PATH = "shadow_panel"
-PANEL_PATHS = ("panel", SHADOW_PATH)
+#: Tab-selection fields. Outside the `doc.` namespace, so `nest()` ignores them and no parser
+#: change is needed to round-trip which tab the operator was on.
+UI_PREFIX = "ui."
+
+
+def ui_of(form: FormData) -> dict[str, str]:
+    """The tabs the submitted page was showing, keyed by radio group name without its prefix."""
+    return {
+        name[len(UI_PREFIX) :]: value
+        for name, value in form.multi_items()
+        if name.startswith(UI_PREFIX) and isinstance(value, str) and value
+    }
 
 
 # ---------------------------------------------------------------------- index
@@ -114,7 +134,8 @@ async def history(request: Request, kind: str, config_id: str) -> HTMLResponse:
 
 @router.get("/baskets/new", response_class=HTMLResponse)
 async def new_basket(request: Request) -> HTMLResponse:
-    return _basket_form(request, blank_basket_draft(), existing=None)
+    venue_id = state_of(request).application.catalogue.venue_id
+    return _basket_form(request, blank_basket_draft(venue_id), existing=None)
 
 
 @router.get("/baskets/{basket_id}", response_class=HTMLResponse)
@@ -125,16 +146,27 @@ async def edit_basket(request: Request, basket_id: str) -> HTMLResponse:
 
 @router.post("/baskets/{basket_id}/draft", response_class=HTMLResponse)
 async def redraft_basket(request: Request, basket_id: str) -> HTMLResponse:
-    """Add or remove a row and re-render, publishing nothing.
+    """Add or remove a row, look up an instrument, and re-render, publishing nothing.
 
     This is what keeps the provider picker honest: a provider added in this form appears in
     every seat's fallback select the moment the draft is re-rendered, so the chain is still
-    built from declared providers rather than from free text (DESIGN §6.10).
+    built from declared providers rather than from free text (DESIGN §6.10). The same round trip
+    is what lets **Look up** fill a row from the venue before anything is published (ADR 0025).
     """
     form = await request.form()
     draft = nest(form.multi_items())
-    _apply_row_action(draft, form)
-    return _basket_form(request, draft, existing=_version_field(form), basket_id=basket_id)
+    ui = ui_of(form) | _apply_row_action(draft, form)
+    errors = await _apply_lookup(request, draft, form)
+    if errors:
+        ui = ui | {"section": "instruments"}
+    return _basket_form(
+        request,
+        draft,
+        existing=_version_field(form),
+        basket_id=basket_id,
+        errors=errors,
+        ui=ui,
+    )
 
 
 @router.post("/baskets/{basket_id}", response_class=HTMLResponse)
@@ -148,7 +180,9 @@ async def publish_basket(request: Request) -> Response:
     draft = fold_prices(drop_blank_shadow(nest(form.multi_items())))
     basket, errors = validate(Basket, draft)
     if basket is None:
-        return _basket_form(request, draft, existing=_version_field(form), errors=errors)
+        return _basket_form(
+            request, draft, existing=_version_field(form), errors=errors, ui=ui_of(form)
+        )
 
     application = state_of(request).application
     try:
@@ -160,7 +194,13 @@ async def publish_basket(request: Request) -> Response:
             note=_note(form, "edited in the dashboard"),
         )
     except ConfigError as exc:
-        return _basket_form(request, draft, existing=_version_field(form), errors=_refusal(exc))
+        return _basket_form(
+            request,
+            draft,
+            existing=_version_field(form),
+            errors=_refusal(exc),
+            ui=ui_of(form),
+        )
     logger.warning(
         "basket published from the dashboard",
         extra={"basket_id": record.ref.config_id, "version": record.ref.version},
@@ -227,18 +267,27 @@ def _basket_form(
     existing: int | None,
     errors: tuple[FieldError, ...] = (),
     basket_id: str = "",
+    ui: dict[str, str] | None = None,
 ) -> HTMLResponse:
     draft = unfold_prices(draft)
+    application = state_of(request).application
+    basket_key = str(draft.get("basket_id") or basket_id)
+    quarantine, basket_quarantined = _stored_quarantine(application.configs, basket_key)
     return render(
         request,
         "configure/basket.html",
         draft=draft,
         errors=errors,
         existing=existing,
-        basket_id=str(draft.get("basket_id") or basket_id),
-        instrument_keys=_instrument_keys(draft),
-        providers=_declared_providers(draft, "panel"),
-        shadow_providers=_declared_providers(draft, SHADOW_PATH),
+        basket_id=basket_key,
+        ui=ui or {},
+        instrument_keys=instrument_keys(draft),
+        providers=declared_providers(draft, "panel"),
+        shadow_providers=declared_providers(draft, SHADOW_PATH),
+        panel_seats=seat_rows(draft.get("panel") or {}),
+        panel_providers_view=provider_rows(draft.get("panel") or {}),
+        shadow_seats=seat_rows(draft.get(SHADOW_PATH) or {}),
+        shadow_providers_view=provider_rows(draft.get(SHADOW_PATH) or {}),
         timeframes=TIMEFRAMES,
         indicators=sorted(REGISTRY),
         news_sources=sorted(FEEDS),
@@ -248,7 +297,31 @@ def _basket_form(
         provider_kinds=[kind.value for kind in ProviderKind],
         decision_modes=[mode.value for mode in DecisionMode],
         statuses=[status.value for status in BasketStatus],
+        catalogue=application.catalogue,
+        basket_quarantined=basket_quarantined,
+        instrument_rows=instrument_rows(
+            draft,
+            venue_id=application.catalogue.venue_id,
+            quarantined=quarantine,
+            holders=holders_of(application.configs.baskets()),
+            basket_id=basket_key,
+        ),
     )
+
+
+def _stored_quarantine(configs: ConfigStore, basket_id: str) -> tuple[tuple[str, ...], bool]:
+    """What the *stored* basket excludes: the named instruments, and the whole-basket flag.
+
+    Read from the store rather than from the draft, because the form does not carry quarantine at
+    all — the act lives on the workspace, which has the held-position guard this form cannot offer
+    (ADR 0022). Read at render time too, so a quarantine set on the workspace while this form was
+    open is shown the next time the page paints.
+    """
+    record = configs.latest(ConfigKind.BASKET, basket_id) if basket_id else None
+    if record is None or not record.usable:
+        return (), False
+    policy = record.document.risk_policy
+    return tuple(policy.quarantined_instruments), policy.quarantined
 
 
 def _risk_form(
@@ -314,38 +387,7 @@ def unfold_prices(draft: dict[str, Any]) -> dict[str, Any]:
 
 def _providers_of(draft: dict[str, Any]) -> list[dict[str, Any]]:
     """Provider rows across **both** panels — the champion's and the challenger's."""
-    return [row for path in PANEL_PATHS for row in _panel_providers(draft, path)]
-
-
-def _panel_providers(draft: dict[str, Any], path: str) -> list[dict[str, Any]]:
-    panel = draft.get(path)
-    providers = panel.get("providers") if isinstance(panel, dict) else None
-    return [p for p in providers if isinstance(p, dict)] if isinstance(providers, list) else []
-
-
-def _instrument_keys(draft: dict[str, Any]) -> tuple[str, ...]:
-    """`venue:symbol` for each instrument row — the only scopes a quarantine may name.
-
-    Read from the draft rather than from the stored document, so an instrument added in this same
-    edit is immediately selectable, exactly as a provider added here appears in every seat's
-    picker. `Basket` still refuses a key it does not hold, so this is a convenience, not the check.
-    """
-    rows = draft.get("instruments")
-    return tuple(
-        f"{str(row['venue']).strip()}:{str(row['symbol']).strip()}"
-        for row in (rows if isinstance(rows, list) else ())
-        if isinstance(row, dict) and str(row.get("venue", "")).strip()
-        if str(row.get("symbol", "")).strip()
-    )
-
-
-def _declared_providers(draft: dict[str, Any], path: str) -> tuple[str, ...]:
-    """Provider ids one panel declares — the only options its seats' pickers may offer."""
-    return tuple(
-        str(p["provider_id"])
-        for p in _panel_providers(draft, path)
-        if str(p.get("provider_id", "")).strip()
-    )
+    return [row for path in PANEL_PATHS for row in panel_providers(draft, path)]
 
 
 def drop_blank_shadow(draft: dict[str, Any]) -> dict[str, Any]:
@@ -363,12 +405,14 @@ def drop_blank_shadow(draft: dict[str, Any]) -> dict[str, Any]:
     return draft
 
 
-def blank_basket_draft() -> dict[str, Any]:
+def blank_basket_draft(venue_id: str = "sim") -> dict[str, Any]:
     """A new basket, with the models' own defaults filled in and one row of each repeatable part.
 
     Built from the models rather than from a literal, so a default changed in `core/config.py`
     is the default the form offers — a form with its own copy of the numbers is a second source
-    of truth for a risk limit.
+    of truth for a risk limit. `venue_id` defaults to `"sim"` only so this stays free of a running
+    application; every real caller passes the wired catalogue's own id, because a new row must
+    never silently prefill a venue this process cannot verify it against.
     """
     panel = PanelConfig(
         panel_id="",
@@ -380,7 +424,7 @@ def blank_basket_draft() -> dict[str, Any]:
     return {
         "basket_id": "",
         "name": "",
-        "instruments": [{"venue": "sim", "asset_class": AssetClass.CRYPTO.value}],
+        "instruments": [{"venue": venue_id, "asset_class": AssetClass.CRYPTO.value}],
         "panel": draft_of(panel),
         "risk_policy": draft_of(RiskPolicy()),
         "schedule": draft_of(Schedule()),
@@ -395,14 +439,60 @@ def blank_basket_draft() -> dict[str, Any]:
 # ---------------------------------------------------------------------- form plumbing
 
 
-def _apply_row_action(draft: dict[str, Any], form: FormData) -> None:
-    """Apply the add/remove button the operator pressed. At most one per submission."""
+def _apply_row_action(draft: dict[str, Any], form: FormData) -> dict[str, str]:
+    """Apply the add/remove button the operator pressed, and say which tab that lands on.
+
+    At most one per submission. The focus overrides whatever tab was posted: adding an instrument
+    must show the operator the instrument, not the tab they happened to press the button from.
+    """
     added = _field(form, "add")
     if added:
         add_row(draft, added)
+        return focus_for(added) | _selected_seat(draft, added)
     removed = _field(form, "remove")
     if removed:
         remove_row(draft, removed)
+        return focus_for(removed)
+    return {}
+
+
+def _selected_seat(draft: dict[str, Any], path: str) -> dict[str, str]:
+    """A seat just added is the seat the detail pane should be showing."""
+    prefix, _, tail = path.partition(".")
+    if tail != "seats" or prefix not in PANEL_PATHS:
+        return {}
+    seats = (draft.get(prefix) or {}).get("seats") or []
+    return {f"seat.{prefix}": str(len(seats) - 1)} if seats else {}
+
+
+async def _apply_lookup(
+    request: Request, draft: dict[str, Any], form: FormData
+) -> tuple[FieldError, ...]:
+    """Resolve one row's identifier against the venue and fill the rest of it in.
+
+    The button is convenience; `control/reference.py` is the guarantee. What it buys is that the
+    operator sees the venue's own numbers *before* publishing rather than a refusal afterwards —
+    and that `venue`, `asset_class` and both currencies come from the catalogue that answered
+    rather than from whoever typed the identifier (ADR 0025).
+
+    Failure semantics: a refusal is located on the row's symbol field in the venue's own words, and
+    nothing else in the draft is touched. An unreachable venue reads as itself, not as "not listed".
+    """
+    index = _field(form, "lookup")
+    rows = draft.get("instruments")
+    if not index.isdigit() or not isinstance(rows, list) or int(index) >= len(rows):
+        return ()
+    slot = int(index)
+    path = f"instruments[{slot}].symbol"
+    symbol = str((rows[slot] or {}).get("symbol", "")).strip()
+    try:
+        instrument = await instrument_of(state_of(request).application.catalogue, symbol)
+    except ConfigError as exc:
+        return (FieldError(field=path, message=str(exc)),)
+    except TradebotError as exc:
+        return (FieldError(field=path, message=f"the venue could not be reached: {exc}"),)
+    rows[slot] = draft_of(instrument)
+    return ()
 
 
 def _basket_record(request: Request, basket_id: str) -> Any:

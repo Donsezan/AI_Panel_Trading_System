@@ -19,6 +19,20 @@
   </div>
 {% endmacro %}
 
+{# Reference data, not operator input. A readonly input rather than plain text because the value
+   must still round-trip in the document — ADR 0013 pins the rules in the version a cycle ran on —
+   and because an operator copying a lot size out of the form is a thing that happens. Readonly is
+   not the guarantee: publish re-resolves against the venue (ADR 0025), which is why it does not
+   matter that devtools can still edit this. #}
+{% macro resolved(path, label, value, errors) %}
+  <div class="field resolved">
+    <label for="doc.{{ path }}">{{ label }}</label>
+    <input id="doc.{{ path }}" name="doc.{{ path }}" type="text" readonly
+           value="{{ value if value is not none else '' }}">
+    {{ _message(errors, path) }}
+  </div>
+{% endmacro %}
+
 {% macro choice(path, label, value, options, errors, hint="") %}
   <div class="field">
     <label for="doc.{{ path }}">{{ label }}</label>
