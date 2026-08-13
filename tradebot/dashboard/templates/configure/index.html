@@ -32,17 +32,4 @@
 </table>
 <p class="actions"><a class="button-link" href="/configure/baskets/new">New basket</a></p>
 
-<h2>Global (Tier-2) risk policy</h2>
-{% if policy %}
-  <p>
-    Version {{ policy.ref.version }}, published by {{ policy.actor }}.
-    <a href="/configure/risk">edit</a> ·
-    <a href="/configure/history/global_risk/global">history</a>
-  </p>
-{% else %}
-  <p class="empty danger">
-    No Tier-2 policy is published — nothing may run without global limits.
-    <a href="/configure/risk">publish one</a>.
-  </p>
-{% endif %}
 {% endblock %}
