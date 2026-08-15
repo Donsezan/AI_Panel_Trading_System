@@ -63,6 +63,13 @@ packages = ["tradebot"]
 line-length = 100
 target-version = "py311"
 src = ["tradebot", "tests"]
+# ruff formats Python inside Markdown, which is right for DESIGN.md and the ADRs: their snippets
+# are whole declarations and drift from the code if nobody checks them. Planning documents under
+# `docs/superpowers/` quote *fragments* — a method body, the middle of a function — which are
+# correct in the file they land in and are not valid stand-alone modules. Formatted as modules they
+# are rewritten into something that no longer says what it meant, so they are excluded rather than
+# reformatted.
+extend-exclude = ["docs/superpowers"]
 
 [tool.ruff.lint]
 select = [

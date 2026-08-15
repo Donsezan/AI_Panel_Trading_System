@@ -1,0 +1,12 @@
+# Vendored client assets are hash-pinned dependencies, not source (ADR 0014). Their SHA-384 is
+# recorded in three places — the ADR, the template's `integrity` attribute, and
+# `tests/unit/test_dashboard_static.py` — and CI fails if the bytes on disk stop matching.
+#
+# Git's `core.autocrlf` (on by default on Windows) rewrites line endings on checkout. That changes
+# the bytes, so the hash changes, so the pin fails on every Windows working copy and the `integrity`
+# attribute stops describing what is actually served. A supply-chain check that fails for a reason
+# unrelated to the supply chain is a check people learn to ignore.
+#
+# Add any newly vendored asset here.
+tradebot/dashboard/static/htmx.min.js -text
+tradebot/dashboard/static/lightweight-charts.standalone.production.js -text

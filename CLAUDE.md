@@ -207,6 +207,14 @@ and nowhere else. `Application.catalogue` is **not** optional:
   fail-useless: a pause, a quarantine toggle or a tightened stop touches no instrument, so it costs
   no venue call and survives an outage. An unreachable venue while an instrument *did* change is a
   refusal naming the venue — a basket whose rules cannot be checked is not one that gets stored.
+- **An unresolved row is refused by naming the act, not the fields** (`configure.ask_for_lookup`).
+  The venue-owned inputs are `readonly` and blank until **Look up** fills them, and `nest()` omits
+  empty values, so a new basket reaches the models as four `Field required` messages on `lot_size`,
+  `tick_size` and both currencies — a refusal that appears to ask for the one thing ADR 0025 exists
+  to prevent, on inputs the page will not let anyone type into. It is relocated onto the row's
+  identifier, the only field on it a human fills in. Presentation only, and only when *none* of
+  `VERIFIED_FIELDS` is present: a row carrying any venue-owned value keeps the models' own message,
+  so "the venue publishes 0.00100000" still reads as itself.
 - **Drift after publish scales with whether the cycles are evidence.** Startup and the supervisor's
   resync sweep re-verify everything; live and paper halt the affected *basket* (which alerts, via
   `BASKET_STATUS_CHANGED`), sim records one `RISK_EVENT` and runs on. Not because one is called

@@ -40,7 +40,7 @@ from starlette.datastructures import FormData
 from starlette.responses import Response
 
 from tradebot.control.config_store import SINGLETON_ID, ConfigStore
-from tradebot.control.reference import holders_of, store_basket
+from tradebot.control.reference import VERIFIED_FIELDS, holders_of, store_basket
 from tradebot.core.config import (
     Basket,
     GlobalRiskPolicy,
@@ -237,7 +237,11 @@ async def publish_basket(request: Request) -> Response:
     basket, errors = validate(Basket, draft)
     if basket is None:
         return _basket_form(
-            request, draft, existing=_version_field(form), errors=errors, ui=ui_of(form)
+            request,
+            draft,
+            existing=_version_field(form),
+            errors=ask_for_lookup(draft, errors),
+            ui=ui_of(form),
         )
 
     application = state_of(request).application
@@ -487,6 +491,47 @@ def drop_quarantine(draft: dict[str, Any]) -> dict[str, Any]:
         policy.pop("quarantined", None)
         policy.pop("quarantined_instruments", None)
     return draft
+
+
+#: What one unresolved instrument row is told, in place of the venue-owned fields it is missing.
+LOOKUP_REFUSAL = (
+    "this row has not been resolved: name the venue's own symbol and press Look up. An "
+    "instrument's trading rules are what the venue publishes and are never typed here (ADR 0025)"
+)
+
+
+def ask_for_lookup(draft: dict[str, Any], errors: tuple[FieldError, ...]) -> tuple[FieldError, ...]:
+    """Say "press Look up" rather than demand fields the operator is not allowed to type.
+
+    An instrument row is blank until it is resolved and `nest()` omits empty values, so a row that
+    was never looked up reaches the models as four missing fields and is refused — correctly — as
+    `lot_size — Field required`. That describes the document instead of the act, and the act it
+    appears to ask for is the one thing ADR 0025 exists to prevent: those inputs are `readonly`
+    precisely because a hand-typed `min_notional` sizes the risk layer against a floor the venue
+    never set. An operator reading it has no way forward that is not the wrong one.
+
+    Presentation only. The same document is refused by the same validator; this relocates the
+    refusal onto the row's identifier, which is the one field on it a human fills in. A row that
+    *was* resolved is untouched, so a rule the venue disagrees with still reads as itself
+    (`store_basket` is what checks that, and it is unaffected either way).
+
+    `VERIFIED_FIELDS` is shared with the verifier rather than restated here, so the form's notion
+    of "the venue answers for this" cannot drift from the set `store_basket` re-resolves.
+    """
+    rows = draft.get("instruments")
+    unresolved = tuple(
+        index
+        for index, row in enumerate(rows if isinstance(rows, list) else ())
+        # *None* of them present, not "some missing": a row carrying any venue-owned value has
+        # been filled in somehow, and then the models' own messages are the right answer —
+        # including "the venue publishes 0.00100000", which is the refusal ADR 0025 turns on.
+        if isinstance(row, dict) and not any(field in row for field in VERIFIED_FIELDS)
+    )
+    owned = {f"instruments[{index}].{field}" for index in unresolved for field in VERIFIED_FIELDS}
+    return tuple(
+        FieldError(field=f"instruments[{index}].symbol", message=LOOKUP_REFUSAL)
+        for index in unresolved
+    ) + tuple(error for error in errors if error.field not in owned)
 
 
 def blank_basket_draft(venue_id: str = "sim") -> dict[str, Any]:

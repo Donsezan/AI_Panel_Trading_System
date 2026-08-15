@@ -59,8 +59,8 @@ def flat(draft: dict[str, Any], prefix: str = "doc") -> list[tuple[str, str]]:
     return pairs
 
 
-def new_basket_form(*, lot_size: str) -> list[tuple[str, str]]:
-    """The blank new-basket form, filled in as an operator would — `lot_size` is theirs to type.
+def _typed_basket_draft() -> dict[str, Any]:
+    """The blank new-basket form with everything an operator may actually type filled in.
 
     `SOL/USDT` rather than `BTC/USDT`: the seeded demo basket holds BTC and ETH, and an instrument
     belongs to exactly one basket in service (ADR 0026).
@@ -70,12 +70,24 @@ def new_basket_form(*, lot_size: str) -> list[tuple[str, str]]:
     draft["name"] = "Alpha"
     draft["panel"]["panel_id"] = "alpha-panel"
     draft["timeframes"] = ["1h"]
+    draft["instruments"][0]["symbol"] = "SOL/USDT"
+    return draft
+
+
+def unresolved_basket_form() -> list[tuple[str, str]]:
+    """That form as a browser posts it, with the row still unresolved — no Look up was pressed.
+
+    The state every new basket starts in: the venue-owned fields are `readonly` and blank, so they
+    reach the server omitted (ADR 0025, and `forms.nest`).
+    """
+    return flat(_typed_basket_draft())
+
+
+def new_basket_form(*, lot_size: str) -> list[tuple[str, str]]:
+    """The same form with the trading rules *typed*, which is what ADR 0025 exists to catch."""
+    draft = _typed_basket_draft()
     draft["instruments"][0].update(
-        symbol="SOL/USDT",
-        base_currency="SOL",
-        quote_currency="USDT",
-        lot_size=lot_size,
-        tick_size="0.01",
+        base_currency="SOL", quote_currency="USDT", lot_size=lot_size, tick_size="0.01"
     )
     return flat(draft)
 
@@ -1026,6 +1038,82 @@ async def test_look_up_publishes_nothing(
     )
 
     assert sim_application.configs.latest(ConfigKind.BASKET, "demo").ref.version == 1  # type: ignore[union-attr]
+
+
+#: The row's inputs on the rendered page. Narrow on purpose: nine known names, so this reads what
+#: the page will *submit* rather than re-deriving it from the catalogue.
+RESOLVED_ROW = re.compile(r'name="(doc\.instruments\[0\]\.[a-z_]+)"[^>]*value="([^"]*)"')
+
+#: What a catalogue answers for, and therefore what Look up has to have filled in for a publish to
+#: be possible at all. Spelled out rather than imported so a field quietly dropped from
+#: `VERIFIED_FIELDS` fails here instead of agreeing with itself.
+VENUE_OWNED = {
+    "base_currency",
+    "quote_currency",
+    "lot_size",
+    "tick_size",
+    "min_qty",
+    "min_notional",
+}
+
+
+async def test_publishing_a_row_that_was_never_looked_up_asks_for_the_lookup(
+    sim_application: Application, client: httpx.AsyncClient
+) -> None:
+    """The refusal must name the act, not the fields — those inputs are readonly (ADR 0025).
+
+    A new basket starts with a blank instrument row, so this is the first thing every operator
+    creating one meets. It used to answer with four `Field required` messages naming `lot_size`
+    and `tick_size`, which asks for the one thing nobody may type and which the page will not let
+    them type anyway.
+    """
+    response = await client.post("/configure/baskets/alpha", data=as_form(unresolved_basket_form()))
+
+    assert response.status_code == 200
+    assert "press Look up" in response.text
+    assert "<code>instruments[0].lot_size</code>" not in response.text
+    assert "<code>instruments[0].base_currency</code>" not in response.text
+    assert {r.ref.config_id for r in sim_application.configs.baskets()} == {"demo"}
+
+
+async def test_an_unrelated_error_on_a_resolved_row_still_reads_as_itself(
+    client: httpx.AsyncClient,
+) -> None:
+    """The relocation is for unresolved rows only; a typed-and-wrong value must not be swallowed."""
+    body = (
+        await client.post(
+            "/configure/baskets/alpha", data=as_form(new_basket_form(lot_size="0,001"))
+        )
+    ).text
+
+    assert "not a valid decimal amount" in body
+    assert "press Look up" not in body
+
+
+async def test_looking_up_then_publishing_creates_the_basket(
+    sim_application: Application, client: httpx.AsyncClient
+) -> None:
+    """The whole operator journey, which nothing covered end to end: name it, resolve it, publish.
+
+    The row is rebuilt from what the *rendered* page carries rather than from the catalogue, so
+    this fails if Look up resolves a field the form then does not submit. Both halves have to agree
+    or a basket cannot be created from the GUI at all — the one thing `test_every_document_field_
+    is_still_submitted` cannot say, because it starts from a basket that is already stored.
+    """
+    typed = unresolved_basket_form()
+    body = (
+        await client.post("/configure/baskets/alpha/draft", data=as_form([*typed, ("lookup", "0")]))
+    ).text
+    resolved = RESOLVED_ROW.findall(body)
+    assert {name.rsplit(".", 1)[-1] for name, _ in resolved} >= VENUE_OWNED
+
+    kept = [(key, value) for key, value in typed if not key.startswith("doc.instruments[0].")]
+    response = await client.post("/configure/baskets/alpha", data=as_form([*kept, *resolved]))
+
+    assert response.status_code == 303
+    record = sim_application.configs.latest(ConfigKind.BASKET, "alpha")
+    assert record is not None
+    assert record.document.instruments[0].lot_size == Decimal("0.001")  # sim's own SOL/USDT rule
 
 
 async def test_the_instruments_pane_states_where_the_rules_came_from(
