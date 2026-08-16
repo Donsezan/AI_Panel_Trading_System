@@ -177,6 +177,8 @@ class StartupSequence:
 
         if not failures and first_run:
             await self._arm_first_run()
+        elif not failures:
+            await self._announce_valuation_basis()
 
         recovery = Recovery(
             state=self._states.load(),
@@ -335,6 +337,50 @@ class StartupSequence:
         if state.kill_switch is KillSwitchState.ARMED:
             return state
         return await self._watchdog.rearm(self._equity(), actor="first_run")
+
+    async def _announce_valuation_basis(self) -> RiskState | None:
+        """Say what the stored high-water mark is now being compared against.
+
+        The mark in an existing database was recorded on **cost basis**, because that is all the
+        old equity function could compute. Mark-to-market equity is a different number, and any
+        open unrealized loss now shows as drawdown against it — correctly, and possibly for the
+        first time (PHASE_12 §3.9).
+
+        This records the two figures and changes nothing. There is deliberately **no automatic
+        re-baseline**: resetting the mark here would silently forgive whatever loss happened to be
+        open at the moment of the upgrade, which is precisely the laundering `record_flow` refuses
+        to do, arriving through a migration instead of through a flow. If the difference trips the
+        switch, that is a real loss, and the operator clears it with the typed `risk rearm` — the
+        mechanism that already exists for exactly this decision (ADR 0027, decision D3).
+
+        Emitted whenever the two differ, not once: it is derived from the log rather than from a
+        flag column, and an operator restarting mid-incident should see the current comparison
+        rather than one from a start they may not have been watching.
+        """
+        state = self._states.load()
+        valuation = self._portfolio.valuation() if self._portfolio is not None else None
+        if valuation is None or valuation.frozen or state.high_water_mark <= ZERO:
+            return None
+        if valuation.equity == state.high_water_mark:
+            return None
+        drawdown = state.drawdown_pct(valuation.equity)
+        detail = (
+            f"the stored high-water mark {state.high_water_mark} was recorded on cost basis; "
+            f"mark-to-market equity is {valuation.equity}, a drawdown of {drawdown}%. "
+            "No baseline has been changed. If this trips the switch it is an unrealized loss that "
+            "was previously invisible, and clearing it is a human decision (`tradebot risk rearm`)"
+        )
+        await self._store.append(
+            EventFactory(clock=self._clock, basket_id="global", cycle_id="startup").risk_event(
+                tier=RiskTier.TIER2,
+                rule="valuation_basis",
+                scope="portfolio",
+                action="recorded",
+                detail=detail,
+            )
+        )
+        logger.warning("portfolio valuation basis", extra={"detail": detail})
+        return state
 
     def _equity(self) -> Decimal:
         """Mark-to-market equity, or zero when nothing can value the portfolio.

@@ -326,3 +326,27 @@ class TestTheOperatorIsTold:
             assert [action for _, action, _ in frozen] == ["frozen", "thawed"]
         finally:
             harness.close()
+
+    async def test_the_valuation_basis_change_is_announced_and_changes_nothing(
+        self, basket: Basket, clock: ManualClock, market_data: ReplayMarketData
+    ) -> None:
+        """D3: no silent re-baseline. The operator is told, and decides (ADR 0027)."""
+        harness = await make_harness(basket, clock, market_data, [DEFAULT_RESPONSE] * 2)
+        try:
+            # Through a real cycle, so the fill is in the log: `recover` replays the ledger from
+            # the log, and a position applied directly would not survive it.
+            await harness.runner.run_once()
+            assert not harness.ledger.position(basket.instruments[0].key).is_flat
+            mark(harness, basket, "25000")
+            before = harness.states.load()
+
+            await harness.startup.recover()
+
+            after = harness.states.load()
+            assert after.high_water_mark == before.high_water_mark, "no silent re-baseline"
+            assert after.day_start_equity == before.day_start_equity
+            recorded = [e for e in harness.risk_events() if e[0] == "valuation_basis"]
+            assert len(recorded) == 1
+            assert "cost basis" in recorded[0][2]
+        finally:
+            harness.close()

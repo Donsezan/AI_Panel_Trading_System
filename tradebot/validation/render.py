@@ -65,10 +65,35 @@ def promotion_markdown(report: PromotionReport) -> str:
             if report.passed
             else "The failures above must be resolved and the soak continued."
         ),
+        _valuation_basis(),
         _sign_off(),
         *_evidence_sections(report.evidence),
     ]
     return "\n\n".join(sections) + "\n"
+
+
+def _valuation_basis() -> str:
+    """The boundary the drawdown gate changed across (ADR 0027, PHASE_12 decision D4).
+
+    Printed on every promotion report rather than only where it applies. Whether a given soak spans
+    the change is a fact about *this database*, and the operator is the one who knows it; a report
+    that silently omitted the question would let the decision pass as an oversight instead of a
+    decision, which is the whole reason this section exists.
+    """
+    return (
+        "## Valuation basis\n\n"
+        "Portfolio equity became **mark-to-market** in ADR 0027. Before it, the drawdown kill "
+        "switch measured the *cost basis* and could not see unrealized loss at all — a portfolio "
+        "that had halved reported 0% drawdown.\n\n"
+        "Cycles gathered before that change therefore ran under a drawdown limit that was not "
+        "enforcing what it claims. Search this mode's log for the `valuation_basis` risk event to "
+        "find where the change landed:\n\n"
+        "```powershell\n"
+        ".venv\\Scripts\\python.exe -m tradebot config history basket demo --mode paper\n"
+        "```\n\n"
+        "**Whether the earlier cycles still count is a decision, not a detail.** Record it on the "
+        "sign-off below."
+    )
 
 
 def backtest_markdown(report: BacktestReport) -> str:

@@ -418,34 +418,64 @@ see below. What otherwise remains is not code: the paper soak (weeks of
 `tradebot run --mode paper`, measured with `report promotion`) and then a human's decision to arm
 live, following [docs/OPERATIONS.md](docs/OPERATIONS.md). **Live ships disarmed and I never arm it.**
 
-### Phase 12 — one portfolio, valued in one notional currency (planned, nothing built)
+### Phase 12 — one portfolio, valued in one notional currency
 
 Planned in [docs/PHASE_12_PORTFOLIO_VALUATION_AND_MIXED_ASSETS.md](docs/PHASE_12_PORTFOLIO_VALUATION_AND_MIXED_ASSETS.md);
-two pieces, six slices. **Piece 1 is a live defect fix, not a feature, and blocks Piece 2.**
+two pieces. **Piece 1 has shipped** ([ADR 0027](docs/adr/0027-portfolio-equity-is-mark-to-market-in-one-notional-currency.md));
+it was a live defect fix, not a feature, and it blocked Piece 2. **Piece 2 — mixed crypto+equity
+baskets — is not built.**
 
-**Portfolio equity is computed on cost basis, not mark-to-market, so the drawdown kill switch
-cannot see unrealized loss.** `BasketRunner._equity()` passes `{key: avg_entry}` to `Ledger.equity`,
-whose own fallback is `avg_entry` — so the result is the cost basis by construction, and
-`basket_runner.py:181` is the *only* `Watchdog.check` call site in the system. A position that has
-halved contributes its full cost; drawdown reads 0%. DESIGN §6.6 says these baselines are
-"computed on mark-to-market equity", and the correct marks are built eleven lines further down in
-`_build_proposal` — after the gate has already run. Three defects travel with it: equity is
-basket-dependent (the marks map covers only the cycling basket's instruments while the ledger
-iterates every position), non-quote cash is worth zero (1,000 USDT + 9,000 USDC values at 1,000),
-and `record_flow` drops the currency off an `ExternalFlow`, so a stablecoin deposit raises the
-high-water mark while contributing nothing to equity — a guaranteed spurious kill-switch trip.
+**Portfolio equity is mark-to-market, and one function answers it.** `risk.aggregate.aggregate` is
+that function; `Ledger.equity` no longer exists. The ledger knows what is held, never what it is
+worth. Equity is cash valued in the notional currency plus each position at its current mark, read
+from `ledger.marks.Marks` — a shared cache written by every cycle's snapshot, the supervisor's
+sweep, startup and a manual close. Six call sites each building their own price map out of
+`avg_entry` is how the drawdown kill switch came to measure the cost basis and report 0% on a
+portfolio that had halved.
 
-Until Piece 1 lands: **the drawdown gate measures realized losses only**, so soak cycles counted
-by `report promotion` were gathered under a limit that was not enforcing what it claims. Do not
-build new valuation call sites on `Ledger.equity` in the meantime — the fix collapses them into one.
+Six rules that are easy to get backwards:
 
-**A mixed crypto+equity basket cannot run, and is refused in four places**, all fail-closed:
-`app._quote_currency` (one quote currency per process), one `VenueStack`/`Ledger`/`ExecutionService`
-per process, `reference._findings_for_one` (an instrument whose venue is not the wired catalogue's),
-and `_alpaca_stack` (no equity market-data provider exists, and its catalogue is
-`UnavailableCatalogue`). The *domain* model is ready — `asset_class`, `venue:symbol` keys, an
-`equities` correlation cluster, and `risk/aggregate.py` already taking `Mapping[str, Ledger]` and
-emitting a `VenueSlice` per venue. It was built for N venues and is only ever called with one.
+- **A stale mark is not a mark.** `price_of` returns `None` for absent *or* older than
+  `mark_staleness_seconds`, and there is no third outcome. The fallback is a **freeze**, never cost.
+  Valuing a position at what it cost is not conservative — it is differently wrong, in whichever
+  direction the market moved. `test_valuation_boundary.py` asserts structurally that no module in
+  `ledger/`, `risk/` or `control/` reintroduces it, the way `test_dashboard_chart.py` guards floats.
+- **Freezing blocks new orders; it does not trip the kill switch.** The switch is for breaches, and
+  a freeze is ignorance. Nothing is tripped, no baseline moves, no state is written, and it clears
+  itself when marks return. A freeze spanning midnight leaves `day_start_equity` at yesterday's —
+  the conservative direction, chosen rather than incidental. **It never blocks a reduce-only
+  operator exit**, by construction: every rule reading `equity` or `basket_budget` already stands
+  aside on `SELL` (ADR 0015).
+- **A base asset is a position, not cash.** `value_cash`'s rungs are ordered, and rung 3 (a
+  configured instrument's base asset → zero) must precede rung 4 (mark it against its own market),
+  or every spot holding is counted twice. A *zero* balance in an unvaluable currency does not
+  freeze: dust already converted away is not a reason to stop a live account trading.
+- **A portfolio-wide limit reads the configured universe, never one basket's instruments.** Gross
+  exposure, per-instrument exposure and cluster membership all take the universe; only
+  `basket_exposure` stays basket-scoped. With one basket in service the two are equal, which is why
+  `max_gross_exposure` silently omitted every sibling basket's positions for so long.
+- **The sweep runs in two places and both are needed.** `BasketWorker.cycle` refreshes marks before
+  the gate — the gate runs *before* the snapshot, so it cannot get them from the cycle, and every
+  path that cycles goes through the worker. The supervisor's resync tick marks the positions of
+  baskets that are **not** cycling; without it, pausing a basket that holds a position would freeze
+  the whole portfolio and block every other basket. It reads `read_only_prices`, never `prices`:
+  the sim stack's bridge would match resting orders, and a valuation sweep must never move the
+  venue.
+- **The valuation basis change is announced, never absorbed.** A high-water mark stored by an
+  earlier version was recorded on cost basis. Startup records one `RISK_EVENT` naming both figures
+  and changes nothing — an automatic re-baseline would silently forgive whatever unrealized loss
+  was open at the moment of the upgrade. If it trips, that is a real loss, cleared by the typed
+  `risk rearm`.
+
+**Soak evidence gathered before Piece 1 landed ran under a drawdown gate that could not see
+unrealized loss.** Whether those cycles still count is the operator's call, but it is a call.
+
+**Piece 2 is still refused in four places**, all fail-closed: `app._quote_currency` (one quote
+currency per process), one `VenueStack`/`Ledger`/`ExecutionService` per process,
+`reference._findings_for_one`, and `_alpaca_stack` (no equity market-data provider exists). The
+domain model is ready — `asset_class`, `venue:symbol` keys, an `equities` cluster, and `aggregate`
+already taking `Mapping[str, Ledger]` and emitting a `VenueSlice` per venue. It was built for N
+venues and is only ever called with one.
 
 Phases 0–6: guardrails and money primitives, the sim-only walking skeleton, the
 deterministic shell to full depth (order lifecycle with venue-held protective groups, the
