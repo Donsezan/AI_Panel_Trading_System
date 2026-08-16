@@ -208,6 +208,27 @@ faster than its feed publishes is **refused at wiring, naming both numbers**.
 `feed` is a constructor parameter, so moving to real-time SIP after a subscription is a wiring
 change rather than a rewrite, and `delay` moves with it.
 
+**A delayed feed has three consequences, and two of them are refusals at wiring.** Found while
+grounding the implementation plan, and each is the same hazard wearing a different hat — a system
+that would appear to work while deciding nothing:
+
+- **The mark staleness tolerance must exceed the delay.** A quote from this feed carries an
+  `observed_at` at least fifteen minutes in the past, truthfully. But
+  `GlobalRiskPolicy.mark_staleness_seconds` defaults to **300**, so `Marks.price_of` would return
+  `None` for every equity mark, `aggregate` would freeze on every evaluation, and every cycle would
+  record `BLOCKED` — for a portfolio that is entirely healthy, with nothing in the log naming the
+  cause. `PortfolioWatch` already refuses a tolerance below `3 ×` the sweep cadence for exactly this
+  reason; it gains the sibling clause against the provider's declared delay. An equity basket
+  therefore needs `mark_staleness_seconds ≥ 1200`.
+- **A basket cannot cycle faster than its feed publishes**, which `_assert_feed_keeps_up` already
+  enforces — this is that existing check finally having a venue that exercises it.
+- **There is no live spread.** `fetch_top_of_book` derives from the newest closed bar, so
+  `bid == ask == last`. Alpaca's latest-quote and latest-trade endpoints are real-time by
+  definition and therefore forbidden on this plan; the alternative — a real-time IEX quote beside
+  delayed SIP bars — would put two different views of the market into one decision. **Real-time
+  SIP is therefore a precondition for live equity trading**, discovered here rather than in
+  Stage D.
+
 ### 3.6 Sessions are tagged
 
 Equity bars carry `MarketSession.REGULAR` or `EXTENDED` rather than `CONTINUOUS`, so
@@ -252,6 +273,10 @@ widening the protocol would touch Binance and sim for a case nobody has yet.
 - **A stale feed is honest; an unrepresentative one is not.** 15-minute-old consolidated prices are
   a declared limitation the system already enforces against. Real-time IEX quotes carry no marker
   at all and would be trusted exactly as Binance's are.
+- **A tolerance shorter than the delay is a permanent freeze, not a tight limit.** Every mark is
+  stale the moment it arrives, so a healthy portfolio blocks every cycle and no event says why.
+  This is the sweep-cadence hazard arriving through the other door, and it is refused in the same
+  place, for the same reason: at wiring, not at 03:00.
 - **A venue that publishes no rule is not a venue with permissive rules.** An asset outside
   `MAJOR_EXCHANGES`, inactive, non-tradable, or not `us_equity` is simply **not listed** by the
   catalogue, so `resolve` refuses it in the venue's own terms through the existing `ConfigError`
@@ -322,15 +347,22 @@ In addition to the standing per-module DoD in
    2026 review date beside them.
 4. **No float exists on the Alpaca data path**, proven by test, and `loads_exact` is shared rather
    than reimplemented.
-5. **`adjustment=all` and `feed=sip` are asserted on the wire**, not assumed from a default.
-6. **Both contract suites run against `AlpacaGateway`** and pass exactly as for the fake.
-7. **The venue boundary holds**: only `tradebot.app` imports the Alpaca modules, enforced by test.
-8. **An ADR records the amendment to ADR 0025** — derived market-structure rules where a venue
+5. **`adjustment=all`, `feed=sip` and `sort=desc` are asserted on the wire**, not assumed from a
+   default. `sort` belongs here: with `sort=asc` and no `start`, Alpaca returns the *oldest* bars of
+   available history, so every series would open in 2016 and abort as `DATA_STALE`.
+6. **The provider contract suite runs against `AlpacaGateway`**, and the catalogue suite carries an
+   equity class proving an equity venue's answers travel through the shared resolution semantics
+   intact. The shared catalogue cases stay Binance-shaped deliberately: `VenueCatalogue` is the
+   same class for both, so parameterizing them would re-test shared code with different data.
+7. **A mark tolerance below the feed's declared delay is refused at wiring**, beside the existing
+   sweep-cadence refusal, and the message names both numbers and the remedy.
+8. **The venue boundary holds**: only `tradebot.app` imports the Alpaca modules, enforced by test.
+9. **An ADR records the amendment to ADR 0025** — derived market-structure rules where a venue
    publishes none — with its review date.
-9. **CLAUDE.md gains the Stage A rules** from [§4](#4-rules-that-are-easy-to-get-backwards).
-10. **DESIGN §6.2 states the equity feed's declared delay**, and §8.1 keeps its existing
+10. **CLAUDE.md gains the Stage A rules** from [§4](#4-rules-that-are-easy-to-get-backwards).
+11. **DESIGN §6.2 states the equity feed's declared delay**, and §8.1 keeps its existing
     `DATA_STALE` row (no new row is needed — a delayed feed is refused at wiring, not at runtime).
-11. `.\check.ps1` clean; coverage gates hold.
+12. `.\check.ps1` clean; coverage gates hold.
 
 ## 7. What Stage A deliberately does not do
 
