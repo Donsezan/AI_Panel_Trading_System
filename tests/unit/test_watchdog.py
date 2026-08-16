@@ -9,6 +9,7 @@ Three properties are load-bearing and each is tested directly:
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from decimal import Decimal
 
@@ -281,3 +282,24 @@ class TestBaselineEdges:
         )
 
         assert state.drawdown_pct(Decimal("12000")) == Decimal(0)
+
+
+class TestConcurrency:
+    async def test_concurrent_checks_do_not_lose_a_high_water_raise(
+        self, watchdog: Watchdog, states: RiskStateStore
+    ) -> None:
+        """Load-compare-save from N basket tasks plus the sweep.
+
+        `SingleWriter` serializes the *write*; it does not make read-compare-write atomic, so two
+        cycles raising the mark could each read the old value and the higher one be lost. The
+        sweep added an N+1th caller on a fixed cadence and made the interleaving routine rather
+        than incidental — and the row this guards is the kill switch (PHASE_12 §3.8).
+        """
+        await armed(watchdog)
+
+        # Descending, deliberately. Ascending passes even unlocked: each caller reads the stale
+        # mark, but the highest happens to write last, so the right answer survives by luck of
+        # scheduling. Descending makes the *lowest* write last, which is exactly the lost update.
+        await asyncio.gather(*(watchdog.check(valued(str(10_000 + n))) for n in range(20, 0, -1)))
+
+        assert states.load().high_water_mark == Decimal(10_020)

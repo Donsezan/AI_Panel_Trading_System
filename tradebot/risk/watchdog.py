@@ -24,6 +24,7 @@ if it cannot compute a baseline it leaves the system as it found it rather than 
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Iterable
 from dataclasses import dataclass
 from decimal import Decimal
@@ -90,6 +91,8 @@ class Watchdog:
         self._notional_currency = notional_currency
         #: Refreshed through `use_universe`, never captured here.
         self._position_currencies: frozenset[str] = frozenset()
+        #: Serializes every read-modify-write of the `risk_state` row. See `check`.
+        self._lock = asyncio.Lock()
         #: Whose "day" the daily-loss baseline rolls over on. Absent means the UTC date, which is
         #: correct for crypto and wrong for equities: a US session ends at 20:00 UTC and its
         #: after-hours prints land the next UTC day, so a UTC rollover would reset the baseline
@@ -110,7 +113,19 @@ class Watchdog:
         return EventFactory(clock=self._clock, basket_id="global", cycle_id="watchdog")
 
     async def check(self, valuation: PortfolioAggregate) -> WatchdogVerdict:
-        """Evaluate the drawdown and daily-loss baselines against current equity.
+        """Evaluate the baselines against current equity, serialized against every other writer.
+
+        The lock is load-bearing rather than defensive. Every mutator here is read-modify-write
+        over one `risk_state` row, and `SingleWriter` serializes only the *write* — so two baskets
+        raising the high-water mark, or the sweep racing a cycle, could each read the old value and
+        the higher one be lost. The row holds the kill switch and the drawdown baselines, so a lost
+        update there is a limit that silently stopped being enforced (PHASE_12 §3.8).
+        """
+        async with self._lock:
+            return await self._check(valuation)
+
+    async def _check(self, valuation: PortfolioAggregate) -> WatchdogVerdict:
+        """The evaluation itself. Called with the lock held, so it may not re-acquire it.
 
         A **frozen** valuation is ignorance, not a breach: nothing is tripped, no baseline moves,
         and no state is written — but no new order may be sent either. Rolling the day or raising
@@ -138,7 +153,7 @@ class Watchdog:
                 f"{state.high_water_mark}, limit {self._policy.max_drawdown_pct}%"
             )
             return WatchdogVerdict(
-                state=await self.trip(DRAWDOWN_RULE, detail), tripped=True, reason=detail
+                state=await self._trip(DRAWDOWN_RULE, detail), tripped=True, reason=detail
             )
 
         daily_loss = state.daily_loss_pct(equity)
@@ -162,6 +177,11 @@ class Watchdog:
 
     async def trip(self, rule: str, detail: str) -> RiskState:
         """Stop everything. Idempotent — tripping an already-tripped switch changes nothing."""
+        async with self._lock:
+            return await self._trip(rule, detail)
+
+    async def _trip(self, rule: str, detail: str) -> RiskState:
+        """The trip itself. Called with the lock held — `_check` reaches it directly."""
         state = self._states.load()
         if not state.may_trade:
             return state
@@ -191,6 +211,10 @@ class Watchdog:
         has looked at what happened and accepts the current equity as the new starting point.
         Keeping the old mark would trip the switch again on the next sweep.
         """
+        async with self._lock:
+            return await self._rearm(equity, actor=actor)
+
+    async def _rearm(self, equity: Decimal, *, actor: str) -> RiskState:
         state = await self._states.save(
             RiskState(
                 kill_switch=KillSwitchState.ARMED,
@@ -251,6 +275,10 @@ class Watchdog:
         value refuses: a baseline adjusted by a number in the wrong unit is worse than no
         adjustment, and the caller turns the refusal into a halted process.
         """
+        async with self._lock:
+            return await self._record_flow(flow)
+
+    async def _record_flow(self, flow: ExternalFlow) -> RiskState:
         amount = value_cash(
             flow.currency,
             flow.amount,
