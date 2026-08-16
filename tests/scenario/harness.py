@@ -26,6 +26,7 @@ from tradebot.execution.monitor import ExecutionMonitor
 from tradebot.execution.service import ExecutionService
 from tradebot.interfaces.market_data import MarketDataProvider
 from tradebot.ledger.history import HistoryReader
+from tradebot.ledger.marks import Marks
 from tradebot.ledger.portfolio import Ledger
 from tradebot.ledger.reconciler import Reconciler
 from tradebot.persistence.database import SingleWriter, create_database
@@ -109,6 +110,8 @@ class Harness:
             clock,
             instruments=basket.instruments,
         )
+        #: The process-wide price cache. One basket here, so the harness *is* the universe.
+        self.marks = Marks()
         self.runner = BasketRunner(
             basket,
             mode=Mode.SIM,
@@ -124,6 +127,8 @@ class Harness:
             store=self.store,
             clock=clock,
             venue=self.broker.venue_id,
+            marks=self.marks,
+            universe=lambda: basket.instruments,
             global_policy=self.policy,
         )
 

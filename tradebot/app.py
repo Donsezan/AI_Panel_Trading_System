@@ -55,7 +55,7 @@ from tradebot.control.live import EffectivePolicy, effective_policy
 from tradebot.control.manual_close import ManualCloser
 from tradebot.control.preflight import VenuePreflight
 from tradebot.control.readiness import LiveReadiness
-from tradebot.control.reference import DriftWatch
+from tradebot.control.reference import DriftWatch, configured_instruments
 from tradebot.control.scheduler import Scheduler
 from tradebot.control.startup import Recovery, StartupSequence
 from tradebot.control.supervisor import Supervisor
@@ -99,6 +99,7 @@ from tradebot.interfaces.llm import LLMProvider
 from tradebot.interfaces.market_data import MarketDataProvider
 from tradebot.interfaces.news import NewsFeed
 from tradebot.ledger.history import HistoryReader
+from tradebot.ledger.marks import Marks
 from tradebot.ledger.portfolio import Ledger
 from tradebot.ledger.reconciler import Reconciler
 from tradebot.marketdata.binance import BinanceSpotGateway
@@ -652,6 +653,7 @@ class RunnerBuilder:
         history: HistoryReader,
         news_feed: NewsFeed | None,
         quote_currency: str,
+        marks: Marks,
     ) -> None:
         self._clock = clock
         self._mode = mode
@@ -666,6 +668,8 @@ class RunnerBuilder:
         self._history = history
         self._news_feed = news_feed
         self._quote_currency = quote_currency
+        #: One cache for the whole process, shared by every runner and the supervisor's sweep.
+        self._marks = marks
         self._pools: dict[str, ProviderPool] = {}
 
     def calendar_for(self, basket: Basket) -> TradingCalendar:  # noqa: ARG002 — one venue in v1
@@ -708,6 +712,8 @@ class RunnerBuilder:
             store=self._store,
             clock=self._clock,
             venue=self._stack.broker.venue_id,
+            marks=self._marks,
+            universe=lambda: configured_instruments(self._configs),
             global_policy=policy,
             config_refs=(record.ref, policy_record.ref),
             quote_currency=self._quote_currency,
@@ -904,6 +910,11 @@ async def _assemble(
         announcements=stack.announcements,
     )
 
+    # One price cache for the process. Shared like the ledger and for the same reason: equity is a
+    # property of the portfolio, not of a basket, so basket A's cycle must refresh the mark basket
+    # B is valued against (DESIGN §4, PHASE_12 Finding 2).
+    marks = Marks()
+
     drift = DriftWatch(stack.catalogue, configs, watchdog, states, store, clock, mode=mode)
     builder = RunnerBuilder(
         clock=clock,
@@ -919,6 +930,7 @@ async def _assemble(
         history=history,
         news_feed=news_feed,
         quote_currency=quote_currency,
+        marks=marks,
     )
     return Application(
         mode=mode,

@@ -39,7 +39,7 @@ from tradebot.core.logging import correlate, get_logger
 from tradebot.core.market import Quote
 from tradebot.core.money import ZERO, multiply, percent_of
 from tradebot.core.orders import Order
-from tradebot.core.schema import DomainModel
+from tradebot.core.schema import DomainModel, UtcDatetime
 from tradebot.core.snapshot import ContextSnapshot
 from tradebot.decision.engine import DecisionEngine
 from tradebot.decision.shadow import ShadowEvaluator
@@ -47,9 +47,10 @@ from tradebot.execution.monitor import ExecutionMonitor
 from tradebot.execution.service import ExecutionService
 from tradebot.interfaces.risk import RiskProposal
 from tradebot.ledger.history import HistoryReader
+from tradebot.ledger.marks import Marks
 from tradebot.ledger.portfolio import Ledger
 from tradebot.persistence.store import EventStore
-from tradebot.risk.aggregate import aggregate
+from tradebot.risk.aggregate import PortfolioAggregate, aggregate
 from tradebot.risk.rules import AUTO_PAUSE_RULE
 from tradebot.risk.tier1 import RiskOutcome, Tier1RiskEngine, basket_budget
 from tradebot.risk.tier2 import Tier2RiskEngine
@@ -114,6 +115,8 @@ class BasketRunner:
         store: EventStore,
         clock: Clock,
         venue: str,
+        marks: Marks,
+        universe: Callable[[], tuple[Instrument, ...]],
         global_policy: GlobalRiskPolicy | None = None,
         config_refs: tuple[ConfigRef, ...] = (),
         quote_currency: str = "USDT",
@@ -137,6 +140,12 @@ class BasketRunner:
         #: promotion report can tell the evidence base from an adapter integration check that
         #: shares the same database (DESIGN §9).
         self._venue = venue
+        #: Shared with every other basket and with the supervisor's sweep. Written from this
+        #: cycle's snapshot, read by the valuation — a cache, never an authority (ADR 0027).
+        self._marks = marks
+        #: Every configured instrument, read fresh at each use because a basket published while
+        #: the process runs changes it.
+        self._universe = universe
         self._policy = global_policy or GlobalRiskPolicy()
         #: The configuration versions this runner was built from, recorded on every cycle it
         #: starts so a past decision is re-read against the limits that produced it (DESIGN §6.1).
@@ -195,6 +204,11 @@ class BasketRunner:
     async def _run(self, cycle_id: str, events: EventFactory) -> CycleResult:
         snapshot = await self._context.build(self._basket)
         await self._store.append(events.snapshot_frozen(snapshot))
+        # Every basket writes the marks every basket is valued against, from quotes this cycle has
+        # already paid for. That is what makes portfolio equity one number rather than one per
+        # basket, each blind to the others' holdings (PHASE_12 Finding 2).
+        for context in snapshot.instruments:
+            self._marks.observe_quote(context.quote)
         if self._basket.risk_policy.quarantined:
             return await self._finish(
                 cycle_id, events, CycleOutcome.QUARANTINED, detail=QUARANTINED
@@ -307,22 +321,31 @@ class BasketRunner:
             )
             await self._watchdog.halt_basket(self._basket.basket_id, blocking.detail)
 
+    def _valuation(self, as_of: UtcDatetime) -> PortfolioAggregate:
+        """What the portfolio is worth, over the whole configured universe.
+
+        The universe rather than this basket's instruments: gross exposure, per-instrument
+        exposure and a cluster's membership are all portfolio-wide questions, and answering them
+        from one basket's slice made Tier-2 blind to its siblings (PHASE_12 Finding 6).
+        """
+        return aggregate(
+            {self._venue: self._ledger},
+            self._universe(),
+            self._marks,
+            self._policy,
+            as_of=as_of,
+            notional_currency=self._quote_currency,
+        )
+
     def _build_proposal(
         self, snapshot: ContextSnapshot, instrument: Instrument, decision: Decision
     ) -> RiskProposal:
         context = snapshot.context_for(instrument.key)
         atr = context.indicator("ATR", self._risk_timeframe)
         prices = {i.instrument.key: i.quote.last for i in snapshot.instruments}
-        equity = self._ledger.equity(prices, quote_currency=self._quote_currency)
-        summary = aggregate(
-            {instrument.venue: self._ledger},
-            self._basket.instruments,
-            prices,
-            self._policy,
-            as_of=snapshot.as_of,
-            quote_currency=self._quote_currency,
-        )
-        cluster = self._policy.cluster_members(instrument, self._basket.instruments)
+        summary = self._valuation(snapshot.as_of)
+        equity = summary.equity
+        cluster = self._policy.cluster_members(instrument, self._universe())
         return RiskProposal(
             decision=decision,
             instrument=instrument,

@@ -121,6 +121,26 @@ def holders_of(records: Sequence[ConfigRecord[Basket]]) -> dict[str, tuple[str, 
     return held
 
 
+def configured_instruments(configs: ConfigStore) -> tuple[Instrument, ...]:
+    """Every instrument any basket in service may trade, deduplicated — the *universe*.
+
+    The set every portfolio-wide question is answered over: gross exposure, per-instrument
+    exposure, a correlation cluster's membership, and which currencies are already held as
+    positions. Answering those from one basket's instruments is what let `max_gross_exposure` omit
+    every sibling basket's positions while its rule claimed to span all of them (PHASE_12
+    Finding 6).
+
+    Read fresh rather than held: a basket published while the process runs changes it, and a set
+    captured at boot is the same defect ADR 0021 fixed for the Tier-2 cap. `ConfigStore.baskets()`
+    already excludes retired documents — but note that a *paused* basket is still in service and
+    still holds positions, so its instruments stay in the universe.
+    """
+    seen: dict[str, Instrument] = {}
+    for record in configs.baskets():
+        seen.update({instrument.key: instrument for instrument in record.document.instruments})
+    return tuple(seen.values())
+
+
 def exclusive_findings(
     records: Sequence[ConfigRecord[Basket]], basket_id: str, edited: Sequence[Instrument]
 ) -> tuple[str, ...]:
