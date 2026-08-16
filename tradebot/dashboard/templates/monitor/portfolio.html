@@ -7,7 +7,7 @@
 <section class="figures">
   <div class="figure">
     <span class="label">Equity, mark-to-market ({{ quote_currency }})</span>
-    <span class="value">{{ equity | money }}</span>
+    <span class="value">{% if valuation.frozen %}unknown{% else %}{{ valuation.equity | money }}{% endif %}</span>
   </div>
   <div class="figure">
     <span class="label">Closed round trips</span>

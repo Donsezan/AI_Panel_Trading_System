@@ -58,7 +58,8 @@ from tradebot.control.readiness import LiveReadiness
 from tradebot.control.reference import DriftWatch, configured_instruments
 from tradebot.control.scheduler import Scheduler
 from tradebot.control.startup import Recovery, StartupSequence
-from tradebot.control.supervisor import Supervisor
+from tradebot.control.supervisor import DEFAULT_RESYNC_SECONDS, Supervisor
+from tradebot.control.valuation import PortfolioWatch
 from tradebot.core.clock import Clock, SystemClock
 from tradebot.core.config import (
     Basket,
@@ -124,6 +125,7 @@ from tradebot.ops.dispatcher import AlertDispatcher
 from tradebot.ops.sinks import build_sinks
 from tradebot.persistence.database import SingleWriter, create_database
 from tradebot.persistence.store import EventStore
+from tradebot.risk.aggregate import PortfolioAggregate, aggregate
 from tradebot.risk.state import RiskStateStore
 from tradebot.risk.tier1 import Tier1RiskEngine
 from tradebot.risk.tier2 import Tier2RiskEngine
@@ -190,6 +192,13 @@ class Application:
     #: in a comment (ADR 0025). A venue that cannot answer refuses when asked, and is still one.
     catalogue: InstrumentCatalogue
     quote_currency: str
+    #: The process-wide price cache every valuation reads. Shared like the ledger, and for the same
+    #: reason: equity is a property of the portfolio, not of a basket (DESIGN §4, ADR 0027).
+    marks: Marks
+    #: Refreshes `marks` for every held instrument and measures drawdown between cycles. Exposed
+    #: like `monitor`, because the backtest harness steps time itself and must drive from its own
+    #: loop what a running process drives from the supervisor's.
+    portfolio_watch: PortfolioWatch
     _writer: SingleWriter
     #: Async resources that hold sockets — HTTP clients, exchange sessions. Closed by `shutdown`.
     _closers: tuple[Callable[[], Awaitable[None]], ...] = ()
@@ -241,10 +250,21 @@ class Application:
         """Run DESIGN §8.2 before anything trades. Nothing else may be called first."""
         return await self.startup.recover()
 
-    def equity(self) -> Decimal:
-        return self.ledger.equity(
-            {p.instrument_key: p.avg_entry for p in self.ledger.positions()},
-            quote_currency=self.quote_currency,
+    def valuation(self) -> PortfolioAggregate:
+        """What the portfolio is worth right now, or why that cannot be said.
+
+        Returns the aggregate rather than a bare `Decimal` deliberately: a method called `equity`
+        returning a number is what let six call sites each build their own price map, and every one
+        of them built it out of `avg_entry` (PHASE_12 §3.5, ADR 0027). Callers that need a figure
+        must first decide what they do when there is none.
+        """
+        return aggregate(
+            {self.ledger.venue: self.ledger},
+            configured_instruments(self.configs),
+            self.marks,
+            self.policy.policy,
+            as_of=self.clock.now(),
+            notional_currency=self.quote_currency,
         )
 
     async def shutdown(self) -> None:
@@ -915,6 +935,25 @@ async def _assemble(
     # B is valued against (DESIGN §4, PHASE_12 Finding 2).
     marks = Marks()
 
+    # One price cache for the process. Shared like the ledger and for the same reason: equity is a
+    # property of the portfolio, not of a basket, so basket A's cycle must refresh the mark basket
+    # B is valued against (DESIGN §4, PHASE_12 Finding 2).
+    portfolio_watch = PortfolioWatch(
+        ledger,
+        marks,
+        configs,
+        watchdog,
+        clock,
+        # `read_only_prices`, never `prices`: in the sim stack the latter is a bridge that feeds
+        # the tick to `SimBroker` and matches resting orders. A valuation sweep must observe the
+        # market, never move it.
+        market_data=stack.read_only_prices,
+        catalogue=stack.catalogue,
+        notional_currency=quote_currency,
+        policy_of=lambda: enforced_policy(configs, arming, mode).policy,
+        resync_seconds=DEFAULT_RESYNC_SECONDS,
+    )
+
     drift = DriftWatch(stack.catalogue, configs, watchdog, states, store, clock, mode=mode)
     builder = RunnerBuilder(
         clock=clock,
@@ -938,7 +977,14 @@ async def _assemble(
         store=store,
         ledger=ledger,
         supervisor=Supervisor(
-            builder, configs, Scheduler(clock), watchdog, states, clock, drift=drift
+            builder,
+            configs,
+            Scheduler(clock),
+            watchdog,
+            states,
+            clock,
+            drift=drift,
+            portfolio=portfolio_watch,
         ),
         configs=configs,
         startup=StartupSequence(
@@ -951,7 +997,6 @@ async def _assemble(
             watchdog,
             clock,
             instruments=instruments,
-            quote_currency=quote_currency,
             # A simulated venue's books die with the process; without this an ordinary restart is
             # indistinguishable from a testnet wipe.
             venue_restore=stack.venue_restore,
@@ -966,6 +1011,7 @@ async def _assemble(
                 alert_sinks=alert_sinks,
             ),
             drift=drift,
+            portfolio=portfolio_watch,
         ),
         watchdog=watchdog,
         states=states,
@@ -982,6 +1028,8 @@ async def _assemble(
             monitor=monitor,
             store=store,
             quote_currency=quote_currency,
+            marks=marks,
+            valuation=portfolio_watch.valuation,
         ),
         monitor=monitor,
         alerts=AlertDispatcher(
@@ -994,6 +1042,8 @@ async def _assemble(
         market_data=stack.read_only_prices,
         catalogue=stack.catalogue,
         quote_currency=quote_currency,
+        marks=marks,
+        portfolio_watch=portfolio_watch,
         _writer=writer,
         _closers=(
             builder.close,

@@ -24,10 +24,26 @@ from tradebot.core.errors import VenueError
 from tradebot.core.events import EventType
 from tradebot.core.portfolio import AccountState
 from tradebot.decision.providers import DEFAULT_RESPONSE, FAIL
+from tradebot.ledger.portfolio import ExternalFlow
 from tradebot.marketdata.replay import ReplayMarketData
+from tradebot.risk.aggregate import PortfolioAggregate
 from tradebot.risk.state import REARM_PHRASE, assert_rearm_phrase
 
 pytestmark = pytest.mark.scenario
+
+
+def valued(harness: Harness, equity: str) -> PortfolioAggregate:
+    """A stated equity, in the shape the watchdog now reads.
+
+    These tests are about the *watchdog's* response to a number, not about how the number is
+    computed; `tests/unit/test_aggregate.py` owns the latter (PHASE_12 §1.5).
+    """
+    return PortfolioAggregate(
+        equity=Decimal(equity),
+        cash=Decimal(equity),
+        gross_exposure=Decimal(0),
+        as_of=harness.clock.now(),
+    )
 
 
 async def make_harness(
@@ -181,7 +197,7 @@ class TestReconciliationRows:
 
             report = await harness.reconciler.reconcile()
             for flow in harness.reconciler.apply_external_flows(report):
-                await harness.watchdog.record_flow(flow.amount, flow.reason)
+                await harness.watchdog.record_flow(flow)
 
             assert report.classification is ReconcileClass.EXTERNAL_CHANGE
             assert harness.states.load().high_water_mark == before + Decimal("5000")
@@ -194,9 +210,11 @@ class TestReconciliationRows:
         """R16: the whole reason the baselines are flow-adjusted."""
         harness = await make_harness(basket, clock, market_data, [DEFAULT_RESPONSE])
         try:
-            await harness.watchdog.record_flow(Decimal("-4000"), "withdrawal")
+            await harness.watchdog.record_flow(
+                ExternalFlow(currency="USDT", amount=Decimal("-4000"), reason="withdrawal")
+            )
 
-            verdict = await harness.watchdog.check(Decimal("6000"))
+            verdict = await harness.watchdog.check(valued(harness, "6000"))
 
             assert not verdict.tripped
             assert verdict.state.kill_switch is KillSwitchState.ARMED
@@ -246,7 +264,7 @@ class TestKillSwitchTriggers:
     ) -> None:
         harness = await make_harness(basket, clock, market_data, [DEFAULT_RESPONSE])
         try:
-            verdict = await harness.watchdog.check(Decimal("8000"))  # 20% below the mark
+            verdict = await harness.watchdog.check(valued(harness, "8000"))  # 20% below the mark
 
             assert verdict.tripped
             assert harness.states.load().kill_switch is KillSwitchState.TRIPPED
@@ -260,7 +278,7 @@ class TestKillSwitchTriggers:
         try:
             harness.broker.credit("USDT", Decimal("-6000"))
             report = await harness.reconciler.reconcile()
-            equity = harness.ledger.equity({}, quote_currency="USDT")
+            equity = harness.valuation().equity
 
             assert harness.reconciler.exceeds_kill_tolerance(report, equity)
             await harness.watchdog.trip(report.classification.value, report.detail)

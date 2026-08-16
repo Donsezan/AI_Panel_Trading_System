@@ -187,19 +187,10 @@ class BasketRunner:
         """Everything that must be true before a cycle is worth running. Returns why not."""
         if self._basket.status is not BasketStatus.ACTIVE:
             return f"basket status is {self._basket.status.value}"
-        verdict = await self._watchdog.check(self._equity())
+        verdict = await self._watchdog.check(self._valuation(self._clock.now()))
         if not verdict.may_trade:
             return verdict.reason or "trading is halted"
         return ""
-
-    def _equity(self) -> Decimal:
-        return self._ledger.equity(self._prices(), quote_currency=self._quote_currency)
-
-    def _prices(self) -> dict[str, Decimal]:
-        """Last marks the ledger already knows. Refreshed from the snapshot once one exists."""
-        return {
-            position.instrument_key: position.avg_entry for position in self._ledger.positions()
-        }
 
     async def _run(self, cycle_id: str, events: EventFactory) -> CycleResult:
         snapshot = await self._context.build(self._basket)

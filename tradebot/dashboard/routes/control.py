@@ -290,7 +290,18 @@ async def rearm(request: Request) -> Response:
         assert_rearm_phrase(_field(form, "confirm"))
     except TradebotError as exc:
         return _refused(request, form, str(exc))
-    await application.watchdog.rearm(application.equity(), actor=ACTOR)
+    # Re-arming writes both baselines from current equity, so it cannot proceed on a number the
+    # system has just said it cannot compute — that would persist a fiction outliving the outage
+    # and would spend the operator's typed phrase on nothing (ADR 0027).
+    current = application.valuation()
+    if current.frozen:
+        return _refused(
+            request,
+            form,
+            "the portfolio cannot be valued, so there is no equity to re-arm against: "
+            f"{current.frozen_reason}",
+        )
+    await application.watchdog.rearm(current.equity, actor=ACTOR)
     logger.warning("kill switch re-armed from the dashboard")
     return _back(form)
 

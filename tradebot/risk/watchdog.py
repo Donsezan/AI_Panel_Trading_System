@@ -24,17 +24,23 @@ if it cannot compute a baseline it leaves the system as it found it rather than 
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from decimal import Decimal
 
 from tradebot.core.clock import Clock
 from tradebot.core.config import GlobalRiskPolicy
 from tradebot.core.enums import BasketStatus, KillSwitchState, RiskTier
+from tradebot.core.errors import FailClosedError
 from tradebot.core.events import EventFactory
+from tradebot.core.instrument import Instrument, base_currencies_of
 from tradebot.core.logging import get_logger
 from tradebot.core.money import ZERO
 from tradebot.interfaces.broker import TradingCalendar
+from tradebot.ledger.marks import Marks
+from tradebot.ledger.portfolio import ExternalFlow
 from tradebot.persistence.store import EventStore
+from tradebot.risk.aggregate import PortfolioAggregate, value_cash
 from tradebot.risk.state import RiskState, RiskStateStore, rolled_over, start_of_day
 
 logger = get_logger(__name__)
@@ -50,11 +56,14 @@ class WatchdogVerdict:
     state: RiskState
     tripped: bool = False
     day_halted: bool = False
+    #: The portfolio could not be valued, so no limit could be evaluated. Distinct from a halt:
+    #: nothing is wrong with the *system*, and it clears on its own when marks return.
+    frozen: bool = False
     reason: str = ""
 
     @property
     def may_trade(self) -> bool:
-        return self.state.may_trade and not self.day_halted
+        return self.state.may_trade and not self.day_halted and not self.frozen
 
 
 class Watchdog:
@@ -68,11 +77,19 @@ class Watchdog:
         clock: Clock,
         *,
         calendar: TradingCalendar | None = None,
+        marks: Marks | None = None,
+        notional_currency: str = "USDT",
     ) -> None:
         self._policy = policy
         self._states = states
         self._store = store
         self._clock = clock
+        #: The same cache `aggregate` reads, so a flow is converted by the rule that values the
+        #: balance it lands in — one ladder, not two that can disagree (PHASE_12 §3.7).
+        self._marks = marks if marks is not None else Marks()
+        self._notional_currency = notional_currency
+        #: Refreshed through `use_universe`, never captured here.
+        self._position_currencies: frozenset[str] = frozenset()
         #: Whose "day" the daily-loss baseline rolls over on. Absent means the UTC date, which is
         #: correct for crypto and wrong for equities: a US session ends at 20:00 UTC and its
         #: after-hours prints land the next UTC day, so a UTC rollover would reset the baseline
@@ -92,8 +109,24 @@ class Watchdog:
     def _events(self) -> EventFactory:
         return EventFactory(clock=self._clock, basket_id="global", cycle_id="watchdog")
 
-    async def check(self, equity: Decimal) -> WatchdogVerdict:
-        """Evaluate the drawdown and daily-loss baselines against current equity."""
+    async def check(self, valuation: PortfolioAggregate) -> WatchdogVerdict:
+        """Evaluate the drawdown and daily-loss baselines against current equity.
+
+        A **frozen** valuation is ignorance, not a breach: nothing is tripped, no baseline moves,
+        and no state is written — but no new order may be sent either. Rolling the day or raising
+        the mark against a number the system has just said it cannot compute would persist a
+        fiction that outlives the outage, and tripping would spend the operator's typed re-arm
+        phrase on a feed that will recover by itself (PHASE_12 §3.4, ADR 0027).
+
+        A freeze spanning midnight therefore leaves `day_start_equity` at yesterday's, measuring
+        the daily loss from an older and generally higher baseline. That is the conservative
+        direction, and it is chosen rather than incidental.
+        """
+        if valuation.frozen:
+            return WatchdogVerdict(
+                state=self._states.load(), frozen=True, reason=valuation.frozen_reason
+            )
+        equity = valuation.equity
         state = await self._roll_day(self._states.load(), equity)
         if not state.may_trade:
             return WatchdogVerdict(state=state, reason=state.reason)
@@ -196,13 +229,43 @@ class Watchdog:
         )
         return status
 
-    async def record_flow(self, amount: Decimal, reason: str) -> RiskState:
-        """Move both baselines by an external deposit or withdrawal.
+    def use_universe(self, instruments: Iterable[Instrument]) -> None:
+        """Adopt the configured instrument set, so a flow is converted against current truth.
 
-        Without this a withdrawal reads as a drawdown and trips the switch, and a deposit masks
-        a real loss (DESIGN §6.6, R16). The adjustment is the flow itself, never a re-derivation
-        from current equity, which would launder a genuine loss into the baseline.
+        Not captured at construction: it moves whenever a basket adds an instrument, and a set
+        fixed at boot is the same defect ADR 0021 fixed for the Tier-2 cap (PHASE_12 §3.7).
         """
+        self._position_currencies = base_currencies_of(instruments)
+
+    async def record_flow(self, flow: ExternalFlow) -> RiskState:
+        """Move both baselines by an external deposit or withdrawal, in the notional currency.
+
+        Without this a withdrawal reads as a drawdown and trips the switch, and a deposit masks a
+        real loss (DESIGN §6.6, R16). The adjustment is the flow itself, never a re-derivation from
+        current equity, which would launder a genuine loss into the baseline.
+
+        **The currency is not decoration.** `startup.py` used to drop it and add the bare amount to
+        baselines denominated in the notional currency, so a 9,000 USDC deposit raised the
+        high-water mark by 9,000 while contributing nothing at all to equity — a guaranteed
+        spurious kill-switch trip on the very next check (PHASE_12 Finding 4). A flow this cannot
+        value refuses: a baseline adjusted by a number in the wrong unit is worse than no
+        adjustment, and the caller turns the refusal into a halted process.
+        """
+        amount = value_cash(
+            flow.currency,
+            flow.amount,
+            self._marks,
+            notional_currency=self._notional_currency,
+            position_currencies=self._position_currencies,
+            now=self._clock.now(),
+            tolerance=self._policy.mark_tolerance,
+        )
+        if amount is None:
+            raise FailClosedError(
+                f"an external flow of {flow.amount} {flow.currency} cannot be valued in "
+                f"{self._notional_currency}, so the drawdown baselines cannot be adjusted for it; "
+                "adjusting them by a number in the wrong unit would fabricate a drawdown"
+            )
         state = self._states.load()
         adjusted = await self._states.save(
             state.model_copy(
@@ -212,7 +275,15 @@ class Watchdog:
                 }
             )
         )
-        logger.info("risk baselines flow-adjusted", extra={"amount": str(amount), "why": reason})
+        logger.info(
+            "risk baselines flow-adjusted",
+            extra={
+                "amount": str(amount),
+                "currency": flow.currency,
+                "original": str(flow.amount),
+                "why": flow.reason,
+            },
+        )
         return adjusted
 
     async def _session_day(self) -> str:

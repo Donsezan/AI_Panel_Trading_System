@@ -149,7 +149,7 @@ class TestHappyPath:
             key = eager.instruments[0].key
             outcomes = [(await harness.runner.run_once()).outcome for _ in range(4)]
             held = harness.ledger.position(key)
-            budget = harness.ledger.equity({}, quote_currency="USDT")
+            budget = harness.valuation().equity
 
             assert outcomes[0] is CycleOutcome.ORDERS_PLACED
             assert CycleOutcome.RISK_VETOED in outcomes, "the cap must bite before the cash does"

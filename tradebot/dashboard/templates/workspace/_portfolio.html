@@ -5,7 +5,7 @@
   <div class="pane-body">
     <dl class="ledger-lines">
       <dt>Balance total ({{ quote_currency }})</dt>
-      <dd class="total">{{ equity | money }}</dd>
+      <dd class="total">{% if valuation.frozen %}unknown{% else %}{{ valuation.equity | money }}{% endif %}</dd>
 
       {# The same flow-adjusted baseline the daily-loss rule measures against (DESIGN §6.6), so
          this figure and that limit can never disagree. A deposit moves both. #}

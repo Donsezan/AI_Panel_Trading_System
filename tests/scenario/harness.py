@@ -13,8 +13,10 @@ from decimal import Decimal
 from sqlalchemy import select
 
 from tradebot.control.basket_runner import BasketRunner
+from tradebot.control.config_store import ConfigStore
 from tradebot.control.context_builder import ContextBuilder
 from tradebot.control.startup import Recovery, StartupSequence
+from tradebot.control.valuation import PortfolioWatch
 from tradebot.core.clock import ManualClock
 from tradebot.core.config import Basket, GlobalRiskPolicy
 from tradebot.core.enums import Mode
@@ -29,6 +31,7 @@ from tradebot.ledger.history import HistoryReader
 from tradebot.ledger.marks import Marks
 from tradebot.ledger.portfolio import Ledger
 from tradebot.ledger.reconciler import Reconciler
+from tradebot.marketdata.catalogue import sim_catalogue
 from tradebot.persistence.database import SingleWriter, create_database
 from tradebot.persistence.schema import (
     cycles,
@@ -40,6 +43,7 @@ from tradebot.persistence.schema import (
     round_trips,
 )
 from tradebot.persistence.store import EventStore
+from tradebot.risk.aggregate import PortfolioAggregate, aggregate
 from tradebot.risk.state import RiskStateStore
 from tradebot.risk.tier1 import Tier1RiskEngine
 from tradebot.risk.tier2 import Tier2RiskEngine
@@ -99,6 +103,23 @@ class Harness:
             protective_orders_supported=self.broker.capabilities().protective_orders,
             trading_history=self.history,
         )
+        #: The process-wide price cache. One basket here, so the harness *is* the universe.
+        self.marks = Marks()
+        #: What the startup sequence values the portfolio with. `market_data=None`: the harness
+        #: drives `runner.run_once()` directly rather than through a worker, so marks arrive from
+        #: each cycle's own snapshot — which is the path these scenarios exist to exercise.
+        self.portfolio = PortfolioWatch(
+            self.ledger,
+            self.marks,
+            ConfigStore(engine, self.writer, self.store, clock),
+            self.watchdog,
+            clock,
+            market_data=None,
+            catalogue=sim_catalogue(),
+            notional_currency="USDT",
+            policy_of=lambda: self.policy,
+            resync_seconds=30.0,
+        )
         self.startup = StartupSequence(
             self.store,
             self.ledger,
@@ -109,9 +130,8 @@ class Harness:
             self.watchdog,
             clock,
             instruments=basket.instruments,
+            portfolio=self.portfolio,
         )
-        #: The process-wide price cache. One basket here, so the harness *is* the universe.
-        self.marks = Marks()
         self.runner = BasketRunner(
             basket,
             mode=Mode.SIM,
@@ -134,6 +154,17 @@ class Harness:
 
     async def start(self) -> Recovery:
         return await self.startup.recover()
+
+    def valuation(self) -> PortfolioAggregate:
+        """What the portfolio is worth, through the one function the system uses (ADR 0027)."""
+        return aggregate(
+            {self.ledger.venue: self.ledger},
+            self.basket.instruments,
+            self.marks,
+            self.policy,
+            as_of=self.clock.now(),
+            notional_currency="USDT",
+        )
 
     def projections(self) -> dict[str, list[tuple[object, ...]]]:
         with self.store.engine.connect() as connection:

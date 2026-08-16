@@ -31,12 +31,14 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from decimal import Decimal
 
 from sqlalchemy import select
 
 from tradebot.control.preflight import VenuePreflight
 from tradebot.control.readiness import LiveReadiness
 from tradebot.control.reference import DriftWatch
+from tradebot.control.valuation import PortfolioWatch
 from tradebot.core.clock import Clock
 from tradebot.core.config import Basket
 from tradebot.core.enums import KillSwitchState, OrderState, RiskTier
@@ -44,6 +46,7 @@ from tradebot.core.errors import TradebotError
 from tradebot.core.events import EventFactory
 from tradebot.core.instrument import Instrument
 from tradebot.core.logging import get_logger
+from tradebot.core.money import ZERO
 from tradebot.core.orders import Fill, Order
 from tradebot.execution.monitor import ExecutionMonitor
 from tradebot.execution.service import ExecutionService
@@ -94,11 +97,11 @@ class StartupSequence:
         clock: Clock,
         *,
         instruments: Sequence[Instrument] = (),
-        quote_currency: str = "USDT",
         venue_restore: RestorableVenue | None = None,
         preflight: VenuePreflight | None = None,
         readiness: LiveReadiness | None = None,
         drift: DriftWatch | None = None,
+        portfolio: PortfolioWatch | None = None,
     ) -> None:
         self._store = store
         self._ledger = ledger
@@ -109,7 +112,6 @@ class StartupSequence:
         self._watchdog = watchdog
         self._clock = clock
         self._instruments = {i.key: i for i in instruments}
-        self._quote_currency = quote_currency
         self._venue_restore = venue_restore
         #: Absent for a simulated venue, which has no clock of its own to disagree with and no key
         #: to hold permissions. Present for every real one.
@@ -119,6 +121,10 @@ class StartupSequence:
         #: Every mode. Unlike the gates above, it halts *baskets* rather than the process, and
         #: only in the modes whose cycles are evidence (ADR 0025).
         self._drift = drift
+        #: Seeds the marks before anything is valued, and answers "what is the portfolio worth"
+        #: for the reconciler's tolerance and the first-run baseline. Absent only in tests that
+        #: wire no venue, where a flat ledger needs no marks anyway (ADR 0027).
+        self._portfolio = portfolio
 
     async def recover(self) -> Recovery:
         """Bring the process to a known state, or to a halted one."""
@@ -135,6 +141,13 @@ class StartupSequence:
             self._restore_simulated_venue()
         except TradebotError as exc:
             failures.append(f"projection replay failed: {exc}")
+
+        # Best-effort, and deliberately not a failure: an unreachable venue leaves the marks
+        # absent, which freezes the aggregate and stops new orders — the correct, self-clearing
+        # response. Refusing to start would cost the operator the dashboard, the log and the
+        # ledger view, which are the three things needed to diagnose it (ADR 0027).
+        if not failures and self._portfolio is not None:
+            await self._portfolio.refresh()
 
         if not failures and self._preflight is not None:
             failures.extend(await self._preflight.run())
@@ -198,13 +211,16 @@ class StartupSequence:
     async def _reconcile(self) -> tuple[ReconcileReport, ...]:
         """Adopt venue truth. An unclean report halts rather than being trusted."""
         report = await self._reconciler.reconcile()
+        # The whole `ExternalFlow`, currency included. Dropping it here is what let a stablecoin
+        # deposit raise the high-water mark by its face amount while contributing nothing to
+        # equity — a guaranteed spurious trip (PHASE_12 Finding 4).
+        self._watchdog.use_universe(self._instruments.values())
         for flow in self._reconciler.apply_external_flows(report):
-            await self._watchdog.record_flow(flow.amount, flow.reason)
+            await self._watchdog.record_flow(flow)
         if report.clean:
             return (report,)
 
-        equity = self._ledger.equity({}, quote_currency=self._quote_currency)
-        if self._reconciler.exceeds_kill_tolerance(report, equity):
+        if self._reconciler.exceeds_kill_tolerance(report, self._equity()):
             await self._watchdog.trip(report.classification.value, report.detail)
         raise _RecoveryHaltError(
             f"{report.classification.value}: {report.detail or 'see event log'}"
@@ -318,11 +334,20 @@ class StartupSequence:
         state = self._states.load()
         if state.kill_switch is KillSwitchState.ARMED:
             return state
-        equity = self._ledger.equity(
-            {p.instrument_key: p.avg_entry for p in self._ledger.positions()},
-            quote_currency=self._quote_currency,
-        )
-        return await self._watchdog.rearm(equity, actor="first_run")
+        return await self._watchdog.rearm(self._equity(), actor="first_run")
+
+    def _equity(self) -> Decimal:
+        """Mark-to-market equity, or zero when nothing can value the portfolio.
+
+        Zero is the right answer for both readers here. The reconciler's tolerance denominator
+        scales a mismatch against equity, and an unknown equity must make *every* mismatch
+        intolerable rather than tolerable; a first-run baseline of zero simply means the watchdog
+        measures nothing until the first sweep establishes one, which is what a portfolio nobody
+        can value deserves (ADR 0027).
+        """
+        if self._portfolio is None:
+            return ZERO
+        return self._portfolio.valuation().equity
 
 
 class _RecoveryHaltError(TradebotError):

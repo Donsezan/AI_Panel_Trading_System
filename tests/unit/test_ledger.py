@@ -96,20 +96,26 @@ class TestBalances:
 
 
 class TestValuation:
-    def test_equity_is_cash_plus_marked_holdings(self, ledger: Ledger) -> None:
-        book(ledger, fill(Side.BUY, "0.1", "50000"))
-        equity = ledger.equity({KEY: Decimal("60000")}, quote_currency="USDT")
-        assert equity == Decimal("11000")  # 5000 cash + 0.1 × 60000
+    """The ledger knows what is held, never what it is worth (ADR 0027)."""
 
-    def test_an_unpriced_holding_is_valued_at_cost_not_dropped(self, ledger: Ledger) -> None:
-        """Dropping it would understate exposure and quietly loosen every percentage limit."""
-        book(ledger, fill(Side.BUY, "0.1", "50000"))
-        assert ledger.equity({}, quote_currency="USDT") == Decimal("10000")
+    def test_equity_is_not_the_ledgers_to_answer(self, ledger: Ledger) -> None:
+        """One function answers "what is the portfolio worth", and it is `risk.aggregate`."""
+        assert not hasattr(ledger, "equity")
+
+    def test_unrealized_pnl_is_gone_with_it(self, ledger: Ledger) -> None:
+        assert not hasattr(ledger, "unrealized_pnl")
 
     def test_exposure_sums_the_named_instruments(self, ledger: Ledger) -> None:
         book(ledger, fill(Side.BUY, "0.1", "50000"))
         assert ledger.exposure((KEY,), {KEY: Decimal("50000")}) == Decimal("5000")
         assert ledger.exposure(("sim:OTHER",), {}) == 0
+
+    def test_exposure_refuses_a_held_key_it_was_given_no_price_for(self, ledger: Ledger) -> None:
+        """The old fallback to `avg_entry` here is PHASE_12 Finding 1 wearing a different hat."""
+        book(ledger, fill(Side.BUY, "0.1", "50000"))
+
+        with pytest.raises(KeyError):
+            ledger.exposure((KEY,), {})
 
     def test_unrealized_pnl_percent_is_on_cost_basis(self, ledger: Ledger) -> None:
         book(ledger, fill(Side.BUY, "1", "100"))
@@ -337,17 +343,6 @@ def _stub_order():
 
 
 class TestMarkToMarket:
-    def test_unrealized_pnl_marks_every_holding(self, ledger: Ledger) -> None:
-        book(ledger, fill(Side.BUY, "1", "50000", fill_id="b1"))
-
-        assert ledger.unrealized_pnl({KEY: Decimal("51000")}) == Decimal("1000")
-
-    def test_an_unpriced_holding_is_marked_at_cost_not_dropped(self, ledger: Ledger) -> None:
-        """Dropping it would understate exposure and loosen every percentage-based limit."""
-        book(ledger, fill(Side.BUY, "1", "50000", fill_id="b1"))
-
-        assert ledger.unrealized_pnl({}) == Decimal(0)
-
     def test_realized_pnl_sums_across_instruments(self, ledger: Ledger) -> None:
         book(ledger, fill(Side.BUY, "1", "50000", fill_id="b1"))
         book(ledger, fill(Side.SELL, "1", "51000", fill_id="s1"))

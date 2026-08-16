@@ -80,7 +80,7 @@ async def portfolio(request: Request) -> HTMLResponse:
     return render(
         request,
         "monitor/portfolio.html",
-        equity=application.equity(),
+        valuation=application.valuation(),
         quote_currency=application.quote_currency,
         positions=queries.positions(),
         round_trips=queries.round_trips(),

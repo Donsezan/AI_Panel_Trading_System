@@ -9,6 +9,7 @@ Three properties are load-bearing and each is tested directly:
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
@@ -18,11 +19,31 @@ from tradebot.core.config import GlobalRiskPolicy
 from tradebot.core.enums import BasketStatus, KillSwitchState
 from tradebot.core.errors import ConfigError
 from tradebot.core.events import EventType
+from tradebot.core.money import ZERO
+from tradebot.ledger.portfolio import ExternalFlow
 from tradebot.persistence.store import EventStore
+from tradebot.risk.aggregate import PortfolioAggregate
 from tradebot.risk.state import REARM_PHRASE, RiskState, RiskStateStore, assert_rearm_phrase
 from tradebot.risk.watchdog import DAILY_LOSS_RULE, DRAWDOWN_RULE, Watchdog
 
 START_EQUITY = Decimal(10_000)
+NOW = datetime(2026, 3, 1, 12, 0, tzinfo=UTC)
+
+
+def valued(equity: str, *, frozen: str = "") -> PortfolioAggregate:
+    """The aggregate the watchdog now reads, rather than a bare number.
+
+    The seam this phase fixed is *what the caller passes*, not the arithmetic here — so these
+    tests state an equity directly and `tests/scenario/` asserts that a real cycle computes it
+    mark-to-market (PHASE_12 §1.5).
+    """
+    return PortfolioAggregate(
+        equity=Decimal(equity),
+        cash=Decimal(equity),
+        gross_exposure=ZERO,
+        frozen_reason=frozen,
+        as_of=NOW,
+    )
 
 
 @pytest.fixture
@@ -71,7 +92,7 @@ class TestTriggers:
     async def test_a_drawdown_past_the_limit_trips_the_switch(self, watchdog: Watchdog) -> None:
         await armed(watchdog)
 
-        verdict = await watchdog.check(Decimal("8500"))  # 15% below the mark, limit 10%
+        verdict = await watchdog.check(valued("8500"))  # 15% below the mark, limit 10%
 
         assert verdict.tripped
         assert not verdict.may_trade
@@ -81,7 +102,7 @@ class TestTriggers:
         await armed(watchdog)
 
         # Inside both baselines: 2.5% below the mark (limit 10%) and below day start (limit 3%).
-        verdict = await watchdog.check(Decimal("9750"))
+        verdict = await watchdog.check(valued("9750"))
 
         assert not verdict.tripped
         assert verdict.may_trade
@@ -92,7 +113,7 @@ class TestTriggers:
         """A lesser response on purpose: existing protective legs keep doing their job."""
         await armed(watchdog)
 
-        verdict = await watchdog.check(Decimal("9600"))  # 4% below day start, limit 3%
+        verdict = await watchdog.check(valued("9600"))  # 4% below day start, limit 3%
 
         assert verdict.day_halted
         assert not verdict.tripped
@@ -121,7 +142,7 @@ class TestTriggers:
         await armed(watchdog)
         await watchdog.trip("manual", "stopped")
 
-        verdict = await watchdog.check(Decimal("20000"))
+        verdict = await watchdog.check(valued("20000"))
 
         assert not verdict.may_trade
 
@@ -130,16 +151,16 @@ class TestHighWaterMark:
     async def test_the_mark_rises_with_equity(self, watchdog: Watchdog) -> None:
         await armed(watchdog)
 
-        verdict = await watchdog.check(Decimal("12000"))
+        verdict = await watchdog.check(valued("12000"))
 
         assert verdict.state.high_water_mark == Decimal("12000")
 
     async def test_the_mark_never_falls(self, watchdog: Watchdog) -> None:
         """A mark that follows equity down would make drawdown unmeasurable."""
         await armed(watchdog)
-        await watchdog.check(Decimal("12000"))
+        await watchdog.check(valued("12000"))
 
-        verdict = await watchdog.check(Decimal("11500"))
+        verdict = await watchdog.check(valued("11500"))
 
         assert verdict.state.high_water_mark == Decimal("12000")
 
@@ -147,9 +168,9 @@ class TestHighWaterMark:
         self, watchdog: Watchdog
     ) -> None:
         await armed(watchdog)
-        await watchdog.check(Decimal("12000"))
+        await watchdog.check(valued("12000"))
 
-        verdict = await watchdog.check(Decimal("10700"))  # ~10.8% below the peak
+        verdict = await watchdog.check(valued("10700"))  # ~10.8% below the peak
 
         assert verdict.tripped
 
@@ -159,8 +180,10 @@ class TestExternalFlows:
         """Otherwise withdrawing your own money reads as a drawdown and stops trading (R16)."""
         await armed(watchdog)
 
-        await watchdog.record_flow(Decimal("-3000"), "withdrawal")
-        verdict = await watchdog.check(Decimal("7000"))
+        await watchdog.record_flow(
+            ExternalFlow(currency="USDT", amount=Decimal("-3000"), reason="withdrawal")
+        )
+        verdict = await watchdog.check(valued("7000"))
 
         assert not verdict.tripped
         assert verdict.state.high_water_mark == Decimal("7000")
@@ -169,8 +192,10 @@ class TestExternalFlows:
         """Otherwise a deposit masks a real loss."""
         await armed(watchdog)
 
-        await watchdog.record_flow(Decimal("5000"), "deposit")
-        verdict = await watchdog.check(Decimal("13500"))  # 10% below the adjusted 15000
+        await watchdog.record_flow(
+            ExternalFlow(currency="USDT", amount=Decimal("5000"), reason="deposit")
+        )
+        verdict = await watchdog.check(valued("13500"))  # 10% below the adjusted 15000
 
         assert verdict.state.day_start_equity == Decimal("15000")
         assert verdict.day_halted
@@ -180,7 +205,9 @@ class TestExternalFlows:
     ) -> None:
         await armed(watchdog)
 
-        state = await watchdog.record_flow(Decimal("-99999"), "everything withdrawn")
+        state = await watchdog.record_flow(
+            ExternalFlow(currency="USDT", amount=Decimal("-99999"), reason="everything withdrawn")
+        )
 
         assert state.high_water_mark == Decimal(0)
 
@@ -190,10 +217,10 @@ class TestDayBoundary:
         self, watchdog: Watchdog, clock: ManualClock
     ) -> None:
         await armed(watchdog)
-        await watchdog.check(Decimal("9800"))
+        await watchdog.check(valued("9800"))
 
         clock.advance(60 * 60 * 24)
-        verdict = await watchdog.check(Decimal("9800"))
+        verdict = await watchdog.check(valued("9800"))
 
         assert verdict.state.day_start_equity == Decimal("9800")
         assert not verdict.day_halted
@@ -212,7 +239,7 @@ class TestRearming:
     ) -> None:
         """Otherwise the next sweep re-trips on the same drawdown the operator just reviewed."""
         await armed(watchdog)
-        await watchdog.check(Decimal("8000"))
+        await watchdog.check(valued("8000"))
 
         state = await watchdog.rearm(Decimal("8000"), actor="cli")
 

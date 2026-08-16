@@ -37,6 +37,7 @@ from tradebot.control.basket_runner import BasketRunner, CycleResult
 from tradebot.control.config_store import ConfigRecord, ConfigStore
 from tradebot.control.reference import DriftWatch
 from tradebot.control.scheduler import Scheduler
+from tradebot.control.valuation import PortfolioWatch
 from tradebot.core.clock import Clock
 from tradebot.core.config import Basket
 from tradebot.core.enums import ConfigKind, CycleOutcome
@@ -107,6 +108,7 @@ class BasketWorker:
         clock: Clock,
         backoff: Backoff = DEFAULT_BACKOFF,
         max_consecutive_failures: int = DEFAULT_MAX_CONSECUTIVE_FAILURES,
+        portfolio: PortfolioWatch | None = None,
     ) -> None:
         self.basket_id = basket_id
         self._factory = factory
@@ -117,6 +119,8 @@ class BasketWorker:
         self._clock = clock
         self._backoff = backoff
         self._max_failures = max_consecutive_failures
+        #: Refreshes the marks this cycle's gate is about to value the portfolio against.
+        self._portfolio = portfolio
         self._runner: BasketRunner | None = None
         self._version = 0
         self._failures = 0
@@ -159,9 +163,29 @@ class BasketWorker:
             return None
         self._running = True
         try:
+            # Before the gate, which values the portfolio *before* a snapshot exists. Every path
+            # that runs a cycle goes through here — `serve`, `run --once`, the backtest harness and
+            # the scenario suite — so this is the one place that guarantees the gate has marks to
+            # read. `serve`'s own periodic sweep is still needed and is not redundant: it marks the
+            # positions of baskets that are *not* cycling (ADR 0027, PHASE_12 D1).
+            await self._refresh_marks()
             return await self._cycle(record)
         finally:
             self._running = False
+
+    async def _refresh_marks(self) -> None:
+        """Bring the marks up to date before this cycle is gated. Never fatal.
+
+        A failure here leaves the previous marks to age out, and aging out freezes the aggregate —
+        which blocks new orders and clears itself when prices return. That is the intended
+        response to an unreachable venue, so it must not also fail the cycle.
+        """
+        if self._portfolio is None:
+            return
+        try:
+            await self._portfolio.refresh()
+        except Exception:
+            logger.exception("could not refresh marks before the cycle; the gate will decide")
 
     async def _cycle(self, record: ConfigRecord[Basket]) -> CycleResult | None:
         with correlate(basket_id=self.basket_id):
@@ -297,6 +321,7 @@ class Supervisor:
         backoff: Backoff = DEFAULT_BACKOFF,
         max_consecutive_failures: int = DEFAULT_MAX_CONSECUTIVE_FAILURES,
         drift: DriftWatch | None = None,
+        portfolio: PortfolioWatch | None = None,
     ) -> None:
         self._factory = factory
         self._configs = configs
@@ -311,6 +336,11 @@ class Supervisor:
         #: baskets, which is the supervisor's own vocabulary, and it lives on the sweep because
         #: that is the only loop in the process that outlives every cycle (ADR 0025).
         self._drift = drift
+        #: Refreshes the marks every basket's valuation reads, and measures the drawdown between
+        #: cycles. On this loop for the same reason `DriftWatch` is: it is the only loop in the
+        #: process that outlives every cycle, and a paused basket's position still has to be
+        #: marked or the whole portfolio freezes (PHASE_12 D1).
+        self._portfolio = portfolio
         self._workers: dict[str, BasketWorker] = {}
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._serving = False
@@ -351,6 +381,7 @@ class Supervisor:
                 clock=self._clock,
                 backoff=self._backoff,
                 max_consecutive_failures=self._max_failures,
+                portfolio=self._portfolio,
             )
             self._workers[basket_id] = worker
         return worker
@@ -375,6 +406,7 @@ class Supervisor:
         try:
             while self._serving:
                 await self._check_drift()
+                await self._sweep_portfolio()
                 self.sync()
                 await self._clock.sleep(resync_seconds)
         finally:
@@ -393,6 +425,21 @@ class Supervisor:
             await self._drift.check()
         except Exception:
             logger.exception("the instrument reference-data check raised; supervision continues")
+
+    async def _sweep_portfolio(self) -> None:
+        """Refresh every mark and measure the drawdown. Never fatal.
+
+        This is the only thing measuring drawdown while every basket is paused, halted or between
+        cycles, and the only thing marking a paused basket's position — without it a routine pause
+        would freeze the whole portfolio (PHASE_12 D1). Guarded like the drift check: a dead
+        supervisor leaves working orders with nobody polling them.
+        """
+        if self._portfolio is None:
+            return
+        try:
+            await self._portfolio.sweep()
+        except Exception:
+            logger.exception("the portfolio valuation sweep raised; supervision continues")
 
     def sync(self) -> None:
         """Start a task for every basket in service; forget the tasks that have finished."""

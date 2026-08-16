@@ -13,7 +13,9 @@
       <span class="dock-label">Kill switch</span>
       {{ m.pill(risk_state.kill_switch.value) }}
       <span class="muted small">
-        equity {{ equity | money }} {{ quote_currency }} · high-water {{ risk_state.high_water_mark | money }}
+        {% if valuation.frozen %}<strong>equity unknown</strong> — {{ valuation.frozen_reason }}
+        {% else %}equity {{ valuation.equity | money }} {{ quote_currency }}{% endif %}
+        · high-water {{ risk_state.high_water_mark | money }}
       </span>
     </div>
     {% if risk_state.reason %}<p class="dock-note danger">{{ risk_state.reason }}</p>{% endif %}

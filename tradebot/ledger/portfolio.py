@@ -16,6 +16,12 @@ Balances are held as **totals**. What is free versus locked behind a resting ord
 truth, adopted by the reconciler rather than mirrored here: two independent sets of books on
 the same funds drift, and the drift shows up as phantom headroom in a risk check.
 
+**The ledger knows what is held, never what it is worth.** Valuation lives in one place —
+`risk.aggregate` — because six call sites each building their own price map is how the drawdown
+gate came to measure cost basis and never see an unrealized loss (PHASE_12 Finding 1, ADR 0027).
+The one pricing method left here, `exposure`, takes a strict map and raises rather than falling
+back to what a position cost.
+
 Failure semantics: a sell larger than the holding raises rather than going negative — v1 is
 long-only, so a negative position is a corrupted ledger, not a short.
 """
@@ -94,6 +100,11 @@ class Ledger:
         self._locked: dict[str, Decimal] = {}
         self._positions: dict[str, Position] = {}
         self._trips: dict[str, _OpenTrip] = {}
+
+    @property
+    def venue(self) -> str:
+        """Which venue portfolio this is. The key it appears under in the aggregate."""
+        return self._venue
 
     def position(self, instrument_key: str) -> Position:
         """The holding, or a flat position. Never `None` — absence is a position of zero."""
@@ -191,36 +202,19 @@ class Ledger:
 
     # ------------------------------------------------------------------ valuation
 
-    def equity(self, prices: Mapping[str, Decimal], *, quote_currency: str) -> Decimal:
-        """Mark-to-market equity in the quote currency.
-
-        A position with no price is valued at cost rather than skipped: dropping it would
-        understate exposure and quietly loosen every percentage-based risk limit.
-        """
-        holdings = sum(
-            (
-                position.market_value(prices.get(key, position.avg_entry))
-                for key, position in self._positions.items()
-            ),
-            start=ZERO,
-        )
-        return self.balance(quote_currency) + holdings
-
     def exposure(self, instrument_keys: tuple[str, ...], prices: Mapping[str, Decimal]) -> Decimal:
-        """Value currently deployed across a set of instruments — a basket's exposure."""
-        return sum(
-            (
-                self.position(key).market_value(prices.get(key, self.position(key).avg_entry))
-                for key in instrument_keys
-            ),
-            start=ZERO,
-        )
+        """Value currently deployed across a set of instruments — a basket's exposure.
 
-    def unrealized_pnl(self, prices: Mapping[str, Decimal]) -> Decimal:
+        `prices` is **strict**: a held key it does not carry raises rather than falling back to
+        `avg_entry`. The caller has already decided what an unmarked position means, and the answer
+        is a frozen aggregate — never a position quietly valued at what it cost, which reports zero
+        drawdown on a portfolio that has halved (PHASE_12 Finding 1, ADR 0027).
+        """
         return sum(
             (
-                position.unrealized_pnl(prices.get(key, position.avg_entry))
-                for key, position in self._positions.items()
+                position.market_value(prices[key])
+                for key in instrument_keys
+                if not (position := self.position(key)).is_flat
             ),
             start=ZERO,
         )

@@ -38,6 +38,7 @@ tier refuses and is recorded with full provenance. Only a fully approved intent 
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import timedelta
 from decimal import Decimal
@@ -61,8 +62,10 @@ from tradebot.execution.service import ExecutionService
 from tradebot.interfaces.market_data import MarketDataProvider
 from tradebot.interfaces.risk import RiskProposal
 from tradebot.ledger.history import HistoryReader
+from tradebot.ledger.marks import Marks
 from tradebot.ledger.portfolio import Ledger
 from tradebot.persistence.store import EventStore
+from tradebot.risk.aggregate import PortfolioAggregate
 from tradebot.risk.tier1 import Tier1RiskEngine, basket_budget
 from tradebot.risk.tier2 import Tier2RiskEngine
 
@@ -122,6 +125,8 @@ class ManualCloser:
         monitor: ExecutionMonitor,
         store: EventStore,
         quote_currency: str,
+        marks: Marks,
+        valuation: Callable[[], PortfolioAggregate],
         quote_tolerance: timedelta = DEFAULT_QUOTE_TOLERANCE,
     ) -> None:
         self._clock = clock
@@ -134,6 +139,8 @@ class ManualCloser:
         self._monitor = monitor
         self._store = store
         self._quote_currency = quote_currency
+        self._marks = marks
+        self._valuation = valuation
         self._tolerance = quote_tolerance
 
     def closable(self) -> tuple[tuple[str, str], ...]:
@@ -260,8 +267,16 @@ class ManualCloser:
             raise ConfigError(f"nothing to close: no position is held in {instrument.key}")
 
         quote = self._fresh_quote(await self._prices.get_quote(instrument))
-        prices = {instrument.key: quote.last}
-        equity = self._ledger.equity(prices, quote_currency=self._quote_currency)
+        # Into the shared cache before valuing: this is the freshest mark in the system for this
+        # instrument, and an exit should never be the one act that lets it go stale.
+        self._marks.observe_quote(quote)
+        # A frozen valuation yields no equity — and does not need to. Every Tier-1 and Tier-2 rule
+        # that reads `equity` or `basket_budget` already stands aside on a SELL, and `_size_sell`
+        # clamps to the holding, so a reduce-only operator exit is unaffected by construction
+        # rather than by a new exemption. The switch stops the bot trading, not a human getting
+        # out (ADR 0015, ADR 0027).
+        summary = self._valuation()
+        equity = summary.equity
         policy = basket.risk_policy
         return RiskProposal(
             # `size_hint=FULL` against a reduce-only SELL is the whole position, and nothing
@@ -284,7 +299,10 @@ class ManualCloser:
             atr=ZERO,
             equity=equity,
             basket_budget=basket_budget(equity, policy.max_basket_allocation_pct),
-            basket_exposure=self._ledger.exposure(tuple(i.key for i in basket.instruments), prices),
+            # From the valuation, not a hand-built map. A map carrying only the instrument being
+            # closed cannot value the basket's *other* holdings, and the cost fallback that used to
+            # paper over that is exactly what this phase removed (PHASE_12 Finding 1).
+            basket_exposure=summary.exposure_of(*(i.key for i in basket.instruments)),
             history=self._history.for_instrument(basket.basket_id, instrument.key),
             # The only place in the system that sets this. It exempts the *metering* rules —
             # cooldown, the daily cap, the loss streak, the hourly rate — from a strictly

@@ -427,7 +427,7 @@ async def test_rearming_with_the_phrase_restores_trading(
     assert response.status_code == 303
     state = sim_application.states.load()
     assert state.kill_switch is KillSwitchState.ARMED
-    assert state.high_water_mark == sim_application.equity()
+    assert state.high_water_mark == sim_application.valuation().equity
 
 
 # ---------------------------------------------------------------- manual close

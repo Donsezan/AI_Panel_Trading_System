@@ -231,10 +231,12 @@ def _portfolio(state: DashboardState) -> dict[str, Any]:
     """
     application = state.application
     risk_state = application.states.load()
-    equity = application.equity()
+    valuation = application.valuation()
+    equity = valuation.equity
     boundary = day_boundary(risk_state)
     return {
         "equity": equity,
+        "valuation": valuation,
         "quote_currency": application.quote_currency,
         "day_start_equity": risk_state.day_start_equity,
         "day_move": equity - risk_state.day_start_equity if risk_state.day_start_equity else None,
@@ -307,7 +309,7 @@ def _rc(state: DashboardState) -> dict[str, Any]:
         ),
         "clamps": application.policy.clamps,
         "risk_events": state.queries.risk_events(limit=RC_EVENTS),
-        "equity": application.equity(),
+        "valuation": application.valuation(),
         "quote_currency": application.quote_currency,
     }
 

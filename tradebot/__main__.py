@@ -50,7 +50,7 @@ from tradebot.control.config_store import ConfigStore
 from tradebot.control.supervision import SupervisionController
 from tradebot.core.clock import ManualClock, SystemClock, ensure_utc
 from tradebot.core.enums import ConfigKind, Mode
-from tradebot.core.errors import TradebotError
+from tradebot.core.errors import ConfigError, TradebotError
 from tradebot.core.logging import configure_logging, get_logger
 from tradebot.dashboard.app import create_dashboard
 from tradebot.dashboard.auth import assert_bind_allowed, require_token
@@ -854,7 +854,15 @@ async def _risk_status(application: Application, _args: argparse.Namespace) -> i
 async def _risk_rearm(application: Application, args: argparse.Namespace) -> int:
     assert_rearm_phrase(args.confirm)
     await application.recover()
-    state = await application.watchdog.rearm(application.equity(), actor=CLI_ACTOR)
+    # Same refusal as the dashboard's: baselines written from an equity nobody can compute would
+    # outlive the outage that caused it (ADR 0027).
+    current = application.valuation()
+    if current.frozen:
+        raise ConfigError(
+            "the portfolio cannot be valued, so there is no equity to re-arm against: "
+            f"{current.frozen_reason}"
+        )
+    state = await application.watchdog.rearm(current.equity, actor=CLI_ACTOR)
     logger.warning("kill switch re-armed", extra={"high_water_mark": str(state.high_water_mark)})
     return 0
 

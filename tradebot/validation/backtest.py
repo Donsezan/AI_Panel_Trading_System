@@ -215,6 +215,9 @@ class BacktestHarness:
             if basket_id in retired:
                 continue
             self._clock.set(moment)
+            # No explicit mark refresh here: `BasketWorker.cycle` does it, so a replay stepping
+            # hours at a time gets the same freshness a running process gets from the supervisor's
+            # sweep (ADR 0027).
             worker = self._application.supervisor.worker_for(basket_id)
             await worker.cycle()
             await self._application.monitor.poll()

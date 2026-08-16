@@ -10,7 +10,9 @@ from decimal import Decimal
 
 import pytest
 
+from tradebot.control.config_store import ConfigStore
 from tradebot.control.startup import StartupSequence
+from tradebot.control.valuation import PortfolioWatch
 from tradebot.core.clock import ManualClock
 from tradebot.core.config import Basket, GlobalRiskPolicy
 from tradebot.core.enums import KillSwitchState, Mode, OrderState, OrderType, Side
@@ -22,8 +24,10 @@ from tradebot.core.portfolio import AccountState
 from tradebot.execution.brokers.sim import SimBroker, Tick
 from tradebot.execution.monitor import ExecutionMonitor
 from tradebot.execution.service import ExecutionService
+from tradebot.ledger.marks import Marks
 from tradebot.ledger.portfolio import Ledger
 from tradebot.ledger.reconciler import Reconciler
+from tradebot.marketdata.catalogue import sim_catalogue
 from tradebot.persistence.store import EventStore
 from tradebot.risk.state import RiskStateStore
 from tradebot.risk.watchdog import Watchdog
@@ -83,6 +87,21 @@ class Stack:
             mode=Mode.SIM,
             instruments=(instrument,),
         )
+        # The valuation the sequence reads for its reconciliation tolerance and its first-run
+        # baseline. No market data: a flat ledger of quote-currency cash needs no marks at all,
+        # which is exactly the property that keeps a fresh database working offline (ADR 0027).
+        self.portfolio = PortfolioWatch(
+            ledger,
+            Marks(),
+            ConfigStore(store.engine, store._writer, store, clock),
+            self.watchdog,
+            clock,
+            market_data=None,
+            catalogue=sim_catalogue(),
+            notional_currency="USDT",
+            policy_of=GlobalRiskPolicy,
+            resync_seconds=30.0,
+        )
         self.sequence = StartupSequence(
             store,
             ledger,
@@ -94,6 +113,7 @@ class Stack:
             clock,
             instruments=(instrument,),
             readiness=readiness,  # type: ignore[arg-type]
+            portfolio=self.portfolio,
         )
 
 
@@ -163,7 +183,7 @@ class TestFirstRun:
     ) -> None:
         recovery = await stack.sequence.recover()
 
-        assert recovery.state.day_start_equity == ledger.equity({}, quote_currency="USDT")
+        assert recovery.state.day_start_equity == stack.portfolio.valuation().equity
 
 
 class TestPersistedState:
