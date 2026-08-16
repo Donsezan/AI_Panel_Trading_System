@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from decimal import Decimal
 
 from tradebot.core.enums import AssetClass
@@ -40,3 +41,15 @@ class Instrument(DomainModel):
             min_qty=self.min_qty,
             min_notional=self.min_notional,
         )
+
+
+def base_currencies_of(instruments: Iterable[Instrument]) -> frozenset[str]:
+    """The base assets already counted as positions rather than as cash.
+
+    On a spot venue an instrument's base asset *is* a balance, so two readers need this exact set
+    and must not compute it twice: the reconciler excludes it from the balance diff, or it reports
+    every position discrepancy a second time, and the valuation excludes it from cash, or it counts
+    every holding twice — once as a position and once as the currency it settles in
+    (PHASE_12 §3.3, rung 3).
+    """
+    return frozenset(instrument.base_currency for instrument in instruments)

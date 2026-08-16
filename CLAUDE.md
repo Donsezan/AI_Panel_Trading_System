@@ -413,9 +413,39 @@ is no CLI mutation command, consistent with every other Tier-1 limit; `config li
 
 ## Phase status
 
-Phases 0–8 are **code-complete**. What remains is not code: the paper soak (weeks of
+Phases 0–8 are **code-complete**, and Phase 12 has since found that one of them is not correct —
+see below. What otherwise remains is not code: the paper soak (weeks of
 `tradebot run --mode paper`, measured with `report promotion`) and then a human's decision to arm
 live, following [docs/OPERATIONS.md](docs/OPERATIONS.md). **Live ships disarmed and I never arm it.**
+
+### Phase 12 — one portfolio, valued in one notional currency (planned, nothing built)
+
+Planned in [docs/PHASE_12_PORTFOLIO_VALUATION_AND_MIXED_ASSETS.md](docs/PHASE_12_PORTFOLIO_VALUATION_AND_MIXED_ASSETS.md);
+two pieces, six slices. **Piece 1 is a live defect fix, not a feature, and blocks Piece 2.**
+
+**Portfolio equity is computed on cost basis, not mark-to-market, so the drawdown kill switch
+cannot see unrealized loss.** `BasketRunner._equity()` passes `{key: avg_entry}` to `Ledger.equity`,
+whose own fallback is `avg_entry` — so the result is the cost basis by construction, and
+`basket_runner.py:181` is the *only* `Watchdog.check` call site in the system. A position that has
+halved contributes its full cost; drawdown reads 0%. DESIGN §6.6 says these baselines are
+"computed on mark-to-market equity", and the correct marks are built eleven lines further down in
+`_build_proposal` — after the gate has already run. Three defects travel with it: equity is
+basket-dependent (the marks map covers only the cycling basket's instruments while the ledger
+iterates every position), non-quote cash is worth zero (1,000 USDT + 9,000 USDC values at 1,000),
+and `record_flow` drops the currency off an `ExternalFlow`, so a stablecoin deposit raises the
+high-water mark while contributing nothing to equity — a guaranteed spurious kill-switch trip.
+
+Until Piece 1 lands: **the drawdown gate measures realized losses only**, so soak cycles counted
+by `report promotion` were gathered under a limit that was not enforcing what it claims. Do not
+build new valuation call sites on `Ledger.equity` in the meantime — the fix collapses them into one.
+
+**A mixed crypto+equity basket cannot run, and is refused in four places**, all fail-closed:
+`app._quote_currency` (one quote currency per process), one `VenueStack`/`Ledger`/`ExecutionService`
+per process, `reference._findings_for_one` (an instrument whose venue is not the wired catalogue's),
+and `_alpaca_stack` (no equity market-data provider exists, and its catalogue is
+`UnavailableCatalogue`). The *domain* model is ready — `asset_class`, `venue:symbol` keys, an
+`equities` correlation cluster, and `risk/aggregate.py` already taking `Mapping[str, Ledger]` and
+emitting a `VenueSlice` per venue. It was built for N venues and is only ever called with one.
 
 Phases 0–6: guardrails and money primitives, the sim-only walking skeleton, the
 deterministic shell to full depth (order lifecycle with venue-held protective groups, the

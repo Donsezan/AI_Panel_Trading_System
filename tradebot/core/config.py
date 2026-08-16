@@ -204,6 +204,18 @@ class GlobalRiskPolicy(DomainModel):
     #: halt. Valuing a depegged stablecoin at 1.00 overstates equity and loosens every limit.
     stablecoin_peg_tolerance_pct: Money = Decimal(2)
 
+    #: How old a price may be and still value a position. Beyond it the mark is *absent*, the
+    #: aggregate freezes, and new orders stop — because a stale mark is not a more conservative
+    #: mark, it is a wrong one, in whichever direction the market moved (PHASE_12 §1.4). Policy
+    #: rather than a constant for the reason every other limit is: a limit a restart can clear is
+    #: not a limit (ADR 0005).
+    #:
+    #: That it must also exceed the supervisor's resync cadence — a tolerance below it freezes
+    #: permanently — is deliberately *not* checked here: `core/` depends on nothing, and the
+    #: cadence belongs to `control/supervisor.py`. `PortfolioWatch` asserts it where both numbers
+    #: are known.
+    mark_staleness_seconds: int = Field(default=300, gt=0)
+
     #: The kill switch halts and cancels; it does not liquidate. Flattening into a broken market
     #: is often the worse outcome, and it is the operator's call, not the bot's (DESIGN §6.6).
     flatten_on_kill: bool = False
@@ -234,6 +246,11 @@ class GlobalRiskPolicy(DomainModel):
         if self.max_order_notional is not None and self.max_order_notional <= Decimal(0):
             raise ValueError("max_order_notional must be positive when set, or left unset")
         return self
+
+    @property
+    def mark_tolerance(self) -> timedelta:
+        """`mark_staleness_seconds` as the `timedelta` every valuation call passes."""
+        return timedelta(seconds=self.mark_staleness_seconds)
 
     def cluster_for(self, instrument: Instrument) -> CorrelationCluster | None:
         return next((c for c in self.clusters if c.contains(instrument)), None)

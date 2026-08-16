@@ -37,7 +37,7 @@ from tradebot.core.clock import Clock
 from tradebot.core.enums import Mode, ReconcileClass, RiskTier
 from tradebot.core.events import EventFactory
 from tradebot.core.ids import owns_client_order_id
-from tradebot.core.instrument import Instrument
+from tradebot.core.instrument import Instrument, base_currencies_of
 from tradebot.core.logging import get_logger
 from tradebot.core.money import ZERO, divide, multiply
 from tradebot.core.portfolio import AccountState, CorporateAction, Position
@@ -170,7 +170,7 @@ class Reconciler:
         """
         ours = self._ledger.snapshot()
         keys = {p.instrument_key for p in (*ours.positions, *venue_state.positions)}
-        held_as_positions = {i.base_currency for i in self._instruments.values()}
+        held_as_positions = base_currencies_of(self._instruments.values())
         currencies = {
             b.currency for b in (*ours.balances, *venue_state.balances)
         } - held_as_positions

@@ -485,7 +485,9 @@ Two tests I consider load-bearing and will write early:
 | R13 | Accidental short on equities (SELL while flat) | Med | **Severe (money)** | Tier-1 long-only/reduce-only veto (DESIGN §6.6) |
 | R14 | Corporate action (split/dividend) mistaken for ledger drift → false halt/kill | Med | Med (ops) | Reconciler corporate-action classification against venue announcements (Phase 2c/5) |
 | R15 | Binance testnet monthly reset breaks soak/reconciliation | High | Med (ops) | `VENUE_RESET` classification; SimBroker-primary soak; promotion gates exclude resets |
-| R16 | External deposit/withdrawal trips drawdown kill switch or masks losses | Med | High | Flow-adjusted HWM and day-start equity from `EXTERNAL_CHANGE` events (DESIGN §6.6) |
+| R16 | External deposit/withdrawal trips drawdown kill switch or masks losses | Med | High | Flow-adjusted HWM and day-start equity from `EXTERNAL_CHANGE` events (DESIGN §6.6). **Mitigation is currently incomplete**: `startup.py` drops the flow's currency, so a flow in any currency but the notional one adjusts the baselines by a number in the wrong unit — [Phase 12](docs/PHASE_12_PORTFOLIO_VALUATION_AND_MIXED_ASSETS.md) Finding 4 |
+| R17 | Drawdown gate measures cost basis, so unrealized loss never trips the kill switch | **Realized** | **Severe (money)** | None today. `BasketRunner._equity()` values every position at `avg_entry`, and it is the only input to `Watchdog.check`. Fixed by [Phase 12](docs/PHASE_12_PORTFOLIO_VALUATION_AND_MIXED_ASSETS.md) Piece 1, which is a defect fix and blocks its own Piece 2 |
+| R18 | Non-quote cash is valued at zero, fabricating a drawdown on a stablecoin conversion | Med | High | None today. `Ledger.equity` sums only `balance(quote_currency)`; `USD_STABLECOINS` and the peg check already exist in `risk/aggregate.py` and are not consulted. Phase 12 Piece 1, Finding 3 |
 
 ---
 

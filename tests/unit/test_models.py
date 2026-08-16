@@ -34,7 +34,7 @@ from tradebot.core.errors import (
     IllegalTransitionError,
     MoneyError,
 )
-from tradebot.core.instrument import Instrument
+from tradebot.core.instrument import Instrument, base_currencies_of
 from tradebot.core.market import Candle, CandleSeries, Quote
 from tradebot.core.orders import Fill, Order, OrderIntent, RiskCheckResult, assert_legal_transition
 from tradebot.core.portfolio import Position
@@ -483,3 +483,41 @@ class TestConfigLimits:
         members = GlobalRiskPolicy().cluster_members(instrument, (instrument, other, equity))
 
         assert set(members) == {instrument.key, other.key}
+
+
+class TestBaseCurrencies:
+    """One definition of "already a position", shared by the reconciler and the valuation."""
+
+    def test_it_names_every_base_asset_once(
+        self, instrument: Instrument, second_instrument: Instrument
+    ) -> None:
+        assert base_currencies_of((instrument, second_instrument)) == frozenset({"BTC", "ETH"})
+
+    def test_it_is_empty_for_no_instruments(self) -> None:
+        assert base_currencies_of(()) == frozenset()
+
+    def test_two_instruments_sharing_a_base_contribute_one_entry(
+        self, instrument: Instrument
+    ) -> None:
+        other = instrument.model_copy(update={"symbol": "BTC/USDC", "quote_currency": "USDC"})
+
+        assert base_currencies_of((instrument, other)) == frozenset({"BTC"})
+
+
+class TestMarkStaleness:
+    """How old a price may be and still value a position (PHASE_12 §3.2)."""
+
+    def test_it_defaults_to_five_minutes(self) -> None:
+        assert GlobalRiskPolicy().mark_staleness_seconds == 300
+        assert GlobalRiskPolicy().mark_tolerance == timedelta(minutes=5)
+
+    def test_a_non_positive_tolerance_is_refused(self) -> None:
+        """A zero tolerance freezes the portfolio permanently, which is not a limit."""
+        with pytest.raises(ValidationError):
+            GlobalRiskPolicy(mark_staleness_seconds=0)
+
+    def test_an_existing_policy_document_gains_the_default(self) -> None:
+        """Stored policies predate the field; they read back with the default, not a failure."""
+        stored = {"max_drawdown_pct": "10"}
+
+        assert GlobalRiskPolicy.model_validate(stored).mark_staleness_seconds == 300
