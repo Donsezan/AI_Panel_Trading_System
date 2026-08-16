@@ -941,8 +941,9 @@ async def _assemble(
     portfolio_watch = PortfolioWatch(
         ledger,
         marks,
-        configs,
+        lambda: configured_instruments(configs),
         watchdog,
+        store,
         clock,
         # `read_only_prices`, never `prices`: in the sim stack the latter is a bridge that feeds
         # the tick to `SimBroker` and matches resting orders. A valuation sweep must observe the

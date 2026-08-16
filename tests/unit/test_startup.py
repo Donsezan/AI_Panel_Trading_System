@@ -10,7 +10,6 @@ from decimal import Decimal
 
 import pytest
 
-from tradebot.control.config_store import ConfigStore
 from tradebot.control.startup import StartupSequence
 from tradebot.control.valuation import PortfolioWatch
 from tradebot.core.clock import ManualClock
@@ -93,8 +92,9 @@ class Stack:
         self.portfolio = PortfolioWatch(
             ledger,
             Marks(),
-            ConfigStore(store.engine, store._writer, store, clock),
+            lambda: (instrument,),
             self.watchdog,
+            store,
             clock,
             market_data=None,
             catalogue=sim_catalogue(),

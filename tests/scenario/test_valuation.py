@@ -13,15 +13,16 @@ from __future__ import annotations
 from decimal import Decimal
 
 import pytest
-
 from tests.scenario.harness import Harness
+
+from tradebot.control.valuation import VALUATION_RULE
 from tradebot.core.clock import ManualClock
 from tradebot.core.config import Basket, GlobalRiskPolicy
 from tradebot.core.enums import CycleOutcome, KillSwitchState, Side
 from tradebot.core.errors import FailClosedError
 from tradebot.core.orders import Fill
-from tradebot.ledger.portfolio import ExternalFlow
 from tradebot.decision.providers import DEFAULT_RESPONSE
+from tradebot.ledger.portfolio import ExternalFlow
 from tradebot.marketdata.replay import ReplayMarketData
 
 
@@ -82,7 +83,7 @@ class TestUnrealizedLossIsVisible:
     async def test_the_cycle_gate_blocks_once_the_switch_has_tripped_on_unrealized_loss(
         self, basket: Basket, clock: ManualClock, market_data: ReplayMarketData
     ) -> None:
-        """The gate is the only `Watchdog.check` call site a cycle has; it must see the same loss."""
+        """The gate is a cycle's only `Watchdog.check`; it must see the same loss."""
         harness = await make_harness(basket, clock, market_data, [DEFAULT_RESPONSE])
         try:
             hold(harness, basket, qty="0.1", price="50000")
@@ -229,9 +230,7 @@ class TestCashIsNeverSilentlyWorthNothing:
         """Finding 3: 1,000 USDT beside 9,000 USDC used to value at 1,000."""
         harness = await make_harness(basket, clock, market_data, [DEFAULT_RESPONSE])
         try:
-            harness.ledger.apply_external_change(
-                flow("USDT", "-9000")
-            )  # 10,000 → 1,000 USDT
+            harness.ledger.apply_external_change(flow("USDT", "-9000"))  # 10,000 → 1,000 USDT
             harness.ledger.apply_external_change(flow("USDC", "9000"))
 
             assert harness.valuation().equity == Decimal(10_000)
@@ -290,5 +289,40 @@ class TestCashIsNeverSilentlyWorthNothing:
 
             assert valuation.frozen
             assert "DOGE" in valuation.frozen_reason
+        finally:
+            harness.close()
+
+
+class TestTheOperatorIsTold:
+    async def test_a_freeze_is_recorded_once_per_transition_not_once_per_sweep(
+        self, basket: Basket, clock: ManualClock, market_data: ReplayMarketData
+    ) -> None:
+        """At the resync cadence a per-sweep event would bury the one that matters (ADR 0027)."""
+        harness = await make_harness(basket, clock, market_data, [DEFAULT_RESPONSE])
+        try:
+            hold(harness, basket, qty="0.1", price="50000")
+
+            for _ in range(3):
+                await harness.portfolio.sweep()
+
+            frozen = [e for e in harness.risk_events() if e[0] == VALUATION_RULE]
+            assert [action for _, action, _ in frozen] == ["frozen"]
+        finally:
+            harness.close()
+
+    async def test_the_recovery_is_recorded_too(
+        self, basket: Basket, clock: ManualClock, market_data: ReplayMarketData
+    ) -> None:
+        """This one clears itself, so an operator must not have to infer it from silence."""
+        harness = await make_harness(basket, clock, market_data, [DEFAULT_RESPONSE])
+        try:
+            hold(harness, basket, qty="0.1", price="50000")
+            await harness.portfolio.sweep()
+
+            mark(harness, basket, "50000")
+            await harness.portfolio.sweep()
+
+            frozen = [e for e in harness.risk_events() if e[0] == VALUATION_RULE]
+            assert [action for _, action, _ in frozen] == ["frozen", "thawed"]
         finally:
             harness.close()

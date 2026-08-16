@@ -32,6 +32,11 @@ class AlertKind(StrEnum):
     #: A run of cycles that refused their own market data. Live additionally refuses to *start*
     #: on holed or short data (`control/readiness.py`); this is the same fault appearing later.
     DATA_STALE = "data_stale"
+    #: The portfolio cannot be valued, so no percentage limit can be evaluated and no new order
+    #: may be sent. Not a breach — the kill switch stays armed — but it stops all trading, so a
+    #: soak sitting frozen overnight with nobody told is exactly what alerting exists for
+    #: (ADR 0027).
+    VALUATION_FROZEN = "valuation_frozen"
     DAILY_SUMMARY = "daily_summary"
 
     @property

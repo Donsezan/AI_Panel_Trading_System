@@ -28,6 +28,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from tradebot.control.valuation import VALUATION_RULE
 from tradebot.core.enums import CycleOutcome, KillSwitchState, ReconcileClass
 from tradebot.core.events import Event, EventType
 from tradebot.interfaces.alerts import Alert, AlertKind
@@ -39,6 +40,7 @@ ALERT_TYPES: tuple[EventType, ...] = (
     EventType.BASKET_STATUS_CHANGED,
     EventType.RECONCILED,
     EventType.CYCLE_COMPLETED,
+    EventType.RISK_EVENT,
 )
 
 #: Consecutive degraded cycles before a human is told. Two could be one provider blipping; a
@@ -201,12 +203,51 @@ def _outcome(event: Event) -> CycleOutcome | None:
         return None
 
 
+def valuation_frozen(event: Event, _state: RuleState) -> Alert | None:
+    """The portfolio becoming unvaluable — and becoming valuable again.
+
+    Narrow on purpose: `RISK_EVENT` carries every Tier-1 and Tier-2 rule that ever stood aside, and
+    alerting on all of them would train an operator to ignore the tail. Only the valuation rule's
+    own transitions qualify, and `PortfolioWatch` already emits those once per edge rather than
+    once per sweep (ADR 0027).
+
+    The recovery is an alert too, unlike a re-arm or an un-halt — those are things a human did on
+    purpose, whereas this one clears itself, and an operator woken at 03:00 should not have to
+    infer that from silence.
+    """
+    if text(event, "rule") != VALUATION_RULE:
+        return None
+    frozen = text(event, "action") == "frozen"
+    detail = text(event, "detail") or "no reason recorded"
+    if not frozen:
+        return Alert(
+            kind=AlertKind.VALUATION_FROZEN,
+            at=event.ts,
+            scope="portfolio",
+            title="Portfolio can be valued again — trading resumes",
+            body=detail,
+        )
+    return Alert(
+        kind=AlertKind.VALUATION_FROZEN,
+        at=event.ts,
+        scope="portfolio",
+        title="PORTFOLIO CANNOT BE VALUED — no new orders will be sent",
+        body=(
+            f"{detail}\n"
+            "Every percentage-based risk limit is a share of equity, so none can be evaluated. "
+            "The kill switch is NOT tripped and positions keep their protective legs; this clears "
+            "itself as soon as prices return or the balance is converted."
+        ),
+    )
+
+
 #: One handler per tailed type. Dispatch, never a chain of `if`s (CLAUDE.md).
 RULES: dict[EventType, Callable[[Event, RuleState], Alert | None]] = {
     EventType.KILL_SWITCH_CHANGED: kill_switch,
     EventType.BASKET_STATUS_CHANGED: basket_halted,
     EventType.RECONCILED: recon_mismatch,
     EventType.CYCLE_COMPLETED: cycle_streak,
+    EventType.RISK_EVENT: valuation_frozen,
 }
 
 

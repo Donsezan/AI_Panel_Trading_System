@@ -13,7 +13,6 @@ from decimal import Decimal
 from sqlalchemy import select
 
 from tradebot.control.basket_runner import BasketRunner
-from tradebot.control.config_store import ConfigStore
 from tradebot.control.context_builder import ContextBuilder
 from tradebot.control.startup import Recovery, StartupSequence
 from tradebot.control.valuation import PortfolioWatch
@@ -111,8 +110,9 @@ class Harness:
         self.portfolio = PortfolioWatch(
             self.ledger,
             self.marks,
-            ConfigStore(engine, self.writer, self.store, clock),
+            lambda: basket.instruments,
             self.watchdog,
+            self.store,
             clock,
             market_data=None,
             catalogue=sim_catalogue(),

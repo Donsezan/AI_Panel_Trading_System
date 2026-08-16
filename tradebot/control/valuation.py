@@ -28,11 +28,11 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from tradebot.control.config_store import ConfigStore
-from tradebot.control.reference import configured_instruments
 from tradebot.core.clock import Clock
 from tradebot.core.config import GlobalRiskPolicy
+from tradebot.core.enums import RiskTier
 from tradebot.core.errors import ConfigError, TradebotError
+from tradebot.core.events import EventFactory
 from tradebot.core.instrument import Instrument, base_currencies_of
 from tradebot.core.logging import get_logger
 from tradebot.core.money import ZERO
@@ -41,6 +41,7 @@ from tradebot.interfaces.market_data import MarketDataProvider
 from tradebot.ledger.marks import Marks
 from tradebot.ledger.portfolio import Ledger
 from tradebot.marketdata.catalogue import instrument_for
+from tradebot.persistence.store import EventStore
 from tradebot.risk.aggregate import USD_STABLECOINS, PortfolioAggregate, aggregate
 from tradebot.risk.watchdog import Watchdog
 
@@ -51,6 +52,9 @@ logger = get_logger(__name__)
 #: warning rather than a stopped portfolio.
 MIN_TOLERANCE_MULTIPLE = 3
 
+#: The rule name a freeze is recorded and alerted under.
+VALUATION_RULE = "portfolio_valuation"
+
 
 class PortfolioWatch:
     """Refreshes the marks the whole portfolio is valued against, and checks the baselines."""
@@ -59,8 +63,9 @@ class PortfolioWatch:
         self,
         ledger: Ledger,
         marks: Marks,
-        configs: ConfigStore,
+        universe: Callable[[], tuple[Instrument, ...]],
         watchdog: Watchdog,
+        store: EventStore,
         clock: Clock,
         *,
         market_data: MarketDataProvider | None,
@@ -71,8 +76,11 @@ class PortfolioWatch:
     ) -> None:
         self._ledger = ledger
         self._marks = marks
-        self._configs = configs
+        #: Every configured instrument, read fresh — the same callable the runner takes, so the
+        #: sweep and a cycle can never disagree about what the portfolio contains.
+        self._universe = universe
         self._watchdog = watchdog
+        self._store = store
         self._clock = clock
         #: The source *under* the sim stack's bridge — reading it cannot move the venue.
         self._market_data = market_data
@@ -85,6 +93,8 @@ class PortfolioWatch:
         #: data: it cannot change without a catalogue refresh, and re-asking every thirty seconds
         #: would spend venue weight to be told the same thing.
         self._currency_markets: dict[str, Instrument | None] = {}
+        #: Whether the last sweep could value the portfolio, so only *transitions* are recorded.
+        self._was_frozen = False
 
     def _assert_tolerance_outlives_the_sweep(self, resync_seconds: float) -> None:
         """Refuse to wire a tolerance the sweep cannot possibly keep inside.
@@ -107,15 +117,43 @@ class PortfolioWatch:
         await self.refresh()
         valuation = self.valuation()
         await self._watchdog.check(valuation)
-        if valuation.frozen:
-            logger.warning("the portfolio cannot be valued", extra={"why": valuation.frozen_reason})
+        await self._announce(valuation)
         return valuation
+
+    async def _announce(self, valuation: PortfolioAggregate) -> None:
+        """Record a change in whether the portfolio can be valued. **Transitions only.**
+
+        Once per transition, never once per sweep: at the resync cadence a persistent freeze would
+        write an event every thirty seconds and bury the one that matters. Both edges are recorded
+        — an operator woken by the freeze needs to see the recovery without having to infer it from
+        silence (ADR 0027).
+        """
+        if valuation.frozen == self._was_frozen:
+            return
+        self._was_frozen = valuation.frozen
+        events = EventFactory(clock=self._clock, basket_id="global", cycle_id="portfolio_watch")
+        detail = valuation.frozen_reason or "the portfolio can be valued again"
+        await self._store.append(
+            events.risk_event(
+                tier=RiskTier.TIER2,
+                rule=VALUATION_RULE,
+                scope="portfolio",
+                action="frozen" if valuation.frozen else "thawed",
+                detail=detail,
+            )
+        )
+        logger.warning(
+            "the portfolio cannot be valued; no new order may be sent"
+            if valuation.frozen
+            else "the portfolio can be valued again",
+            extra={"why": detail},
+        )
 
     def valuation(self) -> PortfolioAggregate:
         """The aggregate as it stands, without touching the venue."""
         return aggregate(
             {self._ledger.venue: self._ledger},
-            configured_instruments(self._configs),
+            self._universe(),
             self._marks,
             self._policy_of(),
             as_of=self._clock.now(),
@@ -145,7 +183,7 @@ class PortfolioWatch:
         configured or close the position by hand — the same constraint `manual_close.closable()`
         already imposes, for the same reason (PHASE_12 §3.6).
         """
-        universe = configured_instruments(self._configs)
+        universe = self._universe()
         by_key = {instrument.key: instrument for instrument in universe}
         held = tuple(
             instrument

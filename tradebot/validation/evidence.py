@@ -70,6 +70,10 @@ class IncidentKind(StrEnum):
     CYCLE_FAILED = "cycle_failed"
     RECON_MISMATCH = "recon_mismatch"
     ORDER_STRANDED = "order_stranded"
+    #: The portfolio could not be valued, so trading stopped until someone fixed the feed or the
+    #: balance. Counted because `ops/rules.py` alerts on it, and the two vocabularies must not
+    #: drift — "what needed a human" has one definition in this codebase (ADR 0027).
+    VALUATION_FROZEN = "valuation_frozen"
 
 
 @dataclass(frozen=True, slots=True)
