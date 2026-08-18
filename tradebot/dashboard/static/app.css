@@ -206,7 +206,7 @@ body.centred { display: grid; place-items: center; min-height: 100vh; }
 .grid.tight { grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr)); align-items: end; }
 .field { display: flex; flex-direction: column; gap: 0.2rem; }
 .field label.inline { flex-direction: row; display: flex; align-items: center; gap: 0.4rem; color: var(--text); }
-.field input, .field select { width: 100%; }
+.field input:not([type="checkbox"]), .field select { width: 100%; }
 
 fieldset {
   border: 1px solid var(--line);
@@ -318,15 +318,40 @@ form.retire { display: flex; align-items: center; gap: 0.6rem; margin-top: 2rem;
 /* A seat label carries an id, its provider·model binding and sometimes a warning pill, so its rail
    is wider than the section rail's. Widened here rather than by letting the column size itself: the
    pane clears a *known* width, so a rail that measured its widest label would move the pane every
-   time a seat was renamed. */
-.seat-master { --rail-width: 15rem; }
-.seat-master > .tab-label { display: flex; gap: 0.5rem; align-items: baseline; white-space: nowrap; }
-.seat-master .seat-id { font: 600 13px/1.4 var(--mono); }
+   time a seat was renamed.
+
+   `.tabs.rail.seat-master`, not `.seat-master`: both rules set `--rail-width` on the *same* element,
+   so a single class loses the cascade to `.tabs.rail`'s two and the wider value never applies.
+
+   A known width is only half the job, because the labels are `nowrap`. A grid item's automatic
+   minimum size is its content, which is what lets a long seat id push out of a fixed track and lie
+   across the pane's first field; `min-width: 0` gives that minimum up so the children ellipsize into
+   what the rail actually has. The pill is exempt — it warns that two seats resolve to the same model,
+   which makes it the last part of the label that may be clipped away.
+
+   The id then takes a line to itself (`flex-basis: 100%`), because clipping and legibility are not
+   the same win. Sharing one line with the binding and the pill leaves the id about a third of the
+   rail, and the id is the only part saying *which* seat the pane is showing — two seats named alike
+   both ellipsize to the same stem and the operator edits the wrong one. The rail's rows are
+   `min-content`, so the second line costs height that was free. */
+.tabs.rail.seat-master { --rail-width: 15rem; }
+.seat-master > .tab-label {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.1rem 0.5rem;
+  align-items: baseline;
+  white-space: nowrap;
+  min-width: 0;
+  overflow: hidden;
+}
+.seat-master .seat-id,
+.seat-master .seat-binding { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.seat-master .seat-id { flex-basis: 100%; font: 600 13px/1.4 var(--mono); }
 .seat-master .seat-binding { color: var(--muted); font-size: 0.8rem; }
+.seat-master .pill { flex-shrink: 0; }
 
 .checkgroup { display: flex; flex-wrap: wrap; gap: 0.2rem 0.9rem; }
 .checkgroup label.inline { display: flex; align-items: center; gap: 0.35rem; color: var(--text); }
-.checkgroup input[type="checkbox"] { width: auto; }
 .group-label { color: var(--muted); font-size: 0.85rem; }
 
 /* Publish stays on screen. It used to sit below sixty fields while `remove` sat at eye level, so

@@ -86,6 +86,13 @@
 {# Add and remove re-post the whole form to the draft endpoint and publish nothing, so a row
    change never loses what the operator has already typed elsewhere on the page.
 
+   `remove_row`, not `remove` — and the asymmetry with `add` is the whole point. A control's
+   name is also a property of its own form, so `name="remove"` made `form.remove` this button
+   instead of `Element.prototype.remove`. htmx's outerHTML swap ends in `target.remove()`, so every
+   add, remove and Look up threw there: the re-rendered form was inserted and the old one never
+   removed, leaving two stacked copies of the basket, each with its own Publish button and its own
+   draft. `add` collides with nothing a form element has.
+
    `hx-*` and `formaction` both, deliberately: htmx swaps the form in place and does not scroll on a
    swap, so the operator keeps their position mid-edit; with scripting off the button still performs
    the full POST it always did. The server returns the whole page either way and `hx-select` picks
@@ -93,7 +100,7 @@
 {% macro row_buttons(add_path, remove_path, add_label, action) %}
   <div class="row-buttons">
     {% if remove_path %}
-      <button type="submit" name="remove" value="{{ remove_path }}" class="ghost"
+      <button type="submit" name="remove_row" value="{{ remove_path }}" class="ghost"
               formaction="{{ action }}" formnovalidate
               hx-post="{{ action }}" hx-target="#basket-form" hx-select="#basket-form"
               hx-swap="outerHTML">remove</button>

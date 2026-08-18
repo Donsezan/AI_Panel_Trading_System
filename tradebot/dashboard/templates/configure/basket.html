@@ -79,12 +79,17 @@
           <legend>{{ row.symbol or "new instrument" }}</legend>
           <div class="grid tight">
             {{ f.field(i ~ ".symbol", "Identifier", draft["instruments"][row.index].get("symbol"), errors, hint="the venue's own symbol, e.g. BTC/USDT") }}
+            {# The spacer stands in for the hint under the identifier, and belongs *below* the
+               button because `.grid.tight` aligns its cells to the end: what lines the button up
+               with the input is whatever follows it, not what precedes it. Above the button it
+               pushed nothing anywhere and left Look up level with the hint, a line adrift of the
+               field it acts on. #}
             <div class="field">
-              <span class="muted small">&nbsp;</span>
               <button type="submit" name="lookup" value="{{ row.index }}" class="ghost"
                       formaction="{{ draft_action }}" formnovalidate
                       hx-post="{{ draft_action }}" hx-target="#basket-form"
                       hx-select="#basket-form" hx-swap="outerHTML">Look up</button>
+              <span class="muted small">&nbsp;</span>
             </div>
           </div>
           <div class="grid tight">

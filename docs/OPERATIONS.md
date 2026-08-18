@@ -1,15 +1,143 @@
-# Operations — running this system against real money
+# Operations — running the bot, and running it against real money
 
-> This document is for the person who arms live trading. That person is **you**, never me. Every
+> **§§1–3 are for the person who arms live trading.** That person is **you**, never me. Every
 > command below is one a human types deliberately; nothing in this repository arms itself, and no
 > default, env var, or typo reaches a live venue ([ADR 0012](adr/0012-live-is-four-independent-preconditions.md),
 > [ADR 0020](adr/0020-live-is-the-paper-wiring-minus-headroom.md)).
 
-Three sections, in the order you will need them: [before you arm](#1-before-you-arm),
-[the arming procedure](#2-the-arming-procedure), and [the incident runbook](#3-incident-runbook).
+Four sections, in the order you will need them: [running the bot](#0-running-the-bot) in any mode,
+[before you arm](#1-before-you-arm), [the arming procedure](#2-the-arming-procedure), and
+[the incident runbook](#3-incident-runbook). **§0 applies to sim and paper as much as to live**;
+everything from §1 onward is live only.
 
 Live mode is **Binance spot only** in v1. There is no equity market-data provider, so an Alpaca
 basket refuses to wire — in live exactly as in paper, with the same message.
+
+---
+
+## 0. Running the bot
+
+### 0.1 The three modes
+
+`--mode` is required and has no default — no environment variable, config default or typo selects
+one. Each mode writes its **own** database (`data\sim.db`, `data\paper.db`, `data\live.db`) and
+shares nothing with the others: not the ledger, not the risk state, not the live arming row.
+
+| Mode | Prices | Fills | Money at risk | Needs a key |
+|---|---|---|---|---|
+| `sim` | synthetic, generated locally | `SimBroker` | none | no |
+| `paper` | **real** Binance spot, public REST | `SimBroker` | none | no |
+| `live` | real Binance spot | **the venue** | **real** | yes — live-only variable names |
+
+`sim` refuses `--broker binance` and `--broker alpaca`: a simulation that reaches a venue is
+neither offline nor reproducible. `live` refuses `--broker sim` for the mirror reason — an order
+not sent to a venue is not a live order. Paper's default `--broker sim` is the soak's evidence
+base; `--broker binance` there points the real adapter at the venue's **testnet** and is an
+adapter integration check, reported but never counted as evidence (R15).
+
+### 0.2 Starting it — two commands
+
+```powershell
+# one cycle per basket, then exit — what you use to check a change works
+.venv\Scripts\python.exe -m tradebot run --mode sim --once
+
+# every basket on its own schedule, until Ctrl-C
+.venv\Scripts\python.exe -m tradebot run --mode sim
+
+# the dashboard, with the same supervisor behind it — the normal way to operate
+$env:TRADEBOT_DASHBOARD_TOKEN = "at-least-sixteen-characters"
+.venv\Scripts\python.exe -m tradebot serve --mode sim
+```
+
+`serve` **refuses to start without `TRADEBOT_DASHBOARD_TOKEN`**, in every mode, including sim on
+localhost ([ADR 0014](adr/0014-the-dashboard-is-vendored-and-always-authenticated.md)). It binds
+`127.0.0.1:8000`; `--host` and `--port` move it, and a non-loopback address needs `--allow-remote`
+on top of the token. Open <http://127.0.0.1:8000>, paste the token on the login page — that is the
+whole login. Rotating the token and restarting invalidates every session.
+
+Ctrl-C is the normal way out of both. It cancels nothing at the venue: orders left working are
+recovered by the next start's startup sequence, not abandoned.
+
+### 0.3 A first run, in order
+
+1. **Sim, one cycle.** `run --mode sim --once`. Free, offline, and the scripted `stub` panel — no
+   key, no egress, no cost. A fresh database seeds a two-instrument demo basket so there is
+   something to cycle.
+2. **Sim, with the dashboard.** `serve --mode sim`. Configure a basket, watch a cycle land in the
+   blotter, try Stop and Start. Everything you will do in live, you do here first.
+3. **Paper, one cycle.** `run --mode paper --once`. Same code, real Binance prices, simulated
+   fills. Still no key and still no money.
+4. **The soak.** `serve --mode paper`, left running for weeks, on the default `--broker sim`.
+   Those are the cycles `report promotion` counts — it counts by the venue stamped on each cycle,
+   so a testnet run mixed into the same database is reported and then excluded.
+5. **Then, and only then, §1.** `report promotion --mode paper` writes a report to `reports\`;
+   read it, then work through [before you arm](#1-before-you-arm).
+
+Live is not step 6 of this list — it is [§1](#1-before-you-arm) and [§2](#2-the-arming-procedure),
+and it starts with a signature on a promotion report.
+
+### 0.4 The flags you will actually type
+
+| Flag | On | What it does |
+|---|---|---|
+| `--mode sim\|paper\|live` | every command | required; there is no default |
+| `--once` | `run` | one cycle per basket, then exit. Non-zero if a cycle failed, or if a halted basket never cycled at all |
+| `--observe` | `serve` | dashboard up, **nothing cycling**. The state it starts in, not a lock |
+| `--broker sim\|binance\|alpaca` | `run`, `serve` | which venue takes the orders; defaults to `sim` |
+| `--panel stub\|free\|local` | `run`, `serve` | seeds a **fresh** database only. A stored basket carries its own panel and this flag is ignored — edit it in Settings |
+| `--news <source>` | `run`, `serve` | repeatable: `cointelegraph`, `coindesk`, `sec_press` |
+| `--host` `--port` `--allow-remote` | `serve` | where the dashboard binds |
+| `--data-dir` | every command | where `{mode}.db` lives; defaults to `data\` |
+| `--confirm "<phrase>"` | `run`, `serve` | the live phrase; live only, and typed on every invocation |
+| `--verbose` | every command | debug logging |
+
+Three things are **off unless asked for**, and all three are deliberate:
+
+* **News** reaches the public internet, so it is off until `--news` names a source.
+* **The panel** is the offline `stub`. `--panel free` needs `OPENROUTER_API_KEY`; `--panel local`
+  needs a local runtime (LM Studio) and no key at all.
+* **Alerting** is on exactly when a destination is configured — there is no flag to forget. Optional
+  in sim and paper, mandatory in live ([§1.3](#13-the-environment)).
+
+### 0.5 The dashboard, page by page
+
+| Page | Path | What it is for |
+|---|---|---|
+| **View** | `/` | the workspace: portfolio, blotter, chart, log, the control dock and the risk pane. The only screen the bot is run from |
+| **Parameters** | `/configure/risk` | the Tier-2 global limits |
+| **Settings** | `/configure` | baskets, instruments, panels, schedules, quarantine |
+| **Analytics** | `/cycles`, `/analytics/portfolio`, `/risk`, `/costs` | the cycle drill-down, round trips and the realized equity curve, risk history, model spend |
+
+Selecting a row is a navigation (`/?scope=basket:demo`), so a reload or a bookmark lands on the
+same view. Every act — Start, Stop, pause a basket, quarantine, un-halt, kill switch, manual close
+— is on the dock, and every one of them appears in the event log with `dashboard` as the actor.
+
+**Editing configuration is the dashboard's job.** The CLI's `config` subcommands only read: an edit
+belongs where it is validated against the engine's own models and recorded with an actor.
+
+### 0.6 Looking without trading
+
+```powershell
+.venv\Scripts\python.exe -m tradebot serve --mode sim --observe      # dashboard up, nothing cycles
+.venv\Scripts\python.exe -m tradebot risk status --mode sim          # state, arming, limits in force
+.venv\Scripts\python.exe -m tradebot config list --mode sim          # what is in service, at which version
+.venv\Scripts\python.exe -m tradebot config history basket demo --mode sim
+```
+
+`--observe` is what you want after an incident: the log, the ledger and the reason are all readable
+and nothing trades until someone clicks Start.
+
+### 0.7 Stopping — four different things
+
+| Act | Where | What it does | Cleared by |
+|---|---|---|---|
+| **Ctrl-C** | terminal | ends the process. Cancels nothing at the venue | starting again |
+| **Stop** | the dock | pauses cycling. Cancels nothing, needs no phrase, never refused. It *does* end the polling of open orders, so **no order may be placed while stopped** — manual close included | **Start** (the phrase again, in live) |
+| **Kill switch** | the dock | halts every basket and cancels working orders. Positions are **not** flattened | `risk rearm --confirm "RE-ARM TRADING"` |
+| **Disarm** | the dock, or `risk disarm-live` | prevents the next live start. From the dashboard it also stops supervision | arming again ([§2.1](#21-record-the-arming-decision)) |
+
+Stop is not the kill switch, and neither is a substitute for the other. If you need to close a
+position from here, do **not** reach for Stop first — see [§3.8](#38-getting-out-entirely).
 
 ---
 

@@ -578,7 +578,7 @@ def _apply_row_action(draft: dict[str, Any], form: FormData) -> dict[str, str]:
     if added:
         add_row(draft, added)
         return focus_for(added) | _selected_seat(draft, added)
-    removed = _field(form, "remove")
+    removed = _field(form, "remove_row")
     if removed:
         remove_row(draft, removed)
         return focus_for(removed)

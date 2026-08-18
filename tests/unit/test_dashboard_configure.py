@@ -448,7 +448,7 @@ async def test_removing_a_row_re_renders_without_it(
     body = (
         await client.post(
             "/configure/baskets/demo/draft",
-            data=as_form([*basket_form, ("remove", "instruments[1]")]),
+            data=as_form([*basket_form, ("remove_row", "instruments[1]")]),
         )
     ).text
 
@@ -503,6 +503,30 @@ def button(body: str, name: str) -> str:
     return match.group(0)
 
 
+def lookup_cell(body: str) -> str:
+    """The grid cell holding the Look up button, from its own `<div>` to that div's close."""
+    at = body.index('name="lookup"')
+    opened = body.rindex('<div class="field">', 0, at)
+    return body[opened : body.index("</div>", at)]
+
+
+async def test_look_up_shares_the_identifier_input_s_line(client: httpx.AsyncClient) -> None:
+    """`.grid.tight` aligns its cells to the *end*, so what lines the button up with the input is
+    whatever sits below the button — not above it.
+
+    The identifier carries a hint beneath its input. A spacer placed above the button therefore
+    pushed nothing anywhere, and end-alignment put the button level with that hint: one line below
+    the field it acts on, reading as an unrelated control rather than the second half of "name an
+    identifier and press Look up".
+    """
+    cell = lookup_cell((await client.get("/configure/baskets/demo")).text)
+
+    assert 'class="muted small"' in cell, "the button has nothing standing in for the hint"
+    assert cell.index('name="lookup"') < cell.index('class="muted small"'), (
+        "the spacer is above the button; end-aligned cells need it below"
+    )
+
+
 async def test_row_buttons_swap_the_form_rather_than_reload_the_page(
     client: httpx.AsyncClient,
 ) -> None:
@@ -514,12 +538,99 @@ async def test_row_buttons_swap_the_form_rather_than_reload_the_page(
     """
     body = (await client.get("/configure/baskets/demo")).text
 
-    for name in ("add", "remove"):
+    for name in ("add", "remove_row"):
         tag = button(body, name)
         assert 'hx-post="/configure/baskets/demo/draft"' in tag
         assert 'hx-target="#basket-form"' in tag
         assert 'hx-select="#basket-form"' in tag
         assert 'formaction="/configure/baskets/demo/draft"' in tag
+
+
+#: Members of `HTMLFormElement`, `Element` and `Node` that a control's `name` may not shadow.
+#:
+#: HTML exposes every named control as a property of its own form, so `<button name="remove">` makes
+#: `form.remove` a `RadioNodeList` rather than `Element.prototype.remove`. htmx's `outerHTML` swap
+#: ends in `target.remove()`: it inserts the new form, throws `TypeError: t.remove is not a
+#: function`, and never removes the old one — leaving the operator two stacked copies of the basket
+#: form, the second still holding the pre-edit draft.
+DOM_MEMBERS_A_CONTROL_MAY_NOT_SHADOW = frozenset(
+    {
+        # Node/Element mutation — what a swap calls on the element it is replacing.
+        "after",
+        "append",
+        "appendChild",
+        "before",
+        "cloneNode",
+        "insertAdjacentElement",
+        "insertAdjacentHTML",
+        "insertBefore",
+        "prepend",
+        "remove",
+        "removeChild",
+        "replaceChild",
+        "replaceChildren",
+        "replaceWith",
+        # Traversal and matching.
+        "children",
+        "closest",
+        "contains",
+        "matches",
+        "parentNode",
+        "querySelector",
+        "querySelectorAll",
+        # Identity and attributes a script reads to find or restyle the form.
+        "attributes",
+        "classList",
+        "className",
+        "dataset",
+        "id",
+        "innerHTML",
+        "outerHTML",
+        "style",
+        "tagName",
+        "textContent",
+        # Events.
+        "addEventListener",
+        "dispatchEvent",
+        "removeEventListener",
+        # HTMLFormElement's own API. Shadowing `submit` would stop the form submitting at all.
+        "acceptCharset",
+        "action",
+        "checkValidity",
+        "elements",
+        "encoding",
+        "enctype",
+        "length",
+        "method",
+        "name",
+        "noValidate",
+        "reportValidity",
+        "requestSubmit",
+        "reset",
+        "submit",
+        "target",
+    }
+)
+
+
+async def test_no_control_shadows_a_dom_member_of_its_own_form(client: httpx.AsyncClient) -> None:
+    """A control's `name` is also a property of its form, and the page swaps that form by script.
+
+    This is not a style rule. `<button name="remove">` made `form.remove` the button, so htmx's
+    `outerHTML` swap inserted the re-rendered form and then threw instead of removing the old one:
+    every `add`, `remove` and `Look up` left a second copy of the whole basket form stacked below
+    the first, each with its own Publish button and its own draft. An operator publishing from the
+    lower one publishes the edit they just made *without* it.
+
+    Asserted over the rendered markup rather than the macro, because the hazard is the pair —
+    a name and the form it lands in — and only the rendered page has both.
+    """
+    body = (await client.get("/configure/baskets/demo")).text
+    names = {match.group(1) for match in re.finditer(r'\sname="([^"]+)"', form_markup(body))}
+
+    assert names, "no named controls found; this test no longer guards anything"
+    shadowing = sorted(names & DOM_MEMBERS_A_CONTROL_MAY_NOT_SHADOW)
+    assert not shadowing, f"these control names shadow a DOM member of their form: {shadowing}"
 
 
 def form_markup(body: str) -> str:
@@ -705,6 +816,87 @@ def test_the_rail_places_every_label_ahead_of_the_open_pane() -> None:
     # across the label rows.
     assert "min-content) 1fr" in rail
     assert "grid-row: 1 / -1" in rail
+
+
+def _rules(css: str) -> list[tuple[str, str]]:
+    """(selector, body) for every rule in the stylesheet, comments removed."""
+    stripped = re.sub(r"/\*.*?\*/", "", css, flags=re.S)
+    return [(sel.strip(), body) for sel, body in re.findall(r"([^{}]+)\{([^{}]*)\}", stripped)]
+
+
+def test_the_seat_rail_is_wider_than_the_section_rail_it_overrides() -> None:
+    """`--rail-width` is declared twice for one element, and only one of them can win.
+
+    The seat rail is `<div class="tabs rail seat-master">`, so `.tabs.rail`'s narrow default and
+    `.seat-master`'s wider one are a specificity contest rather than an override — and the base
+    rule wins it on class count. The rail then renders narrower than the labels it carries, and
+    `white-space: nowrap` walks `seat-1 stub - stub-analyst` out of its box and over the top of
+    the pane's first field, which is what an operator sees.
+
+    Asserted on specificity rather than on the literal selector, so the next widening — another
+    `.tabs.rail` variant, a second master-detail rail — cannot reintroduce it by a new spelling.
+    """
+    css = (PACKAGE / "static" / "app.css").read_text(encoding="utf-8")
+    widths = {sel: body for sel, body in _rules(css) if "--rail-width:" in body}
+    base = next(sel for sel in widths if sel == ".tabs.rail")
+    override = next(sel for sel in widths if "seat-master" in sel)
+
+    assert override.count(".") > base.count("."), f"{override} cannot override {base}"
+
+
+def test_a_long_seat_label_is_clipped_rather_than_written_over_the_pane() -> None:
+    """The rail's width is fixed on purpose — one that measured its widest label would move the
+    pane every time a seat was renamed — so the label has to contain its own overflow. Widening it
+    alone only buys a bigger box to spill out of: `white-space: nowrap` puts a long seat id, or the
+    `homogeneous` pill, on top of the pane's first field again.
+    """
+    css = (PACKAGE / "static" / "app.css").read_text(encoding="utf-8")
+    seat = css[css.index(".seat-master {") : css.index(".checkgroup {")]
+
+    # A grid item's automatic minimum size is its content, so the fixed track alone does not hold
+    # it — the label has to be told it may be smaller than what it contains.
+    assert "min-width: 0" in seat and "overflow: hidden" in seat
+    assert "text-overflow: ellipsis" in seat
+    # The pill warns that two seats resolve to the same model. It is the one part of the label that
+    # must never be what gets clipped away.
+    assert "flex-shrink: 0" in seat
+
+
+def test_a_seat_id_gets_the_rail_to_itself() -> None:
+    """Clipping alone is not legibility. On one line the binding and the `homogeneous` pill take
+    most of the rail, and the id — the only part naming *which* seat the pane is showing — is what
+    ellipsis eats first: `momentum-analyst-secondary` and `momentum-analyst-primary` both render as
+    `momentum...`, and an operator edits the wrong seat.
+
+    So the label wraps and the id claims a full line of its own. The rail's rows are `min-content`,
+    so the second line costs height that was free anyway.
+    """
+    css = (PACKAGE / "static" / "app.css").read_text(encoding="utf-8")
+    seat = css[css.index(".seat-master {") : css.index(".checkgroup {")]
+
+    assert "flex-wrap: wrap" in seat
+    assert "flex-basis: 100%" in seat
+
+
+def test_a_checkbox_is_never_stretched_to_the_width_of_its_field() -> None:
+    """`width: 100%` is right for a text box and wrong for a checkbox: it stretches the control
+    across the whole field and shoves its label to the far side of the pane.
+
+    `f.flag` renders four of these — Devil's advocate, Supports JSON mode, Long only, Flatten on
+    kill — and none of them sits in `.checkgroup`, which carried the only escape hatch. So the
+    exclusion belongs on the declaration, where a fifth flag inherits it, rather than on each
+    container that happens to hold one.
+    """
+    css = (PACKAGE / "static" / "app.css").read_text(encoding="utf-8")
+    stretched = [
+        sel
+        for sel, body in _rules(css)
+        if re.search(r"\bwidth:\s*100%", body) and re.search(r"\binput\b", sel)
+    ]
+
+    assert stretched, "the full-width input rule has moved; this test no longer guards anything"
+    for selector in stretched:
+        assert 'not([type="checkbox"])' in selector, selector
 
 
 # ---------------------------------------------------------------- checkbox groups
