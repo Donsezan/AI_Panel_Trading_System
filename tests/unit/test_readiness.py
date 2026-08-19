@@ -33,6 +33,7 @@ from tradebot.core.enums import BasketStatus, ProviderKind
 from tradebot.core.errors import ConfigError
 from tradebot.core.instrument import Instrument
 from tradebot.core.market import Candle, timeframe_interval
+from tradebot.decision.presets import SIM_PANEL
 from tradebot.decision.probe import PanelProbeResult
 from tradebot.indicators.library import DEFAULT_INDICATORS, required_history
 from tradebot.interfaces.alerts import Alert
@@ -265,6 +266,28 @@ class TestPanel:
     ) -> None:
         """A fallback to the stub is one outage away from a real order sized by canned JSON."""
         basket = live_basket.model_copy(update={"panel": STUB_BACKED_PANEL})
+        gates = await readiness(
+            configs, basket, clock, ledger, market_data=market(clock, instrument)
+        )
+        failures = await gates.run()
+        assert any("stub provider" in failure for failure in failures)
+
+    async def test_the_varied_sim_panel_is_refused_like_any_other_stub(
+        self,
+        configs: ConfigStore,
+        live_basket: Basket,
+        clock: ManualClock,
+        ledger: Ledger,
+        instrument: Instrument,
+    ) -> None:
+        """`SIM_PANEL` answers from a random draw, so it is the worst thing live could bind.
+
+        It is caught by the rule that already existed — the refusal reads the provider *kind*,
+        and a `varied-*` seat is still `ProviderKind.STUB`. Asserted rather than reasoned about:
+        a second stub family that slipped past this gate would be an order sized by canned JSON,
+        and nothing downstream would notice.
+        """
+        basket = live_basket.model_copy(update={"panel": SIM_PANEL})
         gates = await readiness(
             configs, basket, clock, ledger, market_data=market(clock, instrument)
         )

@@ -1,0 +1,174 @@
+{
+  "notes": "Answers the offline stub gives for a seat bound to a `varied-*` model. Edit this file to change what a simulated panel argues about; no code change is needed. Every entry is validated as a SeatVote at load, so an unparseable edit is refused by name rather than becoming a run of silent abstentions. The spread of actions is the point: with several seats drawing independently, some cycles reach a qualified majority and some resolve to WAIT for want of one, which is what exercises the consensus rule. Keep at least one entry per action if you want that coverage to survive your edits.",
+  "basket_views": [
+    "These legs are one momentum view; taken together they double a single bet rather than diversifying it.",
+    "The two names are trading independently this week, so sizing them on the same signal would be a mistake.",
+    "Correlation across the basket has risen sharply; I would treat the aggregate exposure as one position.",
+    "Nothing links these beyond both being in the basket. Judge each on its own evidence."
+  ],
+  "responses": [
+    {
+      "action": "BUY",
+      "conviction": 4,
+      "size_hint": "half",
+      "thesis": "Price has held above EMA20 for six consecutive bars and EMA20 sits cleanly above EMA50, so the trend structure is intact rather than merely bouncing. MACD crossed positive two bars ago and the histogram is still expanding, which is the part I weight - a cross that immediately flattens is noise. RSI in the high 50s leaves room before anything I would call stretched. Half size rather than full because the move is already extended from the last consolidation and I would rather add on a retest than pay up here.",
+      "key_risks": [
+        "the EMA20 reclaim is only six bars old and has not been retested",
+        "momentum can reverse without warning on thin weekend liquidity"
+      ],
+      "invalidation": "a 1h close back below EMA20, or MACD histogram contracting for two consecutive bars"
+    },
+    {
+      "action": "BUY",
+      "conviction": 5,
+      "size_hint": "full",
+      "thesis": "This is the cleanest setup the tape has offered in this window. Price broke the upper Bollinger band on volume well above its recent average and has spent four bars consolidating above the breakout level instead of falling straight back inside it - a failed breakout retraces immediately, and this has not. EMA20 and EMA50 are both rising and correctly ordered. ATR has expanded with the move, so the stop distance this sizes to is honest about current volatility rather than borrowed from a quieter regime. Full size is justified because the invalidation is close and unambiguous.",
+      "key_risks": [
+        "buying an extended move means a wide stop in absolute terms",
+        "elevated ATR sizes a smaller position than the conviction alone would suggest"
+      ],
+      "invalidation": "a close back inside the Bollinger band, or any 1h close below the breakout level"
+    },
+    {
+      "action": "BUY",
+      "conviction": 3,
+      "size_hint": "half",
+      "thesis": "A pullback inside an intact uptrend. Price has come back to EMA20 and found buyers there twice without breaking it, while EMA50 continues to rise underneath. RSI has unwound from overbought into the mid 40s, which is where a healthy trend pullback usually stops. I am not more confident than three because volume on the bounce is unremarkable and I would want to see it confirm.",
+      "key_risks": [
+        "a pullback and the start of a reversal look identical until one of them fails",
+        "volume has not confirmed the bounce"
+      ],
+      "invalidation": "a 1h close below EMA50, which would make this a trend change rather than a pullback"
+    },
+    {
+      "action": "BUY",
+      "conviction": 2,
+      "size_hint": "quarter",
+      "thesis": "Marginal, and I want to be explicit that this is a starter rather than a position. RSI dipped below 30 and has turned up, and price is testing the lower Bollinger band from beneath - the mechanical mean-reversion case. But the trend filter disagrees: EMA20 is below EMA50 and both are declining, so I would be buying against structure. Quarter size on the view that oversold bounces are real but short, and that being wrong here should cost very little.",
+      "key_risks": [
+        "buying against a declining EMA structure",
+        "oversold can persist far longer than a position can be held through it",
+        "no catalyst in the news to explain why this would turn here"
+      ],
+      "invalidation": "RSI making a lower low while price makes a lower low"
+    },
+    {
+      "action": "BUY",
+      "conviction": 1,
+      "size_hint": "quarter",
+      "thesis": "The weakest constructive case I am prepared to state. Nothing in the indicator set is outright bearish and price has stopped making lower lows, but nothing is confirming either - MACD is flat around zero and the bands have narrowed to the point where they say nothing about direction. I am voting BUY rather than WAIT only because the basket has budget available and a minimum position keeps us engaged with an instrument that is starting to base. If the rest of the panel disagrees I have no argument to make.",
+      "key_risks": [
+        "compressed volatility resolves in either direction with equal probability",
+        "there is no confirming signal here, only an absence of bearish ones"
+      ],
+      "invalidation": "any close below the recent basing low"
+    },
+    {
+      "action": "SELL",
+      "conviction": 4,
+      "size_hint": "half",
+      "thesis": "Momentum is exhausting and the position has run. RSI printed above 70 and has since rolled over while price made a marginally higher high - a bearish divergence, and the one momentum signal I take seriously on this timeframe. MACD histogram has been contracting for three bars. The unrealized gain on this position is real and I would rather bank half of it into strength than give it back defending a thesis the indicators have stopped supporting. Half rather than full because the primary trend has not broken.",
+      "key_risks": [
+        "trimming a winner early in a trend that may well continue",
+        "divergences can persist for many bars before resolving"
+      ],
+      "invalidation": "RSI reclaiming 70 with MACD histogram expanding again"
+    },
+    {
+      "action": "SELL",
+      "conviction": 5,
+      "size_hint": "full",
+      "thesis": "The structure has broken and I want out of all of it. Price closed below EMA50 on volume, EMA20 has crossed beneath EMA50, and the lower Bollinger band is expanding downward rather than containing the move - that combination is a trend change, not a pullback. ATR has jumped, so every bar from here risks more than the ones that built this position. The news items in the snapshot are consistent with the price action rather than contradicting it. I would rather be flat and wrong than positioned into an expanding-volatility downtrend.",
+      "key_risks": [
+        "selling into a flush is how you exit at the low",
+        "the breakdown could be a stop run that reverses within a bar or two"
+      ],
+      "invalidation": "a 1h close back above EMA50 with ATR contracting"
+    },
+    {
+      "action": "SELL",
+      "conviction": 3,
+      "size_hint": "quarter",
+      "thesis": "A trim, not an exit. Price is pressing the upper Bollinger band for the fourth consecutive bar and RSI is in the high 60s, so we are paying for optimism that is already priced. The trend is intact and I am not arguing against it - I am arguing that this is a poor place to be carrying a full position, and that reducing by a quarter here costs us little if the trend continues and helps materially if it does not.",
+      "key_risks": [
+        "reducing into strength underperforms badly if the trend extends",
+        "riding the upper band is characteristic of strong trends, not just of exhaustion"
+      ],
+      "invalidation": "a decisive close above the band on expanding volume, which would say this is trending rather than stretched"
+    },
+    {
+      "action": "SELL",
+      "conviction": 2,
+      "size_hint": "quarter",
+      "thesis": "I am reacting to the news rather than the chart, and I want that recorded. The technical picture is neutral to mildly constructive, but the headlines in this snapshot cluster around regulatory risk for the asset and the market has not obviously priced them. My weak preference is to carry less through that than more. Quarter size because a headline-driven vote with no confirmation from price is the kind I am most often wrong about.",
+      "key_risks": [
+        "trading a headline the market may have already discounted",
+        "the technical picture does not support this and may be the better signal",
+        "news sentiment is the noisiest input in the snapshot"
+      ],
+      "invalidation": "price making a new high despite the headlines, which would settle the question"
+    },
+    {
+      "action": "HOLD",
+      "conviction": 4,
+      "size_hint": "none",
+      "thesis": "The position is working and the thesis that opened it is intact. Price is above both moving averages, MACD remains positive, and the unrealized gain is accruing without any of the exhaustion signals that would argue for taking it. There is no case for adding here - the entry was at a better price and the risk budget is already committed - and no case for reducing. HOLD is an affirmative vote to leave this alone and let the protective legs do their job.",
+      "key_risks": [
+        "holding through a reversal gives back the whole unrealized gain"
+      ],
+      "invalidation": "a close below EMA20, at which point this becomes a reduce decision"
+    },
+    {
+      "action": "HOLD",
+      "conviction": 3,
+      "size_hint": "none",
+      "thesis": "Chop. Price has crossed EMA20 in both directions three times in the last ten bars, the Bollinger bands have narrowed, and MACD is oscillating around zero. There is no trend to trade and every signal in here is a whipsaw waiting to happen. We hold what we have because exiting into indecision realises cost for no reason, and we add nothing because there is nothing to add on.",
+      "key_risks": [
+        "range-bound conditions can break out violently in either direction",
+        "holding through compression means being positioned when it resolves, without knowing which way"
+      ],
+      "invalidation": "a decisive close outside the recent range on expanding volume"
+    },
+    {
+      "action": "HOLD",
+      "conviction": 2,
+      "size_hint": "none",
+      "thesis": "Mixed, and I hold with reservations. The trend filter is still constructive but momentum has quietly deteriorated - MACD histogram has been shrinking for several bars and RSI has slipped under 50 without price confirming. I would not open this position today. But the case for closing it is not yet made either, and churning a position on a deteriorating-but-unbroken signal is how a strategy pays fees to be indecisive.",
+      "key_risks": [
+        "momentum deterioration usually precedes price",
+        "holding a position I would not open is a bias worth naming"
+      ],
+      "invalidation": "MACD crossing negative, which would resolve this into a reduce"
+    },
+    {
+      "action": "WAIT",
+      "conviction": 3,
+      "size_hint": "none",
+      "thesis": "No edge here that I can defend. The indicators disagree with each other: the moving averages are constructive, RSI is neutral, and the Bollinger width says volatility is too compressed to infer direction. I would rather record no signal than manufacture one. WAIT rather than HOLD because there is nothing in this instrument to hold - this is a view about whether to open, and the answer is not yet.",
+      "key_risks": [
+        "waiting means missing the first leg of a move that resolves upward"
+      ],
+      "invalidation": "a close outside the Bollinger bands, which would give me something to work with"
+    },
+    {
+      "action": "WAIT",
+      "conviction": 4,
+      "size_hint": "none",
+      "thesis": "Stand aside deliberately. ATR has roughly doubled against its recent average, which means any position sized off it now would either be uncomfortably small or carry a stop far enough away to be expensive. Volatility this elevated usually follows an event and precedes a retracement of the move that caused it. The right response is to let it settle and reassess with a stop distance that reflects a normal regime rather than a shock.",
+      "key_risks": [
+        "elevated volatility often accompanies the strongest trends, so this may forgo a real move"
+      ],
+      "invalidation": "ATR reverting toward its recent average, at which point this becomes tradable again"
+    },
+    {
+      "action": "WAIT",
+      "conviction": 2,
+      "size_hint": "none",
+      "thesis": "I do not have enough to say. The technical picture is genuinely neutral and the news in this snapshot is stale relative to the bar we are deciding on. I would rather abstain from a view than round a coin flip into a direction. If another seat sees something in the evidence I have not, I will read the argument and reconsider next round.",
+      "key_risks": [
+        "no-signal cycles are where a panel most easily talks itself into a trade"
+      ],
+      "invalidation": "any of the momentum indicators leaving neutral territory"
+    }
+  ]
+}

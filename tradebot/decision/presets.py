@@ -165,9 +165,57 @@ STUB_PANEL = PanelConfig(
     ),
 )
 
+#: The offline panel that *argues*. Same provider as `STUB_PANEL` — no network, no cost, no key —
+#: but three seats bound to the stub's `varied-*` model family, so each draws its own vote from
+#: `providers/stub_responses.json` and the panel reaches a different answer on different cycles.
+#:
+#: `STUB_PANEL` cannot exercise any of that, and not because it is a stub: one seat means
+#: `required_votes` is 1, so there is no majority to miss, no dissent to record, no abstention
+#: fraction to cross, and `has_converged` ends `blind_then_debate` after the blind round. Three
+#: seats over a fifteen-entry catalogue reach a qualified majority on some cycles and resolve to
+#: `WAIT` for want of one on others, which is what puts the consensus rule and the debate rounds
+#: under a running system rather than only under a hand-written test.
+#:
+#: Three *different* model names on purpose, exactly as the hosted panels use three families:
+#: two seats sharing a fingerprint would trip `PANEL_HOMOGENEOUS` on every cycle and make the
+#: flag meaningless (DESIGN §6.5, R11). Nothing here reaches a venue or a vendor — a stub is
+#: refused in live at `control/readiness.py`, primary or fallback.
+SIM_PANEL = PanelConfig(
+    panel_id="sim-varied",
+    providers=(preset("stub"),),
+    protocol="blind_then_debate",
+    max_rounds=3,  # one blind round, then two debate rounds
+    max_cost_usd_per_cycle=Decimal(0),
+    seats=(
+        SeatConfig(
+            seat_id="technical",
+            role="Technical Analyst",
+            provider_id="stub",
+            model="varied-technical",
+            evidence=("indicators", "position"),
+        ),
+        SeatConfig(
+            seat_id="news",
+            role="News/Sentiment Analyst",
+            provider_id="stub",
+            model="varied-news",
+            evidence=("news", "position"),
+        ),
+        SeatConfig(
+            seat_id="skeptic",
+            role="Macro/Risk Skeptic",
+            provider_id="stub",
+            model="varied-skeptic",
+            evidence=("indicators", "news", "position"),
+            devils_advocate=True,
+        ),
+    ),
+)
+
 #: Panels selectable by name, and what a fresh database's demo basket is seeded with.
 PANELS: dict[str, PanelConfig] = {
     "stub": STUB_PANEL,
+    "sim": SIM_PANEL,
     "free": FREE_PANEL,
     "local": LOCAL_PANEL,
 }

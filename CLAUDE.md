@@ -738,6 +738,34 @@ resolved `WAIT (PANEL_DEGRADED)` on every cycle it ever ran. A *scripted* respon
 verbatim — scripting a per-asset vote into a basket run is the rung-3 fault injection, and
 adapting it would delete the only way to assert that a malformed answer fails closed.
 
+**The stub serves two model families, and the seat's model name picks between them.** `stub-*`
+recites `DEFAULT_RESPONSE`; `varied-*` draws a vote per instrument from
+[providers/stub_responses.json](tradebot/decision/providers/stub_responses.json) and renders it
+the way a real completion arrives — bare, fenced, or behind a sentence of prose. A model id only
+means something to the provider serving it, and the stub is not a vendor, so the names are ours.
+Four rules:
+
+- **The switch is panel data, never a flag.** It is versioned, pinned per cycle (ADR 0013) and
+  edited in Settings, so "was this cycle random?" is answerable from the log. A process-wide flag
+  would leave a database of cycles that behaved differently under identical recorded
+  configuration. `seat_responded` already persists each seat's `raw_text`, so *what was drawn* is
+  in the log either way; what the flag would have lost is *which catalogue it was drawn from*.
+- **One canned answer leaves the consensus rule unexercised**, and not because it is a stub —
+  because `STUB_PANEL` has one seat, so `required_votes` is 1, no majority can be missed, no
+  dissent recorded, no abstention fraction crossed, and `has_converged` ends `blind_then_debate`
+  after the blind round. `SIM_PANEL` (`--panel sim`) is three `varied-*` seats over the fifteen
+  entries; on a 60-cycle run it reaches BUY, SELL, HOLD, and `no qualified majority` → WAIT, with
+  twelve distinct convictions and the early-stop path firing on a few cycles.
+- **A script outranks the model name.** Scripting is the fault-injection path and stays verbatim
+  whatever the seat is called, so the catalogue holds only *valid* votes — malformed JSON and
+  `FAIL` remain scripted.
+- **The draw is per instrument, not per call.** One draw shared across a basket's symbols would
+  make every basket-mode answer internally unanimous — the same flatness, one level down.
+
+A hand-edited catalogue that no longer parses raises `ConfigError` naming the file, rather than
+becoming a seat that abstains on every cycle for reasons only the event log could explain. It is
+read once per process, so an edit takes effect at the next start.
+
 **Each seat has its own fallback chain** — an ordered list of `(provider, model)` bindings, not
 provider names, because a model id only means something to the provider serving it. Two rules are
 enforced at construction, not at runtime: a chain may not repeat a binding, and every binding must

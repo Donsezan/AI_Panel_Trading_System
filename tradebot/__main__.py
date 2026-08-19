@@ -286,11 +286,13 @@ def _add_wiring(parser: argparse.ArgumentParser) -> None:
         choices=sorted(PANELS),
         help=(
             "which agent panel to seed a *fresh* database with. Defaults to 'stub': the offline "
-            "scripted panel, which costs nothing and needs no API key. 'free' uses hosted free "
-            "slots with per-seat cross-vendor fallbacks; 'local' runs entirely on your own "
-            "machine. Once a basket is stored its own panel is what runs and this flag is "
-            "ignored — edit it in the dashboard. Each panel declares its own providers and each "
-            "seat its own fallback chain; see tradebot/decision/presets.py"
+            "scripted panel, which costs nothing and needs no API key. 'sim' is also offline but "
+            "argues — three seats drawing at random from decision/providers/stub_responses.json, "
+            "so the panel disagrees with itself and the consensus rule actually runs. 'free' uses "
+            "hosted free slots with per-seat cross-vendor fallbacks; 'local' runs entirely on "
+            "your own machine. Once a basket is stored its own panel is what runs and this flag "
+            "is ignored — edit it in the dashboard. Each panel declares its own providers and "
+            "each seat its own fallback chain; see tradebot/decision/presets.py"
         ),
     )
     parser.add_argument(
