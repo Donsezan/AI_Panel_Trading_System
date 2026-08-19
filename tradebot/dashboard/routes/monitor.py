@@ -20,9 +20,9 @@ nothing". A pin that no longer resolves is shown as unresolved rather than omitt
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from starlette.responses import Response
 
@@ -47,16 +47,37 @@ async def cycle_history(request: Request, basket: str | None = None) -> HTMLResp
 
 
 @router.get("/cycles/{cycle_id}", response_class=HTMLResponse)
-async def cycle_detail(request: Request, cycle_id: str) -> HTMLResponse:
-    """The "why did it do that" view: snapshot, transcript, risk provenance, orders."""
+async def cycle_detail(
+    request: Request, cycle_id: str, instrument: Annotated[list[str] | None, Query()] = None
+) -> HTMLResponse:
+    """The "why did it do that" view: snapshot, transcript, risk provenance, orders.
+
+    `instrument` narrows the *deliberation* to the ones named — repeat the parameter to follow
+    several at once. Absent means all, as it does for the basket filter on the cycle list, so
+    unticking every box (which sends no parameter at all) restores the whole cycle rather than
+    emptying the page.
+
+    Two things the narrowing must not do, both handled here rather than in the template:
+
+    * The checkbox list comes from the **un-narrowed** cycle. Built from what is on screen it
+      would collapse to the ticked instrument on the first Apply, and the filter would be a
+      one-way door with no control left to leave it by.
+    * An instrument this cycle never deliberated on is **reported**, not dropped — the rule the
+      pinned-configuration table already follows. A hand-edited URL that silently blanked the
+      decisions and the transcript would read as a cycle whose panel never ran.
+    """
     state = state_of(request)
     detail = state.queries.cycle(cycle_id)
     if detail is None:
         raise HTTPException(status_code=404, detail=f"no cycle {cycle_id}")
+    selected = frozenset(instrument or ())
     return render(
         request,
         "monitor/cycle.html",
-        detail=detail,
+        detail=detail.narrowed_to(selected),
+        instruments=detail.instruments,
+        selected=selected,
+        unmatched=tuple(sorted(selected.difference(detail.instruments))),
         pinned=[(ref, resolve(state.application.configs, ref)) for ref in detail.pins],
     )
 

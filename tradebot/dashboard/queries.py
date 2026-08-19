@@ -27,7 +27,8 @@ always preferable to a view that invents a zero.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from collections.abc import Collection
+from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import Decimal
 from typing import Any
@@ -126,6 +127,49 @@ class CycleDetail:
         importing the enum. `EventType` is a `StrEnum`, so the comparison is the same one.
         """
         return tuple(event for event in self.events if event.type in types)
+
+    @property
+    def instruments(self) -> tuple[str, ...]:
+        """The instruments this cycle deliberated on — what the drill-down's filter may offer.
+
+        Decisions and the transcript only, because those are the two sections `narrowed_to`
+        hides. An instrument reaching Orders without either would get a checkbox that changes
+        nothing on screen, and a control that does nothing is one an operator has to test to
+        understand.
+        """
+        keys = {row.instrument_key for row in self.decisions}
+        keys.update(key for event in self.events if (key := seat_instrument(event)) is not None)
+        return tuple(sorted(keys))
+
+    def narrowed_to(self, instruments: Collection[str]) -> CycleDetail:
+        """This cycle with its *deliberation* narrowed to the named instruments.
+
+        Only the decisions and the debate transcript narrow. What was in force and what happened
+        — the configuration pins, risk checks, orders, fills and the frozen snapshot — stay whole:
+        a portfolio-wide veto such as `max_gross_exposure` is recorded against one instrument but
+        is the condition that shaped every other instrument's decision in the same cycle, so a
+        filter that hid it would show a clean flow with the reason for it missing. The snapshot is
+        the packet every seat saw, for all of them at once.
+
+        That falls out of the event rule rather than being a list of exemptions: only a seat
+        response names an instrument *here*, so every other event type passes through untouched.
+
+        An empty selection narrows nothing. Unticking every box sends no parameter at all, and
+        that must read as "all" — a page narrowed to nothing looks like a cycle that deliberated
+        on nothing, which is the one thing this view must never say by accident.
+        """
+        if not instruments:
+            return self
+        keys = frozenset(instruments)
+        return replace(
+            self,
+            decisions=tuple(row for row in self.decisions if row.instrument_key in keys),
+            events=tuple(
+                event
+                for event in self.events
+                if (spoke_for := seat_instrument(event)) is None or spoke_for in keys
+            ),
+        )
 
     @property
     def snapshot(self) -> dict[str, Any] | None:
@@ -382,6 +426,19 @@ class Queries:
     def _one(self, query: Select[Any]) -> Row[Any] | None:
         with self._engine.connect() as connection:
             return connection.execute(query).one_or_none()
+
+
+def seat_instrument(event: Event) -> str | None:
+    """The instrument one transcript row spoke for; `None` for an event that is not a seat's.
+
+    The only place that knows where a seat response keeps its instrument key. `RISK_CHECKED`
+    carries one of its own at the top of its payload and is deliberately not read here — `None`
+    is what keeps it out of the narrowing (`CycleDetail.narrowed_to`).
+    """
+    if event.type is not EventType.SEAT_RESPONDED:
+        return None
+    key = event.payload.get("response", {}).get("instrument_key")
+    return key if isinstance(key, str) else None
 
 
 def parse_pins(config_versions_json: str | None) -> tuple[ConfigRef, ...]:

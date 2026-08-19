@@ -10,6 +10,40 @@
   refused, and what reached the venue — read against the configuration versions that produced it.
 </p>
 
+{# Shown once there is something to choose between, and whenever a filter is active even if
+   there is not — a narrowing with no control beside it is one an operator can only leave by
+   editing the URL. Checkboxes rather than a multi-select: a stray click on a multi-select
+   silently deselects everything (PHASE_11, `f.checkboxes`). No scripting — an auto-submit per
+   tick would be a round trip per instrument. #}
+{% if instruments | length > 1 or selected %}
+<form class="filters" method="get" action="/cycles/{{ cycle.cycle_id }}">
+  <span class="group-label">Instrument</span>
+  <div class="checkgroup">
+    {% for key in instruments %}
+      <label class="inline">
+        <input type="checkbox" name="instrument" value="{{ key }}"
+               {% if key in selected %}checked{% endif %}>
+        <code>{{ key }}</code>
+      </label>
+    {% endfor %}
+  </div>
+  <button type="submit">Apply</button>
+  {% if selected %}<a href="/cycles/{{ cycle.cycle_id }}">Show all</a>{% endif %}
+</form>
+<p class="muted small">
+  Narrows the decisions and the debate transcript. Risk checks, orders, fills and the frozen
+  snapshot are what was in force and what happened — they stay whole, because a portfolio-wide
+  veto recorded against one instrument is the reason another instrument's decision came out as
+  it did.
+</p>
+{% endif %}
+{% if unmatched %}
+  <p class="warn">
+    not in this cycle:
+    {% for key in unmatched %}<code>{{ key }}</code>{% endfor %}
+  </p>
+{% endif %}
+
 <section class="figures">
   <div class="figure"><span class="label">Basket</span><span class="value"><code>{{ cycle.basket_id }}</code></span></div>
   <div class="figure"><span class="label">Outcome</span><span class="value">{{ m.pill(cycle.outcome or "running") }}</span></div>
@@ -65,7 +99,11 @@
       </td>
     </tr>
   {% else %}
-    {{ m.empty(7, "No decision was reached — the cycle ended before the panel ran.") }}
+    {% if selected %}
+      {{ m.empty(7, "No decision matches this filter.") }}
+    {% else %}
+      {{ m.empty(7, "No decision was reached — the cycle ended before the panel ran.") }}
+    {% endif %}
   {% endfor %}
   </tbody>
 </table>
@@ -102,7 +140,11 @@
     </p>
   </details>
 {% else %}
-  <p class="empty">No seat responded in this cycle.</p>
+  {% if selected %}
+    <p class="empty">No seat response matches this filter.</p>
+  {% else %}
+    <p class="empty">No seat responded in this cycle.</p>
+  {% endif %}
 {% endfor %}
 
 <h2>Risk checks</h2>

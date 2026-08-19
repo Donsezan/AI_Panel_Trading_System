@@ -113,6 +113,91 @@ def test_unknown_cycle_is_none(queries: Queries) -> None:
     assert queries.cycle("not-a-cycle") is None
 
 
+# ------------------------------------------------- narrowing the drill-down to one instrument
+
+
+async def test_the_filter_may_only_offer_instruments_the_cycle_deliberated_on(
+    cycled: Application,
+) -> None:
+    """The checkbox list is decisions ∪ transcript — the two sections narrowing can hide.
+
+    A box that hides nothing is a control an operator ticks and learns nothing from.
+    """
+    queries = Queries(cycled.store)
+    detail = queries.cycle(queries.cycles()[0].cycle_id)
+
+    assert detail is not None
+    assert detail.instruments == ("sim:BTC/USDT", "sim:ETH/USDT")
+
+
+async def test_narrowing_keeps_one_instruments_deliberation(cycled: Application) -> None:
+    queries = Queries(cycled.store)
+    detail = queries.cycle(queries.cycles()[0].cycle_id)
+    assert detail is not None
+
+    narrowed = detail.narrowed_to(("sim:BTC/USDT",))
+
+    assert [row.instrument_key for row in narrowed.decisions] == ["sim:BTC/USDT"]
+    spoke_for = {
+        event.payload["response"]["instrument_key"]
+        for event in narrowed.events_of(EventType.SEAT_RESPONDED)
+    }
+    assert spoke_for == {"sim:BTC/USDT"}
+
+
+async def test_narrowing_leaves_what_was_in_force_and_what_happened_whole(
+    cycled: Application,
+) -> None:
+    """Risk checks, orders, fills and the snapshot are the cycle's status, not its deliberation.
+
+    A `max_gross_exposure` veto recorded against one instrument is a portfolio-wide condition
+    that shaped every other instrument's decision too. Hiding it would show a clean flow with
+    the reason for it missing — and the frozen snapshot is the packet every seat saw, for all
+    of them at once.
+    """
+    queries = Queries(cycled.store)
+    detail = queries.cycle(queries.cycles()[0].cycle_id)
+    assert detail is not None
+    assert len(detail.events_of(EventType.RISK_CHECKED)) > 1  # else this asserts nothing
+
+    narrowed = detail.narrowed_to(("sim:BTC/USDT",))
+
+    assert narrowed.events_of(EventType.RISK_CHECKED) == detail.events_of(EventType.RISK_CHECKED)
+    assert narrowed.orders == detail.orders
+    assert narrowed.fills == detail.fills
+    assert narrowed.snapshot == detail.snapshot
+    assert narrowed.pins == detail.pins
+    assert narrowed.cycle == detail.cycle
+
+
+async def test_an_empty_selection_narrows_nothing(cycled: Application) -> None:
+    """Unticking every box sends no parameter at all, and that must mean "all", never "none".
+
+    A page narrowed to nothing reads as a cycle that did nothing, which is the one thing this
+    view must never say by accident.
+    """
+    queries = Queries(cycled.store)
+    detail = queries.cycle(queries.cycles()[0].cycle_id)
+    assert detail is not None
+
+    assert detail.narrowed_to(()) == detail
+
+
+async def test_narrowing_to_an_instrument_the_cycle_never_mentions_hides_the_deliberation(
+    cycled: Application,
+) -> None:
+    """It does not raise and it does not silently widen — the *route* is what reports it."""
+    queries = Queries(cycled.store)
+    detail = queries.cycle(queries.cycles()[0].cycle_id)
+    assert detail is not None
+
+    narrowed = detail.narrowed_to(("sim:NOSUCH/USDT",))
+
+    assert narrowed.decisions == ()
+    assert narrowed.events_of(EventType.SEAT_RESPONDED) == ()
+    assert narrowed.snapshot == detail.snapshot
+
+
 async def test_reading_one_cycle_does_not_read_the_whole_log(cycled: Application) -> None:
     """A soak accumulates months of snapshots; a drill-down must cost one cycle, not one DB."""
     cycle_id = Queries(cycled.store).cycles()[0].cycle_id
