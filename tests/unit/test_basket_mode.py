@@ -23,8 +23,9 @@ from tradebot.core.errors import SchemaViolationError
 from tradebot.core.instrument import Instrument
 from tradebot.core.snapshot import ContextSnapshot
 from tradebot.decision.engine import DecisionEngine
-from tradebot.decision.prompts import build_system_prompt, build_user_prompt
+from tradebot.decision.prompts import build_system_prompt, build_user_prompt, symbols_requested
 from tradebot.decision.protocols import BlindThenDebateProtocol
+from tradebot.decision.providers import DEFAULT_RESPONSE, StubLLMProvider
 from tradebot.decision.seat import SeatRunner, parse_assessments
 from tradebot.interfaces.debate import PanelRequest
 
@@ -304,3 +305,71 @@ async def test_a_basket_transcript_says_which_instrument_an_argument_was_about(
     transcript = provider.calls_for("model-a")[1].user
     assert "Analyst B on BTC/USDT" in transcript
     assert "Analyst B on ETH/USDT" in transcript
+
+
+class TestTheStubPanelAnswersInBasketMode:
+    """The default panel is the stub, so a stub that can only answer per-asset makes `basket`
+    mode unusable: every seat violates the schema, the repair replays the same canned text, and
+    the panel resolves `WAIT (PANEL_DEGRADED)` on every cycle forever. A real model reads the
+    schema out of its prompt; the stub has to do the same or it is easier to satisfy in one mode
+    than the other, which is exactly what the contract suite exists to prevent.
+    """
+
+    async def test_an_unscripted_stub_assesses_every_symbol_the_prompt_asked_for(
+        self,
+        two_instrument_snapshot: ContextSnapshot,
+        clock: ManualClock,
+        seats: tuple[SeatConfig, ...],
+    ) -> None:
+        request = PanelRequest(instrument_keys=(BTC, ETH), decision_mode=DecisionMode.BASKET)
+        runner = SeatRunner({"scripted": StubLLMProvider(provider_id="scripted")}, clock)
+
+        responses = await runner.run(seats[0], two_instrument_snapshot, request)
+
+        assert [r.abstain_reason for r in responses] == [None, None]
+        assert {r.instrument_key for r in responses} == {BTC, ETH}
+
+    async def test_an_unscripted_stub_still_answers_a_per_asset_prompt(
+        self, snapshot: ContextSnapshot, clock: ManualClock, seats: tuple[SeatConfig, ...]
+    ) -> None:
+        runner = SeatRunner({"scripted": StubLLMProvider(provider_id="scripted")}, clock)
+
+        responses = await runner.run(seats[0], snapshot, PanelRequest.for_instrument(BTC))
+
+        assert responses[0].vote is not None
+        assert responses[0].raw_text == DEFAULT_RESPONSE
+
+    async def test_a_scripted_response_is_never_rewritten_to_fit_the_mode(
+        self,
+        two_instrument_snapshot: ContextSnapshot,
+        clock: ManualClock,
+        seats: tuple[SeatConfig, ...],
+    ) -> None:
+        """Scripting a per-asset vote into a basket run is the rung-3 fault injection. Adapting
+        it would delete the only way to assert that a malformed answer fails closed."""
+        request = PanelRequest(instrument_keys=(BTC, ETH), decision_mode=DecisionMode.BASKET)
+        stub = StubLLMProvider([DEFAULT_RESPONSE], provider_id="scripted")
+
+        responses = await SeatRunner({"scripted": stub}, clock).run(
+            seats[0], two_instrument_snapshot, request
+        )
+
+        assert all(r.abstained for r in responses)
+
+    def test_the_stub_reads_the_symbols_out_of_the_prompt_the_builder_writes(
+        self, two_instrument_snapshot: ContextSnapshot, seats: tuple[SeatConfig, ...]
+    ) -> None:
+        """Two-sided, because the coupling is a string: the builder writes the line and the
+        reader parses it, so a reworded prompt breaks here rather than in a sim run."""
+        request = PanelRequest(instrument_keys=(BTC, ETH), decision_mode=DecisionMode.BASKET)
+
+        prompt = build_user_prompt(two_instrument_snapshot, seats[0], request)
+
+        assert symbols_requested(prompt) == ("BTC/USDT", "ETH/USDT")
+
+    def test_a_per_asset_prompt_asks_for_no_symbol_list(
+        self, snapshot: ContextSnapshot, seats: tuple[SeatConfig, ...]
+    ) -> None:
+        prompt = build_user_prompt(snapshot, seats[0], PanelRequest.for_instrument(BTC))
+
+        assert symbols_requested(prompt) == ()

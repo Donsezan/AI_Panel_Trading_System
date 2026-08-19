@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 from sqlalchemy import select
+from tests.conftest import SERIES_START, TIMEFRAMES
 from tests.scenario.harness import Harness
 
 from tradebot.app import BrokerChoice, build, build_sim
@@ -22,11 +23,21 @@ from tradebot.control.supervision import SupervisionController
 from tradebot.core.clock import ManualClock
 from tradebot.core.config import Basket, PanelConfig, SeatConfig
 from tradebot.core.decision import Decision
-from tradebot.core.enums import Action, CycleOutcome, Mode, OrderRole, OrderState, SizeHint
+from tradebot.core.enums import (
+    Action,
+    CycleOutcome,
+    DecisionMode,
+    Mode,
+    OrderRole,
+    OrderState,
+    SizeHint,
+)
 from tradebot.core.errors import ConfigError
 from tradebot.core.events import EventType
+from tradebot.core.instrument import Instrument
 from tradebot.decision.providers import DEFAULT_RESPONSE, FAIL
-from tradebot.marketdata.replay import ReplayMarketData
+from tradebot.marketdata.catalogue import instrument_of
+from tradebot.marketdata.replay import ReplayMarketData, synthetic_candles
 from tradebot.persistence.schema import cycles, orders
 
 pytestmark = pytest.mark.scenario
@@ -287,6 +298,55 @@ class TestDataFaults:
             assert result.outcome is CycleOutcome.DATA_STALE
         finally:
             harness.close()
+
+
+class TestTheSimulatedVenue:
+    """The feed `build_sim` wires when no real one is passed — the one every demo run reads.
+
+    Every other scenario here hands the harness its own `ReplayMarketData`, which is exactly how
+    a fixed map of the start-up universe survived: nothing exercised the wired feed across hours,
+    and a `serve --mode sim` left up overnight quietly answered `DATA_STALE` to every cycle from
+    about an hour in.
+    """
+
+    async def test_a_process_left_running_for_a_day_still_cycles(self, clock: ManualClock) -> None:
+        application = await build_sim(clock=clock, db_path=None)
+        try:
+            await application.recover()
+            assert await application.supervisor.run_once()
+            clock.advance(timedelta(days=1).total_seconds())
+
+            results = await application.supervisor.run_once()
+
+            assert results
+            assert all(r.outcome is not CycleOutcome.DATA_STALE for r in results), results
+        finally:
+            await application.shutdown()
+
+    async def test_an_instrument_added_after_wiring_can_be_cycled(self, clock: ManualClock) -> None:
+        """A basket published from the dashboard is picked up by the resync sweep, so the venue
+        has to price instruments nobody enumerated when the process was wired."""
+        application = await build_sim(clock=clock, db_path=None)
+        try:
+            await application.recover()
+            added = await instrument_of(application.catalogue, "XRP/USDT")
+            await application.configs.put(
+                "crypto_2",
+                Basket(
+                    basket_id="crypto_2",
+                    name="Crypto_2",
+                    instruments=(added,),
+                    panel=application.baskets[0].panel,
+                    timeframes=("1h",),
+                ),
+                actor="test",
+            )
+
+            results = {r.basket_id: r for r in await application.supervisor.run_once()}
+
+            assert results["crypto_2"].outcome is not CycleOutcome.DATA_STALE, results["crypto_2"]
+        finally:
+            await application.shutdown()
 
 
 class TestExecutionFaults:
@@ -571,3 +631,72 @@ def test_decision_is_a_proposal_not_an_order() -> None:
     """A structural reminder: nothing about a Decision can name a quantity or a venue."""
     fields = set(Decision.model_fields)
     assert not fields & {"qty", "quantity", "price", "client_order_id", "venue"}
+
+
+class TestBasketDecisionMode:
+    """`basket` mode over the real loop, on the panel a fresh basket is created with.
+
+    Every rung-3 scenario above scripts the stub, so none of them ever asked the default panel a
+    basket-mode question. It could not answer one: the canned per-asset vote failed
+    `BasketAssessment` on every seat, the repair replayed the same text, and the basket decided
+    `WAIT (PANEL_DEGRADED)` on every cycle it ever ran. Unscripted on purpose — a script here
+    would restore exactly the blind spot that hid it.
+    """
+
+    @pytest.fixture
+    def cross_asset(
+        self, instrument: Instrument, second_instrument: Instrument, panel: PanelConfig
+    ) -> Basket:
+        return Basket(
+            basket_id="b1",
+            name="two-asset basket",
+            instruments=(instrument, second_instrument),
+            panel=panel,
+            decision_mode=DecisionMode.BASKET,
+        )
+
+    @pytest.fixture
+    def two_series(
+        self, instrument: Instrument, second_instrument: Instrument, clock: ManualClock
+    ) -> ReplayMarketData:
+        return ReplayMarketData(
+            {
+                (held.key, timeframe): synthetic_candles(
+                    start=SERIES_START,
+                    timeframe=timeframe,
+                    count=200,
+                    open_price=open_price,
+                    step=Decimal("25"),
+                )
+                for held, open_price in (
+                    (instrument, Decimal("50000")),
+                    (second_instrument, Decimal("3000")),
+                )
+                for timeframe in TIMEFRAMES
+            },
+            clock,
+        )
+
+    async def test_the_default_panel_decides_rather_than_degrading(
+        self, cross_asset: Basket, clock: ManualClock, two_series: ReplayMarketData
+    ) -> None:
+        harness = await make_harness(cross_asset, clock, two_series, [])
+        try:
+            result = await harness.runner.run_once()
+
+            assert result.outcome is not CycleOutcome.PANEL_DEGRADED
+            assert [d.action for d in result.decisions] == [Action.BUY, Action.BUY]
+        finally:
+            harness.close()
+
+    async def test_one_provider_call_answers_for_both_instruments(
+        self, cross_asset: Basket, clock: ManualClock, two_series: ReplayMarketData
+    ) -> None:
+        """The cost saving that is the whole point of the mode, asserted through the real loop."""
+        harness = await make_harness(cross_asset, clock, two_series, [])
+        try:
+            await harness.runner.run_once()
+
+            assert len(harness.provider.calls) == 1
+        finally:
+            harness.close()

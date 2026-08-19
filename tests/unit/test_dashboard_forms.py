@@ -60,6 +60,26 @@ def test_an_emptied_field_is_omitted_so_the_model_default_speaks() -> None:
     assert nest([("doc.name", ""), ("doc.basket_id", "alpha")]) == {"basket_id": "alpha"}
 
 
+def test_a_multi_line_value_arrives_with_the_browsers_carriage_returns_removed() -> None:
+    """A `<textarea>` is submitted with CRLF line breaks (HTML §4.10.5.4).
+
+    Storing the CR would make an identical prompt written from the GUI differ byte-for-byte from
+    one seeded in code, and `ConfigStore` versions the document rather than diffing it — so the
+    stray character would ride along in every later version of that basket.
+    """
+    submitted = "Favour 4h structure." + chr(13) + chr(10) + "A failed breakout counts."
+
+    parsed = nest([("doc.panel.seats[0].instruction", submitted)])
+
+    assert parsed == {
+        "panel": {
+            "seats": [
+                {"instruction": "Favour 4h structure." + chr(10) + "A failed breakout counts."}
+            ]
+        }
+    }
+
+
 def test_blank_rows_are_dropped() -> None:
     """A row added and left untouched must not become a half-built instrument."""
     pairs = [("doc.instruments[0].symbol", "BTC/USDT"), ("doc.instruments[1].symbol", "")]

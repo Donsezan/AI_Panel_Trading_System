@@ -20,7 +20,7 @@ import pytest
 from tradebot.core.enums import Action, OrderRole, OrderState, Side
 from tradebot.core.market import Candle, CandleSeries
 from tradebot.dashboard import chart
-from tradebot.dashboard.chart import GREEN, GREY, RED, chart_payload, marks_of
+from tradebot.dashboard.chart import AMBER, GREEN, GREY, RED, chart_payload, marks_of
 
 START = datetime(2026, 3, 1, 12, 0, tzinfo=UTC)
 HOUR = timedelta(hours=1)
@@ -97,9 +97,44 @@ def test_the_cycles_that_decided_nothing_are_still_marked(action: str) -> None:
 
 
 def test_a_sell_is_toned_apart_from_a_buy() -> None:
-    marks = marks_of([decision(Action.SELL, at=START)], [], [])
+    marks = marks_of([decision(Action.SELL, at=START)], [order()], [])
     assert marks[0].style.color == RED
     assert marks[0].style.shape == "arrowDown"
+
+
+def test_a_decision_no_order_came_of_is_toned_apart_from_one_that_traded() -> None:
+    """Shape is what was decided; colour is what came of it.
+
+    Sixteen of the twenty-three arrows on the reported screenshot were risk vetoes with no order
+    behind them, drawn in the same green as the seven that traded (docs/img/DashBoards.png).
+    """
+    refused = marks_of([decision(Action.BUY, at=START)], [], [])[0]
+    traded = marks_of([decision(Action.BUY, at=START)], [order()], [])[0]
+    assert refused.style.shape == traded.style.shape == "arrowUp"
+    assert refused.style.color == AMBER
+    assert traded.style.color == GREEN
+    assert refused.label == "BUY not placed"
+
+
+def test_an_order_placed_but_not_yet_filled_is_a_decision_that_acted() -> None:
+    """A resting entry is a commitment the venue holds — not a refusal, and not a quantity."""
+    marks = marks_of(
+        [decision(Action.BUY, at=START)],
+        [order(state=OrderState.OPEN.value, filled_qty=Decimal(0))],
+        [],
+    )
+    assert marks[0].style.color == GREEN
+    assert marks[0].label == "BUY placed"
+
+
+def test_an_idle_cycle_is_grey_whether_or_not_the_basket_traded_elsewhere() -> None:
+    """A cycle is basket-wide: one that placed BTC's order and vetoed ETH's is `orders_placed`.
+
+    The mark reads this instrument's own entry orders, so ETH cannot borrow BTC's colour.
+    """
+    marks = marks_of([decision(Action.WAIT, at=START)], [], [])
+    assert marks[0].style.color == GREY
+    assert marks[0].label == "WAIT"
 
 
 def test_an_unknown_action_is_drawn_rather_than_dropped() -> None:
@@ -166,6 +201,76 @@ def test_a_mark_snaps_to_the_bar_it_happened_during() -> None:
     marks = marks_of([], [], [fill(filled_at=START + HOUR + timedelta(minutes=37))])
     marker = chart_payload(candles(3), marks)["markers"][0]
     assert marker["time"] == int((START + HOUR).timestamp())
+
+
+def test_a_bar_carries_one_decision_mark_however_many_cycles_fell_inside_it() -> None:
+    """The reported defect. A basket on a ten-minute grid puts six decisions in one hourly bar,
+    and six markers at one timestamp stack into a column that reads as six trades."""
+    every_ten_minutes = [
+        decision(Action.BUY, at=START + timedelta(minutes=10 * n), cycle_id=f"c{n}")
+        for n in range(6)
+    ]
+    payload = chart_payload(candles(3), marks_of(every_ten_minutes, [], []))
+    assert len(payload["markers"]) == 1
+    assert payload["markers"][0]["time"] == int(START.timestamp())
+    assert payload["markers"][0]["text"] == "BUY not placed · 6 cycles"
+
+
+def test_a_folded_bar_totals_the_quantity_its_cycles_took_on() -> None:
+    """The bar's own total, not the winning cycle's — two entries in an hour bought both."""
+    marks = marks_of(
+        [
+            decision(Action.BUY, at=START, cycle_id="c1"),
+            decision(Action.BUY, at=START + timedelta(minutes=10), cycle_id="c2"),
+        ],
+        [
+            order(cycle_id="c1", qty=Decimal("0.2"), filled_qty=Decimal("0.2")),
+            order(cycle_id="c2", qty=Decimal("0.3"), filled_qty=Decimal("0.3")),
+        ],
+        [],
+    )
+    assert chart_payload(candles(3), marks)["markers"][0]["text"] == "BUY 0.5 · 2 cycles"
+
+
+def test_a_bar_that_traded_once_and_waited_four_times_shows_the_trade() -> None:
+    """Strongest outcome, not the last word: a chart showing the final cycle would hide the only
+    one that moved money."""
+    rows = [
+        decision(Action.BUY, at=START, cycle_id="c1"),
+        *(
+            decision(Action.WAIT, at=START + timedelta(minutes=10 * n), cycle_id=f"w{n}")
+            for n in range(1, 5)
+        ),
+    ]
+    marker = chart_payload(candles(3), marks_of(rows, [order(cycle_id="c1")], []))["markers"][0]
+    assert marker["shape"] == "arrowUp"
+    assert marker["color"] == GREEN
+    assert marker["text"] == "BUY 0.5 · 5 cycles"
+
+
+def test_a_bar_the_panel_only_waited_through_folds_to_one_idle_tick() -> None:
+    rows = [
+        decision(Action.WAIT, at=START + timedelta(minutes=10 * n), cycle_id=f"c{n}")
+        for n in range(3)
+    ]
+    marker = chart_payload(candles(3), marks_of(rows, [], []))["markers"][0]
+    assert marker["shape"] == "circle"
+    assert marker["text"] == "WAIT · 3 cycles"
+
+
+def test_decisions_in_different_bars_are_never_folded_together() -> None:
+    """The fold is per bar. Folding across bars would move a decision to a price it never saw."""
+    rows = [decision(Action.BUY, at=START + HOUR * n, cycle_id=f"c{n}") for n in range(3)]
+    markers = chart_payload(candles(3), marks_of(rows, [], []))["markers"]
+    assert [marker["time"] for marker in markers] == [
+        int((START + HOUR * n).timestamp()) for n in range(3)
+    ]
+
+
+def test_fills_inside_one_bar_are_never_folded() -> None:
+    """A repeated opinion is one fact; two fills are two things that happened at two prices."""
+    marks = marks_of([], [], [fill(filled_at=START), fill(filled_at=START + timedelta(minutes=20))])
+    assert len(chart_payload(candles(3), marks)["markers"]) == 2
 
 
 def test_a_mark_before_the_window_is_dropped_not_clamped() -> None:

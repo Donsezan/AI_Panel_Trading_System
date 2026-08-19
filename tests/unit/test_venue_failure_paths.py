@@ -87,7 +87,7 @@ class TestBinanceMalformedResponses:
     ) -> None:
         transport = FakeBinanceTransport(FakeVenueBook())
         transport.overrides["account"] = lambda _p: ["not", "an", "object"]
-        broker = BinanceSpotBroker(transport, clock, instruments=(crypto,))
+        broker = BinanceSpotBroker(transport, clock, universe=lambda: (crypto,))
         with pytest.raises(DataStaleError, match="non-object"):
             await broker.fetch_positions_and_balances()
 
@@ -97,7 +97,7 @@ class TestBinanceMalformedResponses:
         """A skew check that silently succeeds against a missing answer checks nothing."""
         transport = FakeBinanceTransport(FakeVenueBook())
         transport.overrides["time"] = lambda _p: {}
-        broker = BinanceSpotBroker(transport, clock, instruments=(crypto,))
+        broker = BinanceSpotBroker(transport, clock, universe=lambda: (crypto,))
         with pytest.raises(DataStaleError, match="serverTime"):
             await broker.server_time()
 
@@ -112,7 +112,7 @@ class TestBinanceMalformedResponses:
             "orderId": 1,
             "transactTime": "not-a-number",
         }
-        broker = BinanceSpotBroker(transport, clock, instruments=(crypto,))
+        broker = BinanceSpotBroker(transport, clock, universe=lambda: (crypto,))
         ack = await broker.submit(entry(crypto))
         assert ack.accepted_at == clock.now()
 
@@ -122,7 +122,7 @@ class TestBinanceMalformedResponses:
         """The spot testnet has no `sapi` at all, and "would not say" is not "may not withdraw"."""
         transport = FakeBinanceTransport(FakeVenueBook())
         transport.overrides["apiRestrictions"] = lambda _p: {}
-        broker = BinanceSpotBroker(transport, clock, instruments=(crypto,))
+        broker = BinanceSpotBroker(transport, clock, universe=lambda: (crypto,))
         assert await broker.withdrawals_enabled() is None
 
     async def test_closing_the_broker_closes_its_transport(
@@ -130,7 +130,7 @@ class TestBinanceMalformedResponses:
     ) -> None:
         """A leaked exchange session keeps the process alive after a cycle."""
         transport = FakeBinanceTransport(FakeVenueBook())
-        await BinanceSpotBroker(transport, clock, instruments=(crypto,)).close()
+        await BinanceSpotBroker(transport, clock, universe=lambda: (crypto,)).close()
         assert transport.closed
 
 
@@ -140,7 +140,7 @@ class TestAlpacaMalformedResponses:
     ) -> None:
         api = FakeAlpacaApi(FakeVenueBook(currency="USD"))
         api.overrides["/v2/account"] = lambda _request: httpx.Response(200, json=[])
-        broker = AlpacaBroker(alpaca_transport(api, clock), clock, instruments=(equity,))
+        broker = AlpacaBroker(alpaca_transport(api, clock), clock, universe=lambda: (equity,))
         with pytest.raises(DataStaleError, match="non-object"):
             await broker.fetch_positions_and_balances()
 
@@ -149,7 +149,7 @@ class TestAlpacaMalformedResponses:
     ) -> None:
         api = FakeAlpacaApi(FakeVenueBook(currency="USD"))
         api.overrides["/v2/clock"] = lambda _request: httpx.Response(200, json={})
-        broker = AlpacaBroker(alpaca_transport(api, clock), clock, instruments=(equity,))
+        broker = AlpacaBroker(alpaca_transport(api, clock), clock, universe=lambda: (equity,))
         with pytest.raises(DataStaleError, match="no timestamp"):
             await broker.server_time()
 
@@ -157,7 +157,7 @@ class TestAlpacaMalformedResponses:
         self, clock: ManualClock, equity: Instrument
     ) -> None:
         api = FakeAlpacaApi(FakeVenueBook(currency="USD"))
-        broker = AlpacaBroker(alpaca_transport(api, clock), clock, instruments=(equity,))
+        broker = AlpacaBroker(alpaca_transport(api, clock), clock, universe=lambda: (equity,))
         with pytest.raises(DataStaleError, match="not configured"):
             await broker.submit(entry(equity, instrument_key="alpaca:TSLA"))
 
@@ -166,7 +166,7 @@ class TestAlpacaMalformedResponses:
     ) -> None:
         """An entry in an OCO group would place a second entry disguised as an exit."""
         api = FakeAlpacaApi(FakeVenueBook(currency="USD"))
-        broker = AlpacaBroker(alpaca_transport(api, clock), clock, instruments=(equity,))
+        broker = AlpacaBroker(alpaca_transport(api, clock), clock, universe=lambda: (equity,))
         legs = (
             entry(equity, client_order_id="pap-A", side=Side.SELL),
             entry(
@@ -186,7 +186,7 @@ class TestAlpacaMalformedResponses:
     ) -> None:
         """Alpaca cancels by *its* id, so an order it cannot resolve cannot be cancelled."""
         api = FakeAlpacaApi(FakeVenueBook(currency="USD"))
-        broker = AlpacaBroker(alpaca_transport(api, clock), clock, instruments=(equity,))
+        broker = AlpacaBroker(alpaca_transport(api, clock), clock, universe=lambda: (equity,))
         ack = await broker.cancel(OrderRef(client_order_id="pap-GONE", instrument_key=equity.key))
         assert not ack.cancelled
         assert "no record" in ack.detail
@@ -195,7 +195,7 @@ class TestAlpacaMalformedResponses:
         self, clock: ManualClock, equity: Instrument
     ) -> None:
         api = FakeAlpacaApi(FakeVenueBook(currency="USD"))
-        broker = AlpacaBroker(alpaca_transport(api, clock), clock, instruments=(equity,))
+        broker = AlpacaBroker(alpaca_transport(api, clock), clock, universe=lambda: (equity,))
         await broker.close()  # no exception: the client belongs to whoever created it
 
 

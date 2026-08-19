@@ -33,6 +33,21 @@
   </div>
 {% endmacro %}
 
+{# Free text an operator writes, rather than a value they pick or type once. A `<textarea>`
+   carries its value as its element *body* — writing it as a `value` attribute renders an empty
+   box that still posts its own name, which on a form that round-trips the whole document clears
+   the stored wording on the next publish. The value sits tight against both tags on purpose:
+   a browser drops one leading newline after `<textarea>`, and indenting the closing tag would
+   append the indentation to what the operator typed. #}
+{% macro prose(path, label, value, errors, rows=4, hint="") %}
+  <div class="field">
+    <label for="doc.{{ path }}">{{ label }}</label>
+    <textarea id="doc.{{ path }}" name="doc.{{ path }}" rows="{{ rows }}">{{ value if value is not none else '' }}</textarea>
+    {% if hint %}<span class="muted small">{{ hint }}</span>{% endif %}
+    {{ _message(errors, path) }}
+  </div>
+{% endmacro %}
+
 {% macro choice(path, label, value, options, errors, hint="") %}
   <div class="field">
     <label for="doc.{{ path }}">{{ label }}</label>

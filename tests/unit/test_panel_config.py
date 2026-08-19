@@ -94,6 +94,41 @@ class TestPerSeatChains:
             )
 
 
+class TestSeatInstruction:
+    """The operator's standing instruction for one seat — the panel's tunable text.
+
+    It is versioned configuration like every other seat field, so a cycle's pinned basket version
+    records the exact wording the panel deliberated under (ADR 0013).
+    """
+
+    def test_a_seat_carries_no_instruction_by_default(self) -> None:
+        assert seat("a", "model-a").instruction == ""
+
+    def test_an_instruction_survives_the_json_round_trip_the_store_persists_it_through(
+        self,
+    ) -> None:
+        """`ConfigStore` writes `document_json` and reads it back; line breaks are the wording."""
+        text = "Favour 4h structure over 15m noise." + chr(10) + "A failed breakout counts."
+        original = SeatConfig(
+            seat_id="a", role="Analyst", provider_id="openrouter", model="m", instruction=text
+        )
+
+        restored = SeatConfig.model_validate(original.model_dump(mode="json"))
+
+        assert restored.instruction == text
+
+    def test_an_instruction_longer_than_the_cap_is_refused(self) -> None:
+        """Billed per seat, per round, per cycle — an accidental paste is a standing cost."""
+        with pytest.raises(ValueError, match="at most 4000 characters"):
+            SeatConfig(
+                seat_id="a",
+                role="Analyst",
+                provider_id="openrouter",
+                model="model-a",
+                instruction="x" * 4001,
+            )
+
+
 class TestPanelDeclaresItsProviders:
     def test_a_binding_naming_an_undeclared_provider_is_rejected(self) -> None:
         """A GUI typo must fail here, not become a seat that silently skips its backup."""

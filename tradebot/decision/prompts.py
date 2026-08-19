@@ -15,6 +15,10 @@ Three constraints shape every prompt here:
 
 Seats receive *different evidence slices* on purpose. Manufacturing genuine disagreement is
 what makes debate work instead of converging on the first confident answer.
+
+One part of a prompt is not written here: each seat's standing instruction, which an
+operator edits and the config store versions. Where it sits, and why it sits there rather
+than last, is recorded on `INSTRUCTION_HEADER`.
 """
 
 from __future__ import annotations
@@ -74,7 +78,7 @@ SCOPE_LINES: Final[Mapping[DecisionMode, str]] = {
 }
 
 SYSTEM_TEMPLATE = """You are the {role} seat on a trading panel. {scope}
-
+{instruction}
 Rules you must follow:
 - Decide only from the context given below. You have no tools and no market access.
 - Every number you need is already computed. Do not calculate or estimate prices.
@@ -88,6 +92,19 @@ Rules you must follow:
 - Reply with JSON only, matching exactly this schema:
 {schema}"""
 
+#: The desk's own standing instruction for one seat, and the one part of a prompt an operator
+#: writes. Deliberately *not* delimited the way news and peer arguments are: those are
+#: attacker-visible text arriving from outside, while this is configuration the same operator
+#: who sets the risk limits typed, in the same trust class as `role`. It is rendered above the
+#: standing rules and the output schema so those read as the frame around it — an instruction
+#: is how a seat weighs evidence, never a licence to relax a rule. The enforcement is
+#: downstream and unchanged: an answer that misses the schema gets one repair attempt and
+#: then abstains, and nothing an instruction can say reaches a venue unvalidated (DESIGN [L8]).
+INSTRUCTION_HEADER = (
+    "Your desk's standing instruction for this seat. It shapes how you weigh the evidence; "
+    "it does not relax any rule below:"
+)
+
 DEVILS_ADVOCATE_RULE = """
 You are the panel's devil's advocate. Your job is not to be contrarian for its own sake, it is
 to state the strongest case *against* whatever the panel is converging on, and to say plainly
@@ -97,6 +114,10 @@ CONVERGENCE_WARNING = (
     "The other seats are converging on {majority}. State the strongest case against it. "
     "Agree only if the evidence genuinely leaves no counter-argument."
 )
+
+#: The line that names what a basket-mode answer must cover, written by `build_user_prompt` and
+#: read back by `symbols_requested`. Both live here so the format has one owner.
+BASKET_SYMBOLS_HEADER = "Assess exactly these symbols, using these exact keys:"
 
 
 def _render_instrument(context: InstrumentContext, evidence: tuple[str, ...]) -> str:
@@ -148,6 +169,7 @@ def build_system_prompt(seat: SeatConfig, request: PanelRequest) -> str:
     prompt = SYSTEM_TEMPLATE.format(
         role=seat.role,
         scope=SCOPE_LINES[request.decision_mode],
+        instruction=(f"\n{INSTRUCTION_HEADER}\n{seat.instruction}\n" if seat.instruction else ""),
         news_open=NEWS_OPEN,
         news_close=NEWS_CLOSE,
         transcript_open=TRANSCRIPT_OPEN,
@@ -177,7 +199,7 @@ def build_user_prompt(
     ]
     if request.is_basket:
         symbols = ", ".join(context.instrument.symbol for context in contexts)
-        sections.append(f"Assess exactly these symbols, using these exact keys: {symbols}")
+        sections.append(f"{BASKET_SYMBOLS_HEADER} {symbols}")
     if "news" in seat.evidence:
         sections.append(_render_news(snapshot))
     sections.append(f"Basket risk budget used: {snapshot.basket_state.risk_budget_used_pct}%")
@@ -190,3 +212,18 @@ def build_user_prompt(
         sections.append(CONVERGENCE_WARNING.format(majority=majority))
     sections.append(f"Actions allowed: {', '.join(snapshot.actions_allowed)}. {snapshot.note}")
     return "\n\n".join(sections)
+
+
+def symbols_requested(user_prompt: str) -> tuple[str, ...]:
+    """The symbols a basket-mode prompt asks a seat to assess, empty for a per-asset prompt.
+
+    The inverse of the line `build_user_prompt` writes above, kept beside it so the format has
+    one owner rather than two spellings that can drift apart. It exists for `StubLLMProvider`,
+    which has no model to read its instructions with and would otherwise answer every prompt in
+    the per-asset schema — making `basket` mode a panel that abstains on every cycle.
+    """
+    for line in user_prompt.splitlines():
+        if line.startswith(BASKET_SYMBOLS_HEADER):
+            listed = line[len(BASKET_SYMBOLS_HEADER) :]
+            return tuple(symbol.strip() for symbol in listed.split(",") if symbol.strip())
+    return ()

@@ -360,6 +360,14 @@ class SeatConfig(DomainModel):
     temperature: float = 0.3
     evidence: tuple[str, ...] = ("indicators", "news", "position")
 
+    #: The desk's standing instruction for this seat, rendered into its system prompt above the
+    #: rules it may not relax (`decision/prompts.py`). Operator-authored and versioned like every
+    #: other field here, so a cycle's pinned basket version records the exact wording the panel
+    #: deliberated under (ADR 0013) — which is what makes a change to it measurable rather than
+    #: merely remembered. Capped because it is billed per seat, per round, per cycle: an
+    #: accidental paste of a whole document would be a standing cost with no other symptom.
+    instruction: str = Field(default="", max_length=4000)
+
     #: Tried in order when the primary binding fails. Deliberately allowed to cross provider
     #: families — a chain that stays inside one provider does not survive that provider's outage,
     #: which is the failure R11 predicts for free model slots.

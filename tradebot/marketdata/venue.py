@@ -24,10 +24,10 @@ from datetime import datetime
 
 from tradebot.core.clock import Clock, ensure_utc
 from tradebot.core.enums import AssetClass
-from tradebot.core.errors import ConfigError, DataStaleError
+from tradebot.core.errors import ConfigError
 from tradebot.core.instrument import Instrument
 from tradebot.core.logging import get_logger
-from tradebot.core.market import Candle, CandleSeries, Quote
+from tradebot.core.market import CandleSeries, Quote
 from tradebot.interfaces.exchange import VenueGateway
 from tradebot.interfaces.market_data import DataCapabilities
 from tradebot.marketdata.catalogue import VenueCatalogue, instrument_of
@@ -61,18 +61,7 @@ class VenueMarketData:
         bars = await self._gateway.fetch_bars(
             instrument.symbol, timeframe, self._clamp(limit), end=cutoff
         )
-        visible = self._visible(bars, cutoff)
-        if not visible:
-            raise DataStaleError(
-                f"no {timeframe} candles closed on or before {cutoff.isoformat()} "
-                f"for {instrument.key}"
-            )
-        series = CandleSeries(
-            instrument_key=instrument.key,
-            timeframe=timeframe,
-            candles=visible[-limit:],
-            observed_at=cutoff,
-        )
+        series = CandleSeries.point_in_time(instrument.key, timeframe, bars, cutoff, limit)
         self._report_gaps(series)
         return series
 
@@ -100,11 +89,6 @@ class VenueMarketData:
 
     async def close(self) -> None:
         await self._gateway.close()
-
-    @staticmethod
-    def _visible(bars: tuple[Candle, ...], cutoff: datetime) -> tuple[Candle, ...]:
-        """Closed-at-or-before-cutoff bars only. A forming bar's close is not a fact yet."""
-        return tuple(bar for bar in bars if bar.close_time <= cutoff)
 
     def _clamp(self, limit: int) -> int:
         if limit < 1:

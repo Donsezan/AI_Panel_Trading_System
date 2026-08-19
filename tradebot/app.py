@@ -41,7 +41,6 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import StrEnum
-from hashlib import blake2s
 from pathlib import Path
 
 import httpx
@@ -113,7 +112,7 @@ from tradebot.marketdata.catalogue import (
 )
 from tradebot.marketdata.factory import binance_spot_market_data, live_binance_spot
 from tradebot.marketdata.recorder import ReplayDataset
-from tradebot.marketdata.replay import ReplayMarketData, synthetic_candles
+from tradebot.marketdata.synthetic import SyntheticMarketData
 from tradebot.news.http import build_fetcher
 from tradebot.news.hub import NewsHub
 from tradebot.news.relevance import KeywordRelevanceFilter
@@ -281,12 +280,6 @@ class Application:
         self._writer.close()
 
 
-def _seed_for(instrument_key: str) -> int:
-    """Stable across processes — `hash()` is randomized per run, which would make the
-    simulation irreproducible."""
-    return blake2s(instrument_key.encode(), digest_size=2).digest()[0] + 1
-
-
 def database_path(mode: Mode, root: Path = Path("data")) -> Path:
     """One database per mode. Never shared, never inferred (PLAN §2.4)."""
     return root / f"{mode.value}.db"
@@ -385,28 +378,6 @@ def select_panel(panel_id: str) -> PanelConfig:
     return panel
 
 
-def _synthetic_market(
-    instruments: tuple[Instrument, ...], clock: Clock, opens: dict[str, Decimal]
-) -> ReplayMarketData:
-    """Series ending at *now*, so the staleness policy is exercised rather than tripped."""
-    bars = 240
-    return ReplayMarketData(
-        {
-            (instrument.key, timeframe): synthetic_candles(
-                start=clock.now() - timeframe_interval(timeframe) * bars,
-                timeframe=timeframe,
-                count=bars,
-                open_price=opens.get(instrument.key, Decimal("50000")),
-                step=Decimal("25"),
-                seed=_seed_for(instrument.key),
-            )
-            for instrument in instruments
-            for timeframe in ("1h", "4h", "1d")
-        },
-        clock,
-    )
-
-
 def build_news_hub(
     engine: Engine,
     writer: SingleWriter,
@@ -497,12 +468,19 @@ class VenueStack:
 class StackRequest:
     """What every venue builder needs, so the three share one signature and one dispatch table.
 
-    `instruments` is the union across every configured basket, not one basket's: a venue account
-    is shared by all of them, so the broker, the reconciler and the market feed have to know about
+    `universe` is the union across every configured basket, not one basket's: a venue account is
+    shared by all of them, so the broker, the reconciler and the market feed have to know about
     every instrument any basket might trade (DESIGN §4).
+
+    It is a **callable, read at each use**, not the set that existed when the process was wired. A
+    basket published from the dashboard is picked up by the resync sweep, and on a spot venue an
+    instrument's base asset *is* its position — so a broker holding a boot-time set would refuse
+    to trade the new instrument, drop its resting orders from `fetch_open_orders`, and fail to
+    project its venue holding as a position, which reads to the reconciler as a position that
+    vanished (ADR 0021, the same defect the Tier-2 cap had).
     """
 
-    instruments: tuple[Instrument, ...]
+    universe: Callable[[], tuple[Instrument, ...]]
     clock: Clock
     mode: Mode
     feed: PriceFeed
@@ -525,14 +503,7 @@ def _sim_stack(request: StackRequest) -> VenueStack:
         balances={request.quote_currency: request.start_equity},
         default_quote_currency=request.quote_currency,
     )
-    source = request.feed.prices or _synthetic_market(
-        request.instruments,
-        request.clock,
-        {
-            i.key: Decimal("50000") if i.base_currency == "BTC" else Decimal("3000")
-            for i in request.instruments
-        },
-    )
+    source = request.feed.prices or SyntheticMarketData(request.clock)
     return VenueStack(
         broker=broker,
         prices=SimulatedMarket(source, broker),
@@ -556,7 +527,7 @@ def _binance_stack(request: StackRequest) -> VenueStack:
     trading_transport = binance_spot_trading_transport(
         clock, credentials("binance", mode), mode=mode, limiter=data_transport.limiter
     )
-    broker = BinanceSpotBroker(trading_transport, clock, instruments=request.instruments)
+    broker = BinanceSpotBroker(trading_transport, clock, universe=request.universe)
     prices = request.feed.prices or binance_spot_market_data(data_transport, clock)
     return VenueStack(
         broker=broker,
@@ -590,7 +561,7 @@ def _alpaca_stack(request: StackRequest) -> VenueStack:
     key_id, secret_key = credentials("alpaca", mode)
     client = httpx.AsyncClient()
     transport = AlpacaTransport(client, clock, mode=mode, key_id=key_id, secret_key=secret_key)
-    broker = AlpacaBroker(transport, clock, instruments=request.instruments)
+    broker = AlpacaBroker(transport, clock, universe=request.universe)
     return VenueStack(
         broker=broker,
         prices=prices,
@@ -896,11 +867,20 @@ async def _assemble(
     instruments = _instruments_of(configured)
     quote_currency = _quote_currency(instruments)
 
+    def universe() -> tuple[Instrument, ...]:
+        """Read fresh everywhere the answer can change while the process runs.
+
+        `instruments` above stays the boot snapshot only where the question is itself a boot-time
+        one: the quote currency every basket must agree on, and the DESIGN §8.2 recovery, which
+        completes before anything can be published.
+        """
+        return configured_instruments(configs)
+
     arming = ArmingStore(engine, writer, clock)
     policy = enforced_policy(configs, arming, mode).policy
 
     stack = _STACKS[broker_choice](
-        StackRequest(instruments, clock, mode, feed, start_equity, quote_currency)
+        StackRequest(universe, clock, mode, feed, start_equity, quote_currency)
     )
     # A real venue's balances are *discovered*: the ledger starts empty and the startup
     # reconciliation adopts what the venue actually holds. Seeding it would invent funds and, worse,
@@ -926,7 +906,7 @@ async def _assemble(
         store,
         clock,
         mode=mode,
-        instruments=instruments,
+        universe=universe,
         announcements=stack.announcements,
     )
 
@@ -941,7 +921,7 @@ async def _assemble(
     portfolio_watch = PortfolioWatch(
         ledger,
         marks,
-        lambda: configured_instruments(configs),
+        universe,
         watchdog,
         store,
         clock,

@@ -308,6 +308,23 @@ one marker price. Every quantity a human reads is the server's exact `Decimal` a
 `dashboard/` is outside the packages `test_money_discipline.py` walks, so `test_dashboard_chart.py`
 asserts the boundary directly — the set of modules calling `float(` must be exactly `{chart.py}`.
 
+**A chart bar carries one decision mark, and its colour is what came of the decision.** Both were
+found on a running sim: a basket on a ten-minute grid put six decisions inside one hourly bar, and
+six markers sharing a timestamp stacked into a column of green buy arrows over a portfolio that
+had bought once. Two rules, both in `chart.py`:
+
+- **Shape is what was decided; colour is what came of it.** An arrow for BUY or SELL, a tick for a
+  cycle that asked for nothing; green or red when an entry order reached the venue, **amber** when
+  one was decided on and none did, grey when nothing was decided. "Came of it" is the presence of
+  an *entry order for that cycle and that instrument* — never the cycle's `outcome`, which is
+  basket-wide: a real cycle in `sim.db` is `orders_placed` having placed ETH's order and had BTC's
+  vetoed, and reading it would paint BTC as a purchase that never happened.
+- **The fold is per bar, and takes the strongest outcome, not the last word.** Placed outranks
+  refused outranks idle; the label carries the bar's *total* fill and its cycle count, so nothing
+  is hidden, only summarised. A bar in which one cycle bought and four waited **bought**. Fills
+  and cancellations are never folded — a repeated opinion is one fact, but two fills are two
+  things that happened, at two prices.
+
 Live updates are **read-only pane invalidation over a WebSocket** ([ADR 0024](docs/adr/0024-live-updates-are-read-only-pane-invalidation.md)).
 `WS /ws/updates` carries `{"panes": [...]}` outward and accepts nothing:
 
@@ -713,6 +730,14 @@ Real models are **off unless asked for**, like news: `--panel free` (or `local`)
 panel; the default `stub` panel is offline, so the demo and the whole suite stay free and
 repeatable.
 
+**An unscripted stub answers in the schema the prompt asked for**, reading the symbols back out
+of `prompts.symbols_requested`, because that is what a real model does with the same text. A stub
+answering only the per-asset schema made `decision_mode: basket` unusable on the default panel:
+every seat failed `BasketAssessment`, the repair replayed the same canned text, and the basket
+resolved `WAIT (PANEL_DEGRADED)` on every cycle it ever ran. A *scripted* response is returned
+verbatim — scripting a per-asset vote into a basket run is the rung-3 fault injection, and
+adapting it would delete the only way to assert that a malformed answer fails closed.
+
 **Each seat has its own fallback chain** — an ordered list of `(provider, model)` bindings, not
 provider names, because a model id only means something to the provider serving it. Two rules are
 enforced at construction, not at runtime: a chain may not repeat a binding, and every binding must
@@ -729,6 +754,23 @@ on every dashboard page); **live refuses**, at startup in `control/readiness.py`
 Start in `SupervisionController.blockers`. Refusing to boot would cost the operator the dashboard,
 the log and the ledger view — the three things needed to fix it. The banner names the variable to
 set: keys are environment-only, so no GUI field may ever accept one.
+
+**A seat's standing instruction is operator text, and it sits *above* the rules it cannot relax.**
+`SeatConfig.instruction` is free text edited per seat in Settings and rendered into that seat's
+system prompt beneath the role line and before "Rules you must follow" — so the sizing prohibition
+and the JSON schema frame it rather than follow it. It is *not* delimited the way news and peer
+arguments are: those arrive from outside and are attacker-visible, while this was typed by the same
+operator who sets the risk limits (same trust class as `role`). Three consequences:
+
+- **The wording is versioned configuration, not code.** A cycle pins its basket version (ADR 0013),
+  so "which instruction was this decision made under" is answerable from the log, and `ConfigStore`
+  refuses a secret pasted into it like any other field.
+- **An empty instruction must contribute nothing**, not even a blank line — every panel stored
+  before the field existed has one, and their prompts must not move. Asserted directly.
+- **The shared `_panel.html` macro gives the challenger the same field**, which is how two wordings
+  are compared: run one as `panel` and the other as `shadow_panel` and read `report shadow`. The
+  textarea's value is its element *body*; a macro copied from `f.field` would render an empty box
+  that still posts its name and would clear every instruction on the next publish.
 
 Model ids in `decision/presets.py` need verifying against openrouter.ai/models before a real run;
 free slots churn (R11), which is what the fallback chains are for.
@@ -752,6 +794,59 @@ Venue prices are read from the venue's **string** fields via the raw response, n
 float-parsed unified fields — see [marketdata/binance.py](tradebot/marketdata/binance.py).
 News is off unless a source is named (`--news cointelegraph`): a default that reaches the
 internet on the first simulated cycle is a surprise.
+
+**The simulated venue is a provider, not a fixture** ([marketdata/synthetic.py](tradebot/marketdata/synthetic.py)).
+`SyntheticMarketData` answers for *any* instrument and *any* known timeframe, on the venue's own
+epoch-aligned bar grid, generated on demand and extended as the clock moves. It replaced a map
+`app.py` built once from the baskets configured at wiring, which was wrong twice over: a basket
+published from the dashboard afterwards — which the resync sweep is built to pick up — had no
+prices, so its chart pane and its every cycle answered `DataStaleError: no replay series for …`;
+and because the series ended at *start-up*, a `serve --mode sim` process left up for longer than a
+bar interval plus the staleness tolerance went `DATA_STALE` on every cycle and simply stopped
+deciding. Three rules:
+
+- **It is not `ReplayMarketData`, and the split is the point.** Replay serves recorded bars and
+  refuses what it was not given, because a backtest that fabricated a series the dataset never
+  covered would be quietly meaningless. Fabrication is the product in one and a defect in the
+  other, so they cannot be one class. `SyntheticMarketData` runs through the same
+  `tests/contract/test_market_data_contract.py` as every other provider; `inception` is what gives
+  it the "nothing before the series starts" refusal the others get from running out of bars.
+- **A bar once published is final.** Extension resumes the walk from the last close rather than
+  redrawing it, so the history a pane refreshes into is the history the panel deliberated on.
+- **Timeframes are independent walks of one instrument**, unchanged from the map it replaced: a 4h
+  series is not the aggregate of its 1h bars. `QUOTE_TIMEFRAME` is therefore fixed at `1h` rather
+  than "the shortest series loaded", so the price a sim fill happens at stays the series the
+  workspace charts by default.
+
+`CandleSeries.point_in_time` is the one construction all three providers go through, so "only
+closed bars, most recent `limit`, empty fails closed" is a property of the type rather than a rule
+each of them remembers.
+
+**"What do we trade" is read fresh, never captured at wiring.** `configured_instruments(configs)`
+is the answer and `app._assemble` threads one callable into everything that outlives a publish:
+`StackRequest.universe` (and through it `BinanceSpotBroker` and `AlpacaBroker`), `Reconciler`, and
+`PortfolioWatch`. It is the same defect ADR 0021 fixed for the Tier-2 cap, and it reaches the money
+path in three ways, because **on a spot venue an instrument's base asset *is* its position**:
+
+- **A holding nobody can name looks like one that vanished.** `parse_account` turns venue balances
+  into positions through this map. An instrument added after boot is not in it, so 1 200 XRP at the
+  venue stays a nameless balance while the ledger holds `binance:XRP/USDT` — `ours=1200, theirs=0`,
+  which classifies as `MISMATCH` and, above `mismatch_kill_pct`, trips the kill switch.
+- **The same discrepancy is then counted twice.** `_diff` excludes the base assets of *known*
+  instruments from the currency comparison so BTC is not diffed as both a position and a balance.
+  An unknown instrument is diffed both ways, and the currency copy can classify as an external
+  deposit — which moves the drawdown baselines with it.
+- **`_is_venue_reset` and `fetch_open_orders` both gate on the same map**, so an R15 testnet wipe
+  involving a late instrument is read as a mismatch rather than a reset, and its resting protective
+  legs are dropped from the open-order sweep — orders at the venue with nobody polling them.
+
+Two things deliberately keep a boot snapshot, because the question they ask is itself a boot-time
+one: `_quote_currency`, the currency every basket in one process must agree on, and
+`StartupSequence`, which completes DESIGN §8.2 before anything can be published. **Neither is
+re-checked afterwards** — a basket published later naming a different quote currency is not
+refused today, which is a known gap, not a decision:
+[docs/KNOWN_GAPS.md](docs/KNOWN_GAPS.md) records it
+alongside the other two found in the same seam.
 
 The pieces most likely to surprise a reader are recorded as decisions:
 [ADR 0004](docs/adr/0004-protective-orders-are-venue-held.md) (protective legs),

@@ -6,7 +6,7 @@ by the consumer, and so a replayed cycle can prove it only saw what existed at t
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from datetime import timedelta
 from itertools import pairwise
 
@@ -75,6 +75,36 @@ class CandleSeries(DomainModel):
         if times != sorted(times):
             raise ValueError("candles must be ordered oldest first")
         return self
+
+    @classmethod
+    def point_in_time(
+        cls,
+        instrument_key: str,
+        timeframe: str,
+        candles: Iterable[Candle],
+        cutoff: UtcDatetime,
+        limit: int,
+    ) -> CandleSeries:
+        """The most recent `limit` bars to have **closed** at or before `cutoff`.
+
+        The one construction every provider goes through, so point-in-time discipline is a
+        property of the type rather than a rule each of them has to remember: a bar still forming
+        at `cutoff` is not a fact yet, and including it leaks the future into a decision (DESIGN
+        [L12]). Nothing visible fails closed rather than returning an empty series — deciding on
+        no data is the fail-open behaviour the design forbids.
+        """
+        visible = tuple(candle for candle in candles if candle.close_time <= cutoff)
+        if not visible:
+            raise DataStaleError(
+                f"no {timeframe} candles closed on or before {cutoff.isoformat()} "
+                f"for {instrument_key}"
+            )
+        return cls(
+            instrument_key=instrument_key,
+            timeframe=timeframe,
+            candles=visible[-limit:],
+            observed_at=cutoff,
+        )
 
     def __len__(self) -> int:
         return len(self.candles)

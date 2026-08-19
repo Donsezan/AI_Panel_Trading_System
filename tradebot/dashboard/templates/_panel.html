@@ -55,6 +55,7 @@
               {{ f.field(s ~ ".temperature", "Temperature", panel["seats"][row.index].get("temperature"), errors) }}
               {{ f.checkboxes(s ~ ".evidence", "Evidence slice", panel["seats"][row.index].get("evidence") or [], evidence_slices, hint="different slices per seat manufacture genuine disagreement") }}
             </div>
+            {{ f.prose(s ~ ".instruction", "Standing instruction", panel["seats"][row.index].get("instruction"), errors, rows=5, hint="how this seat should weigh the evidence; it cannot relax a rule, and an empty box leaves the seat on its role alone") }}
             {{ f.flag(s ~ ".devils_advocate", "Devil's advocate", panel["seats"][row.index].get("devils_advocate"), hint="argues against the emerging majority every round") }}
 
             <h4>Fallback chain</h4>
@@ -69,8 +70,11 @@
             {{ f.row_buttons(s ~ ".fallbacks", s, "add fallback", draft_action) }}
           </section>
         {% endfor %}
+        {# Inside the rail, so it lands under the last seat label. As a sibling *below* the rail it
+           tracked the open pane's height instead — the grid is as tall as the seat editor — and sat
+           further from the list with every field that editor gained. #}
+        {{ f.row_buttons(prefix ~ ".seats", "", "add seat", draft_action) }}
       </div>
-      {{ f.row_buttons(prefix ~ ".seats", "", "add seat", draft_action) }}
     </section>
 
     <input type="radio" class="tab-toggle" name="ui.tab.{{ prefix }}" id="t-{{ prefix }}-providers"

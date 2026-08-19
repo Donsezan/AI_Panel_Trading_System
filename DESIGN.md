@@ -176,7 +176,7 @@ Core entities (persisted; names are the ubiquitous language of the codebase):
 |---|---|---|
 | **Instrument** | A tradable thing, asset-class-aware | `symbol`, `asset_class` (crypto/equity/index_etf), `venue`, `quote_currency`, `lot_size`, `min_notional`, `tick_size`, `trading_hours` |
 | **Basket** | GUI-created group of 1..N instruments with its own config | `name`, `instruments[]`, `decision_mode` (per_asset \| basket), `schedule`, `panel_config_id`, `risk_policy_id`, `status` (active/paused/halted) |
-| **PanelConfig** | The agent panel definition | `providers[]` (endpoint, kind, `secret_ref`, prices), `seats[]` (role, provider, model, temperature, `fallbacks[]`), `debate_protocol`, `max_rounds`, `consensus_rule`, `token_budget` |
+| **PanelConfig** | The agent panel definition | `providers[]` (endpoint, kind, `secret_ref`, prices), `seats[]` (role, `instruction`, provider, model, temperature, `fallbacks[]`), `debate_protocol`, `max_rounds`, `consensus_rule`, `token_budget` |
 | **RiskPolicy** | Tier-1 limits attached to a basket (and defaults per asset) | see [§6.6](#66-risk-management-two-tier) |
 | **GlobalRiskPolicy** | Tier-2 limits: one instance per venue portfolio (hard, synchronous), plus cross-venue aggregate rules over the PortfolioAggregate | see [§6.6](#66-risk-management-two-tier) |
 | **DecisionCycle** | One run of the loop for one basket | `basket_id`, `started_at`, `context_snapshot_id`, `status`, `outcome` |
@@ -391,6 +391,14 @@ Nothing outside `providers[]` is ever constructed or contacted. Provider setting
 
 Giving seats *different evidence slices* is deliberate: it manufactures genuine
 disagreement, which debate research shows is what makes debate work.
+
+Each seat also carries a **standing instruction** — free text saying how that seat should
+weigh what it is shown. It is rendered into the seat's system prompt *above* the standing
+rules and the output schema, so those frame it: an instruction changes how a seat reasons,
+never what it is allowed to emit. Being versioned configuration rather than code is the
+point — a cycle pins the basket version it ran (§6.9), so the wording a decision was made
+under is recoverable from the log, and two wordings can be compared by running one as the
+champion and the other as the shadow panel.
 
 **Debate protocol** (a pluggable `DebateProtocol`; default = "blind-then-debate"):
 
@@ -644,7 +652,8 @@ FastAPI + server-rendered or light SPA frontend; WebSocket for live updates. Thr
 
 1. **Configure** — CRUD for Baskets (instrument picker with venue search, decision mode,
    schedule), PanelConfigs (**provider editor**: endpoint, kind, `secret_ref`, per-model prices;
-   **seat editor**: role, evidence slice, primary provider+model, devil's-advocate flag, and an
+   **seat editor**: role, standing instruction, evidence slice, primary provider+model,
+   devil's-advocate flag, and an
    ordered **per-seat fallback chain** built from the panel's declared providers — a picker, so a
    provider that is not declared cannot be typed in; plus protocol and budgets),
    RiskPolicies (tier-1 forms), GlobalRiskPolicy (tier-2, extra confirmation to loosen) —

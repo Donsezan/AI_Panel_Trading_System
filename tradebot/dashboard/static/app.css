@@ -206,7 +206,9 @@ body.centred { display: grid; place-items: center; min-height: 100vh; }
 .grid.tight { grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr)); align-items: end; }
 .field { display: flex; flex-direction: column; gap: 0.2rem; }
 .field label.inline { flex-direction: row; display: flex; align-items: center; gap: 0.4rem; color: var(--text); }
-.field input:not([type="checkbox"]), .field select { width: 100%; }
+.field input:not([type="checkbox"]), .field select, .field textarea { width: 100%; }
+/* Vertical only: a textarea a reader drags wider would push the seat pane past its column. */
+.field textarea { resize: vertical; min-height: 4.5rem; }
 
 fieldset {
   border: 1px solid var(--line);
@@ -349,6 +351,13 @@ form.retire { display: flex; align-items: center; gap: 0.6rem; margin-top: 2rem;
 .seat-master .seat-id { flex-basis: 100%; font: 600 13px/1.4 var(--mono); }
 .seat-master .seat-binding { color: var(--muted); font-size: 0.8rem; }
 .seat-master .pill { flex-shrink: 0; }
+
+/* "add seat" appends to the list, so it belongs under the last label. As a sibling below the
+   rail it was placed against a grid whose height is the *open pane's* — the pane spans every
+   row — so it sat a seat-editor's length beneath the column it acts on, and drifted further
+   with each field that editor gained. Column 1 is stated rather than left to auto-placement,
+   which finds this cell only because the panes happen to fill column 2 of every row. */
+.seat-master > .row-buttons { grid-column: 1; margin-top: 0.4rem; }
 
 .checkgroup { display: flex; flex-wrap: wrap; gap: 0.2rem 0.9rem; }
 .checkgroup label.inline { display: flex; align-items: center; gap: 0.35rem; color: var(--text); }

@@ -80,7 +80,7 @@ class TestBinanceTestnet:
         transport = binance_spot_trading_transport(
             clock, credentials("binance", Mode.PAPER), mode=Mode.PAPER
         )
-        return BinanceSpotBroker(transport, clock, instruments=(BTC,))
+        return BinanceSpotBroker(transport, clock, universe=lambda: (BTC,))
 
     async def test_the_account_reads_and_parses(self) -> None:
         """Proves the balance shape is still what `parse_account` expects."""
@@ -127,7 +127,7 @@ class TestAlpacaPaper:
         transport, client = self._transport()
         try:
             state = await AlpacaBroker(
-                transport, SystemClock(), instruments=(AAPL,)
+                transport, SystemClock(), universe=lambda: (AAPL,)
             ).fetch_positions_and_balances()
             assert state.venue == "alpaca"
         finally:

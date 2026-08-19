@@ -169,7 +169,7 @@ def binance_venue(clock: ManualClock) -> Venue:
     instrument = crypto()
     book = FakeVenueBook()
     transport = FakeBinanceTransport(book, server_time=NOW)
-    broker = BinanceSpotBroker(transport, clock, instruments=(instrument,))
+    broker = BinanceSpotBroker(transport, clock, universe=lambda: (instrument,))
     return Venue(
         broker,
         instrument,
@@ -185,7 +185,7 @@ async def alpaca_venue(clock: ManualClock) -> AsyncIterator[Venue]:
     book = FakeVenueBook(currency="USD")
     api = FakeAlpacaApi(book, clock_time=NOW)
     transport = alpaca_transport(api, clock, mode=Mode.PAPER)
-    broker = AlpacaBroker(transport, clock, instruments=(instrument,))
+    broker = AlpacaBroker(transport, clock, universe=lambda: (instrument,))
     yield Venue(
         broker,
         instrument,

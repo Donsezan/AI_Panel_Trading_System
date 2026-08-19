@@ -26,6 +26,7 @@ import pytest
 
 from tradebot.app import Application
 from tradebot.core.clock import ManualClock
+from tradebot.core.config import Basket
 from tradebot.core.enums import CycleOutcome, OrderRole, OrderState, OrderType, Side
 from tradebot.core.errors import SubmitUnknownError
 from tradebot.core.instrument import Instrument
@@ -35,6 +36,7 @@ from tradebot.dashboard.routes.workspace import CHART_BARS
 from tradebot.dashboard.updates import Pane
 from tradebot.dashboard.views import PACKAGE
 from tradebot.execution.brokers.sim import SimBroker, SimulatedMarket
+from tradebot.marketdata.catalogue import instrument_of
 from tradebot.marketdata.replay import ReplayMarketData
 
 PANES = [
@@ -443,6 +445,33 @@ async def test_an_instrument_this_process_does_not_trade_is_refused(
     """Checked against configuration, not trusted from the URL: a chart is a venue read."""
     response = await chart_of(client, "instrument:demo:sim:DOGE/USDT")
     assert response.status_code == 503
+
+
+async def test_a_basket_published_after_wiring_charts_its_instruments(
+    client: httpx.AsyncClient, sim_application: Application
+) -> None:
+    """The reported defect. A basket added from the GUI is picked up by the resync sweep, so its
+    instruments have to be priceable by the process that is already running — the sim feed used
+    to be a map built from the baskets configured at start-up and answered
+    `DataStaleError: no replay series for sim:XRP/USDT 1h` to the chart pane and to every cycle.
+    """
+    added = await instrument_of(sim_application.catalogue, "XRP/USDT")
+    await sim_application.configs.put(
+        "crypto_2",
+        Basket(
+            basket_id="crypto_2",
+            name="Crypto_2",
+            instruments=(added,),
+            panel=sim_application.baskets[0].panel,
+            timeframes=("1h",),
+        ),
+        actor="test",
+    )
+
+    payload = (await chart_of(client, f"instrument:crypto_2:{added.key}", tf="1h")).json()
+
+    assert payload["instrument_key"] == added.key
+    assert len(payload["candles"]) == CHART_BARS
 
 
 async def test_a_failed_chart_renders_as_a_failure_not_a_spinner(

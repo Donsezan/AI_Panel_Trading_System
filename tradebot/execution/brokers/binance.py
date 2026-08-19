@@ -28,7 +28,7 @@ legal resolution is querying this same adapter by `client_order_id` (PLAN §2.3)
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, Final
@@ -229,13 +229,18 @@ class BinanceSpotBroker:
         transport: TradingTransport,
         clock: Clock,
         *,
-        instruments: Sequence[Instrument],
+        universe: Callable[[], Sequence[Instrument]],
         recv_window_ms: int = 5_000,
     ) -> None:
         self._transport = transport
         self._clock = clock
-        self._instruments = {instrument.key: instrument for instrument in instruments}
-        self._by_symbol = {to_symbol_id(i.symbol): i for i in instruments}
+        #: What this adapter may translate between venue symbols and instruments, **read at
+        #: each call** rather than held from wiring. A spot balance *is* a position, so this map
+        #: is what turns the venue's assets into positions the reconciler can diff — and a basket
+        #: published while the process runs adds an instrument a set captured at boot would leave
+        #: out, making a real holding look like one that vanished. The same callable
+        #: `PortfolioWatch` and `Reconciler` take, for the same reason (ADR 0021).
+        self._universe = universe
         self._recv_window = recv_window_ms
 
     def capabilities(self) -> BrokerCapabilities:
@@ -360,17 +365,18 @@ class BinanceSpotBroker:
         payload = await self._transport.call(
             "openOrders", self._signed(), weight=WEIGHTS["openOrders"]
         )
+        by_symbol = {to_symbol_id(i.symbol): i for i in self._universe()}
         return tuple(
             self._status_without_fills(entry, instrument)
             for entry in (payload if isinstance(payload, list) else ())
-            if (instrument := self._by_symbol.get(str(entry.get("symbol")))) is not None
+            if (instrument := by_symbol.get(str(entry.get("symbol")))) is not None
         )
 
     async def fetch_positions_and_balances(self) -> AccountState:
         payload = await self._transport.call("account", self._signed(), weight=WEIGHTS["account"])
         if not isinstance(payload, dict):
             raise DataStaleError("binance account returned a non-object payload")
-        return parse_account(payload, tuple(self._instruments.values()), self._clock.now())
+        return parse_account(payload, self._universe(), self._clock.now())
 
     async def server_time(self) -> datetime:
         payload = await self._transport.call("time", {}, weight=WEIGHTS["time"])
@@ -398,7 +404,7 @@ class BinanceSpotBroker:
     # ------------------------------------------------------------------ internals
 
     def _instrument(self, instrument_key: str) -> Instrument:
-        instrument = self._instruments.get(instrument_key)
+        instrument = next((i for i in self._universe() if i.key == instrument_key), None)
         if instrument is None:
             raise DataStaleError(
                 f"{instrument_key} is not configured on this binance adapter; refusing to trade "

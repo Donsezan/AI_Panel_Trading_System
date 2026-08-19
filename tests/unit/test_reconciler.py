@@ -109,9 +109,64 @@ def reconciler(
         store,
         clock,
         mode=Mode.SIM,
-        instruments=(instrument.model_copy(update={"symbol": "BTC/USDT", "venue": "sim"}),),
+        universe=lambda: (instrument.model_copy(update={"symbol": "BTC/USDT", "venue": "sim"}),),
         **kwargs,  # type: ignore[arg-type]
     )
+
+
+class TestTheUniverseIsReadFresh:
+    """A basket published while the process runs changes what the account holds.
+
+    The universe used to be captured when the reconciler was built, and on a spot venue an
+    instrument's base asset *is* its position — so an instrument added afterwards was diffed
+    twice, once as the position and once as a loose currency balance, and a venue reset involving
+    it could not be recognised. Both are answered by asking for the universe at each reconcile.
+    """
+
+    async def test_a_shortfall_is_one_difference_not_two(
+        self, store: EventStore, clock: ManualClock, instrument: Instrument
+    ) -> None:
+        """Counted twice, one real discrepancy is also *absorbed* twice: the currency copy can
+        classify as an external deposit and move the drawdown baselines with it."""
+        universe: list[Instrument] = []
+        state = venue_state(clock, qty="0.4")
+        broker = StubBroker(
+            state.model_copy(
+                update={"balances": (*state.balances, Balance(currency="BTC", free=Decimal("0.4")))}
+            )
+        )
+        subject = Reconciler(
+            broker,  # type: ignore[arg-type]
+            held_ledger(clock),
+            store,
+            clock,
+            mode=Mode.SIM,
+            universe=lambda: tuple(universe),
+        )
+        universe.append(instrument.model_copy(update={"symbol": "BTC/USDT", "venue": "sim"}))
+
+        report = await subject.reconcile()
+
+        assert [d.scope for d in report.differences] == [KEY]
+
+    async def test_a_venue_reset_is_recognised_for_an_instrument_added_after_wiring(
+        self, store: EventStore, clock: ManualClock, instrument: Instrument
+    ) -> None:
+        """R15: a testnet wipe read as a mismatch trips the kill switch for a routine event."""
+        universe: list[Instrument] = []
+        subject = Reconciler(
+            StubBroker(venue_state(clock, qty=None)),  # type: ignore[arg-type]
+            held_ledger(clock),
+            store,
+            clock,
+            mode=Mode.SIM,
+            universe=lambda: tuple(universe),
+        )
+        universe.append(instrument.model_copy(update={"symbol": "BTC/USDT", "venue": "sim"}))
+
+        report = await subject.reconcile()
+
+        assert report.classification is ReconcileClass.VENUE_RESET
 
 
 class TestClassification:

@@ -16,7 +16,7 @@ design forbids.
 from __future__ import annotations
 
 import csv
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
@@ -72,18 +72,8 @@ class ReplayMarketData:
         end: datetime | None = None,
     ) -> CandleSeries:
         cutoff = ensure_utc(end) if end is not None else self._clock.now()
-        candles = self._lookup(instrument.key, timeframe)
-        visible = tuple(candle for candle in candles if candle.close_time <= cutoff)
-        if not visible:
-            raise DataStaleError(
-                f"no {timeframe} candles closed on or before {cutoff.isoformat()} "
-                f"for {instrument.key}"
-            )
-        return CandleSeries(
-            instrument_key=instrument.key,
-            timeframe=timeframe,
-            candles=visible[-limit:],
-            observed_at=cutoff,
+        return CandleSeries.point_in_time(
+            instrument.key, timeframe, self._lookup(instrument.key, timeframe), cutoff, limit
         )
 
     async def get_quote(self, instrument: Instrument) -> Quote:
@@ -158,6 +148,47 @@ def _read_csv(path: Path) -> Iterable[Candle]:
             )
 
 
+def synthetic_walk(
+    *,
+    start: datetime,
+    timeframe: str,
+    count: int,
+    open_price: Decimal,
+    step: Decimal = Decimal("0.5"),
+    seed: int = 7,
+) -> Iterator[tuple[Candle, int]]:
+    """The walk behind `synthetic_candles`, yielding each bar with the state that produced it.
+
+    Exposed apart from the tuple so a caller can *resume* the sequence: passing the last yielded
+    state back as `seed` continues it exactly, where re-using the original seed would replay the
+    same drifts and turn a walk into a sawtooth. `marketdata/synthetic.py` extends a live series
+    bar by bar and is the only caller that needs it.
+    """
+    duration = timeframe_interval(timeframe)
+    opening = ensure_utc(start)
+    price = open_price
+    state = seed
+    for index in range(count):
+        state = (state * 1103515245 + 12345) % 2147483648
+        drift = multiply(step, Decimal((state % 7) - 3))
+        close = max(price + drift, step)
+        high = max(price, close) + step
+        low = max(min(price, close) - step, ZERO + step)
+        yield (
+            Candle(
+                open_time=opening + duration * index,
+                close_time=opening + duration * (index + 1),
+                open=price,
+                high=high,
+                low=low,
+                close=close,
+                volume=Decimal(100 + (state % 50)),
+            ),
+            state,
+        )
+        price = close
+
+
 def synthetic_candles(
     *,
     start: datetime,
@@ -172,27 +203,14 @@ def synthetic_candles(
     Not a market model and not meant to be one — it exists so the loop has something to chew on.
     The walk is integer-driven so prices stay exact decimals with no float anywhere.
     """
-    duration = timeframe_interval(timeframe)
-    opening = ensure_utc(start)
-    price = open_price
-    state = seed
-    candles: list[Candle] = []
-    for index in range(count):
-        state = (state * 1103515245 + 12345) % 2147483648
-        drift = multiply(step, Decimal((state % 7) - 3))
-        close = max(price + drift, step)
-        high = max(price, close) + step
-        low = max(min(price, close) - step, ZERO + step)
-        candles.append(
-            Candle(
-                open_time=opening + duration * index,
-                close_time=opening + duration * (index + 1),
-                open=price,
-                high=high,
-                low=low,
-                close=close,
-                volume=Decimal(100 + (state % 50)),
-            )
+    return tuple(
+        candle
+        for candle, _ in synthetic_walk(
+            start=start,
+            timeframe=timeframe,
+            count=count,
+            open_price=open_price,
+            step=step,
+            seed=seed,
         )
-        price = close
-    return tuple(candles)
+    )

@@ -84,7 +84,7 @@ class Stack:
             store,
             clock,
             mode=Mode.SIM,
-            instruments=(instrument,),
+            universe=lambda: (instrument,),
         )
         # The valuation the sequence reads for its reconciliation tolerance and its first-run
         # baseline. No market data: a flat ledger of quote-currency cash needs no marks at all,

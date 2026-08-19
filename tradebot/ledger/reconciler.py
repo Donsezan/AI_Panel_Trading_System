@@ -29,7 +29,7 @@ half-applied reconciliation is worse than none.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import timedelta
 from decimal import Decimal
 
@@ -98,7 +98,7 @@ class Reconciler:
         clock: Clock,
         *,
         mode: Mode,
-        instruments: Sequence[Instrument] = (),
+        universe: Callable[[], Sequence[Instrument]] = tuple,
         dust_tolerance: Decimal = Decimal("0.00000001"),
         drift_tolerance_pct: Decimal = Decimal("0.5"),
         mismatch_kill_pct: Decimal = Decimal(5),
@@ -110,7 +110,13 @@ class Reconciler:
         self._store = store
         self._clock = clock
         self._mode = mode
-        self._instruments = {i.key: i for i in instruments}
+        #: Every instrument the process trades, **read at each reconciliation** rather than held
+        #: from wiring. A basket published while the process runs adds one, and a set captured at
+        #: boot cannot see it: on a spot venue an instrument's base asset *is* its position, so an
+        #: unknown instrument's holding is diffed twice — once as the position and once as a loose
+        #: currency balance — and `_is_venue_reset` cannot recognise a wipe that involves it. The
+        #: same callable `PortfolioWatch` takes, for the same reason (ADR 0021, PHASE_12 §3.5).
+        self._universe = universe
         self._dust = dust_tolerance
         self._drift_pct = drift_tolerance_pct
         self._mismatch_kill_pct = mismatch_kill_pct
@@ -148,11 +154,12 @@ class Reconciler:
         yields nothing and the halt stands — the fail-closed direction.
         """
         actions = list(self._static_actions)
-        if self._announcements is not None and self._instruments:
+        instruments = self._universe()
+        if self._announcements is not None and instruments:
             today = self._clock.now().date()
             actions.extend(
                 await self._announcements.fetch(
-                    tuple(self._instruments.values()),
+                    tuple(instruments),
                     since=today - ANNOUNCEMENT_LOOKBACK,
                     until=today,
                 )
@@ -170,7 +177,7 @@ class Reconciler:
         """
         ours = self._ledger.snapshot()
         keys = {p.instrument_key for p in (*ours.positions, *venue_state.positions)}
-        held_as_positions = base_currencies_of(self._instruments.values())
+        held_as_positions = base_currencies_of(self._universe())
         currencies = {
             b.currency for b in (*ours.balances, *venue_state.balances)
         } - held_as_positions
@@ -283,7 +290,8 @@ class Reconciler:
         Deliberately narrow: partial disappearance is a mismatch. Only a state where we believe
         we hold positions and the venue reports none at all qualifies.
         """
-        held = [d for d in differences if d.ours > ZERO and d.scope in self._instruments]
+        keys = {instrument.key for instrument in self._universe()}
+        held = [d for d in differences if d.ours > ZERO and d.scope in keys]
         return bool(held) and not venue_state.positions and all(d.theirs <= ZERO for d in held)
 
     # ------------------------------------------------------------------ adoption
@@ -371,11 +379,11 @@ class Reconciler:
 
     def apply_external_flows(self, report: ReconcileReport) -> tuple[ExternalFlow, ...]:
         """The flows the report found, for the watchdog to adjust its baselines with."""
+        keys = {instrument.key for instrument in self._universe()}
         flows = tuple(
             ExternalFlow(currency=d.scope, amount=d.delta, reason=d.detail)
             for d in report.differences
-            if d.classification is ReconcileClass.EXTERNAL_CHANGE
-            and d.scope not in self._instruments
+            if d.classification is ReconcileClass.EXTERNAL_CHANGE and d.scope not in keys
         )
         for flow in flows:
             self._ledger.apply_external_change(flow)

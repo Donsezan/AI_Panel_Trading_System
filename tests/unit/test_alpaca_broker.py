@@ -60,7 +60,7 @@ def api() -> FakeAlpacaApi:
 @pytest.fixture
 def broker(clock: ManualClock, instrument: Instrument, api: FakeAlpacaApi) -> AlpacaBroker:
     return AlpacaBroker(
-        alpaca_transport(api, clock, mode=Mode.PAPER), clock, instruments=(instrument,)
+        alpaca_transport(api, clock, mode=Mode.PAPER), clock, universe=lambda: (instrument,)
     )
 
 
@@ -126,7 +126,7 @@ class TestWireFormat:
         import json
 
         broker = AlpacaBroker(
-            alpaca_transport(api, clock), clock, instruments=(instrument,), extended_hours=True
+            alpaca_transport(api, clock), clock, universe=lambda: (instrument,), extended_hours=True
         )
         await broker.submit(intent(instrument))
         assert json.loads(api.requests[-1].content)["extended_hours"] is True
@@ -180,7 +180,7 @@ class TestOrderClasses:
     ) -> None:
         """Alpaca cannot bracket an extended-hours order; declaring otherwise would place two."""
         broker = AlpacaBroker(
-            alpaca_transport(api, clock), clock, instruments=(instrument,), extended_hours=True
+            alpaca_transport(api, clock), clock, universe=lambda: (instrument,), extended_hours=True
         )
         assert not broker.capabilities().oco_groups
 
@@ -243,6 +243,42 @@ class TestAccountParsing:
             NOW,
         )
         assert state.positions == ()
+
+
+class TestTheUniverseIsReadFresh:
+    """The same rule as the crypto adapter, on the venue where a position is its own record.
+
+    Alpaca reports positions directly, so nothing is double-counted here — but the symbol→
+    instrument map is still what decides whether a position and its resting orders are *seen at
+    all*, and a basket published while the process runs must not be invisible to reconciliation.
+    """
+
+    async def test_an_instrument_added_after_wiring_is_traded_and_seen(
+        self, clock: ManualClock, instrument: Instrument, api: FakeAlpacaApi
+    ) -> None:
+        universe: list[Instrument] = []
+        broker = AlpacaBroker(
+            alpaca_transport(api, clock, mode=Mode.PAPER), clock, universe=lambda: tuple(universe)
+        )
+        universe.append(instrument)
+        try:
+            ack = await broker.submit(intent(instrument))
+
+            assert ack.reject_reason is None
+            assert [o.client_order_id for o in await broker.fetch_open_orders()] == ["pap-ENTRY"]
+        finally:
+            await broker.close()
+
+    async def test_an_instrument_still_unknown_is_refused_by_name(
+        self, clock: ManualClock, instrument: Instrument, api: FakeAlpacaApi
+    ) -> None:
+        """Fail closed stays fail closed: unknown precision and minimums are not tradable."""
+        broker = AlpacaBroker(alpaca_transport(api, clock, mode=Mode.PAPER), clock, universe=tuple)
+        try:
+            with pytest.raises(DataStaleError, match="not configured on this alpaca adapter"):
+                await broker.submit(intent(instrument))
+        finally:
+            await broker.close()
 
 
 class TestCorporateActions:

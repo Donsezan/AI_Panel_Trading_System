@@ -60,7 +60,7 @@ def transport() -> FakeBinanceTransport:
 def broker(
     clock: ManualClock, instrument: Instrument, transport: FakeBinanceTransport
 ) -> BinanceSpotBroker:
-    return BinanceSpotBroker(transport, clock, instruments=(instrument,))
+    return BinanceSpotBroker(transport, clock, universe=lambda: (instrument,))
 
 
 def intent(instrument: Instrument, **overrides: object) -> OrderIntent:
@@ -76,6 +76,62 @@ def intent(instrument: Instrument, **overrides: object) -> OrderIntent:
         "created_at": NOW,
     }
     return OrderIntent(**{**base, **overrides})  # type: ignore[arg-type]
+
+
+class TestTheUniverseIsReadFresh:
+    """A basket published while the process runs adds an instrument this adapter must know.
+
+    A spot balance *is* a position, so the translation table is what turns the venue's assets into
+    something the reconciler can diff. Held from wiring, it refused to trade the new instrument,
+    dropped its resting orders, and left its holding unprojected — which reads to the reconciler
+    as a position that vanished, and above the tolerance trips the kill switch.
+    """
+
+    async def test_an_instrument_added_after_wiring_can_be_traded(
+        self, clock: ManualClock, instrument: Instrument, transport: FakeBinanceTransport
+    ) -> None:
+        universe: list[Instrument] = []
+        broker = BinanceSpotBroker(transport, clock, universe=lambda: tuple(universe))
+        universe.append(instrument)
+
+        ack = await broker.submit(intent(instrument))
+
+        assert ack.reject_reason is None
+        assert ack.venue_order_id
+
+    async def test_an_instrument_still_unknown_is_refused_by_name(
+        self, clock: ManualClock, instrument: Instrument, transport: FakeBinanceTransport
+    ) -> None:
+        """Fail closed stays fail closed: unknown precision and minimums are not tradable."""
+        broker = BinanceSpotBroker(transport, clock, universe=tuple)
+
+        with pytest.raises(DataStaleError, match="not configured on this binance adapter"):
+            await broker.submit(intent(instrument))
+
+    async def test_its_holding_is_projected_as_a_position(
+        self, clock: ManualClock, instrument: Instrument, transport: FakeBinanceTransport
+    ) -> None:
+        universe: list[Instrument] = []
+        broker = BinanceSpotBroker(transport, clock, universe=lambda: tuple(universe))
+        universe.append(instrument)
+        transport.book.holdings["BTCUSDT"] = Decimal("0.5")
+
+        state = await broker.fetch_positions_and_balances()
+
+        assert [(p.instrument_key, p.qty) for p in state.positions] == [
+            (instrument.key, Decimal("0.5"))
+        ]
+
+    async def test_its_resting_orders_are_still_seen(
+        self, clock: ManualClock, instrument: Instrument, transport: FakeBinanceTransport
+    ) -> None:
+        """Dropped, they are orders at the venue with nobody polling them (DESIGN §8.2)."""
+        universe: list[Instrument] = []
+        broker = BinanceSpotBroker(transport, clock, universe=lambda: tuple(universe))
+        universe.append(instrument)
+        await broker.submit(intent(instrument))
+
+        assert [o.client_order_id for o in await broker.fetch_open_orders()] == ["pap-ENTRY"]
 
 
 class TestStateMapping:

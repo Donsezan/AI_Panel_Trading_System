@@ -92,12 +92,17 @@ def new_basket_form(*, lot_size: str) -> list[tuple[str, str]]:
     return flat(draft)
 
 
+def basket_form_of(application: Application) -> list[tuple[str, str]]:
+    """The stored demo basket, as the edit form the page would render for it."""
+    record = application.configs.latest(ConfigKind.BASKET, "demo")
+    assert record is not None
+    return flat(unfold_prices(draft_of(record.document)))
+
+
 @pytest.fixture
 def basket_form(sim_application: Application) -> list[tuple[str, str]]:
     """The seeded demo basket, as its own edit form."""
-    record = sim_application.configs.latest(ConfigKind.BASKET, "demo")
-    assert record is not None
-    return flat(unfold_prices(draft_of(record.document)))
+    return basket_form_of(sim_application)
 
 
 def config_events(application: Application) -> list[Any]:
@@ -151,6 +156,28 @@ async def test_editing_a_limit_publishes_a_new_version_and_an_event(
     assert record.actor == "dashboard"
     assert record.note == "raised the conviction floor"
     assert len(config_events(sim_application)) == before + 1
+
+
+async def test_a_stored_seat_instruction_is_rendered_back_into_its_textarea(
+    sim_application: Application, client: httpx.AsyncClient, basket_form: list[tuple[str, str]]
+) -> None:
+    """A `<textarea>` carries its value as its body, never as a `value` attribute.
+
+    A macro copied from `f.field` would render an empty box that still posts its own name — so the
+    page would satisfy the "every field is submitted" guard below while clearing every seat's
+    instruction on the next unrelated publish. That is the `_panel.html` hazard exactly, and the
+    wording of a prompt is not something an operator can be expected to notice going missing.
+    """
+    text = "Favour 4h structure over 15m noise."
+    published = await client.post(
+        "/configure/baskets/demo",
+        data=as_form(_replace(basket_form, "doc.panel.seats[0].instruction", text)),
+    )
+    assert published.status_code == 303
+
+    body = (await client.get("/configure/baskets/demo")).text
+
+    assert textareas(body)["panel.seats[0].instruction"] == text
 
 
 async def test_an_invalid_limit_is_refused_with_the_models_own_message(
@@ -339,6 +366,14 @@ DOC_FIELD = re.compile(r'name="doc\.([^"]+)"')
 #: So `document_paths()` drops a bare path ending in one of these names — it is never a real field,
 #: only ever `flat()`'s sentinel for "this row list happens to be empty right now".
 ROW_MANAGED_LISTS = {"instruments", "providers", "seats", "price_rows", "fallbacks"}
+
+
+TEXTAREA = re.compile(r'<textarea[^>]*name="doc\.([^"]+)"[^>]*>(.*?)</textarea>', re.DOTALL)
+
+
+def textareas(body: str) -> dict[str, str]:
+    """Every `<textarea>` the page renders, as `document path → the value it is pre-filled with`."""
+    return {name: value.strip() for name, value in TEXTAREA.findall(body)}
 
 
 def submitted_paths(body: str) -> set[str]:
@@ -816,6 +851,52 @@ def test_the_rail_places_every_label_ahead_of_the_open_pane() -> None:
     # across the label rows.
     assert "min-content) 1fr" in rail
     assert "grid-row: 1 / -1" in rail
+
+
+def seat_rail(body: str) -> str:
+    """The seat rail element's own markup, from its opening tag to the `</div>` that closes it.
+
+    Depth-counted over `<div` alone, because no other element decides where a `</div>` matches.
+    Source order cannot answer this on its own: the add-seat control follows the last seat pane
+    whether it is inside the rail's grid or a sibling underneath it, and only the first of those
+    puts it in the column of seats it appends to.
+    """
+    start = body.index('<div class="tabs rail seat-master">')
+    depth = 0
+    for token in re.finditer(r"<div\b|</div>", body[start:]):
+        depth += 1 if token.group().startswith("<div") else -1
+        if depth == 0:
+            return body[start : start + token.end()]
+    raise AssertionError("the seat rail is never closed")
+
+
+async def test_add_seat_sits_in_the_rail_beside_the_seats_it_appends_to(
+    client: httpx.AsyncClient,
+) -> None:
+    """Outside the rail it is a sibling of a two-column grid whose height is the *open pane's*.
+
+    The pane spans every row, so the grid is as tall as the seat editor — and a button below the
+    grid therefore tracks how tall one seat's form is rather than how many seats there are. Adding
+    a field to the editor pushed it a screen away from the list it belongs to, which is a coupling
+    no future field should be able to reintroduce.
+    """
+    body = (await client.get("/configure/baskets/demo")).text
+
+    assert 'value="panel.seats"' in seat_rail(body)
+
+
+def test_the_rail_places_its_add_button_in_the_column_of_labels() -> None:
+    """Being inside the grid is half of it; the other half is landing in column 1.
+
+    An auto-placed item would probably find the same cell today, but only because the panes happen
+    to occupy column 2 of every row — a span the pane's own rule is free to change. Stating the
+    column makes the button's place independent of that, and it is asserted on the stylesheet for
+    the same reason as the rail's `order`: no rendered page shows the difference.
+    """
+    css = (PACKAGE / "static" / "app.css").read_text(encoding="utf-8")
+    rule = next(body for sel, body in _rules(css) if sel == ".seat-master > .row-buttons")
+
+    assert "grid-column: 1" in rule
 
 
 def _rules(css: str) -> list[tuple[str, str]]:

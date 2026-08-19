@@ -91,7 +91,7 @@ class Harness:
             self.store,
             clock,
             mode=Mode.SIM,
-            instruments=basket.instruments,
+            universe=lambda: basket.instruments,
         )
         self.history = HistoryReader(engine, clock)
         self.context = ContextBuilder(

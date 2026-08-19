@@ -94,7 +94,10 @@ def _text(raw: Any) -> str | None:
     than becoming the string `"None"` — which would set a limit to a value nobody typed.
     """
     if isinstance(raw, str):
-        return raw.strip()
+        # A `<textarea>` is submitted with CRLF line breaks (HTML §4.10.5.4). The document is
+        # versioned rather than diffed, so a stray CR rides along in every later version and
+        # makes a GUI-authored prompt differ from an identical one written anywhere else.
+        return raw.replace("\r\n", "\n").strip()
     if raw is None:
         return ""
     if isinstance(raw, int | float | Decimal):

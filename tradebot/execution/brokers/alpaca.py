@@ -27,7 +27,7 @@ placement raises `SubmitUnknownError` from the transport and may only be resolve
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from typing import Any, Final
@@ -241,13 +241,18 @@ class AlpacaBroker:
         transport: TradingTransport,
         clock: Clock,
         *,
-        instruments: Sequence[Instrument],
+        universe: Callable[[], Sequence[Instrument]],
         extended_hours: bool = False,
     ) -> None:
         self._transport = transport
         self._clock = clock
-        self._instruments = {instrument.key: instrument for instrument in instruments}
-        self._by_symbol = {instrument.symbol: instrument for instrument in instruments}
+        #: What this adapter may translate between venue symbols and instruments, **read at
+        #: each call** rather than held from wiring. A basket published while the process runs
+        #: adds an instrument a set captured at boot would leave out, so its venue position would
+        #: not be projected and its resting orders would be dropped from `fetch_open_orders` —
+        #: a real holding looking like one that vanished. The same callable `PortfolioWatch` and
+        #: `Reconciler` take, for the same reason (ADR 0021).
+        self._universe = universe
         self._extended_hours = extended_hours
 
     def capabilities(self) -> BrokerCapabilities:
@@ -347,10 +352,11 @@ class AlpacaBroker:
         payload = await self._transport.call(
             "GET /v2/orders", {"status": "open", "nested": "true"}, weight=WEIGHT
         )
+        by_symbol = {instrument.symbol: instrument for instrument in self._universe()}
         return tuple(
             self._status_without_fills(entry, instrument)
             for entry in (payload if isinstance(payload, list) else ())
-            if (instrument := self._by_symbol.get(str(entry.get("symbol")))) is not None
+            if (instrument := by_symbol.get(str(entry.get("symbol")))) is not None
         )
 
     async def fetch_positions_and_balances(self) -> AccountState:
@@ -361,7 +367,7 @@ class AlpacaBroker:
         return parse_account(
             account,
             positions if isinstance(positions, list) else (),
-            tuple(self._instruments.values()),
+            self._universe(),
             self._clock.now(),
         )
 
@@ -377,7 +383,7 @@ class AlpacaBroker:
     # ------------------------------------------------------------------ internals
 
     def _instrument(self, instrument_key: str) -> Instrument:
-        instrument = self._instruments.get(instrument_key)
+        instrument = next((i for i in self._universe() if i.key == instrument_key), None)
         if instrument is None:
             raise DataStaleError(
                 f"{instrument_key} is not configured on this alpaca adapter; refusing to trade an "

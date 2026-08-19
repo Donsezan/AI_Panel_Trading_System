@@ -35,6 +35,7 @@ from tradebot.interfaces.market_data import MarketDataProvider
 from tradebot.ledger.portfolio import Ledger
 from tradebot.marketdata.cache import CachingMarketData
 from tradebot.marketdata.replay import ReplayMarketData, synthetic_candles
+from tradebot.marketdata.synthetic import SyntheticMarketData
 from tradebot.marketdata.venue import VenueMarketData
 
 pytestmark = pytest.mark.contract
@@ -115,18 +116,25 @@ def venue(clock: ManualClock, venue_gateway: MultiTimeframeGateway) -> VenueMark
     return VenueMarketData(venue_gateway, clock)
 
 
-@pytest.fixture(params=["replay", "venue", "cached_venue"])
+@pytest.fixture(params=["replay", "venue", "cached_venue", "synthetic"])
 def provider(
     request: pytest.FixtureRequest,
     replay: ReplayMarketData,
     venue: VenueMarketData,
     clock: ManualClock,
 ) -> MarketDataProvider:
-    """Every provider in the system, including the caching decorator wrapping one."""
+    """Every provider in the system, including the caching decorator wrapping one.
+
+    The synthetic venue is here on the same terms as the rest. It fabricates rather than serves,
+    which is exactly why the point-in-time rules have to hold for it too: it is what the whole
+    simulation decides on, and `inception` is what gives it the "nothing before the series
+    starts" refusal the others get from having run out of recorded bars.
+    """
     return {
         "replay": replay,
         "venue": venue,
         "cached_venue": CachingMarketData(venue, clock),
+        "synthetic": SyntheticMarketData(clock, inception=H1_START),
     }[request.param]
 
 
