@@ -5,10 +5,15 @@ only a read transaction — a plain file copy would miss the WAL and a `.backup`
 own retry policy. The output is an ordinary SQLite database: recovery is copying it back over
 `data/<mode>.db` with the process stopped (spec §4.1).
 
-The copy is written to a `.tmp` sibling of its final name and only renamed onto that name once
+The copy is written to a `.tmp` sibling of its final name and published onto that name only once
 `VACUUM INTO` has finished, so a process killed mid-copy never leaves a truncated file under the
 name a restore trusts — the final name is either absent or a complete backup, never partial
-(spec §2 D2/D4).
+(spec §2 D2/D4). Publishing is a hard link, not `Path.replace` (POSIX `rename(2)`), because
+`replace` overwrites an existing file silently — a second call for the same mode, instant and
+revision finishing during this one's copy must be refused, not let destroy the first (D4: nothing
+this module writes is ever deleted or overwritten by it). Every failure past the point the `.tmp`
+is created also unlinks it, so a persistent failure does not accumulate files that eat the very
+headroom `HEADROOM_BYTES` reserves.
 
 Failure semantics: anything that prevents a complete copy raises `BackupError`, and no caller
 swallows it — including a plain `OSError` from the filesystem itself (a missing volume, a
@@ -19,6 +24,7 @@ anything.
 
 from __future__ import annotations
 
+import os
 import shutil
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -61,6 +67,40 @@ def backup_name(mode: str, at: datetime, *, revision: str = "") -> str:
 def free_bytes(directory: Path) -> int:
     """Free space on the volume holding `directory`. A seam, so a test can starve it."""
     return shutil.disk_usage(directory).free
+
+
+def _publish(tmp_target: Path, target: Path) -> None:
+    """Move the finished copy onto its final name without a window where it could be overwritten.
+
+    `Path.replace` (POSIX `rename(2)`) succeeds silently over an existing file, so a second call
+    for the same mode, instant and revision finishing during *this* one's copy would destroy a
+    completed backup — the early `target.exists()` check in `take_backup` cannot close that
+    window, since it runs before `VACUUM INTO`, not after (spec D4). `os.link` is the OS's own
+    fail-if-the-name-is-taken primitive on both platforms (POSIX `link(2)`, Win32
+    `CreateHardLink`), so the existence check and the publish are one atomic syscall rather than
+    the check-then-act pair `exists()` + `replace()` would be.
+    """
+    os.link(tmp_target, target)
+    tmp_target.unlink()
+
+
+def _discard(tmp_target: Path) -> None:
+    """Remove a `.tmp` left by a failed attempt, on every failure path past its creation.
+
+    Before this, the only cleanup was the *next* call's stale-`.tmp` clear, which only fires for
+    an identical mode+instant+revision — so a persistent failure (a full volume, say) would
+    accumulate orphaned `.tmp` files that eat exactly the headroom `HEADROOM_BYTES` exists to
+    protect. Best-effort: the failure already being raised by the caller is the one that matters,
+    so a second failure while cleaning up is logged, not raised — it must never mask the first,
+    which is what a bare `except: pass` would risk turning this into if it re-raised.
+    """
+    try:
+        tmp_target.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning(
+            "could not remove temp file after a failed backup",
+            extra={"path": str(tmp_target), "error": str(exc)},
+        )
 
 
 def source_path(engine: Engine) -> Path:
@@ -111,7 +151,7 @@ def take_backup(
     if target.exists():
         raise BackupError(f"{target} already exists; refusing to overwrite a backup")
 
-    # Written to a `.tmp` sibling and renamed onto the final name only once the copy is whole —
+    # Written to a `.tmp` sibling and published onto the final name only once the copy is whole —
     # see the module docstring. A `.tmp` left by an interrupted prior run is not a backup, so it
     # is cleared rather than fought over.
     tmp_target = target.with_name(target.name + ".tmp")
@@ -128,11 +168,16 @@ def take_backup(
         try:
             connection.exec_driver_sql(f"VACUUM INTO '{literal}'")
         except Exception as exc:  # re-raised classified below, never swallowed
+            _discard(tmp_target)
             raise BackupError(f"could not write {target} (via {tmp_target}): {exc}") from exc
 
     try:
-        tmp_target.replace(target)
+        _publish(tmp_target, target)
+    except FileExistsError as exc:
+        _discard(tmp_target)
+        raise BackupError(f"{target} already exists; refusing to overwrite a backup") from exc
     except OSError as exc:
+        _discard(tmp_target)
         raise BackupError(f"could not finalize {target}: {exc}") from exc
 
     result = BackupResult(path=target, size_bytes=target.stat().st_size)

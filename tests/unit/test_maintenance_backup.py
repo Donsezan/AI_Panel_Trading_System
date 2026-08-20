@@ -6,6 +6,7 @@ against the *restored* database rather than against the fact that a file appeare
 
 from __future__ import annotations
 
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -120,6 +121,66 @@ class TestTakeBackup:
 
         assert result.path.exists()
         assert list(result.path.parent.glob("*.tmp")) == []
+
+    def test_a_backup_finishing_during_another_s_copy_is_refused_not_overwritten(
+        self, database: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The early `target.exists()` check runs *before* `VACUUM INTO`, so it cannot see a
+        second call finishing at the same name during this one's copy — the whole duration of
+        the copy is the window (fix round 2). Simulated by making the publish step's own
+        `os.link` call find the name already taken, exactly as a faster concurrent call would
+        leave it: nothing this module writes is ever destroyed by it, including this way (D4).
+        """
+        destination = tmp_path / "backups"
+        real_link = os.link
+
+        def collide_then_link(src: Path, dst: Path) -> None:
+            Path(dst).write_bytes(b"already finished")
+            real_link(src, dst)
+
+        monkeypatch.setattr("tradebot.maintenance.backup.os.link", collide_then_link)
+
+        with pytest.raises(BackupError, match="already exists"):
+            take_backup(database, destination, mode="sim", clock=ManualClock(AT))
+
+        # The "other backup" that won the race must survive untouched.
+        assert (destination / backup_name("sim", AT)).read_bytes() == b"already finished"
+        # And this call's own failed attempt must not linger either (fix round 2, Finding 2).
+        assert list(destination.glob("*.tmp")) == []
+
+    def test_a_failed_copy_does_not_leave_its_tmp_behind(
+        self, database: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Neither the `except` around `VACUUM INTO` nor the one around publishing unlinked the
+        `.tmp` before re-raising (fix round 2, Finding 3) — a persistent failure (a full volume,
+        say) would accumulate orphaned `.tmp` files that eat exactly the headroom
+        `HEADROOM_BYTES` exists to protect. The fake connection below writes to the `.tmp` before
+        raising, standing in for a real `VACUUM INTO` that started writing before the underlying
+        failure — so the cleanup this proves runs against a file that is actually there.
+        """
+        destination = tmp_path / "backups"
+        tmp_target = destination / (backup_name("sim", AT) + ".tmp")
+
+        class PartiallyWrittenThenFailing:
+            def execution_options(self, **_kwargs: object) -> PartiallyWrittenThenFailing:
+                return self
+
+            def __enter__(self) -> PartiallyWrittenThenFailing:
+                return self
+
+            def __exit__(self, *_exc_info: object) -> None:
+                return None
+
+            def exec_driver_sql(self, _statement: str) -> None:
+                tmp_target.write_bytes(b"partial")
+                raise RuntimeError("simulated disk failure mid-copy")
+
+        monkeypatch.setattr(database, "connect", lambda *a, **kw: PartiallyWrittenThenFailing())
+
+        with pytest.raises(BackupError):
+            take_backup(database, destination, mode="sim", clock=ManualClock(AT))
+
+        assert list(destination.glob("*.tmp")) == []
 
 
 class TestFreeSpaceGuard:
