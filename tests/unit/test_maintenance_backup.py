@@ -14,7 +14,13 @@ from sqlalchemy import Engine, select
 
 from tradebot.core.clock import ManualClock
 from tradebot.core.events import Event, EventType
-from tradebot.maintenance.backup import BackupError, backup_name, take_backup
+from tradebot.maintenance.backup import (
+    HEADROOM_BYTES,
+    BackupError,
+    backup_name,
+    required_bytes,
+    take_backup,
+)
 from tradebot.persistence.database import SingleWriter, create_database
 from tradebot.persistence.schema import events
 from tradebot.persistence.store import EventStore
@@ -114,3 +120,46 @@ class TestTakeBackup:
 
         assert result.path.exists()
         assert list(result.path.parent.glob("*.tmp")) == []
+
+
+class TestFreeSpaceGuard:
+    """Because nothing rotates (spec D4), the backup must not be what fills the volume."""
+
+    def test_it_refuses_when_the_volume_is_too_full(self, database: Engine, tmp_path: Path) -> None:
+        with pytest.raises(BackupError, match="bytes free"):
+            take_backup(
+                database,
+                tmp_path / "backups",
+                mode="sim",
+                clock=ManualClock(AT),
+                probe=lambda _: 1024,
+            )
+
+    def test_a_refused_backup_writes_nothing_at_all(self, database: Engine, tmp_path: Path) -> None:
+        destination = tmp_path / "backups"
+
+        with pytest.raises(BackupError):
+            take_backup(
+                database, destination, mode="sim", clock=ManualClock(AT), probe=lambda _: 1024
+            )
+
+        assert list(destination.glob("*.db")) == []
+
+    def test_the_requirement_counts_the_wal_the_copy_will_absorb(self, tmp_path: Path) -> None:
+        """VACUUM INTO folds the WAL into the copy, so ignoring it would under-reserve.
+
+        Asserted on plain files rather than a live engine: writing to a real `-wal` to make it
+        large would corrupt the database the other tests are reading.
+        """
+        source = tmp_path / "sim.db"
+        source.write_bytes(b"\0" * 1000)
+        source.with_name("sim.db-wal").write_bytes(b"\0" * 500)
+
+        # 1000 + 500 live, a fifth again (300), plus the headroom.
+        assert required_bytes(source) == 1500 + 300 + HEADROOM_BYTES
+
+    def test_an_absent_wal_is_simply_not_counted(self, tmp_path: Path) -> None:
+        source = tmp_path / "sim.db"
+        source.write_bytes(b"\0" * 1000)
+
+        assert required_bytes(source) == 1000 + 200 + HEADROOM_BYTES
