@@ -5,9 +5,16 @@ only a read transaction — a plain file copy would miss the WAL and a `.backup`
 own retry policy. The output is an ordinary SQLite database: recovery is copying it back over
 `data/<mode>.db` with the process stopped (spec §4.1).
 
+The copy is written to a `.tmp` sibling of its final name and only renamed onto that name once
+`VACUUM INTO` has finished, so a process killed mid-copy never leaves a truncated file under the
+name a restore trusts — the final name is either absent or a complete backup, never partial
+(spec §2 D2/D4).
+
 Failure semantics: anything that prevents a complete copy raises `BackupError`, and no caller
-swallows it. The pre-migration hook refuses to upgrade; the daily tick reports a maintenance
-failure and does not go on to compact anything.
+swallows it — including a plain `OSError` from the filesystem itself (a missing volume, a
+permissions problem, a destination whose parent path is not a directory). The pre-migration hook
+refuses to upgrade; the daily tick reports a maintenance failure and does not go on to compact
+anything.
 """
 
 from __future__ import annotations
@@ -75,13 +82,25 @@ def take_backup(
     # attribute must reach the stub, not a reference captured when this file was imported.
     probe: Callable[[Path], int] | None = None,
 ) -> BackupResult:
-    """Copy the database into `destination`, or refuse and leave the volume as it was."""
+    """Copy the database into `destination`, without ever leaving a partial file at the final name.
+
+    `mkdir` runs before the space check, because `shutil.disk_usage` needs a directory that
+    already exists to probe it — so a refusal on a brand-new destination can still leave an
+    empty directory behind. What is guaranteed is narrower and matters more: the backup's final
+    name is either absent or a complete copy, never truncated and never overwritten.
+    """
     probe = probe or free_bytes
     source = source_path(engine)
-    destination.mkdir(parents=True, exist_ok=True)
+    try:
+        destination.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise BackupError(f"could not create {destination}: {exc}") from exc
 
     required = required_bytes(source)
-    available = probe(destination)
+    try:
+        available = probe(destination)
+    except OSError as exc:
+        raise BackupError(f"could not read free space on {destination}: {exc}") from exc
     if available < required:
         raise BackupError(
             f"{destination} has {available} bytes free; a backup of {source.name} needs "
@@ -92,14 +111,29 @@ def take_backup(
     if target.exists():
         raise BackupError(f"{target} already exists; refusing to overwrite a backup")
 
+    # Written to a `.tmp` sibling and renamed onto the final name only once the copy is whole —
+    # see the module docstring. A `.tmp` left by an interrupted prior run is not a backup, so it
+    # is cleared rather than fought over.
+    tmp_target = target.with_name(target.name + ".tmp")
+    try:
+        if tmp_target.exists():
+            tmp_target.unlink()
+    except OSError as exc:
+        raise BackupError(f"could not clear stale {tmp_target}: {exc}") from exc
+
     # VACUUM cannot run inside a transaction, and SQLAlchemy opens one implicitly. The literal is
     # escaped rather than bound because SQLite takes no parameter in this position.
-    literal = str(target).replace("'", "''")
+    literal = str(tmp_target).replace("'", "''")
     with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
         try:
             connection.exec_driver_sql(f"VACUUM INTO '{literal}'")
         except Exception as exc:  # re-raised classified below, never swallowed
-            raise BackupError(f"could not write {target}: {exc}") from exc
+            raise BackupError(f"could not write {target} (via {tmp_target}): {exc}") from exc
+
+    try:
+        tmp_target.replace(target)
+    except OSError as exc:
+        raise BackupError(f"could not finalize {target}: {exc}") from exc
 
     result = BackupResult(path=target, size_bytes=target.stat().st_size)
     logger.info(
@@ -114,9 +148,14 @@ def required_bytes(source: Path) -> int:
 
     Public because it is the one piece of this module worth asserting on directly: whether the
     WAL is counted cannot be observed from the outside without corrupting a live database.
+
+    Raises `BackupError`, not a raw `OSError`, so a caller never has to catch both.
     """
-    live = source.stat().st_size
-    wal = source.with_name(source.name + "-wal")
-    if wal.exists():
-        live += wal.stat().st_size
+    try:
+        live = source.stat().st_size
+        wal = source.with_name(source.name + "-wal")
+        if wal.exists():
+            live += wal.stat().st_size
+    except OSError as exc:
+        raise BackupError(f"could not read size of {source}: {exc}") from exc
     return live + live // 5 + HEADROOM_BYTES

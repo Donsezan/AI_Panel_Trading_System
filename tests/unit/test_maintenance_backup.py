@@ -92,3 +92,25 @@ class TestTakeBackup:
 
         with pytest.raises(BackupError):
             take_backup(database, tmp_path, mode="sim", clock=ManualClock(AT))
+
+    def test_a_misconfigured_destination_is_refused_not_leaked_as_a_raw_oserror(
+        self, database: Engine, tmp_path: Path
+    ) -> None:
+        """A destination whose parent path component is a file, not a directory, must fail
+        closed through `BackupError` — never as the raw `OSError` `mkdir` raises underneath
+        (fix round 1, Finding 1)."""
+        blocker = tmp_path / "blocker"
+        blocker.write_text("not a directory")
+
+        with pytest.raises(BackupError):
+            take_backup(database, blocker / "backups", mode="sim", clock=ManualClock(AT))
+
+    def test_no_tmp_file_survives_a_completed_backup(
+        self, database: Engine, tmp_path: Path
+    ) -> None:
+        """The copy lands under a `.tmp` sibling and is renamed onto the final name only once
+        `VACUUM INTO` finishes (fix round 1, Finding 2) — nothing should be left behind."""
+        result = take_backup(database, tmp_path / "backups", mode="sim", clock=ManualClock(AT))
+
+        assert result.path.exists()
+        assert list(result.path.parent.glob("*.tmp")) == []
