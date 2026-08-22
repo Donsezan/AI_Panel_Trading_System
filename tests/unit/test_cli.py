@@ -18,15 +18,47 @@ from tests.unit.test_migration_backup import BEHIND, database_at, revision_of
 
 from tradebot.__main__ import _race, main, parse_args
 from tradebot.app import Application
+from tradebot.control.config_store import SINGLETON_ID, ConfigStore
+from tradebot.core.clock import SystemClock
+from tradebot.core.config import MaintenancePolicy
 from tradebot.core.enums import Mode
 from tradebot.dashboard.auth import TOKEN_ENV
-from tradebot.persistence.database import create_database
+from tradebot.persistence.database import SingleWriter, create_database
+from tradebot.persistence.store import EventStore
 from tradebot.risk.state import REARM_PHRASE
 
 
 @pytest.fixture
 def data_dir(tmp_path: Path) -> list[str]:
     return ["--data-dir", str(tmp_path)]
+
+
+def status_of(capsys: pytest.CaptureFixture[str]) -> dict[str, object]:
+    """The `maintenance status` line, read the way an operator's terminal receives it.
+
+    Non-JSON lines are skipped rather than assumed absent: anything logged before `main` installs
+    the JSON handler — Alembic's migration chatter, most of it — shares the stream.
+    """
+    for line in capsys.readouterr().err.splitlines():
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(record, dict) and record.get("message") == "maintenance status":
+            return dict(record)
+    raise AssertionError("maintenance status printed no line")
+
+
+def publish_windows(path: Path, **fields: int) -> None:
+    """Publish a `maintenance` document, the way the dashboard's Parameters form does."""
+    engine = create_database(path)
+    writer = SingleWriter(engine)
+    configs = ConfigStore(engine, writer, EventStore(engine, writer), SystemClock())
+    try:
+        asyncio.run(configs.put(SINGLETON_ID, MaintenancePolicy(**fields), actor="test"))
+    finally:
+        writer.close()
+        engine.dispose()
 
 
 class TestModeSafety:
@@ -439,6 +471,93 @@ class TestMaintenanceCommands:
         self, data_dir: list[str], tmp_path: Path
     ) -> None:
         assert main(["maintenance", "status", "--mode", "sim", *data_dir]) == 2
+
+
+class TestMaintenanceStatus:
+    """Spec §7: the windows in force and where they came from, the last backup, the last
+    compaction, the archive inventory and free disk.
+
+    It is the one command an operator runs to ask "is housekeeping healthy", and it could answer
+    three of those six. Combined with a retention loop that can wedge, that was the sharp edge:
+    retention stopped for weeks and the command whose name suggests it would say so did not look.
+    """
+
+    def test_the_windows_in_force_are_named_as_the_defaults_when_none_was_published(
+        self, data_dir: list[str], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The setting that governs how long financial records are kept (OPERATIONS 17)."""
+        create_database(tmp_path / "sim.db")
+
+        assert main(["maintenance", "status", "--mode", "sim", *data_dir]) == 0
+
+        line = status_of(capsys)
+        assert (line["compact_after_days"], line["archive_keep_days"]) == (30, 90)
+        assert line["windows_source"] == "defaults"
+
+    def test_a_published_document_is_named_by_its_version(
+        self, data_dir: list[str], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """ "Who shortened retention, and when" begins with knowing that somebody did."""
+        publish_windows(tmp_path / "sim.db", compact_after_days=10, archive_keep_days=20)
+
+        main(["maintenance", "status", "--mode", "sim", *data_dir])
+
+        line = status_of(capsys)
+        assert (line["compact_after_days"], line["archive_keep_days"]) == (10, 20)
+        assert line["windows_source"] == "document v1"
+
+    def test_a_database_that_has_never_run_a_pass_says_so(
+        self, data_dir: list[str], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A dead daily tick and a healthy one looked identical here."""
+        create_database(tmp_path / "sim.db")
+
+        main(["maintenance", "status", "--mode", "sim", *data_dir])
+
+        assert status_of(capsys)["last_pass_at"] == ""
+
+    def test_the_last_pass_is_reported_with_what_it_did(
+        self, data_dir: list[str], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        main(["run", "--mode", "sim", "--once", *data_dir])
+        main(["maintenance", "compact", "--mode", "sim", *data_dir])
+        capsys.readouterr()
+
+        main(["maintenance", "status", "--mode", "sim", *data_dir])
+
+        line = status_of(capsys)
+        assert line["last_pass_at"]
+        assert line["last_pass_outcome"] == "ok"
+
+    def test_the_archive_inventory_is_counted_and_spanned(
+        self, data_dir: list[str], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The only place to see what deletion has already taken."""
+        create_database(tmp_path / "sim.db")
+        for day in ("2026-01-05", "2026-03-09"):
+            path = tmp_path / "archive" / "sim" / day[:7] / f"{day}.jsonl.gz"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"x" * 16)
+
+        main(["maintenance", "status", "--mode", "sim", *data_dir])
+
+        line = status_of(capsys)
+        assert line["archives"] == 2
+        assert (line["archive_oldest"], line["archive_newest"]) == ("2026-01-05", "2026-03-09")
+        assert line["archive_bytes"] == 32
+
+    def test_another_mode_s_archives_are_never_counted(
+        self, data_dir: list[str], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """One mode's inventory, like every other narrow thing this package does."""
+        create_database(tmp_path / "sim.db")
+        path = tmp_path / "archive" / "live" / "2026-01" / "2026-01-05.jsonl.gz"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"x" * 16)
+
+        main(["maintenance", "status", "--mode", "sim", *data_dir])
+
+        assert status_of(capsys)["archives"] == 0
 
 
 class TestMaintenanceCompact:

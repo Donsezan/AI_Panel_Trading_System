@@ -481,7 +481,10 @@ Rules that are easy to get backwards:
 - **Work is found by what is still heavy, never by event type.** `pending_days` selects on each
   compactor's own `heavy_key`. Selecting by type revisits every past day forever, and once that
   day's archive is deleted the next pass **recreates** it from already-compacted rows — a hollow
-  archive reappearing daily, contradicting the promise that deletion is final.
+  archive reappearing daily, contradicting the promise that deletion is final. The cost of
+  that choice is two unindexable `LIKE` scans over `payload_json`, so the call hops to a thread
+  like every other filesystem step in the pass — the loop it shares with the supervisor, the
+  execution monitor and the dashboard's socket may not stall behind housekeeping.
 - **Compaction batches advance by `seq`, not by rows rewritten.** A seat that abstained has no
   `raw_text`, so it never gains a marker; a loop stopping on a zero rewrite count leaves a chunk of
   abstentions at the head of every batch and permanently stops compacting the day behind them.
@@ -492,6 +495,27 @@ Rules that are easy to get backwards:
   archive directory, matched by parsing each file's name. Never the database, never a backup.
 - **An absent policy means the defaults, not a refusal**, and the windows are read fresh at every
   pass. A failed pass is recorded rather than raised, and still counts as the day's run.
+- **Containment is per day, not per pass.** A day whose archive will not verify costs that day and
+  nothing else, and `delete_aged` runs whatever the archive step did — it is scoped by file name and
+  depends on none of it. Both were one `try` around the whole day loop, and a corrupt file is
+  *permanent* because an existing day file is verified rather than rewritten: one of them stopped
+  every day behind it and the 90-day deletion with it, so retention silently stopped while the
+  database kept growing. The summary on the report is bounded, because it reaches the event payload
+  *and* the notification body and one permissions fault fails every pending day at once; the full
+  list is a `WARNING`.
+- **A file that will not delete is a line in the daily report, not an alarm.** Spec §6.4 gives it
+  its own row — reported, skipped, retried next pass — so it rides on `MaintenanceReport.undeletable`
+  rather than on `failure`, which is what `ok` means. Folding it in made a locked file a HIGH
+  `MAINTENANCE_FAILED`, and HIGH notices deliberately never supersede: a virus scanner holding one
+  file stacked another red row every night *and* suppressed the LOW line carrying the night's real
+  work.
+- **`maintenance status` answers all six of the spec's questions**, and the two easiest to leave out
+  are the ones an operator needs: the windows' *provenance* — "30 and 90 because nobody published
+  anything" and "30 and 90 because somebody did" are different facts about how long financial
+  records are kept — and the last pass, without which a dead daily tick and a healthy one look
+  identical. It opens the database to answer them, which nothing else in the command family avoids:
+  `open_database` never migrates, the reads write nothing, and the schema is WAL, so it stays
+  pointable at a file the bot has open.
 
 **Piece C makes the alerts `ops/rules.py` already produced visible, and nothing new decides what
 an operator should be told** ([ADR 0029](docs/adr/0029-notifications-are-a-projection-of-the-alert-rules.md)).

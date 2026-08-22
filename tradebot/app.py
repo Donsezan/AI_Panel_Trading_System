@@ -103,6 +103,7 @@ from tradebot.ledger.history import HistoryReader
 from tradebot.ledger.marks import Marks
 from tradebot.ledger.portfolio import Ledger
 from tradebot.ledger.reconciler import Reconciler
+from tradebot.maintenance.archive import archive_destination
 from tradebot.maintenance.backup import backup_destination
 from tradebot.maintenance.service import MaintenanceService
 from tradebot.marketdata.binance import BinanceSpotGateway
@@ -865,7 +866,7 @@ def _maintenance_service(
         writer=writer,
         clock=clock,
         mode=mode.value,
-        archive_root=db_path.parent / "archive",
+        archive_root=archive_destination(db_path),
         backup_dir=backup_destination(db_path),
         policy=lambda: _maintenance_policy(configs),
     )

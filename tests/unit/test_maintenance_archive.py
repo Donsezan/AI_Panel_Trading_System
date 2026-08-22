@@ -23,6 +23,7 @@ from tradebot.maintenance.archive import (
     archive_day,
     archive_path,
     delete_aged,
+    inventory,
     read_archive,
 )
 from tradebot.persistence.store import EventStore
@@ -300,6 +301,46 @@ class TestDeleteAged:
         assert len(failures) == 1
         assert "locked by another process" in failures[0]
         assert locked.exists()
+
+
+class TestInventory:
+    """What the archive directory holds — the only place to see what deletion has taken."""
+
+    def _day_file(self, root: Path, day: date, mode: str = "sim", size: int = 8) -> Path:
+        path = archive_path(root, mode, day)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"x" * size)
+        return path
+
+    def test_an_empty_directory_reports_nothing_rather_than_raising(self, tmp_path: Path) -> None:
+        """A database that has never archived is a normal state, not a fault."""
+        found = inventory(tmp_path, "sim")
+
+        assert (found.files, found.oldest, found.newest, found.total_bytes) == (0, None, None, 0)
+
+    def test_it_counts_and_spans_this_mode_s_day_files(self, tmp_path: Path) -> None:
+        self._day_file(tmp_path, date(2026, 4, 1))
+        self._day_file(tmp_path, date(2026, 7, 19))
+
+        found = inventory(tmp_path, "sim")
+
+        assert found.files == 2
+        assert (found.oldest, found.newest) == (date(2026, 4, 1), date(2026, 7, 19))
+        assert found.total_bytes == 16
+
+    def test_another_mode_is_never_counted(self, tmp_path: Path) -> None:
+        """Narrow like every other thing in this module: one mode's directory, never more."""
+        self._day_file(tmp_path, date(2026, 4, 1), mode="live")
+
+        assert inventory(tmp_path, "sim").files == 0
+
+    def test_a_partial_write_is_not_a_day_file(self, tmp_path: Path) -> None:
+        """The same rule `delete_aged` decides by: a `.tmp` is an interrupted write, not a day."""
+        base = archive_path(tmp_path, "sim", date(2026, 4, 1))
+        base.parent.mkdir(parents=True, exist_ok=True)
+        base.with_suffix(base.suffix + ".tmp").write_bytes(b"x")
+
+        assert inventory(tmp_path, "sim").files == 0
 
 
 class TestArchiveFailuresFailClosed:

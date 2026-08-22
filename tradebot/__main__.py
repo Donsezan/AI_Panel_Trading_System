@@ -24,7 +24,7 @@ import asyncio
 import logging
 import sys
 from collections.abc import Coroutine, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -51,16 +51,18 @@ from tradebot.control.arming import (
     assert_live_confirmation,
 )
 from tradebot.control.basket_runner import CycleResult
-from tradebot.control.config_store import ConfigStore
+from tradebot.control.config_store import SINGLETON_ID, ConfigStore
 from tradebot.control.supervision import SupervisionController
 from tradebot.core.clock import ManualClock, SystemClock, ensure_utc
 from tradebot.core.config import MaintenancePolicy
 from tradebot.core.enums import ConfigKind, Mode
 from tradebot.core.errors import ConfigError, TradebotError
+from tradebot.core.events import EventType
 from tradebot.core.logging import configure_logging, get_logger
 from tradebot.dashboard.app import create_dashboard
 from tradebot.dashboard.auth import assert_bind_allowed, require_token
 from tradebot.decision.presets import PANELS
+from tradebot.maintenance.archive import archive_destination, inventory
 from tradebot.maintenance.backup import (
     BACKUP_DIR_ENV,
     BackupError,
@@ -75,6 +77,7 @@ from tradebot.marketdata.recorder import ReplayDataset
 from tradebot.marketdata.recorder import record as record_history
 from tradebot.news.rss import FEEDS
 from tradebot.persistence.database import SingleWriter, create_database, open_database
+from tradebot.persistence.store import EventStore
 from tradebot.risk.state import assert_rearm_phrase
 from tradebot.validation.backtest import BANNER, BacktestHarness
 from tradebot.validation.comparison import Comparison, ComparisonReport
@@ -932,27 +935,99 @@ def _maintenance_backup(mode: Mode, path: Path, destination: Path) -> int:
 
 
 def _maintenance_status(mode: Mode, path: Path, destination: Path) -> int:
-    """The inventory, and whether the next copy would fit. Writes nothing, opens nothing.
+    """The six questions spec §7 asks of it, and the one an operator is really asking.
+
+    "Is housekeeping healthy" needs the windows in force *and where they came from*, the last
+    backup, the last pass, the archive inventory and free disk. It answered three of those, which
+    is what let retention wedge for weeks with the command whose name suggests it would say so
+    reporting nothing amiss.
 
     `required_bytes` is reported beside `free_bytes` because the interesting question is not how
     much room there is but whether tonight's backup will be refused — and nothing rotates, so that
     answer only ever moves one way (spec D4).
+
+    It now opens the database, which the backup action beside it already does: `open_database`
+    never migrates, the reads here write nothing, and the schema is WAL — so this stays safe to
+    point at a file the bot has open, which is the whole premise of the `maintenance` command.
     """
     copies = sorted(destination.glob("*.db")) if destination.exists() else []
+    engine = open_database(path)
+    # `ConfigStore` and `EventStore` both take a writer; a `SingleWriter` that is never `run`
+    # opens no connection, spawns no thread and writes nothing. This command must never become
+    # the second writer `SingleWriter` exists to prevent, and it does not.
+    writer = SingleWriter(engine)
+    try:
+        store = EventStore(engine, writer)
+        windows, source = _retention_windows(ConfigStore(engine, writer, store, SystemClock()))
+        last = _last_pass(store)
+    finally:
+        writer.close()
+        engine.dispose()
+
+    archives = inventory(archive_destination(path), mode.value)
     logger.info(
         "maintenance status",
         extra={
             "mode": mode.value,
             "database": str(path),
             "database_bytes": path.stat().st_size,
+            "compact_after_days": windows.compact_after_days,
+            "archive_keep_days": windows.archive_keep_days,
+            "windows_source": source,
             "backup_dir": str(destination),
             "backups": len(copies),
             "newest_backup": copies[-1].name if copies else "",
             "free_bytes": free_bytes(destination if destination.exists() else path.parent),
             "next_backup_needs_bytes": required_bytes(path),
+            "archive_dir": str(archives.directory),
+            "archives": archives.files,
+            "archive_oldest": _day(archives.oldest),
+            "archive_newest": _day(archives.newest),
+            "archive_bytes": archives.total_bytes,
+            **last,
         },
     )
     return 0
+
+
+def _retention_windows(configs: ConfigStore) -> tuple[MaintenancePolicy, str]:
+    """The windows a pass would run under, and whether a human published them.
+
+    The defaults are a real answer rather than an absence (spec §3.7) — but "30 and 90 because
+    nobody said otherwise" and "30 and 90 because somebody published them" are different facts to
+    an operator auditing how long financial records are kept, so the source is reported beside the
+    numbers rather than left to be inferred from them.
+    """
+    record = configs.latest(ConfigKind.MAINTENANCE, SINGLETON_ID)
+    if record is not None and isinstance(record.document, MaintenancePolicy):
+        return record.document, f"document v{record.ref.version}"
+    return MaintenancePolicy(), "defaults"
+
+
+def _last_pass(store: EventStore) -> dict[str, object]:
+    """What the newest `MAINTENANCE_RAN` says, or that there has never been one.
+
+    This is the answer to "is the daily tick running at all", which nothing else surfaces: a dead
+    tick and a healthy one were indistinguishable from this command.
+    """
+    recorded = store.read_types(EventType.MAINTENANCE_RAN)
+    if not recorded:
+        return {"last_pass_at": "", "last_pass_outcome": "never run"}
+    last = recorded[-1]
+    return {
+        "last_pass_at": last.ts.isoformat(),
+        "last_pass_outcome": last.payload.get("outcome", ""),
+        "last_pass_detail": last.payload.get("detail", ""),
+        "last_pass_archived_days": last.payload.get("archived_days", 0),
+        "last_pass_compacted_rows": last.payload.get("compacted_rows", 0),
+        "last_pass_deleted_archives": last.payload.get("deleted_archives", 0),
+        "last_pass_undeletable": last.payload.get("undeletable", []),
+    }
+
+
+def _day(value: date | None) -> str:
+    """A day for the status line, or `""` — never a `None` an operator has to interpret."""
+    return value.isoformat() if value else ""
 
 
 async def config_command(args: argparse.Namespace) -> int:
