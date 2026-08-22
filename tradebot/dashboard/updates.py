@@ -70,6 +70,9 @@ class Pane(StrEnum):
     LOG = "log"
     CONTROLS = "controls"
     RC = "rc"
+    #: The header's notification bell. Not one of the workspace's six panes — it lives above the
+    #: grid and is on every page — but it refreshes by exactly the same mechanism.
+    NOTIFICATIONS = "notifications"
 
 
 #: Which panes an event invalidates. The whole routing decision of this module, as data.
@@ -101,6 +104,12 @@ PANES_BY_EVENT: dict[EventType, frozenset[Pane]] = {
     EventType.KILL_SWITCH_CHANGED: frozenset({Pane.RC, Pane.CONTROLS, Pane.BLOTTER}),
     EventType.BASKET_STATUS_CHANGED: frozenset({Pane.RC, Pane.CONTROLS, Pane.BLOTTER}),
     EventType.CONFIG_CHANGED: frozenset({Pane.RC, Pane.CONTROLS, Pane.BLOTTER}),
+    # The bell, and *only* these two. Deliberately not the five types the alert rules read: a
+    # kill-switch trip reaches this tail immediately, but the notification it produces is written
+    # later, when the dispatcher next polls — so keying on the trip would repaint the widget
+    # before there was anything new in it, and then never repaint it again (spec §5.7).
+    EventType.NOTIFICATION_RAISED: frozenset({Pane.NOTIFICATIONS}),
+    EventType.ALERT_DISMISSED: frozenset({Pane.NOTIFICATIONS}),
 }
 
 #: What the tail asks the store for. Narrowing here is what keeps a soak's transcripts and frozen

@@ -270,9 +270,7 @@ class TestMaintenanceRule:
         assert alert is not None
         assert "no reason recorded" in alert.body
 
-    def test_a_successful_pass_is_a_low_alert_quoting_what_it_did(
-        self, clock: ManualClock
-    ) -> None:
+    def test_a_successful_pass_is_a_low_alert_quoting_what_it_did(self, clock: ManualClock) -> None:
         alert = evaluate(
             maintenance_event(clock, compacted_rows=42, deleted_archives=1), RuleState()
         )

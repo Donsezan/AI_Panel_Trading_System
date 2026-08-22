@@ -35,6 +35,14 @@
     </details>
   </nav>
   <span class="spacer"></span>
+  {# The notification bell, left of the transport pill so the group right of the menus reads
+     notifications -> "live updates lost" -> "not trading" -> Log out (spec 5.6). The counter *is*
+     the button: a `details`, the same scripting-free disclosure as the Analytics menu, and it
+     carries `data-pane` so the socket can name it — but nothing swaps it, or the dropdown would
+     shut under whoever is reading it (ADR 0029). #}
+  <details class="menu notifications" id="notifications" data-pane="notifications">
+    {% include "workspace/_notifications.html" %}
+  </details>
   {# Loud by design: silent staleness is the failure the live transport exists to prevent, so
      losing the transport may not itself be silent (ADR 0024). Shown by workspace.js only. #}
   <span class="pill danger" id="live-pill" hidden>live updates lost — reconnecting</span>

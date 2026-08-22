@@ -14,16 +14,25 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from datetime import datetime
 
 from sqlalchemy import Connection, delete, select, update
+from sqlalchemy.dialects.sqlite import insert
 
+from tradebot.core.clock import ensure_utc
 from tradebot.core.events import Event, EventType
+
+# The one import from outside `core` here, and deliberate: this table stores alert vocabulary,
+# so the supersession rule below is better expressed in that vocabulary than as a magic string.
+# `interfaces.alerts` is protocols and enums over the standard library, so there is no cycle.
+from tradebot.interfaces.alerts import AlertKind
 from tradebot.persistence.schema import (
     PROJECTION_TABLES,
     cycles,
     decisions,
     events,
     fills,
+    notifications,
     orders,
     positions,
     reconciliations,
@@ -238,6 +247,78 @@ def _project_reconciled(connection: Connection, event: Event) -> None:
 
 #: Audit-only event types are absent by design, not by omission: seat responses, risk-check
 #: provenance, protective-leg placement and config changes are read from the log, not queried.
+#: Kinds whose newest notice retires the one before it, with `dismissed_by = "system"`. One
+#: entry today: a daily "housekeeping ran" line is reassurance, and thirty identical green rows
+#: are how an operator learns to ignore the list the red ones live in (spec §5.4).
+#:
+#: Only ever *quiet* kinds belong here. Superseding a failure would hide yesterday's unread
+#: problem behind today's, which is the one thing this list must never be used for.
+SUPERSEDING_KINDS: frozenset[str] = frozenset({AlertKind.MAINTENANCE_OK.value})
+
+
+def _project_notification_raised(connection: Connection, event: Event) -> None:
+    """Fold one raised alert into the bell's read model.
+
+    **Insert, ignore on conflict — never an upsert.** Recording is at-least-once, so the same
+    `alert_id` can arrive twice; rewriting the payload columns on the second arrival would clear
+    a `dismissed_at` an operator set in between, and the notice would come back from the dead
+    (spec §5.5).
+    """
+    payload = event.payload
+    alert_id = str(payload["alert_id"])
+    kind = str(payload["kind"])
+    connection.execute(
+        insert(notifications)
+        .values(
+            alert_id=alert_id,
+            kind=kind,
+            severity=str(payload["severity"]),
+            # The alert's own instant, falling back to when it was recorded: the two differ by at
+            # most one poll, and a row nobody can date is worse than one dated a minute late.
+            at=_moment(payload.get("at")) or event.ts,
+            scope=str(payload.get("scope", "")),
+            title=str(payload.get("title", "")),
+            body=str(payload.get("body", "")),
+            event_seq=int(payload.get("event_seq", 0) or 0),
+        )
+        .on_conflict_do_nothing(index_elements=["alert_id"])
+    )
+    if kind in SUPERSEDING_KINDS:
+        connection.execute(
+            update(notifications)
+            .where(
+                notifications.c.kind == kind,
+                notifications.c.alert_id != alert_id,
+                notifications.c.dismissed_at.is_(None),
+            )
+            .values(dismissed_at=event.ts, dismissed_by="system")
+        )
+
+
+def _project_alert_dismissed(connection: Connection, event: Event) -> None:
+    """Clear one notice, keeping the first dismissal's provenance.
+
+    Scoped to rows that are still open, so two tabs clicking the same X record who cleared it
+    rather than who clicked last — and so a replay lands on the same answer.
+    """
+    connection.execute(
+        update(notifications)
+        .where(
+            notifications.c.alert_id == str(event.payload["alert_id"]),
+            notifications.c.dismissed_at.is_(None),
+        )
+        .values(dismissed_at=event.ts, dismissed_by=str(event.payload.get("actor", "dashboard")))
+    )
+
+
+def _moment(value: object) -> datetime | None:
+    """An ISO-8601 instant from a payload, or `None` if it does not read as one."""
+    try:
+        return ensure_utc(datetime.fromisoformat(str(value)))
+    except (TypeError, ValueError):
+        return None
+
+
 PROJECTORS: dict[EventType, Projector] = {
     EventType.CYCLE_STARTED: _project_cycle_started,
     EventType.SNAPSHOT_FROZEN: _project_snapshot_frozen,
@@ -250,6 +331,8 @@ PROJECTORS: dict[EventType, Projector] = {
     EventType.RECONCILED: _project_reconciled,
     EventType.RISK_EVENT: _project_risk_event,
     EventType.CYCLE_COMPLETED: _project_cycle_completed,
+    EventType.NOTIFICATION_RAISED: _project_notification_raised,
+    EventType.ALERT_DISMISSED: _project_alert_dismissed,
 }
 
 

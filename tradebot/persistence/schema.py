@@ -194,6 +194,33 @@ risk_events = Table(
     Column("detail", Text, default=""),
 )
 
+#: What the dashboard's bell shows: one row per alert the rules produced, dismissed or not.
+#:
+#: A true projection, folded from `NOTIFICATION_RAISED` and `ALERT_DISMISSED` and listed in
+#: `PROJECTION_TABLES`, so a rebuild reproduces the notification history *and* its dismissals.
+#: `alert_id` is deterministic — `"{event_seq}:{kind}"`, or `"summary:{day}"` for the daily line —
+#: which is what makes recording idempotent: a retry folds onto the row that already exists.
+notifications = Table(
+    "notifications",
+    metadata,
+    Column("alert_id", String(96), primary_key=True),
+    Column("kind", String(32), nullable=False),
+    Column("severity", String(8), nullable=False),
+    #: When the thing *happened*, not when the tail noticed it.
+    Column("at", UtcText, nullable=False),
+    Column("scope", String(128), nullable=False, default=""),
+    Column("title", Text, nullable=False),
+    Column("body", Text, nullable=False, default=""),
+    #: The event that justified it, for the drill-down. Zero for the daily summary, which the
+    #: clock produces rather than anything in the log.
+    Column("event_seq", Integer, nullable=False, default=0),
+    #: Null until cleared. `dismissed_by` is `dashboard` for an operator's click and `system`
+    #: for a `MAINTENANCE_OK` superseded by the next day's (spec §5.4).
+    Column("dismissed_at", UtcText),
+    Column("dismissed_by", String(32)),
+    Index("ix_notifications_open", "dismissed_at"),
+)
+
 #: Closed positions. The unit the consecutive-loss rule counts, and the tax artifact.
 round_trips = Table(
     "round_trips",
@@ -354,6 +381,7 @@ PROJECTION_TABLES: tuple[Table, ...] = (
     risk_events,
     round_trips,
     reconciliations,
+    notifications,
 )
 
 

@@ -1,0 +1,56 @@
+{# The notification bell's contents — the only fragment that appears on every page.
+
+   The `<details>` around this lives in `base.html` and is **never** the swap target: htmx
+   replacing it would close the dropdown while someone is reading it, up to once a second
+   (spec §5.7). So the two regions inside it carry their own `hx-get` against one route, and
+   listen on the `<details>` — `workspace.js` dispatches `refresh` on the element carrying
+   `data-pane`, with `bubbles: false`, so `from:` is what reaches a child.
+
+   The counts always refresh; the list only while it is open, so a closed bell costs one small
+   query and no markup. `hx-select` is what lets one route serve both, and is why first paint and
+   every later paint go through this same partial (PHASE_10 §Pane contracts). #}
+
+<summary title="{{ counts.high }} high, {{ counts.medium }} medium, {{ counts.low }} low"
+         aria-label="{{ counts.high }} high, {{ counts.medium }} medium, {{ counts.low }} low">
+  <span id="notification-counts"
+        hx-get="/workspace/notifications" hx-trigger="refresh from:closest details"
+        hx-select="#notification-counts" hx-swap="outerHTML"
+        class="counts {{ 'quiet' if not (counts.high or counts.medium or counts.low) }}">
+    {# Fixed order, all three always present even at zero, and the reading is spelled out in the
+       label above: colour is never the only carrier of meaning, so this survives a colourblind
+       reader, a greyscale screenshot and a missing stylesheet (spec §5.6). #}
+    <b class="danger">{{ counts.high }}</b><span
+      class="sep">|</span><b class="warn">{{ counts.medium }}</b><span
+      class="sep">|</span><b class="ok">{{ counts.low }}</b>
+  </span>
+</summary>
+
+<div id="notification-list" class="menu-items notification-list"
+     hx-get="/workspace/notifications"
+     hx-trigger="refresh[this.closest('details').open] from:closest details"
+     hx-select="#notification-list" hx-swap="outerHTML">
+  {% if not notifications %}
+    <p class="muted small">Nothing to report.</p>
+  {% endif %}
+  {% for row in notifications %}
+    <div class="notification sev-{{ row.severity }}">
+      <div class="notification-head">
+        <span class="pill {{ {'high': 'danger', 'medium': 'warn'}.get(row.severity, 'ok') }}">{{ row.severity }}</span>
+        <strong>{{ row.title }}</strong>
+        {# An ordinary POST form, so the X works with scripting off. The selection travels with it
+           like every other act on this screen, so dismissing a notice returns the operator to
+           the view they were acting from (`routes/control.py`). #}
+        <form method="post" action="/control/notifications/{{ row.alert_id | urlencode }}/dismiss"
+              class="dismiss-form">
+          <input type="hidden" name="scope" value="{{ scope or '' }}">
+          <button type="submit" class="ghost" title="dismiss"
+                  aria-label="dismiss {{ row.title }}">&times;</button>
+        </form>
+      </div>
+      <p class="notification-body small">{{ row.body }}</p>
+      <p class="muted small">
+        {{ row.at | moment }}{% if row.scope %} · <code>{{ row.scope }}</code>{% endif %}
+      </p>
+    </div>
+  {% endfor %}
+</div>

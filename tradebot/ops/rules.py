@@ -27,6 +27,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import PurePath
 
 from tradebot.control.valuation import VALUATION_RULE
 from tradebot.core.enums import CycleOutcome, KillSwitchState, ReconcileClass
@@ -251,6 +252,13 @@ def _count(number: int, noun: str) -> str:
     return f"{number} {noun}" if number == 1 else f"{number} {noun}s"
 
 
+def _file_name(path: str) -> str:
+    """Just the backup's name. Seen on a rendered page: the absolute path took three lines of a
+    four-line notice, and the directory is the same every day and is what `maintenance status`
+    prints. The name is the part that identifies which copy this was."""
+    return PurePath(path).name if path else "none"
+
+
 def _windows(event: Event) -> str:
     """Which retention windows the pass ran under, and whether they were the published ones.
 
@@ -288,7 +296,7 @@ def maintenance(event: Event, _state: RuleState) -> Alert | None:
         scope=MAINTENANCE_SCOPE,
         title="Housekeeping ran",
         body=(
-            f"backup {text(event, 'backup') or 'none'}; "
+            f"backup {_file_name(text(event, 'backup'))}; "
             f"{_count(int(event.payload.get('compacted_rows', 0)), 'payload')} compacted; "
             f"{_count(int(event.payload.get('deleted_archives', 0)), 'archive')} deleted. "
             f"{_windows(event)}"

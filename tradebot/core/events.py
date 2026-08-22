@@ -66,6 +66,10 @@ class EventType(StrEnum):
     #: deliberately **not** in `ops/rules.ALERT_TYPES`: the dispatcher appends these, and a
     #: dispatcher that tailed its own writes would be a feedback loop (spec 5.2).
     NOTIFICATION_RAISED = "NOTIFICATION_RAISED"
+    #: An operator clearing one notification off the dashboard. An event rather than a column
+    #: written in place, so "who cleared the reconciliation-mismatch notice, and when" is in the
+    #: audit trail and survives a projection rebuild (spec §2 D6).
+    ALERT_DISMISSED = "ALERT_DISMISSED"
 
 
 class Event(DomainModel):

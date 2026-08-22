@@ -552,10 +552,14 @@ class TestDeliveringWhatWasRecorded:
         assert sent.scope == raised.payload["scope"]
         assert sent.at.isoformat() == raised.payload["at"]
 
-    async def test_an_unreadable_notification_is_skipped_rather_than_blocking_the_tail(
+    async def test_a_kind_this_version_cannot_read_is_skipped_not_blocked_on(
         self, wired: tuple[EventStore, AlertCursorStore, Engine], clock: ManualClock
     ) -> None:
-        """One malformed row must not stop every later notice reaching the operator."""
+        """A rollback past a version that added an `AlertKind` is the realistic way this happens.
+
+        The projection stores `kind` as text and is unbothered; delivery has to build the enum
+        and cannot. It must cost that one notice, never the delivery of everything behind it.
+        """
         store, cursor, _ = wired
         sink = RecordingSink()
         dispatcher = dispatcher_for(wired, clock, sink)
@@ -565,7 +569,16 @@ class TestDeliveringWhatWasRecorded:
                 ts=clock.now(),
                 type=EventType.NOTIFICATION_RAISED,
                 aggregate_id="notifications",
-                payload={"kind": "not_a_kind", "at": "not_a_time"},
+                payload={
+                    "alert_id": "1:from_the_future",
+                    "kind": "from_the_future",
+                    "severity": "high",
+                    "at": clock.now().isoformat(),
+                    "scope": "portfolio",
+                    "title": "a kind this version has never heard of",
+                    "body": "",
+                    "event_seq": 1,
+                },
             )
         )
         await a_trip(store, clock)
