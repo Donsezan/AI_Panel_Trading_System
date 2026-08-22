@@ -8,12 +8,17 @@ own retry policy. The output is an ordinary SQLite database: recovery is copying
 The copy is written to a `.tmp` sibling of its final name and published onto that name only once
 `VACUUM INTO` has finished, so a process killed mid-copy never leaves a truncated file under the
 name a restore trusts — the final name is either absent or a complete backup, never partial
-(spec §2 D2/D4). Publishing is a hard link, not `Path.replace` (POSIX `rename(2)`), because
-`replace` overwrites an existing file silently — a second call for the same mode, instant and
-revision finishing during this one's copy must be refused, not let destroy the first (D4: nothing
-this module writes is ever deleted or overwritten by it). Every failure past the point the `.tmp`
-is created also unlinks it, so a persistent failure does not accumulate files that eat the very
-headroom `HEADROOM_BYTES` reserves.
+(spec §2 D2/D4). Publishing tries a hard link first, not `Path.replace` (POSIX `rename(2)`),
+because `replace` overwrites an existing file silently — a second call for the same mode, instant
+and revision finishing during this one's copy must be refused, not let destroy the first (D4:
+nothing this module writes is ever deleted or overwritten by it). Where hard links are not
+supported at all — exFAT, FAT32, and several SMB/network shares, which is exactly the kind of
+destination the design points `TRADEBOT_BACKUP_DIR` at — publishing falls back to `Path.replace`
+after re-proving the name is not taken, the same narrow-window mechanism the pre-Task-2 code
+already ran with (review finding, Critical — a hard-link-only publish fails every call, not just
+a colliding one, on a filesystem that cannot make hard links at all). Every failure past the point
+the `.tmp` is created also unlinks it, so a persistent failure does not accumulate files that eat
+the very headroom `HEADROOM_BYTES` reserves.
 
 Failure semantics: anything that prevents a complete copy raises `BackupError`, and no caller
 swallows it — including a plain `OSError` from the filesystem itself (a missing volume, a
@@ -69,36 +74,72 @@ def free_bytes(directory: Path) -> int:
     return shutil.disk_usage(directory).free
 
 
+def _already_exists_message(target: Path) -> str:
+    """One wording for both places a completed backup's name refuses a second writer.
+
+    Shared between `take_backup`'s up-front `target.exists()` check and its handler for
+    `_publish` raising `FileExistsError`, so the two could not read differently after an edit to
+    one of them (review finding, Minor — the message was duplicated verbatim before this).
+    """
+    return f"{target} already exists; refusing to overwrite a backup"
+
+
 def _publish(tmp_target: Path, target: Path) -> None:
     """Move the finished copy onto its final name without a window where it could be overwritten.
 
-    `Path.replace` (POSIX `rename(2)`) succeeds silently over an existing file, so a second call
-    for the same mode, instant and revision finishing during *this* one's copy would destroy a
-    completed backup — the early `target.exists()` check in `take_backup` cannot close that
-    window, since it runs before `VACUUM INTO`, not after (spec D4). `os.link` is the OS's own
-    fail-if-the-name-is-taken primitive on both platforms (POSIX `link(2)`, Win32
-    `CreateHardLink`), so the existence check and the publish are one atomic syscall rather than
-    the check-then-act pair `exists()` + `replace()` would be.
+    `os.link` is the OS's own fail-if-the-name-is-taken primitive on both platforms (POSIX
+    `link(2)`, Win32 `CreateHardLink`) and is tried first: where it works, the existence check and
+    the publish are one atomic syscall, closing the D4 race outright rather than merely narrowing
+    it, unlike `Path.replace` (POSIX `rename(2)`), which succeeds silently over an existing file.
+
+    Hard links are not universal, though (review finding, Critical): exFAT, FAT32 and
+    several SMB/network shares do not support them at all, which is exactly the kind of
+    destination the design tells an operator to point `TRADEBOT_BACKUP_DIR` at (a second drive, a
+    synced folder). There, `os.link` raises a plain `OSError` — not `FileExistsError` — on *every*
+    call, not just a colliding one, so treating all `OSError` the same as a name collision would
+    make backups fail permanently on such a destination. Matching `exc.errno` / `winerror` to tell
+    "hard links unsupported" apart from "any other OSError" was considered and rejected: the codes
+    differ by platform, filesystem and driver, so any list written here would be wrong on a
+    filesystem nobody tested against. Instead, any `OSError` other than the name being taken falls
+    back to re-proving the race did not land in this exact gap, then `Path.replace` — the
+    mechanism the pre-Task-2 code already shipped with, and still correct wherever a genuinely
+    atomic publish is unavailable: every path here still ends in either a complete backup or an
+    exception for `take_backup` to classify.
     """
-    os.link(tmp_target, target)
-    tmp_target.unlink()
+    try:
+        os.link(tmp_target, target)
+    except FileExistsError:
+        raise
+    except OSError:
+        if target.exists():
+            raise FileExistsError(str(target)) from None
+        tmp_target.replace(target)
+        return
+    # The backup is already complete under `target` at this point (the hard link shares its data)
+    # — a failure removing the now-redundant `.tmp` is housekeeping, not a failed backup, so it is
+    # never allowed to turn a successful publish into a reported failure (review finding,
+    # Important).
+    _discard(tmp_target)
 
 
 def _discard(tmp_target: Path) -> None:
-    """Remove a `.tmp` left by a failed attempt, on every failure path past its creation.
+    """Best-effort removal of a `.tmp` that is no longer needed.
 
-    Before this, the only cleanup was the *next* call's stale-`.tmp` clear, which only fires for
-    an identical mode+instant+revision — so a persistent failure (a full volume, say) would
-    accumulate orphaned `.tmp` files that eat exactly the headroom `HEADROOM_BYTES` exists to
-    protect. Best-effort: the failure already being raised by the caller is the one that matters,
-    so a second failure while cleaning up is logged, not raised — it must never mask the first,
-    which is what a bare `except: pass` would risk turning this into if it re-raised.
+    Called on every failure path past the point the `.tmp` was created: before this, the only
+    cleanup was the *next* call's stale-`.tmp` clear, which only fires for an identical
+    mode+instant+revision, so a persistent failure (a full volume, say) would accumulate orphaned
+    files eating exactly the headroom `HEADROOM_BYTES` exists to protect. Also called after a
+    *successful* publish (review finding, Important): once `os.link` has linked `target` to the
+    same data, the backup exists and a stuck scratch file is a cleanup matter, not a failed backup.
+    Either way, a second failure while cleaning up must never mask what the caller is already
+    reporting (or, on the success path, invent a failure that never happened) — so it is logged,
+    not raised.
     """
     try:
         tmp_target.unlink(missing_ok=True)
     except OSError as exc:
         logger.warning(
-            "could not remove temp file after a failed backup",
+            "could not remove backup scratch file",
             extra={"path": str(tmp_target), "error": str(exc)},
         )
 
@@ -149,7 +190,7 @@ def take_backup(
 
     target = destination / backup_name(mode, clock.now(), revision=revision)
     if target.exists():
-        raise BackupError(f"{target} already exists; refusing to overwrite a backup")
+        raise BackupError(_already_exists_message(target))
 
     # Written to a `.tmp` sibling and published onto the final name only once the copy is whole —
     # see the module docstring. A `.tmp` left by an interrupted prior run is not a backup, so it
@@ -175,7 +216,7 @@ def take_backup(
         _publish(tmp_target, target)
     except FileExistsError as exc:
         _discard(tmp_target)
-        raise BackupError(f"{target} already exists; refusing to overwrite a backup") from exc
+        raise BackupError(_already_exists_message(target)) from exc
     except OSError as exc:
         _discard(tmp_target)
         raise BackupError(f"could not finalize {target}: {exc}") from exc
