@@ -15,9 +15,9 @@ from tradebot.core.enums import (
     KillSwitchState,
     ReconcileClass,
 )
-from tradebot.core.events import EventFactory
+from tradebot.core.events import Event, EventFactory, EventType
 from tradebot.core.schema import DomainModel, UtcDatetime
-from tradebot.interfaces.alerts import AlertKind
+from tradebot.interfaces.alerts import AlertKind, Severity
 from tradebot.ops.rules import RuleState, evaluate
 
 
@@ -42,7 +42,7 @@ class TestUrgentTriggers:
         alert = evaluate(event, RuleState())
         assert alert is not None
         assert alert.kind is AlertKind.KILL_SWITCH
-        assert alert.kind.is_urgent
+        assert alert.kind.severity is Severity.HIGH
         assert "drawdown 12%" in alert.body
 
     def test_re_arming_does_not(self, clock: ManualClock) -> None:
@@ -197,3 +197,111 @@ class TestDefensiveReading:
 
     def test_an_untailed_event_type_yields_nothing(self, clock: ManualClock) -> None:
         assert evaluate(events_for(clock).cycle_started((), "sim"), RuleState()) is None
+
+
+class TestSeverity:
+    """Severity lives on the kind, because behaviour belongs on the enum (repo conventions)."""
+
+    def test_the_things_that_stopped_trading_are_high(self) -> None:
+        assert AlertKind.KILL_SWITCH.severity is Severity.HIGH
+        assert AlertKind.BASKET_HALTED.severity is Severity.HIGH
+        assert AlertKind.RECON_MISMATCH.severity is Severity.HIGH
+        assert AlertKind.MAINTENANCE_FAILED.severity is Severity.HIGH
+
+    def test_a_frozen_valuation_is_high_though_it_trips_nothing(self) -> None:
+        """It is not a breach, but it stops every basket trading (ADR 0027)."""
+        assert AlertKind.VALUATION_FROZEN.severity is Severity.HIGH
+
+    def test_the_degradations_are_medium(self) -> None:
+        assert AlertKind.PROVIDER_FAILURE.severity is Severity.MEDIUM
+        assert AlertKind.DATA_STALE.severity is Severity.MEDIUM
+
+    def test_the_routine_notices_are_low(self) -> None:
+        assert AlertKind.DAILY_SUMMARY.severity is Severity.LOW
+        assert AlertKind.MAINTENANCE_OK.severity is Severity.LOW
+
+    def test_every_kind_has_one(self) -> None:
+        """A kind added later without a severity must fail here, not render as blank."""
+        assert all(isinstance(kind.severity, Severity) for kind in AlertKind)
+
+    def test_only_the_low_ones_are_quiet(self) -> None:
+        """What `is_urgent` used to answer, now derived rather than stored twice."""
+        quiet = {kind for kind in AlertKind if kind.severity is Severity.LOW}
+        assert quiet == {AlertKind.DAILY_SUMMARY, AlertKind.MAINTENANCE_OK}
+
+
+def maintenance_event(clock: ManualClock, **payload: object) -> Event:
+    """A `MAINTENANCE_RAN` event shaped exactly as `MaintenanceService._record` writes one."""
+    return Event(
+        ts=clock.now(),
+        type=EventType.MAINTENANCE_RAN,
+        aggregate_id="maintenance",
+        payload={
+            "mode": "sim",
+            "outcome": "ok",
+            "detail": "",
+            "backup": "",
+            "archived_days": 0,
+            "compacted_rows": 0,
+            "deleted_archives": 0,
+            "compact_after_days": 30,
+            "archive_keep_days": 90,
+            "overridden": False,
+            **payload,
+        },
+    )
+
+
+class TestMaintenanceRule:
+    def test_a_failed_pass_is_a_high_alert_naming_the_reason(self, clock: ManualClock) -> None:
+        alert = evaluate(
+            maintenance_event(clock, outcome="failed", detail="backup: no room"), RuleState()
+        )
+
+        assert alert is not None
+        assert alert.kind is AlertKind.MAINTENANCE_FAILED
+        assert alert.kind.severity is Severity.HIGH
+        assert "no room" in alert.body
+
+    def test_a_failure_with_no_detail_still_says_something(self, clock: ManualClock) -> None:
+        """An empty `detail` must not render as a blank alert nobody can act on."""
+        alert = evaluate(maintenance_event(clock, outcome="failed"), RuleState())
+
+        assert alert is not None
+        assert "no reason recorded" in alert.body
+
+    def test_a_successful_pass_is_a_low_alert_quoting_what_it_did(self, clock: ManualClock) -> None:
+        alert = evaluate(
+            maintenance_event(clock, compacted_rows=42, deleted_archives=1), RuleState()
+        )
+
+        assert alert is not None
+        assert alert.kind is AlertKind.MAINTENANCE_OK
+        assert alert.kind.severity is Severity.LOW
+        assert "42" in alert.body
+        assert "1 archive" in alert.body
+
+    def test_the_daily_line_names_the_windows_in_force(self, clock: ManualClock) -> None:
+        """So "why did that get deleted" is answerable from the notice itself."""
+        alert = evaluate(maintenance_event(clock), RuleState())
+
+        assert alert is not None
+        assert "30" in alert.body and "90" in alert.body
+
+    def test_a_one_off_override_says_so(self, clock: ManualClock) -> None:
+        """Otherwise the notice attributes a deletion to a policy that was never in force."""
+        alert = evaluate(
+            maintenance_event(clock, compact_after_days=1, archive_keep_days=3, overridden=True),
+            RuleState(),
+        )
+
+        assert alert is not None
+        assert "override" in alert.body
+
+    def test_the_rule_touches_no_streak(self, clock: ManualClock) -> None:
+        """It is not a "cycle after cycle" rule, and must not borrow another's counter."""
+        state = RuleState(degraded_streak=2, stale_streak=1)
+
+        evaluate(maintenance_event(clock), state)
+
+        assert (state.degraded_streak, state.stale_streak) == (2, 1)

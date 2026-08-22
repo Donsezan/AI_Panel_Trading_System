@@ -43,6 +43,10 @@ The **kill switch** trips through the same `Watchdog.trip` the drawdown breach u
 through `Watchdog.rearm` behind `assert_rearm_phrase`. Re-arming resets the baselines, so it is
 an assertion that a human has looked at what happened.
 
+**Dismissing a notification** is the one act here that changes nothing about what the bot
+does. It acknowledges a message and is recorded as one, so the audit trail says who cleared what;
+it never clears the state the message was about, which each keep their own act above.
+
 **Manual close has no side door**: it goes through `ManualCloser`, which builds an `OrderIntent`
 and hands it to the same Tier-1 and Tier-2 engines a cycle uses. A metering rule may refuse it,
 and when it does, the rule and its reason are shown rather than worked around.
@@ -66,6 +70,7 @@ from tradebot.control.reference import store_basket
 from tradebot.core.config import Basket
 from tradebot.core.enums import BasketStatus, ConfigKind
 from tradebot.core.errors import ConfigError, ModeConfusionError, TradebotError
+from tradebot.core.events import Event, EventType
 from tradebot.core.logging import get_logger
 from tradebot.core.money import to_decimal
 from tradebot.dashboard.dock import (
@@ -76,6 +81,7 @@ from tradebot.dashboard.dock import (
 )
 from tradebot.dashboard.routes.workspace import page
 from tradebot.dashboard.views import ACTOR, state_of
+from tradebot.ops.dispatcher import NOTIFICATION_AGGREGATE
 from tradebot.risk.state import assert_rearm_phrase
 
 logger = get_logger(__name__)
@@ -303,6 +309,38 @@ async def rearm(request: Request) -> Response:
         )
     await application.watchdog.rearm(current.equity, actor=ACTOR)
     logger.warning("kill switch re-armed from the dashboard")
+    return _back(form)
+
+
+@router.post("/notifications/{alert_id}/dismiss")
+async def dismiss_notification(request: Request, alert_id: str) -> Response:
+    """Clear one notice off the bell. An audited act, like every other thing done here.
+
+    An event rather than a column written in place (spec §2 D6): the log is what answers "who
+    cleared the reconciliation-mismatch notice, and when", and it is what a projection rebuild
+    replays, so the dismissal survives one rather than being silently undone by it.
+
+    It is never refused, and it is never a no-op event. Dismissing something already gone — a
+    second browser tab, a notice superseded while the page sat open — is a 303 back to the
+    workspace and *nothing written*: answering a stale tab with an error would teach an operator
+    that the X is unreliable, and appending an event that projects onto no row would leave the
+    audit trail describing a dismissal that never happened.
+
+    The state this notice was *about* is untouched either way. Dismissing a notification
+    acknowledges a message; the kill switch, the halt and the quarantine each keep their own act.
+    """
+    form = await request.form()
+    state = state_of(request)
+    if state.queries.notification_is_open(alert_id):
+        await state.application.store.append(
+            Event(
+                ts=state.application.clock.now(),
+                type=EventType.ALERT_DISMISSED,
+                aggregate_id=NOTIFICATION_AGGREGATE,
+                payload={"alert_id": alert_id, "actor": ACTOR},
+            )
+        )
+        logger.info("notification dismissed", extra={"alert_id": alert_id, "actor": ACTOR})
     return _back(form)
 
 

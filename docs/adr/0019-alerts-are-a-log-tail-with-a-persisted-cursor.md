@@ -1,7 +1,11 @@
 # 19. Ops alerts are a log tail with a persisted cursor, never a hook on the money path
 
 Date: 2026-08-01
-Status: accepted
+Status: accepted. Amended 2026-08-22 by
+[ADR 0029](0029-notifications-are-a-projection-of-the-alert-rules.md): the **tail now runs
+unconditionally** and records what the rules produce, while *delivery* stays configured-only. A
+second cursor, `recorded_seq`, was added for it — everything below about `last_seq` and
+at-least-once delivery is unchanged and still describes delivery.
 
 ## Context
 

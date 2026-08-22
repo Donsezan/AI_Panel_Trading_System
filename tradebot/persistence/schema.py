@@ -194,6 +194,33 @@ risk_events = Table(
     Column("detail", Text, default=""),
 )
 
+#: What the dashboard's bell shows: one row per alert the rules produced, dismissed or not.
+#:
+#: A true projection, folded from `NOTIFICATION_RAISED` and `ALERT_DISMISSED` and listed in
+#: `PROJECTION_TABLES`, so a rebuild reproduces the notification history *and* its dismissals.
+#: `alert_id` is deterministic — `"{event_seq}:{kind}"`, or `"summary:{day}"` for the daily line —
+#: which is what makes recording idempotent: a retry folds onto the row that already exists.
+notifications = Table(
+    "notifications",
+    metadata,
+    Column("alert_id", String(96), primary_key=True),
+    Column("kind", String(32), nullable=False),
+    Column("severity", String(8), nullable=False),
+    #: When the thing *happened*, not when the tail noticed it.
+    Column("at", UtcText, nullable=False),
+    Column("scope", String(128), nullable=False, default=""),
+    Column("title", Text, nullable=False),
+    Column("body", Text, nullable=False, default=""),
+    #: The event that justified it, for the drill-down. Zero for the daily summary, which the
+    #: clock produces rather than anything in the log.
+    Column("event_seq", Integer, nullable=False, default=0),
+    #: Null until cleared. `dismissed_by` is `dashboard` for an operator's click and `system`
+    #: for a `MAINTENANCE_OK` superseded by the next day's (spec §5.4).
+    Column("dismissed_at", UtcText),
+    Column("dismissed_by", String(32)),
+    Index("ix_notifications_open", "dismissed_at"),
+)
+
 #: Closed positions. The unit the consecutive-loss rule counts, and the tax artifact.
 round_trips = Table(
     "round_trips",
@@ -313,7 +340,13 @@ alert_cursor = Table(
     "alert_cursor",
     metadata,
     Column("scope", String(32), primary_key=True),
+    #: How far **delivery** has got. Advanced only after a sink has taken the notification,
+    #: which is what makes delivery at-least-once (ADR 0019). Indexes `NOTIFICATION_RAISED`.
     Column("last_seq", Integer, nullable=False, default=0),
+    #: How far **recording** has got, over the alert source types. A separate cursor because the
+    #: two fail differently: a dead webhook must not withhold what the operator could already see
+    #: on screen, and a retry must not append a second notification (spec 5.2).
+    Column("recorded_seq", Integer, nullable=False, default=0),
     #: The session day the last daily summary covered. Empty means none has been sent, which is
     #: how the first poll of a fresh database avoids summarising a day it only saw the end of.
     Column("last_summary_day", String(10), default=""),
@@ -348,6 +381,7 @@ PROJECTION_TABLES: tuple[Table, ...] = (
     risk_events,
     round_trips,
     reconciliations,
+    notifications,
 )
 
 

@@ -27,6 +27,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import PurePath
 
 from tradebot.control.valuation import VALUATION_RULE
 from tradebot.core.enums import CycleOutcome, KillSwitchState, ReconcileClass
@@ -41,7 +42,12 @@ ALERT_TYPES: tuple[EventType, ...] = (
     EventType.RECONCILED,
     EventType.CYCLE_COMPLETED,
     EventType.RISK_EVENT,
+    EventType.MAINTENANCE_RAN,
 )
+
+#: What a maintenance notice is *about*. One scope, so the dashboard groups a pass's notices
+#: together and the supersession rule has something to key on.
+MAINTENANCE_SCOPE = "maintenance"
 
 #: Consecutive degraded cycles before a human is told. Two could be one provider blipping; a
 #: third is a panel that has stopped working, and every cycle since the first has traded nothing.
@@ -241,6 +247,63 @@ def valuation_frozen(event: Event, _state: RuleState) -> Alert | None:
     )
 
 
+def _count(number: int, noun: str) -> str:
+    """`1 archive`, `2 archives`. These lines are read by a person, half-asleep, on a phone."""
+    return f"{number} {noun}" if number == 1 else f"{number} {noun}s"
+
+
+def _file_name(path: str) -> str:
+    """Just the backup's name. Seen on a rendered page: the absolute path took three lines of a
+    four-line notice, and the directory is the same every day and is what `maintenance status`
+    prints. The name is the part that identifies which copy this was."""
+    return PurePath(path).name if path else "none"
+
+
+def _windows(event: Event) -> str:
+    """Which retention windows the pass ran under, and whether they were the published ones.
+
+    On the notice itself rather than a click away: this is the line that answers "why was that
+    deleted", and a one-off `--older-than` would otherwise be attributed to a policy that was
+    never in force (spec §7).
+    """
+    override = (
+        " (one-off override, not the published policy)" if event.payload.get("overridden") else ""
+    )
+    return (
+        f"windows in force: compact after {event.payload.get('compact_after_days')}d, "
+        f"keep archives {event.payload.get('archive_keep_days')}d{override}"
+    )
+
+
+def maintenance(event: Event, _state: RuleState) -> Alert | None:
+    """One housekeeping pass, rendered for a human. Loud on failure, quiet on success.
+
+    A dedicated event type rather than an overloaded `RISK_EVENT`: maintenance is not a risk rule,
+    and `valuation_frozen` keeps sole ownership of that type (spec §5.4). It reads no streak — it
+    is one pass a day, not a "cycle after cycle" degradation — so the counters stay untouched.
+    """
+    if text(event, "outcome") == "failed":
+        return Alert(
+            kind=AlertKind.MAINTENANCE_FAILED,
+            at=event.ts,
+            scope=MAINTENANCE_SCOPE,
+            title="Housekeeping failed — backups or retention did not complete",
+            body=f"{text(event, 'detail') or 'no reason recorded'}. {_windows(event)}",
+        )
+    return Alert(
+        kind=AlertKind.MAINTENANCE_OK,
+        at=event.ts,
+        scope=MAINTENANCE_SCOPE,
+        title="Housekeeping ran",
+        body=(
+            f"backup {_file_name(text(event, 'backup'))}; "
+            f"{_count(int(event.payload.get('compacted_rows', 0)), 'payload')} compacted; "
+            f"{_count(int(event.payload.get('deleted_archives', 0)), 'archive')} deleted. "
+            f"{_windows(event)}"
+        ),
+    )
+
+
 #: One handler per tailed type. Dispatch, never a chain of `if`s (CLAUDE.md).
 RULES: dict[EventType, Callable[[Event, RuleState], Alert | None]] = {
     EventType.KILL_SWITCH_CHANGED: kill_switch,
@@ -248,6 +311,7 @@ RULES: dict[EventType, Callable[[Event, RuleState], Alert | None]] = {
     EventType.RECONCILED: recon_mismatch,
     EventType.CYCLE_COMPLETED: cycle_streak,
     EventType.RISK_EVENT: valuation_frozen,
+    EventType.MAINTENANCE_RAN: maintenance,
 }
 
 

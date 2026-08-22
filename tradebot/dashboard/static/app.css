@@ -573,3 +573,55 @@ details.banner-detail { padding: 0.4rem 1.2rem; }
   cursor: default;
 }
 .warn.small { color: var(--warn); margin: 0.3rem 0; }
+
+/* ---------------------------------------------------------------- notifications
+   The header bell. It sits outside `nav`, so it does not inherit the menu rules above and
+   carries its own disclosure styling — and its dropdown opens to the *right* edge, because at
+   this end of the header a left-aligned panel would hang off the screen.
+
+   No new colour enters the stylesheet: --danger, --warn and --ok are the ones the pills already
+   use. Colour is never the only carrier of meaning here — the order is fixed, and the summary's
+   title and aria-label spell the three numbers out (spec §5.6). */
+details.notifications { position: relative; }
+details.notifications > summary { cursor: pointer; list-style: none; }
+details.notifications > summary::-webkit-details-marker { display: none; }
+
+/* `tabular-nums` and a fixed width so a count going from 9 to 10 cannot reflow the header and
+   move the Log out link under the cursor of someone mid-incident. */
+.counts {
+  display: inline-flex;
+  gap: 0.25rem;
+  align-items: baseline;
+  font-variant-numeric: tabular-nums;
+  font-family: var(--mono, ui-monospace, monospace);
+}
+.counts b { min-width: 1.1ch; text-align: right; }
+.counts .sep { color: var(--muted); }
+/* All three zero reads as muted, never as hidden: "nothing to tell you" and "the widget is
+   broken" must not look identical. */
+.counts.quiet b { color: var(--muted); }
+
+.notification-list {
+  position: absolute;
+  z-index: 20;
+  top: 1.6rem;
+  right: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  width: 26rem;
+  max-height: 60vh;
+  overflow-y: auto;
+  padding: 0.6rem 0.8rem;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+.notification { border-left: 3px solid var(--line); padding-left: 0.6rem; }
+.notification.sev-high { border-left-color: var(--danger); }
+.notification.sev-medium { border-left-color: var(--warn); }
+.notification.sev-low { border-left-color: var(--ok); }
+.notification-head { display: flex; align-items: baseline; gap: 0.4rem; }
+.notification-head strong { flex: 1; }
+.notification-body { margin: 0.2rem 0; white-space: pre-line; }
+.dismiss-form { margin: 0; }

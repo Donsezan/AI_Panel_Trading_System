@@ -18,8 +18,8 @@ from sqlalchemy import Engine
 from tradebot.core.clock import ManualClock
 from tradebot.core.enums import BasketStatus, CycleOutcome, KillSwitchState
 from tradebot.core.errors import VenueError
-from tradebot.core.events import EventFactory
-from tradebot.interfaces.alerts import Alert, AlertKind
+from tradebot.core.events import Event, EventFactory, EventType
+from tradebot.interfaces.alerts import Alert, AlertKind, Severity
 from tradebot.ops.cursor import AlertCursorStore
 from tradebot.ops.dispatcher import AlertDispatcher
 from tradebot.persistence.database import SingleWriter, create_database
@@ -70,15 +70,23 @@ async def a_trip(store: EventStore, clock: ManualClock, reason: str = "drawdown 
 
 
 class TestEnablement:
-    async def test_no_sink_means_the_log_is_never_read(
+    """`enabled` gates **delivery**, and only delivery (spec 5.1).
+
+    It used to gate the tail itself, which meant that on a machine with no webhook -- the sim and
+    paper case -- the rules never evaluated at all, and anything fed by them was permanently empty.
+    """
+
+    async def test_no_sink_means_nothing_is_delivered(
         self, wired: tuple[EventStore, AlertCursorStore, Engine], clock: ManualClock
     ) -> None:
         store, cursor, _ = wired
-        await a_trip(store, clock)
         dispatcher = dispatcher_for(wired, clock)
+        await dispatcher.poll()
+        await a_trip(store, clock)
 
         assert not dispatcher.enabled
         assert await dispatcher.poll() == ()
+        # The delivery cursor never moves, because nothing was ever delivered.
         assert cursor.load().last_seq == 0
 
 
@@ -281,7 +289,7 @@ class TestDailySummary:
         assert len(summaries) == 1
         assert "1 cycles" in summaries[0].title
         assert "orders_placed=1" in summaries[0].body
-        assert not summaries[0].kind.is_urgent
+        assert summaries[0].kind.severity is Severity.LOW
 
     async def test_a_failed_summary_is_retried_rather_than_skipped(
         self, wired: tuple[EventStore, AlertCursorStore, Engine], clock: ManualClock
@@ -320,8 +328,10 @@ class TestResilience:
 
         dispatcher.poll = once_broken  # type: ignore[method-assign]
         task = asyncio.create_task(dispatcher.run(poll_seconds=0))
-        for _ in range(50):
-            await asyncio.sleep(0)
+        # A real yield, not `sleep(0)`: every append and cursor save is a hop through the single
+        # writer's thread, and a tight loop of bare yields can starve it of a scheduling slot.
+        for _ in range(100):
+            await asyncio.sleep(0.005)
             if sink.sent:
                 break
         task.cancel()
@@ -329,7 +339,251 @@ class TestResilience:
 
         assert [alert.kind for alert in sink.sent] == [AlertKind.KILL_SWITCH]
 
-    async def test_a_tail_with_no_destination_returns_instead_of_spinning(
+    async def test_a_tail_with_no_destination_keeps_recording(
         self, wired: tuple[EventStore, AlertCursorStore, Engine], clock: ManualClock
     ) -> None:
-        await dispatcher_for(wired, clock).run(poll_seconds=0)
+        """It used to return immediately, so `poll` was never reached on a sim or paper box.
+
+        The loop now runs whatever is configured; only delivery is gated (spec 5.1).
+
+        The log is read **after** the task is cancelled, never while it runs: on the in-memory
+        engine every connection is one shared connection, so a reader returning it to the pool
+        would roll back the writer thread's open transaction and this would pass or fail by
+        timing (CLAUDE.md, Testing).
+        """
+        store, _, _ = wired
+        dispatcher = dispatcher_for(wired, clock)
+        await dispatcher.poll()
+        await a_trip(store, clock)
+
+        task = asyncio.create_task(dispatcher.run(poll_seconds=60))
+        await asyncio.sleep(0.05)
+        still_tailing = not task.done()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+        assert still_tailing
+        assert len(store.read_types(EventType.NOTIFICATION_RAISED)) == 1
+
+
+class TestRecordingWithoutSinks:
+    """The blocking defect this piece exists to fix: with no webhook, nothing ran the rules.
+
+    Recording is unconditional; delivery is not. The dashboard is the only destination a sim or
+    paper run has, and it reads what recording writes (spec 5.1).
+    """
+
+    async def test_a_dispatcher_with_no_sinks_still_records(
+        self, wired: tuple[EventStore, AlertCursorStore, Engine], clock: ManualClock
+    ) -> None:
+        store, _, _ = wired
+        dispatcher = dispatcher_for(wired, clock)
+        await dispatcher.poll()
+        await a_trip(store, clock)
+
+        await dispatcher.poll()
+
+        (raised,) = store.read_types(EventType.NOTIFICATION_RAISED)
+        assert raised.payload["kind"] == AlertKind.KILL_SWITCH.value
+        assert raised.payload["severity"] == Severity.HIGH.value
+        assert "drawdown 12%" in raised.payload["body"]
+
+    async def test_the_identity_is_deterministic_from_the_event_that_caused_it(
+        self, wired: tuple[EventStore, AlertCursorStore, Engine], clock: ManualClock
+    ) -> None:
+        """What makes a re-record idempotent, and what the projection keys on (spec 5.5)."""
+        store, _, _ = wired
+        dispatcher = dispatcher_for(wired, clock)
+        await dispatcher.poll()
+        await a_trip(store, clock)
+        source = store.last_seq()
+
+        await dispatcher.poll()
+
+        (raised,) = store.read_types(EventType.NOTIFICATION_RAISED)
+        assert raised.payload["alert_id"] == f"{source}:{AlertKind.KILL_SWITCH.value}"
+        assert raised.payload["event_seq"] == source
+
+    async def test_the_dispatcher_never_reads_its_own_writes(
+        self, wired: tuple[EventStore, AlertCursorStore, Engine], clock: ManualClock
+    ) -> None:
+        """`NOTIFICATION_RAISED` is deliberately not an alert type; otherwise this is a loop."""
+        store, _, _ = wired
+        dispatcher = dispatcher_for(wired, clock)
+        await dispatcher.poll()
+        await a_trip(store, clock)
+
+        await dispatcher.poll()
+        await dispatcher.poll()
+        await dispatcher.poll()
+
+        assert len(store.read_types(EventType.NOTIFICATION_RAISED)) == 1
+
+    async def test_recording_advances_its_own_cursor_while_delivery_stalls(
+        self, wired: tuple[EventStore, AlertCursorStore, Engine], clock: ManualClock
+    ) -> None:
+        """A dead webhook must not withhold what the operator could already see on screen."""
+        store, cursor, _ = wired
+        sink = RecordingSink(failing=True)
+        dispatcher = dispatcher_for(wired, clock, sink)
+        await dispatcher.poll()
+        anchored = cursor.load().last_seq
+        await a_trip(store, clock)
+
+        await dispatcher.poll()
+        await dispatcher.poll()
+
+        assert len(store.read_types(EventType.NOTIFICATION_RAISED)) == 1
+        assert cursor.load().recorded_seq > anchored
+        assert cursor.load().last_seq == anchored
+
+    async def test_the_streaks_are_counted_once_by_the_recorder(
+        self, wired: tuple[EventStore, AlertCursorStore, Engine], clock: ManualClock
+    ) -> None:
+        """One evaluation, one persisted RuleState -- delivery must not re-count on top of it.
+
+        With the two cursors at different positions, a second evaluation inside `_drain` would
+        raise PROVIDER_FAILURE at a different count on screen than in the webhook.
+        """
+        store, cursor, _ = wired
+        sink = RecordingSink(failing=True)
+        dispatcher = dispatcher_for(wired, clock, sink, degraded_streak=3)
+        await dispatcher.poll()
+
+        for index in range(2):
+            await store.append(
+                events_for(clock, f"d{index}").cycle_completed(
+                    CycleOutcome.PANEL_DEGRADED, Decimal(0)
+                )
+            )
+        await dispatcher.poll()
+        await dispatcher.poll()
+
+        assert cursor.load().degraded_streak == 2
+
+
+class TestFirstPollAnchorsBothCursors:
+    async def test_a_database_alerting_never_ran_against_records_nothing_historic(
+        self, wired: tuple[EventStore, AlertCursorStore, Engine], clock: ManualClock
+    ) -> None:
+        """ADR 0019's rule, applied to the new cursor: three weeks of history is not news.
+
+        Without this the bell fills, on first boot after the upgrade, with every incident the log
+        has ever held -- and an operator who scrolls past a hundred stale rows has learned to
+        scroll past the one that matters.
+        """
+        store, cursor, _ = wired
+        await a_trip(store, clock, "an incident from last month")
+
+        await dispatcher_for(wired, clock).poll()
+
+        assert store.read_types(EventType.NOTIFICATION_RAISED) == ()
+        assert cursor.load().recorded_seq == store.last_seq()
+
+
+class TestRecordingTheSummary:
+    """Section 5.3 gives the summary a severity and 5.8 lists every undismissed notification.
+
+    A summary produced only when a sink is configured would never reach the one destination a
+    sim or paper operator has.
+    """
+
+    async def test_a_summary_is_recorded_without_any_sink(
+        self, wired: tuple[EventStore, AlertCursorStore, Engine], clock: ManualClock
+    ) -> None:
+        store, _, _ = wired
+        dispatcher = dispatcher_for(wired, clock)
+        await dispatcher.poll()
+
+        clock.advance(timedelta(days=1).total_seconds())
+        await dispatcher.poll()
+
+        (raised,) = store.read_types(EventType.NOTIFICATION_RAISED)
+        assert raised.payload["kind"] == AlertKind.DAILY_SUMMARY.value
+        assert raised.payload["severity"] == Severity.LOW.value
+
+    async def test_one_summary_a_day_however_often_it_is_polled(
+        self, wired: tuple[EventStore, AlertCursorStore, Engine], clock: ManualClock
+    ) -> None:
+        store, _, _ = wired
+        dispatcher = dispatcher_for(wired, clock)
+        await dispatcher.poll()
+
+        clock.advance(timedelta(days=1).total_seconds())
+        await dispatcher.poll()
+        await dispatcher.poll()
+
+        assert len(store.read_types(EventType.NOTIFICATION_RAISED)) == 1
+
+    async def test_the_summary_identity_names_its_day(
+        self, wired: tuple[EventStore, AlertCursorStore, Engine], clock: ManualClock
+    ) -> None:
+        """It has no source event to key on, so the day is what makes it idempotent."""
+        store, _, _ = wired
+        dispatcher = dispatcher_for(wired, clock)
+        await dispatcher.poll()
+
+        clock.advance(timedelta(days=1).total_seconds())
+        await dispatcher.poll()
+
+        (raised,) = store.read_types(EventType.NOTIFICATION_RAISED)
+        assert raised.payload["alert_id"].startswith("summary:")
+        assert raised.payload["event_seq"] == 0
+
+
+class TestDeliveringWhatWasRecorded:
+    async def test_the_delivered_alert_is_the_recorded_one_rebuilt(
+        self, wired: tuple[EventStore, AlertCursorStore, Engine], clock: ManualClock
+    ) -> None:
+        """Delivery evaluates nothing: it reads back what recording already decided."""
+        store, _, _ = wired
+        sink = RecordingSink()
+        dispatcher = dispatcher_for(wired, clock, sink)
+        await dispatcher.poll()
+        await a_trip(store, clock, "drawdown 12% below the mark")
+
+        await dispatcher.poll()
+
+        (sent,) = sink.sent
+        (raised,) = store.read_types(EventType.NOTIFICATION_RAISED)
+        assert sent.kind is AlertKind.KILL_SWITCH
+        assert sent.title == raised.payload["title"]
+        assert sent.body == raised.payload["body"]
+        assert sent.scope == raised.payload["scope"]
+        assert sent.at.isoformat() == raised.payload["at"]
+
+    async def test_a_kind_this_version_cannot_read_is_skipped_not_blocked_on(
+        self, wired: tuple[EventStore, AlertCursorStore, Engine], clock: ManualClock
+    ) -> None:
+        """A rollback past a version that added an `AlertKind` is the realistic way this happens.
+
+        The projection stores `kind` as text and is unbothered; delivery has to build the enum
+        and cannot. It must cost that one notice, never the delivery of everything behind it.
+        """
+        store, cursor, _ = wired
+        sink = RecordingSink()
+        dispatcher = dispatcher_for(wired, clock, sink)
+        await dispatcher.poll()
+        await store.append(
+            Event(
+                ts=clock.now(),
+                type=EventType.NOTIFICATION_RAISED,
+                aggregate_id="notifications",
+                payload={
+                    "alert_id": "1:from_the_future",
+                    "kind": "from_the_future",
+                    "severity": "high",
+                    "at": clock.now().isoformat(),
+                    "scope": "portfolio",
+                    "title": "a kind this version has never heard of",
+                    "body": "",
+                    "event_seq": 1,
+                },
+            )
+        )
+        await a_trip(store, clock)
+
+        await dispatcher.poll()
+
+        assert [alert.kind for alert in sink.sent] == [AlertKind.KILL_SWITCH]
+        assert cursor.load().last_seq == store.last_seq()

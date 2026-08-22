@@ -459,9 +459,9 @@ live, following [docs/OPERATIONS.md](docs/OPERATIONS.md). **Live ships disarmed 
 
 ### Phase 13 — retention and backup
 
-Planned in [docs/superpowers/plans/](docs/superpowers/plans/); three pieces. **A (backups) and B
-(retention) have shipped** ([ADR 0028](docs/adr/0028-retention-is-archive-then-compact.md)).
-**C — operator notifications — is not built.**
+Planned in [docs/superpowers/plans/](docs/superpowers/plans/); three pieces, **all shipped** —
+A (backups) and B (retention), [ADR 0028](docs/adr/0028-retention-is-archive-then-compact.md), and
+C (operator notifications), [ADR 0029](docs/adr/0029-notifications-are-a-projection-of-the-alert-rules.md).
 
 `tradebot/maintenance/` is the one package that *writes* outside the money path, which is why it
 is not part of `ops/`. One daily pass: back up, archive, compact only what was archived, delete
@@ -492,6 +492,40 @@ Rules that are easy to get backwards:
   archive directory, matched by parsing each file's name. Never the database, never a backup.
 - **An absent policy means the defaults, not a refusal**, and the windows are read fresh at every
   pass. A failed pass is recorded rather than raised, and still counts as the day's run.
+
+**Piece C makes the alerts `ops/rules.py` already produced visible, and nothing new decides what
+an operator should be told** ([ADR 0029](docs/adr/0029-notifications-are-a-projection-of-the-alert-rules.md)).
+`MAINTENANCE_RAN` joins `ALERT_TYPES` and becomes `MAINTENANCE_FAILED` (HIGH) or `MAINTENANCE_OK`
+(LOW) through one new row in `RULES`. The bell is a `notifications` projection folded from
+`NOTIFICATION_RAISED` and `ALERT_DISMISSED`. Rules that are easy to get backwards:
+
+- **`enabled` gates delivery, not the tail.** It used to gate both, so on a machine with no
+  webhook — the sim and paper case — the rules never evaluated at all. `poll` records
+  unconditionally and `run` loops whatever is configured; only the sinks are configured-only.
+- **Two cursors, because recording and delivering fail differently.** `recorded_seq` advances on
+  the append, `last_seq` only after a sink took it. One cursor would also re-count the streaks:
+  with delivery stalled, a second evaluation would fire `PROVIDER_FAILURE` at a different number
+  on screen than in the webhook. The rules run **once**, in `_record`, which owns the streaks;
+  `_drain` rebuilds the `Alert` from the payload and evaluates nothing.
+- **The dispatcher must never read its own writes.** `NOTIFICATION_RAISED` and `ALERT_DISMISSED`
+  are deliberately absent from `ALERT_TYPES` — either one in it is a notification about a
+  notification, forever.
+- **Insert and ignore on conflict, never upsert.** Recording is at-least-once and `alert_id` is
+  deterministic, so a repeat folds onto the existing row; rewriting the payload columns would
+  clear a `dismissed_at` and resurrect a notice the operator cleared eight minutes earlier.
+- **Only quiet kinds supersede.** A new `MAINTENANCE_OK` retires yesterday's with
+  `dismissed_by = "system"`; `MAINTENANCE_FAILED` never does, because hiding an unread failure
+  behind today's is the one thing the list must not do.
+- **The `<details>` is never swapped**, or the dropdown shuts under whoever is reading it. Its two
+  regions carry their own `hx-get` and listen via `from:closest details`, because `workspace.js`
+  dispatches `refresh` with `bubbles: false`. `PANES_BY_EVENT` keys it on exactly the two events
+  the dispatcher appends — keying on the kill-switch trip would repaint it before the row exists.
+- **The counts *and* the list come from `views.render`.** The bell is in the base template, so a
+  page supplying only the counts renders "Nothing to report" under a counter reading two, and
+  never corrects itself with scripting off or on a page without `workspace.js`.
+- **Dismissal acknowledges a message and changes nothing the bot does**, and dismissing something
+  already gone writes no event — one that projected onto no row would read as a dismissal that
+  never happened.
 
 ### Phase 12 — one portfolio, valued in one notional currency
 
@@ -566,7 +600,7 @@ dashboard.
 ### Phase 7 layering
 
 Everything in `validation/` and `ops/` **reads**. Neither decides or trades; only the alert
-dispatcher writes, and only its own delivery cursor:
+dispatcher writes, and only its two cursors and the notifications it records (ADR 0029):
 
 ```
 Evidence.gather(store)     folds the log's report-relevant types into counters
@@ -575,9 +609,11 @@ Evidence.gather(store)     folds the log's report-relevant types into counters
   BacktestHarness.run      drives the real loop over recorded history, stepping the clock itself
     ReplayDataset          CSVs plus the venue trading rules they were recorded under
 
-AlertDispatcher.poll       tails the log by seq, delivers, then advances a persisted cursor
-  ops/rules.evaluate       the five PLAN triggers, as a dispatch table over event types
-  ops/sinks                webhook + Telegram over httpx, off unless configured
+AlertDispatcher.poll       record, then deliver — two cursors, because they fail differently
+  _record                  evaluates the rules once, appends NOTIFICATION_RAISED, owns the streaks
+    ops/rules.evaluate     the six triggers, as a dispatch table over event types
+  _drain                   tails its own NOTIFICATION_RAISED and delivers; evaluates nothing
+    ops/sinks              webhook + Telegram over httpx, off unless configured
 ```
 
 The one thing in Phase 7 that *runs a panel* is `decision/shadow.py`, which is why it lives in
@@ -620,10 +656,12 @@ and [ADR 0019](docs/adr/0019-alerts-are-a-log-tail-with-a-persisted-cursor.md):
 - **Both panels are edited by one macro** (`dashboard/templates/_panel.html`). A form rendering
   only the champion would delete a configured challenger on the first edit, because the form
   round-trips the whole document.
-- **Alerting never touches the money path.** It tails the log by `seq` and advances its cursor
-  *after* delivery, so the guarantee is at-least-once and a fresh database starts at the log's
-  end. Alert destinations are credentials: environment only, redactor-registered, never named in
-  a log line.
+- **Alerting never touches the money path.** It tails the log by `seq` and advances its delivery
+  cursor *after* delivery, so the guarantee is at-least-once and a fresh database starts at the
+  log's end. Alert destinations are credentials: environment only, redactor-registered, never
+  named in a log line. Since ADR 0029 it does *write* one thing besides its cursors — one
+  `NOTIFICATION_RAISED` per alert, through `SingleWriter`, minutes apart and never in the path of
+  an order intent.
 - **A veto is not an alert**, for the same reason it is not an incident. "Repeated provider
   failure" is three consecutive `PANEL_DEGRADED` cycles, with the streak persisted beside the
   cursor — a streak counted in memory is a streak a restart forgives.

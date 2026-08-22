@@ -45,6 +45,7 @@ from tradebot.persistence.schema import (
     cycles,
     decisions,
     fills,
+    notifications,
     orders,
     positions,
     reconciliations,
@@ -422,6 +423,51 @@ class Queries:
     def reconciliations(self, *, limit: int = DEFAULT_LIMIT) -> Rows:
         return self._rows(
             select(reconciliations).order_by(reconciliations.c.event_seq.desc()).limit(limit)
+        )
+
+    # ---------------------------------------------------------- notifications
+
+    def notification_counts(self) -> dict[str, int]:
+        """Undismissed notifications per severity. One grouped count, on every page render.
+
+        Absent severities are absent here; the template supplies the zeros, because a count the
+        *query* invented would be indistinguishable from one it measured.
+        """
+        return self._counts(
+            select(notifications.c.severity, func.count())
+            .where(notifications.c.dismissed_at.is_(None))
+            .group_by(notifications.c.severity)
+        )
+
+    def open_notifications(self) -> Rows:
+        """Every undismissed notification, newest first — deliberately not a time window.
+
+        An unacknowledged alert that scrolls out of existence by itself is the one behaviour this
+        list must not have (spec §5.8). What bounds it is dismissal and supersession, both of
+        which are acts with a record, rather than a `LIMIT` that hides a row nobody answered for.
+        """
+        return self._rows(
+            select(notifications)
+            .where(notifications.c.dismissed_at.is_(None))
+            .order_by(notifications.c.at.desc(), notifications.c.alert_id.desc())
+        )
+
+    def notification_is_open(self, alert_id: str) -> bool:
+        """Whether this notice exists and is still undismissed.
+
+        Asked before recording a dismissal, so the log holds an act that actually changed
+        something: a second browser tab, or a page left open while the notice was superseded,
+        would otherwise append an `ALERT_DISMISSED` that projects onto nothing and reads in the
+        audit trail as a dismissal that never happened.
+        """
+        return (
+            self._one(
+                select(notifications.c.alert_id).where(
+                    notifications.c.alert_id == alert_id,
+                    notifications.c.dismissed_at.is_(None),
+                )
+            )
+            is not None
         )
 
     # ------------------------------------------------------------------ internals

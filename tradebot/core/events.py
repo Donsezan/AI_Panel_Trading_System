@@ -62,6 +62,14 @@ class EventType(StrEnum):
     #: Also what answers "is a run due" — derived from the log, never counted in memory, so a
     #: restart can neither skip the day's backup nor take a second (spec §6.2).
     MAINTENANCE_RAN = "MAINTENANCE_RAN"
+    #: One alert the rules produced, recorded whether or not a sink exists to deliver it. It is
+    #: deliberately **not** in `ops/rules.ALERT_TYPES`: the dispatcher appends these, and a
+    #: dispatcher that tailed its own writes would be a feedback loop (spec 5.2).
+    NOTIFICATION_RAISED = "NOTIFICATION_RAISED"
+    #: An operator clearing one notification off the dashboard. An event rather than a column
+    #: written in place, so "who cleared the reconciliation-mismatch notice, and when" is in the
+    #: audit trail and survives a projection rebuild (spec §2 D6).
+    ALERT_DISMISSED = "ALERT_DISMISSED"
 
 
 class Event(DomainModel):

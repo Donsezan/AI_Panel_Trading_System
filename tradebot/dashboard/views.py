@@ -47,6 +47,11 @@ MODE_TONE: dict[Mode, str] = {Mode.SIM: "sim", Mode.PAPER: "paper", Mode.LIVE: "
 #: Rendered where a value is genuinely absent, so an empty cell is never read as a zero.
 ABSENT = "—"
 
+#: The bell's three counts, in the order they are displayed, all present even at zero. A widget
+#: that reflowed when a severity emptied would move the Log out link under the cursor of someone
+#: mid-incident (spec §5.6).
+NO_NOTIFICATIONS: dict[str, int] = {"high": 0, "medium": 0, "low": 0}
+
 #: What a template must retype in front of the operator to authorise an act. Four different acts,
 #: four different phrases: one phrase that did two of them could be typed for the wrong one.
 PHRASES = {
@@ -120,7 +125,9 @@ def render(request: Request, template: str, **context: Any) -> HTMLResponse:
     The kill switch, the halted baskets and an unreachable panel are on *every* page deliberately:
     an operator reading a cycle history must not have to navigate elsewhere to discover that
     nothing is trading, or that every cycle in front of them decided nothing because a seat had no
-    key (ADR 0023).
+    key (ADR 0023). The notification counts are here for the same reason, and because this is the
+    one place base-template context is supplied — a count passed per route is one some route
+    forgets, and a bell that silently reads zero is worse than no bell.
     """
     state = state_of(request)
     return state.templates.TemplateResponse(
@@ -128,6 +135,12 @@ def render(request: Request, template: str, **context: Any) -> HTMLResponse:
         template,
         {
             "trading": state.trading,
+            "counts": NO_NOTIFICATIONS | state.queries.notification_counts(),
+            # The list as well as the counts, and on every page: the bell's dropdown is rendered
+            # by the base template, so a page that supplied only the counts would show "Nothing
+            # to report" under a counter reading two — until htmx first refreshed it, which never
+            # happens with scripting off or on a page that does not load `workspace.js`.
+            "notifications": state.queries.open_notifications(),
             "observe_only": state.observe_only,
             "risk_state": state.application.states.load(),
             "halted": state.application.states.halted_baskets(),

@@ -25,7 +25,7 @@ import httpx
 
 from tradebot.core.errors import ConfigError, RateLimitedError, VenueError
 from tradebot.core.logging import SECRETS, get_logger
-from tradebot.interfaces.alerts import Alert, AlertSink
+from tradebot.interfaces.alerts import Alert, AlertSink, Severity
 
 logger = get_logger(__name__)
 
@@ -59,7 +59,11 @@ class WebhookSink:
                 "scope": alert.scope,
                 "title": alert.title,
                 "body": alert.body,
-                "urgent": alert.kind.is_urgent,
+                "severity": alert.kind.severity.value,
+                # Kept beside `severity` rather than replaced by it: this key is an outward
+                # contract with whatever the operator wired the webhook to, and a soak's filter
+                # must not start matching nothing because the dashboard gained three counts.
+                "urgent": alert.kind.severity is not Severity.LOW,
             },
         )
 

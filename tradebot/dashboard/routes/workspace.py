@@ -175,6 +175,25 @@ async def rc_pane(request: Request, scope: str | None = None, tf: str | None = N
     )
 
 
+@router.get("/workspace/notifications", response_class=HTMLResponse)
+async def notifications_pane(request: Request) -> Response:
+    """The bell's two regions, rendered by the same partial as first paint.
+
+    One route for both, selected apart by `hx-select` in the markup: the counts always refresh,
+    the list only while the dropdown is open. The `<details>` itself is never a swap target —
+    replacing it would close the dropdown under someone reading it (spec §5.7).
+
+    It carries no selection. The bell is about the whole system, not about whatever row of the
+    blotter is highlighted, and narrowing it by scope would hide an alert an operator has not
+    answered for.
+
+    Both the counts and the list come from `views.render`, which supplies them to every page —
+    so this route passes nothing of its own, and first paint and every refresh are fed from one
+    place rather than two that could disagree.
+    """
+    return render(request, "workspace/_notifications.html")
+
+
 @router.get("/workspace/chart/data")
 async def chart_data(request: Request, scope: str | None = None, tf: str | None = None) -> Response:
     """Candles and marks for one instrument, as JSON. The only route that awaits the venue.

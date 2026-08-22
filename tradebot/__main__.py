@@ -512,13 +512,15 @@ async def _race(application: Application, *named: tuple[str, Coroutine[Any, Any,
     """Run these alongside the housekeeping tasks until the first finishes, then stop them all.
 
     The alert tail is started here rather than by each caller so there is exactly one answer to
-    "is alerting running?" — it runs whenever the process is doing anything long-lived, and it is
-    a no-op when no destination is configured (ADR 0019). The maintenance tick joins it for the
-    same reason, and is absent only for an in-memory database, which no long-lived process has.
+    "is alerting running?" — it runs whenever the process is doing anything long-lived. It tails
+    the log whatever is configured, because the notifications it records are what the dashboard's
+    bell reads; only *delivery* to a webhook or Telegram needs a destination (ADR 0019, ADR 0029).
+    The maintenance tick joins it for the same reason, and is absent only for an in-memory
+    database, which no long-lived process has.
 
-    Both are **companions, not racers**: the alert no-op returns immediately, so a process whose
-    lifetime either helped decide would exit the moment it started with alerting off — which is
-    the default for sim and paper.
+    Both are **companions, not racers**: neither's completion may end the process, and a task
+    that returned early — as the alert tail used to with no destination configured — must not be
+    what decides a soak's lifetime.
     """
     tasks = [asyncio.create_task(coro, name=name) for name, coro in named]
     companions = [asyncio.create_task(application.alerts.run(), name="alerts")]

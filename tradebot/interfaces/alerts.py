@@ -22,6 +22,18 @@ from enum import StrEnum
 from typing import Protocol, runtime_checkable
 
 
+class Severity(StrEnum):
+    """How much of a human's attention this needs.
+
+    Three levels, because the dashboard shows three counts and a fourth would be a distinction
+    nobody acts on differently. The values reach a page and a webhook, so they read as English.
+    """
+
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+
+
 class AlertKind(StrEnum):
     """What a human is told about. Values reach a person, so they read as English."""
 
@@ -38,11 +50,37 @@ class AlertKind(StrEnum):
     #: (ADR 0027).
     VALUATION_FROZEN = "valuation_frozen"
     DAILY_SUMMARY = "daily_summary"
+    #: A housekeeping pass that did not complete: a refused backup, an archive that would not
+    #: verify, short disk headroom. HIGH because the next compaction is what needs the archive
+    #: that was not written, and because nothing else notices (spec §5.4).
+    MAINTENANCE_FAILED = "maintenance_failed"
+    #: The daily "housekeeping ran" line. LOW, and each one supersedes the previous, so
+    #: reassurance never stacks into thirty identical green rows.
+    MAINTENANCE_OK = "maintenance_ok"
 
     @property
-    def is_urgent(self) -> bool:
-        """Whether this needs someone now. Only the summary does not."""
-        return self is not AlertKind.DAILY_SUMMARY
+    def severity(self) -> Severity:
+        """What this is worth interrupting someone for.
+
+        Total by construction: a kind added later without a row in the table raises here rather
+        than defaulting to quiet, which is the direction a missing entry must never fail in.
+        """
+        return _SEVERITY[self]
+
+
+#: Severity per kind. A table rather than a property body, so the whole policy is readable at
+#: once and `test_ops_rules.py::TestSeverity` can assert it is total.
+_SEVERITY: dict[AlertKind, Severity] = {
+    AlertKind.KILL_SWITCH: Severity.HIGH,
+    AlertKind.BASKET_HALTED: Severity.HIGH,
+    AlertKind.RECON_MISMATCH: Severity.HIGH,
+    AlertKind.VALUATION_FROZEN: Severity.HIGH,
+    AlertKind.MAINTENANCE_FAILED: Severity.HIGH,
+    AlertKind.PROVIDER_FAILURE: Severity.MEDIUM,
+    AlertKind.DATA_STALE: Severity.MEDIUM,
+    AlertKind.DAILY_SUMMARY: Severity.LOW,
+    AlertKind.MAINTENANCE_OK: Severity.LOW,
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,7 +97,7 @@ class Alert:
     @property
     def text(self) -> str:
         """The whole alert as plain text, which is all any sink actually needs."""
-        prefix = "🚨" if self.kind.is_urgent else "📊"
+        prefix = "📊" if self.kind.severity is Severity.LOW else "🚨"
         scope = f" [{self.scope}]" if self.scope else ""
         return f"{prefix} {self.title}{scope}\n{self.body}"
 
