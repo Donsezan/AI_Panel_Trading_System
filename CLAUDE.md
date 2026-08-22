@@ -56,6 +56,22 @@ than printing — a promotion report is filed with the decision it justified:
 .venv\Scripts\python.exe -m tradebot report shadow --mode paper      # champion vs challenger
 ```
 
+Backups are taken on demand and automatically before any migration that will move the schema
+revision — **a backup that cannot be taken stops the upgrade**. Nothing is ever auto-deleted; the
+restore drill is [docs/OPERATIONS.md §4](docs/OPERATIONS.md):
+
+```powershell
+.venv\Scripts\python.exe -m tradebot maintenance backup --mode sim   # exit 6 if refused
+.venv\Scripts\python.exe -m tradebot maintenance status --mode sim
+$env:TRADEBOT_BACKUP_DIR = "D:\tradebot-backups"   # a copy beside the database survives a bad
+                                                   # migration, not a bad disk
+```
+
+`maintenance` is the only command that may be pointed at a database another process has open: it
+wires no `Application` (a second writer is the thing `SingleWriter` exists to prevent) and opens
+the database through `open_database`, which does **not** migrate — the point of copying `live.db`
+before a release is to have a rollback point *for* that release.
+
 Ops alerts are **on exactly when a destination is configured** — there is no flag, so a soak
 cannot be started with alerting forgotten. Destinations are credentials and live in the
 environment, never the database ([ADR 0019](docs/adr/0019-alerts-are-a-log-tail-with-a-persisted-cursor.md)):
@@ -99,7 +115,11 @@ Schema changes go through Alembic — never `create_all`. After editing
 
 Review the generated file: autogenerate does not see data migrations, and it renders custom
 column types fully qualified (the template imports `tradebot.persistence.schema` for that).
-`create_database` upgrades to head on every start, including for a fresh database.
+`create_database` upgrades to head on every start, including for a fresh database — and takes a
+backup first when that upgrade will actually move the revision **and** the database already holds
+tables. A file the same call created has nothing to lose; a file with tables but no
+`alembic_version` is copied, because it cannot be told apart from a real ledger whose version table
+was lost.
 
 Dependencies are hash-pinned. After editing `pyproject.toml`:
 

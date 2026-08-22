@@ -233,6 +233,12 @@ database.
 The append-only event log is the compliance artifact: for any order it can show the data seen, the
 deliberation, the risk decision, and the venue's response (PLAN §3.3).
 
+Row 17 is still only half answerable, and the half that is missing is the retention one. **Backups
+now exist** — on demand, and automatically before any schema migration (§4) — so the log can be
+preserved. **Nothing ages out of it yet**: there is no retention policy to set, so DESIGN §6.9's
+stated policy is not in force and the log grows without bound. If your jurisdiction requires
+records to be *disposed of* after a period, that is not something this system can do for you today.
+
 ---
 
 ## 2. The arming procedure
@@ -458,7 +464,87 @@ disarm.
 
 ---
 
-## 4. Things that are true and easy to forget
+## 4. Backups, and restoring from one
+
+A backup nobody has restored is a hypothesis. Perform the drill in §4.3 once, on a scratch copy,
+before you need it.
+
+### 4.1 What exists, and when
+
+| When | What | Named |
+|---|---|---|
+| On demand | `maintenance backup --mode <mode>` | `sim-20260820T040000Z.db` |
+| Before any migration that will move the schema revision | automatic, and a failure **stops the upgrade** | `sim-pre-0006-20260820T040000Z.db` |
+
+```powershell
+.venv\Scripts\python.exe -m tradebot maintenance backup --mode sim
+.venv\Scripts\python.exe -m tradebot maintenance status --mode sim
+```
+
+Copies land in `data\backups\<mode>\`, or under `TRADEBOT_BACKUP_DIR` / `--backup-dir`. **Point it
+at a second drive or a synced folder.** A copy beside the database survives a bad migration; it
+does not survive the disk.
+
+Three things to know before you rely on it:
+
+* **Nothing is ever deleted by the system.** There is no rotation. Pruning old copies is a human
+  act, deliberately — see §4.4.
+* **A backup is refused rather than allowed to fill the volume.** It needs the database's size
+  plus a fifth, plus 200 MB of headroom. `maintenance status` prints free space beside what the
+  next copy would need, so the refusal is predictable rather than a surprise at 04:00.
+* **`maintenance` never migrates and never wires the bot.** It is the one command safe to run
+  against a database another process has open, and it will not upgrade the schema you are making
+  a rollback point for.
+
+### 4.2 Take one before you upgrade
+
+The pre-migration backup is automatic, but it is taken by the process that is *already starting*.
+If you want a copy in hand before a release, take it yourself while the old version is still what
+is installed:
+
+```powershell
+.venv\Scripts\python.exe -m tradebot maintenance backup --mode live
+```
+
+Exit codes: `0` written, `2` no such database, `6` refused (almost always disk).
+
+### 4.3 The restore
+
+The copy is an ordinary SQLite database. Restoring is copying it back — there is no tool, no
+import, nothing to remember at 03:00.
+
+1. **Stop the process.** `Ctrl+C` the `serve`/`run` session and confirm nothing is cycling. A
+   restore under a live writer produces a database that is neither copy.
+2. **Identify the copy.** `maintenance status --mode <mode>` lists the inventory and the newest
+   file. A `-pre-<revision>-` name is the copy taken immediately before that schema change.
+3. **Move the current database aside** rather than deleting it — it is evidence, and the venue may
+   disagree with the copy in ways only it can explain:
+   ```powershell
+   Move-Item data\<mode>.db data\<mode>.db.broken
+   Move-Item data\<mode>.db-wal data\<mode>.db-wal.broken -ErrorAction SilentlyContinue
+   Move-Item data\<mode>.db-shm data\<mode>.db-shm.broken -ErrorAction SilentlyContinue
+   ```
+4. **Copy the backup into place**: `Copy-Item <backup>.db data\<mode>.db`. Copy, never move — a
+   restore that consumes the backup leaves you with no second attempt.
+5. **Read the risk state before starting**:
+   `.venv\Scripts\python.exe -m tradebot risk status --mode <mode>`. The restored kill switch,
+   high-water mark and day-start equity are whatever they were **at the moment of the copy**.
+6. **Start normally.** Startup reconciles against the venue, which is what makes any gap between
+   the copy and reality visible rather than silent.
+7. **Read what the gap cost.** Cycles, orders and fills between the backup and now are gone from
+   the log. The venue still holds the truth and reconciliation will classify the difference — but
+   a position opened in that window arrives as an *external change*, and the round trip that
+   closes it will not have its entry.
+
+### 4.4 Why nothing is pruned for you
+
+Deleting a backup is irreversible and the system has no way to know which one you still need. The
+accepted cost is that copies accumulate; the mitigation is the free-space guard, which refuses
+rather than fills. Watch `maintenance status`, and prune by hand.
+
+---
+
+## 5. Things that are true and easy to forget
 
 * **Each mode has its own database.** `data/live.db` is not `data/paper.db`. A paper ledger can
   never be read as a live one, and the arming row belongs to live's database alone.
