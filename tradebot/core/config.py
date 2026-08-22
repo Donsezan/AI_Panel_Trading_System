@@ -265,6 +265,40 @@ class GlobalRiskPolicy(DomainModel):
         return tuple(other.key for other in universe if cluster.contains(other))
 
 
+class MaintenancePolicy(DomainModel):
+    """How long the log's heavy payloads are kept — hot, then archived (spec §3.7).
+
+    Both windows are whole days and both are operator-set. The defaults are DESIGN §6.9's stated
+    policy, reached for the first time. An **absent** document means these defaults rather than a
+    refusal: maintenance shares its tick with the daily backup, and refusing to back anything up
+    for want of a published retention policy would be fail-*useless*. The `MAINTENANCE_RAN` event
+    records which windows a pass ran under, defaults included, so the log always says what policy
+    was in force.
+    """
+
+    #: Payloads older than this are archived to disk and compacted out of the database. At least
+    #: one day: zero would compact the transcripts of cycles that are still running, emptying the
+    #: drill-down of the thing an operator is currently reading.
+    compact_after_days: int = Field(default=30, ge=1)
+
+    #: Archive files older than this are deleted. **Irreversible**: past it, the literal model
+    #: completion and the frozen snapshot body exist nowhere. Two days at minimum, because it must
+    #: strictly exceed a `compact_after_days` that is itself at least one.
+    archive_keep_days: int = Field(default=90, ge=2)
+
+    @model_validator(mode="after")
+    def _archives_outlive_the_hot_window(self) -> MaintenancePolicy:
+        """Inverted or equal windows would make a day deletable before it was ever archived, and
+        every pass would then rewrite and re-delete the same file forever."""
+        if self.archive_keep_days <= self.compact_after_days:
+            raise ValueError(
+                f"archive_keep_days ({self.archive_keep_days}) must exceed compact_after_days "
+                f"({self.compact_after_days}); otherwise a day becomes deletable before it is "
+                "ever archived"
+            )
+        return self
+
+
 class ModelPricing(DomainModel):
     """USD per million tokens, quoted the way every provider quotes it.
 

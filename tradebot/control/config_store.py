@@ -33,7 +33,7 @@ from typing import Any, Generic, TypeVar
 from sqlalchemy import Connection, Engine, func, select
 
 from tradebot.core.clock import Clock
-from tradebot.core.config import Basket, ConfigRef, GlobalRiskPolicy
+from tradebot.core.config import Basket, ConfigRef, GlobalRiskPolicy, MaintenancePolicy
 from tradebot.core.enums import ConfigKind
 from tradebot.core.errors import ConfigError
 from tradebot.core.events import EventFactory
@@ -47,7 +47,7 @@ logger = get_logger(__name__)
 
 T = TypeVar("T", bound=DomainModel)
 
-#: The id every singleton document lives under, so `ConfigKind.GLOBAL_RISK` has one address.
+#: The id every singleton document lives under, so a singleton kind has exactly one address.
 SINGLETON_ID = "global"
 
 #: Which model each kind stores. The map is the whole registry: adding a kind is a row here plus
@@ -55,6 +55,7 @@ SINGLETON_ID = "global"
 DOCUMENTS: dict[ConfigKind, type[DomainModel]] = {
     ConfigKind.BASKET: Basket,
     ConfigKind.GLOBAL_RISK: GlobalRiskPolicy,
+    ConfigKind.MAINTENANCE: MaintenancePolicy,
 }
 
 

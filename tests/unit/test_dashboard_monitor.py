@@ -11,11 +11,14 @@ record of what happened, which the workspace links out to rather than duplicatin
 
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest
 
 from tradebot.app import Application
 from tradebot.core.enums import ConfigKind, CycleOutcome
+from tradebot.dashboard.queries import parse_pins
 
 MONITOR_PAGES = ["/analytics/portfolio", "/cycles", "/risk", "/costs"]
 
@@ -348,5 +351,14 @@ def _latest_cycle_id(application: Application, basket_id: str | None = None) -> 
 
 
 def test_config_kinds_are_the_ones_the_drill_down_resolves() -> None:
-    """The pin parser maps `kind:id` back to a `ConfigKind`; a new kind must not break it."""
-    assert {kind.value for kind in ConfigKind} == {"basket", "global_risk"}
+    """The pin parser maps `kind:id` back to a `ConfigKind`; a new kind must not break it.
+
+    `maintenance` is a kind but is never *pinned* by a cycle — retention windows are not part of
+    the configuration a decision was made under (ADR 0013 pins the basket and the Tier-2 policy).
+    It still has to round-trip here, because `_ref` drops a pin whose kind it cannot name, and a
+    silently dropped pin is an unresolvable audit trail rather than a visible refusal.
+    """
+    assert {kind.value for kind in ConfigKind} == {"basket", "global_risk", "maintenance"}
+    for kind in ConfigKind:
+        (ref,) = parse_pins(json.dumps({f"{kind.value}:anything": 1}))
+        assert ref.kind is kind

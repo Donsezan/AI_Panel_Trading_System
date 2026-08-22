@@ -178,11 +178,20 @@ class ConfigKind(StrEnum):
 
     BASKET = "basket"
     GLOBAL_RISK = "global_risk"
+    #: How long the log's heavy payloads are kept hot, and how long the archives are kept at all.
+    #: Versioned like every other limit, so "who shortened retention, and when" is answerable from
+    #: `config history` — which is the whole substance of OPERATIONS precondition 17 (spec §3.7).
+    MAINTENANCE = "maintenance"
 
     @property
     def is_singleton(self) -> bool:
         """Whether exactly one document of this kind exists, under `SINGLETON_ID`."""
-        return self is ConfigKind.GLOBAL_RISK
+        return self in _SINGLETON_KINDS
+
+
+#: Kinds with exactly one document. A membership test rather than an identity test, because there
+#: is now more than one — the same shape `OrderType.needs_stop_price` uses.
+_SINGLETON_KINDS = frozenset({ConfigKind.GLOBAL_RISK, ConfigKind.MAINTENANCE})
 
 
 class OrderType(StrEnum):
