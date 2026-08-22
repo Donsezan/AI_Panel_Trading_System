@@ -17,7 +17,7 @@ from tradebot.core.enums import (
 )
 from tradebot.core.events import EventFactory
 from tradebot.core.schema import DomainModel, UtcDatetime
-from tradebot.interfaces.alerts import AlertKind
+from tradebot.interfaces.alerts import AlertKind, Severity
 from tradebot.ops.rules import RuleState, evaluate
 
 
@@ -42,7 +42,7 @@ class TestUrgentTriggers:
         alert = evaluate(event, RuleState())
         assert alert is not None
         assert alert.kind is AlertKind.KILL_SWITCH
-        assert alert.kind.is_urgent
+        assert alert.kind.severity is Severity.HIGH
         assert "drawdown 12%" in alert.body
 
     def test_re_arming_does_not(self, clock: ManualClock) -> None:
@@ -197,3 +197,34 @@ class TestDefensiveReading:
 
     def test_an_untailed_event_type_yields_nothing(self, clock: ManualClock) -> None:
         assert evaluate(events_for(clock).cycle_started((), "sim"), RuleState()) is None
+
+
+class TestSeverity:
+    """Severity lives on the kind, because behaviour belongs on the enum (repo conventions)."""
+
+    def test_the_things_that_stopped_trading_are_high(self) -> None:
+        assert AlertKind.KILL_SWITCH.severity is Severity.HIGH
+        assert AlertKind.BASKET_HALTED.severity is Severity.HIGH
+        assert AlertKind.RECON_MISMATCH.severity is Severity.HIGH
+        assert AlertKind.MAINTENANCE_FAILED.severity is Severity.HIGH
+
+    def test_a_frozen_valuation_is_high_though_it_trips_nothing(self) -> None:
+        """It is not a breach, but it stops every basket trading (ADR 0027)."""
+        assert AlertKind.VALUATION_FROZEN.severity is Severity.HIGH
+
+    def test_the_degradations_are_medium(self) -> None:
+        assert AlertKind.PROVIDER_FAILURE.severity is Severity.MEDIUM
+        assert AlertKind.DATA_STALE.severity is Severity.MEDIUM
+
+    def test_the_routine_notices_are_low(self) -> None:
+        assert AlertKind.DAILY_SUMMARY.severity is Severity.LOW
+        assert AlertKind.MAINTENANCE_OK.severity is Severity.LOW
+
+    def test_every_kind_has_one(self) -> None:
+        """A kind added later without a severity must fail here, not render as blank."""
+        assert all(isinstance(kind.severity, Severity) for kind in AlertKind)
+
+    def test_only_the_low_ones_are_quiet(self) -> None:
+        """What `is_urgent` used to answer, now derived rather than stored twice."""
+        quiet = {kind for kind in AlertKind if kind.severity is Severity.LOW}
+        assert quiet == {AlertKind.DAILY_SUMMARY, AlertKind.MAINTENANCE_OK}

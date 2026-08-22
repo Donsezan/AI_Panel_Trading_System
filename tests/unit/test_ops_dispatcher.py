@@ -19,7 +19,7 @@ from tradebot.core.clock import ManualClock
 from tradebot.core.enums import BasketStatus, CycleOutcome, KillSwitchState
 from tradebot.core.errors import VenueError
 from tradebot.core.events import EventFactory
-from tradebot.interfaces.alerts import Alert, AlertKind
+from tradebot.interfaces.alerts import Alert, AlertKind, Severity
 from tradebot.ops.cursor import AlertCursorStore
 from tradebot.ops.dispatcher import AlertDispatcher
 from tradebot.persistence.database import SingleWriter, create_database
@@ -281,7 +281,7 @@ class TestDailySummary:
         assert len(summaries) == 1
         assert "1 cycles" in summaries[0].title
         assert "orders_placed=1" in summaries[0].body
-        assert not summaries[0].kind.is_urgent
+        assert summaries[0].kind.severity is Severity.LOW
 
     async def test_a_failed_summary_is_retried_rather_than_skipped(
         self, wired: tuple[EventStore, AlertCursorStore, Engine], clock: ManualClock
