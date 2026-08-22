@@ -12,6 +12,33 @@
 
 **Depends on:** Piece B, for `EventType.MAINTENANCE_RAN` and the events the maintenance rule reads. Piece A only indirectly.
 
+## Built 2026-08-22 — four corrections found against the code
+
+All six tasks shipped. Four things in the task text below were wrong or missing and were changed
+during execution; they are recorded here rather than silently fixed, because each is a decision a
+later reader would otherwise have to re-derive.
+
+1. **`run` also returned early when disabled**, not only `poll` (`dispatcher.py:111`). Task 3 as
+   written would have left the rules unevaluated on exactly the machines this piece exists for,
+   because nothing calls `poll` unless `run` loops. Both changed; spec §5.1 names both.
+2. **The daily summary could not simply "also be recorded".** `last_summary_day` is one field, so
+   a recording pass advancing it would mean the webhook never saw another summary. Resolved by
+   making the summary a *recorded notification* like any other and letting `_drain` deliver it —
+   one pipeline instead of two, and no third cursor. Its identity is `summary:{day}`, since it has
+   no source event to key on.
+3. **`start()` had to anchor `recorded_seq` as well.** Otherwise the first poll on a database
+   alerting never ran against records the entire log into the bell — ADR 0019's rule, applied to
+   the new cursor.
+4. **`views.render` had to supply the *list*, not only the counts.** Found by rendering the page:
+   the bell showed "Nothing to report" under a counter reading `2 | 1 | 1`, and would never have
+   corrected itself with scripting off or on an Analytics page. Task 5's note said only that
+   `counts` must come from `views.render`.
+
+Two smaller departures, both deliberate: the fragment route lives in `routes/workspace.py` beside
+the other `/workspace/*` fragments rather than in `routes/monitor.py` (the plan's own markup used
+the `/workspace/` URL), and the webhook payload **keeps** its `urgent` key alongside the new
+`severity` one, because that key is an outward contract with whatever an operator wired it to.
+
 ## Resolved before Task 3 (decided 2026-08-22, operator-approved)
 
 **Task 3 as drafted corrupts the streak counters.** `_record` and `_drain` would both evaluate the
@@ -73,7 +100,7 @@ Two more things to state rather than discover:
   - `AlertKind.MAINTENANCE_FAILED`, `AlertKind.MAINTENANCE_OK`
   - `Alert.severity` (delegating to `kind`), replacing `AlertKind.is_urgent`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 class TestSeverity:
@@ -102,12 +129,12 @@ class TestSeverity:
         assert all(isinstance(kind.severity, Severity) for kind in AlertKind)
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `.venv\Scripts\python.exe -m pytest tests/unit -k Severity -q`
 Expected: FAIL — `ImportError: cannot import name 'Severity'`
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 In `tradebot/interfaces/alerts.py`:
 
@@ -150,12 +177,12 @@ On `Alert`, replace the `is_urgent` use in `text` with `self.kind.severity is no
 and delete `AlertKind.is_urgent`. Update every call site the compiler and `grep -rn is_urgent`
 find.
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 Run: `.venv\Scripts\python.exe -m pytest tests/unit -k "Severity or sink or dispatcher" -q`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add tradebot/interfaces/alerts.py tradebot/ops/ tests/unit/
@@ -174,7 +201,7 @@ git commit -m "feat(ops): severity on AlertKind, and the two maintenance kinds"
 - Consumes: `EventType.MAINTENANCE_RAN` (Piece B), `AlertKind.MAINTENANCE_*` (Task 1).
 - Produces: `def maintenance(event: Event, state: RuleState) -> Alert | None`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 class TestMaintenanceRule:
@@ -205,12 +232,12 @@ class TestMaintenanceRule:
 
 with a helper building a `MAINTENANCE_RAN` event whose payload matches the one Piece B writes.
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `.venv\Scripts\python.exe -m pytest tests/unit/test_ops_rules.py -k Maintenance -q`
 Expected: FAIL — `evaluate` returns `None`, because the type is unrouted.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 ```python
 def maintenance(event: Event, _state: RuleState) -> Alert | None:
@@ -248,12 +275,12 @@ def maintenance(event: Event, _state: RuleState) -> Alert | None:
 Add `EventType.MAINTENANCE_RAN` to `ALERT_TYPES` and `EventType.MAINTENANCE_RAN: maintenance` to
 `RULES`.
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 Run: `.venv\Scripts\python.exe -m pytest tests/unit/test_ops_rules.py -q`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add tradebot/ops/rules.py tests/unit/test_ops_rules.py
@@ -276,7 +303,7 @@ git commit -m "feat(ops): a maintenance alert rule"
   - `AlertDispatcher.record()` — evaluates and appends, independent of sinks
   - `EventType.NOTIFICATION_RAISED`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 class TestRecordingWithoutSinks:
@@ -314,12 +341,12 @@ class TestRecordingWithoutSinks:
         assert len(store.read_types(EventType.NOTIFICATION_RAISED)) == 1
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `.venv\Scripts\python.exe -m pytest tests/unit/test_ops_dispatcher.py -k Recording -q`
 Expected: FAIL — `poll` returns early with no sinks, so nothing is recorded.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 - Add `NOTIFICATION_RAISED` to `EventType` with a comment saying it is deliberately absent from
   `ALERT_TYPES`.
@@ -366,12 +393,12 @@ The `NOTIFICATION_RAISED` payload carries the deterministic identity the project
 }
 ```
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 Run: `.venv\Scripts\python.exe -m pytest tests/unit/test_ops_dispatcher.py -q`
 Expected: PASS, including every existing at-least-once delivery test unchanged.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add tradebot/ops/dispatcher.py tradebot/persistence/ migrations/ tests/unit/test_ops_dispatcher.py
@@ -392,7 +419,7 @@ git commit -m "feat(ops): record notifications whether or not a sink is configur
 **Interfaces:**
 - Produces: `notifications` table; `_project_notification_raised`; `_project_alert_dismissed`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 class TestProjection:
@@ -418,7 +445,7 @@ class TestProjection:
 Fill each body following the style of `tests/unit/test_projections.py`: append events through the
 store, then assert on `select(notifications)`.
 
-- [ ] **Step 2-5: implement, run, commit** as in the previous tasks.
+- [x] **Step 2-5: implement, run, commit** as in the previous tasks.
 
 The `_project_notification_raised` projector must use the "insert, ignore on conflict" form — never
 an upsert that writes the payload columns again, or a retry would clear `dismissed_at`. The
@@ -445,7 +472,7 @@ git commit -m "feat(persistence): the notifications projection and its dismissal
 - Consumes: the `notifications` table (Task 4).
 - Produces: `GET /workspace/notifications`, `POST /control/notifications/{alert_id}/dismiss`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 class TestCounts:
@@ -482,7 +509,7 @@ class TestPanes:
         assert keyed == {EventType.NOTIFICATION_RAISED, EventType.ALERT_DISMISSED}
 ```
 
-- [ ] **Step 2-5: implement, run, commit.**
+- [x] **Step 2-5: implement, run, commit.**
 
 The markup, in `base.html` immediately before `#live-pill`:
 
@@ -524,7 +551,7 @@ git commit -m "feat(dashboard): a notifications dropdown with severity counts"
 - Modify: `docs/adr/0019-alerts-are-a-log-tail-with-a-persisted-cursor.md`
 - Modify: `CLAUDE.md` (the Phase 7 layering sentence about the dispatcher writing only its cursor)
 
-- [ ] **Step 1-4:** write ADR 0029 in the house format — one entity, two cursors and why, dismissal
+- [x] **Step 1-4:** write ADR 0029 in the house format — one entity, two cursors and why, dismissal
   as an audited act, and the `<details>` swap hazard. Note in ADR 0019 that the tail now runs
   unconditionally while delivery stays configured-only. Correct the CLAUDE.md sentence to "its
   cursors, and the notifications it recorded".
