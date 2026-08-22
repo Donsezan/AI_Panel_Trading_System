@@ -50,6 +50,10 @@ logger = get_logger(__name__)
 #: no float ever enters this arithmetic.
 HEADROOM_BYTES: Final[int] = 200 * 1024 * 1024
 
+#: Where backups land when nothing says otherwise. OPERATIONS encourages pointing this at another
+#: volume: a copy beside the database survives a bad migration, but not a dead disk.
+BACKUP_DIR_ENV: Final = "TRADEBOT_BACKUP_DIR"
+
 
 class BackupError(FailClosedError):
     """A backup that could not be taken. Refused upward, never logged and forgotten."""
@@ -67,6 +71,18 @@ def backup_name(mode: str, at: datetime, *, revision: str = "") -> str:
     """`sim-20260820T040000Z.db`, or `sim-pre-<revision>-...` when a migration is about to run."""
     marker = f"-pre-{revision}" if revision else ""
     return f"{mode}{marker}-{at.strftime('%Y%m%dT%H%M%SZ')}.db"
+
+
+def backup_destination(path: Path) -> Path:
+    """The directory backups of `path` belong in, honouring the environment override.
+
+    The mode is the **last** segment either way, so an operator who points every mode at one
+    second drive still gets `<vault>/live/` and `<vault>/sim/` rather than one pile in which a
+    live copy and a sim copy are told apart only by a filename prefix (PLAN §2.4).
+    """
+    override = os.environ.get(BACKUP_DIR_ENV)
+    root = Path(override) if override else path.parent / "backups"
+    return root / path.stem
 
 
 def free_bytes(directory: Path) -> int:
