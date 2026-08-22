@@ -76,7 +76,11 @@ class UtcText(TypeDecorator[datetime]):
         return None if value is None else ensure_utc(datetime.fromisoformat(value))
 
 
-#: The audit trail. Append-only: no code updates or deletes a row here.
+#: The audit trail. Append-only, with **exactly one exception**: `maintenance/compaction.py`
+#: updates `payload_json` for two event types once their day has been archived and verified,
+#: dropping a seat's verbatim completion and a frozen snapshot's body (ADR 0028). No code anywhere
+#: deletes a row. Nothing else may update one — what licenses that exception is an invariant
+#: asserted directly, that a projection rebuild after compaction is identical to one before it.
 events = Table(
     "events",
     metadata,

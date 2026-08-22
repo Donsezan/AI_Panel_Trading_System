@@ -56,13 +56,15 @@ than printing — a promotion report is filed with the decision it justified:
 .venv\Scripts\python.exe -m tradebot report shadow --mode paper      # champion vs challenger
 ```
 
-Backups are taken on demand and automatically before any migration that will move the schema
-revision — **a backup that cannot be taken stops the upgrade**. Nothing is ever auto-deleted; the
-restore drill is [docs/OPERATIONS.md §4](docs/OPERATIONS.md):
+Backups are taken daily by a running process, before any migration that will move the schema
+revision — **a backup that cannot be taken stops the upgrade** — and on demand. Nothing is ever
+auto-deleted; the restore drill is [docs/OPERATIONS.md §4](docs/OPERATIONS.md):
 
 ```powershell
 .venv\Scripts\python.exe -m tradebot maintenance backup --mode sim   # exit 6 if refused
 .venv\Scripts\python.exe -m tradebot maintenance status --mode sim
+.venv\Scripts\python.exe -m tradebot maintenance compact --mode sim  # one pass now
+.venv\Scripts\python.exe -m tradebot maintenance compact --mode sim --older-than 45 --keep-days 120
 $env:TRADEBOT_BACKUP_DIR = "D:\tradebot-backups"   # a copy beside the database survives a bad
                                                    # migration, not a bad disk
 ```
@@ -454,6 +456,42 @@ Phases 0–8 are **code-complete**, and Phase 12 has since found that one of the
 see below. What otherwise remains is not code: the paper soak (weeks of
 `tradebot run --mode paper`, measured with `report promotion`) and then a human's decision to arm
 live, following [docs/OPERATIONS.md](docs/OPERATIONS.md). **Live ships disarmed and I never arm it.**
+
+### Phase 13 — retention and backup
+
+Planned in [docs/superpowers/plans/](docs/superpowers/plans/); three pieces. **A (backups) and B
+(retention) have shipped** ([ADR 0028](docs/adr/0028-retention-is-archive-then-compact.md)).
+**C — operator notifications — is not built.**
+
+`tradebot/maintenance/` is the one package that *writes* outside the money path, which is why it
+is not part of `ops/`. One daily pass: back up, archive, compact only what was archived, delete
+what has aged out. The order is the design, and the windows are a versioned `maintenance` config
+document — the third `ConfigKind`, edited on the Parameters page.
+
+Rules that are easy to get backwards:
+
+- **No event row is ever deleted, and exactly one module updates one.** `COMPACTORS` has two
+  entries — `SEAT_RESPONDED`'s `raw_text` and `SNAPSHOT_FROZEN`'s `snapshot` body — and a type
+  absent from it is never touched. That registry *is* the containment story.
+- **The invariant is asserted, not argued.** A projection rebuild after compaction is identical to
+  one before it, tested on handmade events *and* on a real cycle driven through the actual loop. If
+  it fails, the compactor is dropping a field a projector reads: fix the compactor, never the test.
+- **Nothing is compacted without a *verified* archive** — re-read, row-counted and hashed, not
+  merely written. Gzip's CRC catches corruption but not truncation at a record boundary.
+- **Work is found by what is still heavy, never by event type.** `pending_days` selects on each
+  compactor's own `heavy_key`. Selecting by type revisits every past day forever, and once that
+  day's archive is deleted the next pass **recreates** it from already-compacted rows — a hollow
+  archive reappearing daily, contradicting the promise that deletion is final.
+- **Compaction batches advance by `seq`, not by rows rewritten.** A seat that abstained has no
+  `raw_text`, so it never gains a marker; a loop stopping on a zero rewrite count leaves a chunk of
+  abstentions at the head of every batch and permanently stops compacting the day behind them.
+- **A compacted cycle is shown as archived, never as empty.** The drill-down names the archive file
+  and the unchanged digest. The seat transcript needs the same line and is easier to forget —
+  compaction keeps the vote, thesis and cost, so it renders as *complete* unless something says so.
+- **Deletion is the one irreversible act** and is the narrowest thing in the package: one mode's
+  archive directory, matched by parsing each file's name. Never the database, never a backup.
+- **An absent policy means the defaults, not a refusal**, and the windows are read fresh at every
+  pass. A failed pass is recorded rather than raised, and still counts as the day's run.
 
 ### Phase 12 — one portfolio, valued in one notional currency
 

@@ -228,16 +228,28 @@ database.
 |---|---|---|
 | 15 | Automated trading of these instruments is permitted for you, in your jurisdiction | **never** — the bot cannot infer this |
 | 16 | You accept each venue's terms for automated access | never |
-| 17 | Your tax and record-keeping requirements are known, and the event log's retention is set to match | never |
+| 17 | Your tax and record-keeping requirements are known, and the event log's retention is set to match | **the requirement is yours; the setting is now real** |
 
 The append-only event log is the compliance artifact: for any order it can show the data seen, the
 deliberation, the risk decision, and the venue's response (PLAN §3.3).
 
-Row 17 is still only half answerable, and the half that is missing is the retention one. **Backups
-now exist** — on demand, and automatically before any schema migration (§4) — so the log can be
-preserved. **Nothing ages out of it yet**: there is no retention policy to set, so DESIGN §6.9's
-stated policy is not in force and the log grows without bound. If your jurisdiction requires
-records to be *disposed of* after a period, that is not something this system can do for you today.
+Row 17 is answerable now. Retention is set on the **Parameters** page, under *Log retention*, and
+is a versioned document like every other limit — so `config history maintenance global` says who
+changed it and when. Two windows, both in days:
+
+| Setting | Default | What it does |
+|---|---:|---|
+| Archive and compact after | 30 | The day's events are written to `data\archive\<mode>\`, verified, and the two heavy payloads then dropped from the database |
+| Delete archives after | 90 | The day file is deleted. **Irreversible** |
+
+What is kept **forever**, whatever you set: every event row, every vote, thesis, invalidation and
+key risk, every cost, every order, fill and round trip, and the per-cycle snapshot digest. What is
+lost after the second window: the verbatim model completion and the frozen snapshot body. After
+that point "what exactly did the model say" is answerable only down to its vote and reasoning.
+
+Decide this against your own jurisdiction before you arm. If you need the full text kept longer,
+raise the second window — the mechanism does not change. Shortening it acts on the next daily pass
+and cannot be undone.
 
 ---
 
@@ -473,13 +485,21 @@ before you need it.
 
 | When | What | Named |
 |---|---|---|
+| Once a day, by any `run` or `serve` process | the first step of the housekeeping pass | `sim-20260820T040000Z.db` |
 | On demand | `maintenance backup --mode <mode>` | `sim-20260820T040000Z.db` |
 | Before any migration that will move the schema revision | automatic, and a failure **stops the upgrade** | `sim-pre-0006-20260820T040000Z.db` |
 
 ```powershell
 .venv\Scripts\python.exe -m tradebot maintenance backup --mode sim
 .venv\Scripts\python.exe -m tradebot maintenance status --mode sim
+.venv\Scripts\python.exe -m tradebot maintenance compact --mode sim   # one full pass, now
 ```
+
+The daily pass does four things in one order that matters: **back up, archive, compact, delete**.
+A failed backup stops everything destructive behind it, and nothing is compacted for a day whose
+archive did not verify — so a payload the database is about to drop always exists in a file first.
+Retention is set on the Parameters page (§1.4, precondition 17); archives live in
+`data\archive\<mode>\<YYYY-MM>\`.
 
 Copies land in `data\backups\<mode>\`, or under `TRADEBOT_BACKUP_DIR` / `--backup-dir`. **Point it
 at a second drive or a synced folder.** A copy beside the database survives a bad migration; it

@@ -44,6 +44,13 @@ dashboard rewrites, and bugs in the read model.
 - Writes go through a single writer thread whose identity is asserted, so the log has a stable
   total order and no two code paths can mutate the same row.
 - Reads bypass the writer; WAL mode lets the dashboard query while a cycle is in flight.
-- Full transcripts and snapshots are large. DESIGN §6.9's retention policy (transcripts and
-  snapshots 90 days; summaries and snapshot *hashes* forever) is not yet implemented — the hash
-  is already recorded per cycle, which is what keeps replay verifiable after compaction.
+- Full transcripts and snapshots are large. DESIGN §6.9's retention policy — transcripts and
+  snapshots 90 days; summaries and snapshot *hashes* forever — is implemented by
+  [ADR 0028](0028-retention-is-archive-then-compact.md): a day is archived to an immutable
+  verified file, then its two heavy payloads are trimmed from the database, and the archive is
+  deleted once past the second window. The per-cycle hash is what keeps replay verifiable after
+  compaction, and that sentence is now load-bearing rather than aspirational.
+- **No event row is ever deleted, and exactly one module updates one.** `maintenance/compaction.py`
+  rewrites `payload_json` for two event types and nothing else. The invariant that licenses it is
+  asserted directly rather than argued: a projection rebuild after compaction is identical to one
+  before it.
