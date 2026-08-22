@@ -300,3 +300,54 @@ class TestDeleteAged:
         assert len(failures) == 1
         assert "locked by another process" in failures[0]
         assert locked.exists()
+
+
+class TestArchiveFailuresFailClosed:
+    """Every way the filesystem can refuse. None may escape as a raw `OSError`.
+
+    The caller compacts a day only when `archive_day` returned, so an unclassified error escaping
+    here would either stop the whole pass with a traceback or — worse, if anyone ever caught it
+    loosely — license compacting against a file that is not there.
+    """
+
+    async def test_a_write_that_fails_is_refused_and_leaves_no_scratch_file(
+        self, store: EventStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        await store.append(seat_event(NOON))
+
+        def refuse(self: Path, target: Path) -> None:
+            raise OSError("read-only file system")
+
+        monkeypatch.setattr(Path, "replace", refuse)
+
+        with pytest.raises(ArchiveError, match="could not write"):
+            archive_day(store.engine, tmp_path, mode="sim", day=DAY)
+
+        assert _scratch_files(tmp_path) == []
+
+    async def test_an_archive_that_cannot_be_read_back_is_refused(
+        self, store: EventStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Verification is a real re-read; a file it cannot open is not a verified archive."""
+        await store.append(seat_event(NOON))
+        archive_day(store.engine, tmp_path, mode="sim", day=DAY)
+
+        def refuse(*_args: object, **_kwargs: object) -> None:
+            raise PermissionError("locked by another process")
+
+        monkeypatch.setattr("tradebot.maintenance.archive.read_archive", refuse)
+
+        with pytest.raises(ArchiveError, match="could not be re-read"):
+            archive_day(store.engine, tmp_path, mode="sim", day=DAY)
+
+    async def test_a_line_that_is_not_json_is_refused(
+        self, store: EventStore, tmp_path: Path
+    ) -> None:
+        """Gzip's CRC passes on a well-compressed file full of nonsense."""
+        await store.append(seat_event(NOON))
+        result = archive_day(store.engine, tmp_path, mode="sim", day=DAY)
+        with gzip.open(result.path, "wt", encoding="utf-8") as handle:
+            handle.write("not json at all\n")
+
+        with pytest.raises(ArchiveError, match="not a readable archive"):
+            archive_day(store.engine, tmp_path, mode="sim", day=DAY)

@@ -512,3 +512,23 @@ class TestTheDrillDownStaysHonest:
             assert field in rendered, field
         for field in ("action", "conviction", "size_hint", "thesis", "key_risks", "invalidation"):
             assert field in rendered["vote"], field
+
+
+class TestAnUndatableRow:
+    """A row whose timestamp does not read as a date is left alone, never guessed at."""
+
+    async def test_it_names_no_day(self, store: EventStore) -> None:
+        """Written below the type decorator, which is the only way such a row could exist.
+
+        `UtcText` refuses to bind an unparseable instant, so this cannot come from our own code —
+        only from corruption or an external writer. It must not crash the pass, and it must not be
+        assigned to a guessed archive file either.
+        """
+        with store.engine.begin() as connection:
+            connection.exec_driver_sql(
+                "INSERT INTO events (event_id, ts, type, aggregate_id, payload_json) "
+                "VALUES ('broken', 'not a timestamp', 'SEAT_RESPONDED', 'c-1', ?)",
+                ('{"response":{"raw_text":"x"}}',),
+            )
+
+        assert pending_days(store.engine, before=date(2030, 1, 1)) == []

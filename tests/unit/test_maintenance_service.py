@@ -293,3 +293,73 @@ class TestAForcedPass:
 
         (recorded,) = service.store.read_types(EventType.MAINTENANCE_RAN)
         assert recorded.payload["overridden"] is False
+
+
+class TestTheLoop:
+    """`run` outlives every pass it reports on, so nothing in it may end the task."""
+
+    async def test_a_defect_in_a_pass_does_not_end_the_loop(
+        self, store: EventStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`run_once` records its own failures; this is the belt to that braces."""
+        import asyncio
+
+        service = build(store, tmp_path)
+        survived = asyncio.Event()
+        calls = 0
+
+        async def explode() -> None:
+            nonlocal calls
+            calls += 1
+            if calls >= 3:
+                survived.set()
+            raise RuntimeError("a defect run_once did not catch")
+
+        monkeypatch.setattr(service, "run_once", explode)
+        task = asyncio.create_task(service.run(poll_seconds=0))
+        await asyncio.wait_for(survived.wait(), timeout=5)
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert calls >= 3
+
+    async def test_cancellation_stops_it(self, store: EventStore, tmp_path: Path) -> None:
+        """Shutdown must actually shut it down, not swallow the cancellation as a defect."""
+        import asyncio
+
+        task = asyncio.create_task(build(store, tmp_path).run(poll_seconds=0))
+        await asyncio.sleep(0)
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+class TestNothingIsCompactedWithoutAnArchive:
+    """The safety property of the whole piece, asserted where it is enforced."""
+
+    async def test_a_day_whose_archive_wrote_no_file_is_not_compacted(
+        self, store: EventStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Defensive, and deliberately kept.
+
+        `pending_days` and `archive_day` query the log separately, so they agree today by
+        construction rather than by contract. If they ever stopped agreeing, compacting against
+        an `ArchiveResult` that wrote no file is precisely the ordering that loses data — so the
+        service checks rather than assumes.
+        """
+        from tradebot.maintenance.archive import ArchiveResult
+
+        await store.append(seat_event(LONG_AGO))
+        monkeypatch.setattr(
+            "tradebot.maintenance.service.archive_day",
+            lambda *_a, **_k: ArchiveResult(path=tmp_path / "nothing.gz", rows=0, sha256=""),
+        )
+
+        report = await build(store, tmp_path).run_once()
+
+        assert report is not None
+        assert report.archived_days == 0
+        assert report.compacted_rows == 0
+        assert any("raw_text" in str(e.payload) for e in store.read_all())
