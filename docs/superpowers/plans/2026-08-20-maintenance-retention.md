@@ -12,6 +12,38 @@
 
 **Depends on:** Piece A (`tradebot/maintenance/backup.py`, `take_backup`). Do not start this piece until Piece A is merged — compaction is destructive and the backup is what makes it recoverable.
 
+## Corrections found while building Piece A (2026-08-22)
+
+Read these before Task 3 and Task 6. They are defects in the task text below, not open questions.
+
+1. **Task 3's `compact_day` loop stalls silently and skips a whole day.** It breaks when a batch
+   rewrites zero rows, and selects `LIMIT chunk` filtered only by `notlike '%"compacted"%'`. A
+   `SEAT_RESPONDED` from a seat that **abstained** carries no `raw_text`, so `_drop_raw_text`
+   returns `None`, no marker is written, and the row stays in the result set forever. Those rows
+   accumulate at the head of every batch (ordered by seq); once a day holds `chunk` of them —
+   routine for a three-seat panel on a degraded day — compaction of that entire day stops
+   permanently, with no error and no failed pass. **Paginate on `seq > last_seen` and break on an
+   empty row count, not an empty changed count.**
+2. **Task 6 blocks the event loop.** `MaintenanceService._pass` calls `self._take(...)`,
+   `archive_day` and `delete_aged` synchronously inside an `async def`. Spec §4.1/§6.3 require
+   `VACUUM INTO` off the loop, and gzipping a day's events is the same class of blocking work. Wrap
+   all three in `asyncio.to_thread`. `compact_day` is already fine — it goes through
+   `SingleWriter`'s executor. Note `tradebot maintenance` (Piece A) does this with **one**
+   `to_thread` hop around the whole command body rather than a thread per call; ruff's `ASYNC240`
+   enforces it either way.
+3. **Task 1 misses a required registration.** `ConfigKind.MAINTENANCE` also needs an entry in
+   `control/config_store._DOCUMENTS` (kind → model), or `configs.put` cannot validate the document.
+4. **Task 8 must change a contract comment, not only the ADRs.** `persistence/schema.py` says of
+   `events`: *"Append-only: no code updates or deletes a row here."* Compaction `UPDATE`s
+   `payload_json`. That comment, ADR 0003 and ADR 0028 have to carry the exception together, or the
+   next reader trusts a comment that is no longer true.
+5. **`MaintenanceService.run` pacing on `Clock.sleep` is correct but sharp.** `ManualClock.sleep`
+   returns immediately, so under a simulated clock the loop busy-spins and advances domain time
+   ~300 s per iteration — a "daily" pass every few hundred iterations. Only `run`/`serve`
+   (`SystemClock`) may start it; the backtest harness and the scenario harness must not.
+6. **`PROJECTION_TABLES` lives in `schema.py`**, re-exported through `projections.py`. Task 4's
+   import works either way.
+
 ## Global Constraints
 
 - **No event row is ever deleted.** This piece only ever `UPDATE`s `events.payload_json` and unlinks files under the archive directory. A `DELETE FROM events` anywhere in this piece is a defect, not an optimisation.

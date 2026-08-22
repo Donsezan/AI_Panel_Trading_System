@@ -12,6 +12,41 @@
 
 **Depends on:** Piece B, for `EventType.MAINTENANCE_RAN` and the events the maintenance rule reads. Piece A only indirectly.
 
+## Resolved before Task 3 (decided 2026-08-22, operator-approved)
+
+**Task 3 as drafted corrupts the streak counters.** `_record` and `_drain` would both evaluate the
+same events against `RuleState`, whose `degraded_streak` / `stale_streak` are two columns of the one
+`alert_cursor` row. With the two cursors at different positions — recording at seq 500 while a dead
+webhook holds delivery at seq 10 — delivery re-counts events on top of the recorder's streak, and a
+`PROVIDER_FAILURE` notice fires at a different count on screen than in the webhook.
+
+**The chosen fix: delivery reads the recorded notifications rather than re-evaluating the rules.**
+
+- `_record` tails `ALERT_TYPES` from `recorded_seq`, evaluates the rules **once**, appends
+  `NOTIFICATION_RAISED`, and owns the streak fields outright.
+- `_drain` tails `NOTIFICATION_RAISED` from `last_seq` and delivers the `Alert` rebuilt from the
+  payload (which already carries kind, at, scope, title, body). It evaluates nothing and touches no
+  streak. At-least-once delivery is unchanged: the cursor still advances only after a sink lands.
+- This is what spec §5.1's *"one evaluation, one persisted `RuleState`, no second opinion"* actually
+  asks for.
+- `last_seq` changes meaning — it now indexes `NOTIFICATION_RAISED` rather than source events. The
+  upgrade is self-healing and needs no data migration for it: no `NOTIFICATION_RAISED` exists below
+  the upgrade point, so `read_after(last_seq, NOTIFICATION_RAISED)` returns only new rows whatever
+  the stored value is. `recorded_seq` still defaults to `last_seq` for existing rows, so the log is
+  not re-recorded from the start.
+- **The daily summary must be recorded too.** §5.3 gives `DAILY_SUMMARY` a severity and §5.8 says
+  the dropdown lists every undismissed notification, but `_summary` currently runs only when
+  `enabled`. Record it on the same unconditional path, or a sim/paper operator never sees one.
+
+Two more things to state rather than discover:
+
+- **Recording appends through `SingleWriter`.** ADR 0019's "alerting never touches the money path"
+  becomes "never *reads* it, but does now queue one small append behind a cycle's". Acceptable —
+  one row per alert, minutes apart — but ADR 0029 must say so rather than leave it implied.
+- **The widget's `counts` must come from `views.render`**, the one place base-template context is
+  supplied. Task 5's markup assumes `counts` exists on every page and does not say where from; one
+  grouped `COUNT(*) ... WHERE dismissed_at IS NULL` per render.
+
 ## Global Constraints
 
 - **Alerting never touches the money path** (ADR 0019). Nothing in this piece may delay, block, or alter a cycle, an order, or a risk decision. A dead sink must not stop a notification being recorded, and a full notifications table must not stop a cycle.
