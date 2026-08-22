@@ -8,12 +8,23 @@
 
    The counts always refresh; the list only while it is open, so a closed bell costs one small
    query and no markup. `hx-select` is what lets one route serve both, and is why first paint and
-   every later paint go through this same partial (PHASE_10 §Pane contracts). #}
+   every later paint go through this same partial (PHASE_10 §Pane contracts).
+
+   **Both regions also fetch on `toggle`, the event a `<details>` fires when it opens**, and that
+   is what keeps the counter and its own dropdown from contradicting each other. Without it a
+   notice raised while the bell was shut moved the counts and skipped the list — the list is
+   filtered on `.open` — and opening the bell fetched nothing, so `0 | 0 | 1` sat above "Nothing
+   to report" until the *next* notification happened to arrive with the dropdown already open. The
+   counts need it for the mirror image: while the socket is down the fallback poll is 30s apart,
+   so a list fetched on open would otherwise be newer than the counter above it. Opening the bell
+   is a read, and a read of an alert widget must be current. #}
 
 <summary title="{{ counts.high }} high, {{ counts.medium }} medium, {{ counts.low }} low"
          aria-label="{{ counts.high }} high, {{ counts.medium }} medium, {{ counts.low }} low">
   <span id="notification-counts"
-        hx-get="/workspace/notifications" hx-trigger="refresh from:closest details"
+        hx-get="/workspace/notifications"
+        hx-trigger="refresh from:closest details,
+                    toggle[this.closest('details').open] from:closest details"
         hx-select="#notification-counts" hx-swap="outerHTML"
         class="counts {{ 'quiet' if not (counts.high or counts.medium or counts.low) }}">
     {# Fixed order, all three always present even at zero, and the reading is spelled out in the
@@ -27,7 +38,8 @@
 
 <div id="notification-list" class="menu-items notification-list"
      hx-get="/workspace/notifications"
-     hx-trigger="refresh[this.closest('details').open] from:closest details"
+     hx-trigger="refresh[this.closest('details').open] from:closest details,
+                 toggle[this.closest('details').open] from:closest details"
      hx-select="#notification-list" hx-swap="outerHTML">
   {% if not notifications %}
     <p class="muted small">Nothing to report.</p>

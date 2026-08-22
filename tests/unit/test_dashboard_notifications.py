@@ -48,6 +48,16 @@ async def raise_alert(
     )
 
 
+def trigger_of(page: str, region: str) -> str:
+    """The `hx-trigger` on one of the bell's two regions, as written into the page."""
+    return page.split(f'id="{region}"')[1].split('hx-trigger="')[1].split('"')[0]
+
+
+def events_of(trigger: str) -> set[str]:
+    """The event names a trigger listens for, with their filters and modifiers dropped."""
+    return {spec.strip().split("[")[0].split(" ")[0] for spec in trigger.split(",")}
+
+
 @pytest.fixture
 def head(client: httpx.AsyncClient) -> httpx.AsyncClient:
     return client
@@ -121,6 +131,36 @@ class TestStructure:
 
     async def test_the_list_only_fetches_while_open(self, client: httpx.AsyncClient) -> None:
         assert "refresh[this.closest('details').open]" in (await client.get("/")).text
+
+    async def test_opening_the_bell_refetches_both_regions(self, client: httpx.AsyncClient) -> None:
+        """Found on a rendered page: the counts said `0 | 0 | 1` over "Nothing to report."
+
+        The same contradiction as `test_the_list_is_filled_on_first_paint...`, one level on. The
+        counts refresh on every socket nudge; the list refreshes only *while the dropdown is
+        open*. So a notice raised while the bell was shut moved the counter and skipped the list,
+        and opening the bell fetched nothing — leaving the two halves in disagreement until the
+        *next* notification happened to arrive with the dropdown already open, which on a quiet
+        system is never.
+
+        `toggle` is what a `<details>` fires when it opens, and both regions take it, not just the
+        list: while the socket is down the fallback poll is 30s apart, so a list that refetched
+        alone would be newer than the counter above it — the same contradiction mirrored. Opening
+        the bell is a read, and a read of an alert widget has to be current.
+        """
+        page = (await client.get("/")).text
+
+        assert events_of(trigger_of(page, "notification-counts")) == {"refresh", "toggle"}
+        assert events_of(trigger_of(page, "notification-list")) == {"refresh", "toggle"}
+
+    async def test_a_shut_bell_still_costs_no_list_markup(self, client: httpx.AsyncClient) -> None:
+        """`toggle` is filtered on `.open` too, so closing the bell fetches nothing either."""
+        page = (await client.get("/")).text
+        open_filter = "[this.closest('details').open]"
+
+        # Both of the list's specs: it is fetched when opened, and refreshed only while open.
+        assert trigger_of(page, "notification-list").count(open_filter) == 2
+        # The counts refresh unconditionally; only their `toggle` spec is filtered.
+        assert trigger_of(page, "notification-counts").count(open_filter) == 1
 
     async def test_both_regions_refresh_through_one_route(self, client: httpx.AsyncClient) -> None:
         """One rendering path however the request arrived — the Phase 10 rule."""

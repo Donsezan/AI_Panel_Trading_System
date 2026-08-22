@@ -520,6 +520,13 @@ an operator should be told** ([ADR 0029](docs/adr/0029-notifications-are-a-proje
   regions carry their own `hx-get` and listen via `from:closest details`, because `workspace.js`
   dispatches `refresh` with `bubbles: false`. `PANES_BY_EVENT` keys it on exactly the two events
   the dispatcher appends — keying on the kill-switch trip would repaint it before the row exists.
+- **Opening the bell refetches both regions**, on the `<details>`'s own `toggle` event. The counter
+  and its dropdown must never contradict each other, and every path that refreshes one without the
+  other produces exactly that: the counts refresh on every nudge while the list is filtered on
+  `.open`, so a notice raised with the bell shut moved the counter, skipped the list, and opening
+  fetched nothing — `0 | 0 | 1` above "Nothing to report" until the next notification arrived with
+  the dropdown already open. The counts take it too, or a list refetched alone would be newer than
+  the counter above it while the socket is down and the fallback poll is 30s apart.
 - **The counts *and* the list come from `views.render`.** The bell is in the base template, so a
   page supplying only the counts renders "Nothing to report" under a counter reading two, and
   never corrects itself with scripting off or on a page without `workspace.js`.

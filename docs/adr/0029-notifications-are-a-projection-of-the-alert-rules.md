@@ -97,6 +97,17 @@ what an operator should be told. What changed is where the answer goes.
   template, so a page supplying only the counts shows "Nothing to report" under a counter reading
   two, and never corrects itself with scripting off or on a page that does not load
   `workspace.js`. This was found by rendering the page, not by reading it.
+- **Opening the bell refetches both regions**, on `toggle`, the event a `<details>` fires when it
+  opens. The same invariant as the bullet above — the counter and its own dropdown must never
+  contradict each other — reached through the other door, and also found on a rendered page: the
+  counts refresh on every socket nudge while the list is filtered on `.open`, so a notice raised
+  with the bell shut moved the counter, skipped the list, and opening the bell fetched nothing.
+  `0 | 0 | 1` then sat above "Nothing to report" until the *next* notification happened to arrive
+  with the dropdown already open, which on a quiet system is never. Both regions take it, not only
+  the list: while the socket is down the fallback poll is 30s apart, so a list that refetched
+  alone would be newer than the counter above it. Opening the bell is a read, and a read of an
+  alert widget has to be current. The `.open` filter stays on both specs, so a shut bell still
+  costs no list markup and closing one fetches nothing.
 - **Dismissing something already gone writes nothing.** It is a 303 back to the workspace: an
   event that projects onto no row would read in the audit trail as a dismissal that never
   happened, and refusing a stale browser tab with an error would teach an operator that the ×
