@@ -88,4 +88,37 @@
     <a class="ghost-link" href="/configure/history/global_risk/global">version history</a>
   </div>
 </form>
+
+{# A second document, and therefore a second form: retention is not a risk limit, it versions on
+   its own schedule, and publishing a stop-loss must never republish a retention window as a side
+   effect (spec §3.7). #}
+<h2>Log retention</h2>
+<p class="muted small">
+  How long the event log's two heavy payloads — each seat's verbatim completion and the frozen
+  snapshot body — are kept. Everything a projection, a report or a cost total reads is kept
+  forever; no event row is ever deleted. Both windows are versioned, so who changed them and when
+  is answerable.
+</p>
+{% if maintenance_errors %}
+  <div class="banner danger">
+    <strong>Not published.</strong>
+    <ul>{% for error in maintenance_errors %}<li>{{ error.message }}</li>{% endfor %}</ul>
+  </div>
+{% endif %}
+<form method="post" action="/configure/maintenance">
+  <div class="grid">
+    {{ f.field("compact_after_days", "Archive and compact after (days)", maintenance.get("compact_after_days"), maintenance_errors, type="number", hint="payloads older than this move to a file and leave the database") }}
+    {{ f.field("archive_keep_days", "Delete archives after (days)", maintenance.get("archive_keep_days"), maintenance_errors, type="number", hint="Irreversible. Shortening this deletes archives on the next pass — past this window the verbatim completion and the snapshot body exist nowhere.") }}
+  </div>
+  <div class="grid">
+    <div class="field">
+      <label for="retention-note">Note (recorded on the version)</label>
+      <input id="retention-note" name="note" type="text" placeholder="why this changed">
+    </div>
+  </div>
+  <div class="actions">
+    <button type="submit">Publish retention windows</button>
+    <a class="ghost-link" href="/configure/history/maintenance/global">version history</a>
+  </div>
+</form>
 {% endblock %}

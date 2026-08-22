@@ -8,6 +8,7 @@ load-bearing as its actions.
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 from pathlib import Path
 
@@ -438,3 +439,72 @@ class TestMaintenanceCommands:
         self, data_dir: list[str], tmp_path: Path
     ) -> None:
         assert main(["maintenance", "status", "--mode", "sim", *data_dir]) == 2
+
+
+class TestMaintenanceCompact:
+    """A deliberate manual pass, for an operator who does not want to wait for the daily tick."""
+
+    def test_a_manual_pass_runs_and_reports(self, data_dir: list[str]) -> None:
+        main(["run", "--mode", "sim", "--once", *data_dir])
+
+        assert main(["maintenance", "compact", "--mode", "sim", *data_dir]) == 0
+
+    def test_a_window_the_model_refuses_is_a_misuse_not_a_crash(self, data_dir: list[str]) -> None:
+        """`--older-than 0` would compact cycles that are still running, so the model refuses it.
+
+        The flags go through `MaintenancePolicy` exactly like the form does — the CLI restates no
+        rule, so a window it accepts is one the daily tick would accept too.
+        """
+        main(["run", "--mode", "sim", "--once", *data_dir])
+
+        assert (
+            main(["maintenance", "compact", "--mode", "sim", "--older-than", "0", *data_dir]) == 2
+        )
+
+    def test_inverted_windows_are_refused_by_the_same_model_rule(self, data_dir: list[str]) -> None:
+        main(["run", "--mode", "sim", "--once", *data_dir])
+
+        exit_code = main(
+            [
+                "maintenance",
+                "compact",
+                "--mode",
+                "sim",
+                "--older-than",
+                "90",
+                "--keep-days",
+                "30",
+                *data_dir,
+            ]
+        )
+
+        assert exit_code == 2
+
+    def test_an_override_is_recorded_on_the_event_as_an_override(
+        self, data_dir: list[str], tmp_path: Path
+    ) -> None:
+        """So "why did that get deleted" survives a pass that did not use the published policy."""
+        main(["run", "--mode", "sim", "--once", *data_dir])
+
+        main(
+            [
+                "maintenance",
+                "compact",
+                "--mode",
+                "sim",
+                "--older-than",
+                "45",
+                "--keep-days",
+                "120",
+                *data_dir,
+            ]
+        )
+
+        with sqlite3.connect(tmp_path / "sim.db") as connection:
+            (payload,) = connection.execute(
+                "SELECT payload_json FROM events WHERE type = 'MAINTENANCE_RAN'"
+            ).fetchone()
+        recorded = json.loads(payload)
+        assert recorded["compact_after_days"] == 45
+        assert recorded["archive_keep_days"] == 120
+        assert recorded["overridden"] is True

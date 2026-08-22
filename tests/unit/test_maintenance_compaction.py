@@ -461,3 +461,54 @@ class TestPendingDays:
         )
 
         assert pending_days(store.engine, before=date(2026, 8, 1)) == [DAY]
+
+
+class TestTheDrillDownStaysHonest:
+    """A compacted cycle *did* freeze a snapshot and its seats *did* answer (spec §3.6).
+
+    The page must say where the detail went, not that it never existed. The seat case is the one
+    easy to forget: compaction keeps the vote, the thesis and the cost, so a compacted transcript
+    renders as *complete* unless something says otherwise.
+    """
+
+    def test_the_snapshot_marker_is_readable_from_the_payload(self) -> None:
+        compacted = compact_payload(EventType.SNAPSHOT_FROZEN, snapshot_payload(), MARKER)
+
+        assert compacted is not None
+        assert compacted[MARKER_KEY]["archive"] == "2026-07-19.jsonl.gz"
+
+    def test_a_compacted_seat_keeps_everything_the_page_renders_except_the_text(self) -> None:
+        """Every field `monitor/cycle.html` reads off `payload.response` must survive."""
+        payload = seat_payload()
+        payload["response"].update(
+            {
+                "role": "Technical Analyst",
+                "round_index": 0,
+                "instrument_key": "sim:BTC/USDT",
+                "latency_ms": 12,
+            }
+        )
+        payload["response"]["vote"].update(
+            {"size_hint": "half", "key_risks": [], "invalidation": "x"}
+        )
+
+        compacted = compact_payload(EventType.SEAT_RESPONDED, payload, MARKER)
+
+        assert compacted is not None
+        rendered = compacted["response"]
+        for field in (
+            "role",
+            "seat_id",
+            "round_index",
+            "instrument_key",
+            "provider_id",
+            "model",
+            "latency_ms",
+            "prompt_tokens",
+            "completion_tokens",
+            "call_id",
+            "cost_usd",
+        ):
+            assert field in rendered, field
+        for field in ("action", "conviction", "size_hint", "thesis", "key_risks", "invalidation"):
+            assert field in rendered["vote"], field

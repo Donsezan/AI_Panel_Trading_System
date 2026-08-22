@@ -249,3 +249,47 @@ class TestFailure:
         assert "something nobody classified" in report.failure
         (recorded,) = store.read_types(EventType.MAINTENANCE_RAN)
         assert recorded.payload["outcome"] == "failed"
+
+
+class TestAForcedPass:
+    """`tradebot maintenance compact` — a human who typed the command meant it."""
+
+    async def test_force_ignores_dueness(self, store: EventStore, tmp_path: Path) -> None:
+        await build(store, tmp_path).run_once()
+
+        report = await build(store, tmp_path).run_once(force=True)
+
+        assert report is not None
+        assert len(store.read_types(EventType.MAINTENANCE_RAN)) == 2
+
+    async def test_an_override_replaces_the_published_windows_for_that_pass_only(
+        self, store: EventStore, tmp_path: Path
+    ) -> None:
+        await store.append(seat_event(NOW - timedelta(days=10)))
+
+        report = await build(store, tmp_path).run_once(
+            force=True,
+            override=MaintenancePolicy(compact_after_days=5, archive_keep_days=400),
+        )
+
+        assert report is not None
+        assert report.compacted_rows == 1
+
+    async def test_an_override_is_recorded_as_one(self, store: EventStore, tmp_path: Path) -> None:
+        """Otherwise the log attributes a deletion to a policy that was never in force."""
+        await build(store, tmp_path).run_once(
+            force=True,
+            override=MaintenancePolicy(compact_after_days=45, archive_keep_days=120),
+        )
+
+        (recorded,) = store.read_types(EventType.MAINTENANCE_RAN)
+        assert recorded.payload["overridden"] is True
+        assert recorded.payload["compact_after_days"] == 45
+
+    async def test_an_ordinary_tick_is_never_marked_as_overridden(
+        self, service: MaintenanceService
+    ) -> None:
+        await service.run_once()
+
+        (recorded,) = service.store.read_types(EventType.MAINTENANCE_RAN)
+        assert recorded.payload["overridden"] is False

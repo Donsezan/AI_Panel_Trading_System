@@ -44,6 +44,7 @@ from tradebot.control.reference import VERIFIED_FIELDS, holders_of, store_basket
 from tradebot.core.config import (
     Basket,
     GlobalRiskPolicy,
+    MaintenancePolicy,
     PanelConfig,
     ProviderSettings,
     RiskPolicy,
@@ -299,6 +300,43 @@ async def edit_risk(request: Request) -> HTMLResponse:
     return _risk_form(request, draft)
 
 
+@router.post("/maintenance", response_class=HTMLResponse)
+async def publish_maintenance(request: Request) -> Response:
+    """The retention windows. Its own document and its own form, beside the risk limits.
+
+    Separate from the Tier-2 policy deliberately: retention is not a risk limit, it versions on
+    its own schedule, and publishing a stop-loss must never republish a retention window as a
+    side effect. It needs no loosening phrase — shortening it is destructive but *stated*, and
+    the confirmation that matters is the warning beside the field (spec §3.7).
+    """
+    form = await request.form()
+    policy, errors = validate(MaintenancePolicy, nest(form.multi_items()))
+    if policy is None:
+        configs = state_of(request).application.configs
+        record = configs.global_risk()
+        risk = draft_of(record.document) if record else draft_of(GlobalRiskPolicy())
+        return _risk_form(request, risk, maintenance_errors=errors)
+
+    configs = state_of(request).application.configs
+    try:
+        published = await configs.put(
+            SINGLETON_ID, policy, actor=ACTOR, note=_note(form, "edited in the dashboard")
+        )
+    except ConfigError as exc:
+        record = configs.global_risk()
+        risk = draft_of(record.document) if record else draft_of(GlobalRiskPolicy())
+        return _risk_form(request, risk, maintenance_errors=_refusal(exc))
+    logger.warning(
+        "retention windows published from the dashboard",
+        extra={
+            "version": published.ref.version,
+            "compact_after_days": policy.compact_after_days,
+            "archive_keep_days": policy.archive_keep_days,
+        },
+    )
+    return RedirectResponse("/configure/risk", status_code=303)
+
+
 @router.post("/risk", response_class=HTMLResponse)
 async def publish_risk(request: Request) -> Response:
     form = await request.form()
@@ -403,7 +441,15 @@ def _risk_form(
     errors: tuple[FieldError, ...] = (),
     loosened: tuple[str, ...] = (),
     needs_confirmation: bool = False,
+    maintenance_errors: tuple[FieldError, ...] = (),
 ) -> HTMLResponse:
+    """The Parameters page: the Tier-2 policy and the retention windows, two documents, two forms.
+
+    The retention draft is read here rather than passed in, because every caller of this function
+    is publishing the *other* document and would otherwise have to remember to fetch it.
+    """
+    record = state_of(request).application.configs.latest(ConfigKind.MAINTENANCE, SINGLETON_ID)
+    maintenance = draft_of(record.document) if record else draft_of(MaintenancePolicy())
     return render(
         request,
         "configure/risk.html",
@@ -412,6 +458,8 @@ def _risk_form(
         loosened=loosened,
         needs_confirmation=needs_confirmation,
         phrase=LOOSEN_PHRASE,
+        maintenance=maintenance,
+        maintenance_errors=maintenance_errors,
     )
 
 

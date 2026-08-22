@@ -362,3 +362,78 @@ def test_config_kinds_are_the_ones_the_drill_down_resolves() -> None:
     for kind in ConfigKind:
         (ref,) = parse_pins(json.dumps({f"{kind.value}:anything": 1}))
         assert ref.kind is kind
+
+
+class TestACompactedCycleIsShownAsArchived:
+    """Retention must not turn the drill-down into a liar (spec §3.6).
+
+    Once a cycle's payloads are compacted the page has no snapshot body and no verbatim
+    completion. Both absences are indistinguishable from "it never happened" unless the page says
+    otherwise — and for the snapshot the existing wording says exactly the wrong thing.
+    """
+
+    async def test_a_compacted_snapshot_names_its_archive_rather_than_denying_the_snapshot(
+        self, cycled: Application, client: httpx.AsyncClient
+    ) -> None:
+        await _compact(cycled)
+
+        body = (await client.get(f"/cycles/{_latest_cycle_id(cycled)}")).text
+
+        assert "2026-07-19.jsonl.gz" in body
+        assert "No snapshot was frozen" not in body
+
+    async def test_the_unchanged_digest_is_shown_beside_it(
+        self, cycled: Application, client: httpx.AsyncClient
+    ) -> None:
+        """The digest is what makes the archived copy verifiably the packet this cycle read.
+
+        Asserted on the actual value from the projection, not on the word "digest": the page said
+        that anyway before compaction, so a looser check would pass without the feature.
+        """
+        from sqlalchemy import select
+
+        from tradebot.persistence.schema import cycles
+
+        await _compact(cycled)
+        with cycled.store.engine.connect() as connection:
+            digest = connection.execute(select(cycles.c.snapshot_digest)).scalars().first()
+        assert digest
+
+        body = (await client.get(f"/cycles/{_latest_cycle_id(cycled)}")).text
+
+        assert str(digest) in body
+
+    async def test_a_compacted_seat_says_where_its_completion_went(
+        self, cycled: Application, client: httpx.AsyncClient
+    ) -> None:
+        """The vote survives compaction, so without this line the transcript looks whole."""
+        await _compact(cycled)
+
+        body = (await client.get(f"/cycles/{_latest_cycle_id(cycled)}")).text
+
+        assert "verbatim completion" in body
+
+    async def test_an_uncompacted_cycle_says_none_of_this(
+        self, cycled: Application, client: httpx.AsyncClient
+    ) -> None:
+        """The archive notice appears only for a cycle that actually has one."""
+        body = (await client.get(f"/cycles/{_latest_cycle_id(cycled)}")).text
+
+        assert "verbatim completion" not in body
+        assert ".jsonl.gz" not in body
+
+
+async def _compact(application: Application) -> None:
+    """Compact the cycle this test just ran, exactly as the daily pass would."""
+    from tests.unit.test_maintenance_compaction import ARCHIVE, writer_of
+
+    from tradebot.maintenance.compaction import compact_day
+
+    store = application.store
+    rewritten = await compact_day(
+        writer_of(store),
+        day=store.read_all()[0].ts.date(),
+        archive=ARCHIVE,
+        at=application.clock.now(),
+    )
+    assert rewritten > 0, "nothing was compacted; the test would prove nothing"

@@ -107,24 +107,31 @@ class MaintenanceService:
                 logger.exception("maintenance pass failed; the loop continues")
             await self._clock.sleep(poll_seconds)
 
-    async def run_once(self) -> MaintenanceReport | None:
+    async def run_once(
+        self, *, force: bool = False, override: MaintenancePolicy | None = None
+    ) -> MaintenanceReport | None:
         """One pass, or `None` when one has already run today.
 
         A pass that *failed* still counts as today's run. It raises a HIGH notification and a
         human is now the next step; retrying every five minutes against a full disk would only
         repeat the alarm.
+
+        `force` and `override` exist for `tradebot maintenance compact` and are never used by the
+        tick. Dueness is the *tick's* rule — a human who typed the command meant it — and an
+        override is recorded on the event as such, so "why did that get deleted" stays answerable
+        for a pass that did not run under the published policy (spec §7).
         """
         now = self._clock.now()
-        if not self._is_due(now):
+        if not force and not self._is_due(now):
             return None
 
-        policy = self._policy()
+        policy = override or self._policy()
         try:
             report = await self._pass(now, policy)
         except Exception as exc:
             logger.exception("unclassified failure in the maintenance pass")
             report = MaintenanceReport(failure=f"unclassified: {exc}")
-        await self._record(now, policy, report)
+        await self._record(now, policy, report, overridden=override is not None)
         return report
 
     async def _pass(self, now: datetime, policy: MaintenancePolicy) -> MaintenanceReport:
@@ -191,7 +198,12 @@ class MaintenanceService:
         return not recorded or recorded[-1].ts.date() != now.date()
 
     async def _record(
-        self, now: datetime, policy: MaintenancePolicy, report: MaintenanceReport
+        self,
+        now: datetime,
+        policy: MaintenancePolicy,
+        report: MaintenanceReport,
+        *,
+        overridden: bool = False,
     ) -> None:
         """One event per pass — the audit line, the dueness marker, and Piece C's alert source."""
         await self.store.append(
@@ -209,6 +221,10 @@ class MaintenanceService:
                     "deleted_archives": report.deleted_archives,
                     "compact_after_days": policy.compact_after_days,
                     "archive_keep_days": policy.archive_keep_days,
+                    #: Whether these windows came from a one-off CLI flag rather than the
+                    #: published document — otherwise the log would attribute a deletion to a
+                    #: policy that was never in force (spec §7).
+                    "overridden": overridden,
                 },
             )
         )

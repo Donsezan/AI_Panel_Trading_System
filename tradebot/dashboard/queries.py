@@ -40,6 +40,7 @@ from tradebot.core.enums import ConfigKind, OrderRole, OrderState
 from tradebot.core.events import Event, EventType
 from tradebot.core.money import ZERO, divide
 from tradebot.dashboard.scope import Scope
+from tradebot.maintenance.compaction import MARKER_KEY
 from tradebot.persistence.schema import (
     cycles,
     decisions,
@@ -176,6 +177,17 @@ class CycleDetail:
         """The frozen input packet, as stored. `None` if the cycle ended before it was built."""
         frozen = self.events_of(EventType.SNAPSHOT_FROZEN)
         return frozen[-1].payload.get("snapshot") if frozen else None
+
+    @property
+    def snapshot_archive(self) -> dict[str, Any] | None:
+        """Where a compacted snapshot went, or `None` if it is still here (spec §3.6).
+
+        The body being absent has two very different causes — the cycle was blocked before one
+        was built, or retention moved it to a file — and the page must not read the second as the
+        first. This is what tells them apart.
+        """
+        frozen = self.events_of(EventType.SNAPSHOT_FROZEN)
+        return frozen[-1].payload.get(MARKER_KEY) if frozen else None
 
 
 class Queries:

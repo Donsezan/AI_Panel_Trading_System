@@ -63,12 +63,13 @@ from tradebot.core.clock import Clock, SystemClock
 from tradebot.core.config import (
     Basket,
     GlobalRiskPolicy,
+    MaintenancePolicy,
     PanelConfig,
     ProviderSettings,
     RiskPolicy,
     Schedule,
 )
-from tradebot.core.enums import AssetClass, Mode, RiskTier
+from tradebot.core.enums import AssetClass, ConfigKind, Mode, RiskTier
 from tradebot.core.errors import ConfigError
 from tradebot.core.events import EventFactory
 from tradebot.core.instrument import Instrument
@@ -102,6 +103,8 @@ from tradebot.ledger.history import HistoryReader
 from tradebot.ledger.marks import Marks
 from tradebot.ledger.portfolio import Ledger
 from tradebot.ledger.reconciler import Reconciler
+from tradebot.maintenance.backup import backup_destination
+from tradebot.maintenance.service import MaintenanceService
 from tradebot.marketdata.binance import BinanceSpotGateway
 from tradebot.marketdata.catalogue import (
     UnavailableCatalogue,
@@ -178,6 +181,11 @@ class Application:
     #: Ops alerting, off unless a destination is configured in the environment (ADR 0019). It
     #: tails the log beside the supervisor and can never reach the money path.
     alerts: AlertDispatcher
+    #: The daily housekeeping pass — backup, archive, compact, delete (ADR 0028). `None` for an
+    #: in-memory database, which is the whole test suite: there is no file to copy and no
+    #: directory to archive into, and a pass that invented one would put filesystem writes under
+    #: every test in the repo.
+    maintenance: MaintenanceService | None
     #: The shared price source an observer may read, exposed for the dashboard's chart (PHASE_10
     #: decision 4). It is the same cache the runners read through, so a chart request spends the
     #: same single-flight budget a cycle does (ADR 0008) and no candle is persisted for the UI —
@@ -819,6 +827,50 @@ def declared_providers(basket: Basket) -> tuple[ProviderSettings, ...]:
     return tuple(seen.values())
 
 
+def _maintenance_policy(configs: ConfigStore) -> MaintenancePolicy:
+    """The published retention windows, or the model's defaults when none was published.
+
+    Defaults rather than a refusal (spec §3.7): maintenance shares its tick with the daily backup,
+    and refusing to back anything up because nobody published a retention policy would be
+    fail-*useless*. The `MAINTENANCE_RAN` event records which windows were in force, defaults
+    included, so the log always says what policy a pass ran under.
+    """
+    record = configs.latest(ConfigKind.MAINTENANCE, SINGLETON_ID)
+    document = record.document if record else None
+    return document if isinstance(document, MaintenancePolicy) else MaintenancePolicy()
+
+
+def _maintenance_service(
+    db_path: Path | None,
+    *,
+    store: EventStore,
+    writer: SingleWriter,
+    clock: Clock,
+    mode: Mode,
+    configs: ConfigStore,
+) -> MaintenanceService | None:
+    """The daily pass, or `None` for a database that lives inside its own connection.
+
+    An in-memory database — the whole test suite — has no file to copy and nothing that would
+    outlive the process to archive, so there is nothing for maintenance to do and a service built
+    anyway would put filesystem writes under every test in the repo.
+
+    The policy is passed as a **callable**, not a value: it is read fresh at each pass, so an edit
+    on the Parameters page takes effect at the next tick with no restart (ADR 0021's rule).
+    """
+    if db_path is None:
+        return None
+    return MaintenanceService(
+        store=store,
+        writer=writer,
+        clock=clock,
+        mode=mode.value,
+        archive_root=db_path.parent / "archive",
+        backup_dir=backup_destination(db_path),
+        policy=lambda: _maintenance_policy(configs),
+    )
+
+
 def _instruments_of(baskets: tuple[Basket, ...]) -> tuple[Instrument, ...]:
     """Every instrument any basket may trade, deduplicated — two baskets may share one."""
     seen: dict[str, Instrument] = {}
@@ -1019,6 +1071,9 @@ async def _assemble(
             alert_sinks,
             clock,
             calendar=stack.calendar,
+        ),
+        maintenance=_maintenance_service(
+            db_path, store=store, writer=writer, clock=clock, mode=mode, configs=configs
         ),
         market_data=stack.read_only_prices,
         catalogue=stack.catalogue,

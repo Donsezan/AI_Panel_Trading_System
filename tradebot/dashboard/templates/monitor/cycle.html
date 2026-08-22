@@ -134,6 +134,14 @@
     {% else %}
       <p class="warn">Abstained: {{ r.abstain_reason }}</p>
     {% endif %}
+    {# Easy to forget, and the reason this line exists: compaction keeps the vote, the thesis and
+       the cost, so without it a compacted transcript renders as though it were whole. #}
+    {% if event.payload.compacted %}
+      <p class="muted small">
+        The verbatim completion is in <code>{{ event.payload.compacted.archive }}</code>; the
+        vote, cost and model below are unchanged.
+      </p>
+    {% endif %}
     <p class="muted small">
       {{ r.latency_ms }} ms · {{ r.prompt_tokens }} prompt + {{ r.completion_tokens }} completion
       tokens · call <code>{{ r.call_id[:8] }}</code> · {{ r.cost_usd | money(4) }} USD
@@ -200,6 +208,15 @@
     <summary>The exact input packet every seat was given</summary>
     <pre class="json">{{ detail.snapshot | prettyjson }}</pre>
   </details>
+{% elif detail.snapshot_archive %}
+  {# A compacted cycle DID freeze a snapshot. The wording below would be a lie about it, and the
+     absence of a body is the only thing the two cases have in common (spec §3.6). #}
+  <p class="empty">
+    The frozen snapshot was archived on {{ detail.snapshot_archive.at }} and compacted out of the
+    database — it is in <code>{{ detail.snapshot_archive.archive }}</code>. Its digest,
+    <code>{{ cycle.snapshot_digest }}</code>, is unchanged, so the archived copy is verifiably the
+    packet this cycle deliberated on.
+  </p>
 {% else %}
   <p class="empty">No snapshot was frozen — the cycle was blocked before one was built.</p>
 {% endif %}
