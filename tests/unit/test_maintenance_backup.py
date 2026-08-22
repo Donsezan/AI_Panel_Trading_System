@@ -7,8 +7,10 @@ against the *restored* database rather than against the fact that a file appeare
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import NoReturn
 
 import pytest
 from sqlalchemy import Engine, select
@@ -224,3 +226,119 @@ class TestFreeSpaceGuard:
         source.write_bytes(b"\0" * 1000)
 
         assert required_bytes(source) == 1000 + 200 + HEADROOM_BYTES
+
+
+def _raising(error: OSError) -> Callable[..., NoReturn]:
+    """A stand-in for a filesystem call that fails. The message is what the refusal must quote."""
+
+    def boom(*_args: object, **_kwargs: object) -> NoReturn:
+        raise error
+
+    return boom
+
+
+class TestWhereHardLinksAreUnsupported:
+    """exFAT, FAT32 and several SMB shares — exactly what `TRADEBOT_BACKUP_DIR` is pointed at.
+
+    There `os.link` raises a plain `OSError` on *every* call, not just a colliding one, so the
+    publish falls back to `Path.replace` after re-proving the name is free. Both halves matter:
+    without the fallback every backup fails on such a volume, and without the re-check the
+    fallback would silently overwrite a completed backup (D4).
+    """
+
+    def test_a_volume_without_hard_links_still_publishes_the_copy(
+        self, database: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            "tradebot.maintenance.backup.os.link",
+            _raising(OSError("hard links are not supported on this filesystem")),
+        )
+
+        result = take_backup(database, tmp_path / "backups", mode="sim", clock=ManualClock(AT))
+
+        assert result.path.exists()
+        assert list(result.path.parent.glob("*.tmp")) == []
+
+    def test_a_name_taken_during_the_copy_is_still_refused_without_hard_links(
+        self, database: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The fallback re-proves the name is free, so the narrow window still fails closed."""
+        destination = tmp_path / "backups"
+
+        def unsupported(_source: Path, target: Path) -> NoReturn:
+            Path(target).write_bytes(b"already finished")
+            raise OSError("hard links are not supported on this filesystem")
+
+        monkeypatch.setattr("tradebot.maintenance.backup.os.link", unsupported)
+
+        with pytest.raises(BackupError, match="already exists"):
+            take_backup(database, destination, mode="sim", clock=ManualClock(AT))
+
+        assert (destination / backup_name("sim", AT)).read_bytes() == b"already finished"
+        assert list(destination.glob("*.tmp")) == []
+
+
+class TestFilesystemFailuresFailClosed:
+    """Every way the volume itself can refuse. None may escape as a raw `OSError`.
+
+    The caller of a backup is either `run_migrations`, which must not proceed on one, or the
+    daily tick, which has to report one — and both are written against `BackupError`.
+    """
+
+    def test_a_publish_that_cannot_complete_at_all_is_refused(
+        self, database: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            "tradebot.maintenance.backup.os.link", _raising(OSError("no hard links here"))
+        )
+        monkeypatch.setattr(Path, "replace", _raising(OSError("read-only file system")))
+
+        with pytest.raises(BackupError, match="could not finalize"):
+            take_backup(database, tmp_path / "backups", mode="sim", clock=ManualClock(AT))
+
+    def test_a_scratch_file_that_will_not_delete_does_not_fail_a_finished_backup(
+        self, database: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Once the hard link exists the backup *is* complete under its final name.
+
+        A stuck `.tmp` after that point is a housekeeping matter, and reporting it as a failed
+        backup would send the daily tick down the fail-closed path over a copy that is on disk
+        and readable.
+        """
+        monkeypatch.setattr(Path, "unlink", _raising(OSError("locked by another process")))
+
+        result = take_backup(database, tmp_path / "backups", mode="sim", clock=ManualClock(AT))
+
+        assert result.path.exists()
+        assert result.size_bytes > 0
+
+    def test_a_stale_scratch_file_that_cannot_be_cleared_refuses(
+        self, database: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Refused rather than written around: a `.tmp` nobody can remove is a volume in a state
+        this module has no business guessing about."""
+        destination = tmp_path / "backups"
+        destination.mkdir()
+        (destination / (backup_name("sim", AT) + ".tmp")).write_bytes(b"leftover")
+        monkeypatch.setattr(Path, "unlink", _raising(OSError("locked by another process")))
+
+        with pytest.raises(BackupError, match="could not clear stale"):
+            take_backup(database, destination, mode="sim", clock=ManualClock(AT))
+
+    def test_a_volume_whose_free_space_cannot_be_read_refuses(
+        self, database: Engine, tmp_path: Path
+    ) -> None:
+        """Unknown headroom is not headroom. A backup that might fill the volume is not taken."""
+        with pytest.raises(BackupError, match="could not read free space"):
+            take_backup(
+                database,
+                tmp_path / "backups",
+                mode="sim",
+                clock=ManualClock(AT),
+                probe=_raising(OSError("volume disappeared")),
+            )
+
+    def test_a_source_that_cannot_be_measured_refuses(self, tmp_path: Path) -> None:
+        """A database that vanished between wiring and the tick is a refusal, not a traceback."""
+        with pytest.raises(BackupError, match="could not read size"):
+            required_bytes(tmp_path / "gone.db")
