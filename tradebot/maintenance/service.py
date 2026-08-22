@@ -19,7 +19,7 @@ because a maintenance defect must never be what stops the bot trading.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -54,6 +54,13 @@ class MaintenanceReport:
     compacted_rows: int = 0
     deleted_archives: int = 0
     failure: str = ""
+    #: Archive files this pass could not unlink — a virus scanner or a backup agent holding one
+    #: open. Its own field rather than part of `failure`, because spec §6.4 gives it its own row:
+    #: reported and skipped, retried next pass, and *counted in the daily line*. Folding it into
+    #: `failure` swapped that line for a HIGH `MAINTENANCE_FAILED`, which is none of the four
+    #: things §5.4 lists — and HIGH notices never supersede, so one locked file stacked a red row
+    #: every night while the pass's real work went unreported.
+    undeletable: tuple[str, ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -135,7 +142,13 @@ class MaintenanceService:
         return report
 
     async def _pass(self, now: datetime, policy: MaintenancePolicy) -> MaintenanceReport:
-        """Back up, archive, compact, delete — in that order, stopping at the first failure."""
+        """Back up, archive, compact, delete — in that order, and the order is the safety property.
+
+        A failed backup stops everything destructive behind it. A day whose archive will not verify
+        costs **that day** and nothing else: the containment is per day, not per pass (spec §6.4).
+        Deletion runs whatever the archive step did, because it is scoped by file name and depends
+        on none of it.
+        """
         try:
             backup = await asyncio.to_thread(
                 self._take,
@@ -150,23 +163,37 @@ class MaintenanceService:
             return MaintenanceReport(failure=f"backup: {exc}")
 
         backup_path = getattr(backup, "path", None)
+        horizon = now.date() - timedelta(days=policy.compact_after_days)
+        # Off the loop like the three filesystem steps around it. `pending_days` is two
+        # unindexable `LIKE '%...%'` scans over `payload_json`, the largest column in the
+        # database — linear in the whole log's payload size, and this task shares its loop with
+        # the supervisor, the execution monitor and the dashboard's socket (spec §6.3).
+        pending = await asyncio.to_thread(pending_days, self.store.engine, before=horizon)
+
         archived = 0
         compacted = 0
-        horizon = now.date() - timedelta(days=policy.compact_after_days)
-        try:
-            for day in pending_days(self.store.engine, before=horizon):
+        failures: list[str] = []
+        for day in pending:
+            try:
                 archived, compacted = await self._archive_then_compact(
                     day, now, archived, compacted
                 )
-        except (TradebotError, OSError) as exc:
-            return MaintenanceReport(
-                backup=backup_path,
-                archived_days=archived,
-                compacted_rows=compacted,
-                failure=f"archive: {exc}",
+            except (TradebotError, OSError) as exc:
+                # This day only. A day file that exists is *verified* rather than rewritten, so a
+                # corrupt one fails on this pass and every pass after; giving up at it took every
+                # later day with it — and `delete_aged` below, which never ran. Retention stopped
+                # entirely, permanently, while the database kept growing.
+                failures.append(f"{day.isoformat()}: {exc}")
+
+        if failures:
+            # Every one of them, here rather than on the report: `failure` is bounded because it
+            # reaches an operator, and this is the record that is not.
+            logger.warning(
+                "days that could not be archived",
+                extra={"days": failures, "scanned": len(pending), "mode": self._mode},
             )
 
-        removed, failures = await asyncio.to_thread(
+        removed, undeletable = await asyncio.to_thread(
             delete_aged,
             self._archive_root,
             self._mode,
@@ -177,7 +204,8 @@ class MaintenanceService:
             archived_days=archived,
             compacted_rows=compacted,
             deleted_archives=len(removed),
-            failure="; ".join(failures),
+            failure=_archive_failure(failures, scanned=len(pending)),
+            undeletable=tuple(undeletable),
         )
 
     async def _archive_then_compact(
@@ -219,6 +247,9 @@ class MaintenanceService:
                     "archived_days": report.archived_days,
                     "compacted_rows": report.compacted_rows,
                     "deleted_archives": report.deleted_archives,
+                    #: Named, not merely counted: the next pass retries the same files, so an
+                    #: operator comparing two days' lines can see whether it is the same one.
+                    "undeletable": list(report.undeletable),
                     "compact_after_days": policy.compact_after_days,
                     "archive_keep_days": policy.archive_keep_days,
                     #: Whether these windows came from a one-off CLI flag rather than the
@@ -228,3 +259,18 @@ class MaintenanceService:
                 },
             )
         )
+
+
+def _archive_failure(failures: Sequence[str], *, scanned: int) -> str:
+    """The day loop's failures, bounded, or `""` when there were none.
+
+    `failure` reaches the `MAINTENANCE_RAN` payload *and* the notification body, so it cannot be a
+    recital. A permissions fault on the archive root fails every pending day at once, and a
+    database that has never run maintenance can have hundreds of them; the full list is one
+    `WARNING` above, and the operator gets the count and one example.
+    """
+    if not failures:
+        return ""
+    if len(failures) == 1:
+        return f"archive: {failures[0]}"
+    return f"archive: {len(failures)} of {scanned} days failed; first: {failures[0]}"

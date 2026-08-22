@@ -58,6 +58,47 @@ class ArchiveResult:
         return self.rows > 0
 
 
+@dataclass(frozen=True, slots=True)
+class ArchiveInventory:
+    """What one mode's archive directory holds, and what it spans."""
+
+    directory: Path
+    files: int
+    oldest: date | None
+    newest: date | None
+    total_bytes: int
+
+
+def archive_destination(path: Path) -> Path:
+    """The archive **root** for a database — one subdirectory per mode beneath it.
+
+    Beside `backup_destination` and for the same reason: the daily pass writes here and
+    `maintenance status` reads here, and a second copy of the expression inline at one of them is
+    how the two come to disagree and the inventory reads empty forever.
+    """
+    return path.parent / "archive"
+
+
+def inventory(root: Path, mode: str) -> ArchiveInventory:
+    """Count and span this mode's day files. Reads nothing, opens nothing, deletes nothing.
+
+    Decides what is a day file by **parsing the name**, exactly as `delete_aged` does, so the two
+    can never disagree about what exists: a `.tmp` from an interrupted write is not a day, and
+    nothing outside this mode's directory is ever looked at. This is the only place an operator
+    can see what deletion has already taken (spec §7).
+    """
+    directory = root / mode
+    files = sorted(directory.glob(f"*/*{ARCHIVE_SUFFIX}")) if directory.exists() else []
+    days = sorted(day for path in files if (day := _day_of(path)) is not None)
+    return ArchiveInventory(
+        directory=directory,
+        files=len(files),
+        oldest=days[0] if days else None,
+        newest=days[-1] if days else None,
+        total_bytes=sum(path.stat().st_size for path in files),
+    )
+
+
 def archive_path(root: Path, mode: str, day: date) -> Path:
     """`<root>/<mode>/2026-07/2026-07-19.jsonl.gz` — grouped by month so a year is browsable."""
     return root / mode / f"{day:%Y-%m}" / f"{day:%Y-%m-%d}{ARCHIVE_SUFFIX}"

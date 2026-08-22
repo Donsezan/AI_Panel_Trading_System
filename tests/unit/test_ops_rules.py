@@ -244,6 +244,7 @@ def maintenance_event(clock: ManualClock, **payload: object) -> Event:
             "archived_days": 0,
             "compacted_rows": 0,
             "deleted_archives": 0,
+            "undeletable": [],
             "compact_after_days": 30,
             "archive_keep_days": 90,
             "overridden": False,
@@ -297,6 +298,46 @@ class TestMaintenanceRule:
 
         assert alert is not None
         assert "override" in alert.body
+
+    def test_a_file_that_would_not_delete_is_counted_in_the_daily_line(
+        self, clock: ManualClock
+    ) -> None:
+        """Spec §6.4: reported and skipped, the next pass retries, *counted in the daily line*.
+
+        It stays a LOW `MAINTENANCE_OK` — a locked file is none of the four things §5.4 lists as
+        a failure — but a line that omitted it would report a clean sweep on a night when one
+        file did not go.
+        """
+        alert = evaluate(
+            maintenance_event(clock, deleted_archives=2, undeletable=["a.jsonl.gz: locked"]),
+            RuleState(),
+        )
+
+        assert alert is not None
+        assert alert.kind is AlertKind.MAINTENANCE_OK
+        assert "1 archive could not be deleted" in alert.body
+
+    def test_a_failed_pass_still_reports_files_that_would_not_delete(
+        self, clock: ManualClock
+    ) -> None:
+        """The fact must not be lost because the pass failed for an unrelated reason."""
+        alert = evaluate(
+            maintenance_event(
+                clock, outcome="failed", detail="archive: bad", undeletable=["a: locked"]
+            ),
+            RuleState(),
+        )
+
+        assert alert is not None
+        assert alert.kind is AlertKind.MAINTENANCE_FAILED
+        assert "1 archive could not be deleted" in alert.body
+
+    def test_a_clean_sweep_says_nothing_about_deletion_failures(self, clock: ManualClock) -> None:
+        """The normal case is every night, and a nightly line must stay short."""
+        alert = evaluate(maintenance_event(clock, deleted_archives=2), RuleState())
+
+        assert alert is not None
+        assert "could not be deleted" not in alert.body
 
     def test_the_rule_touches_no_streak(self, clock: ManualClock) -> None:
         """It is not a "cycle after cycle" rule, and must not borrow another's counter."""

@@ -259,6 +259,18 @@ def _file_name(path: str) -> str:
     return PurePath(path).name if path else "none"
 
 
+def _undeleted(event: Event) -> str:
+    """The archives this pass could not unlink, or `""` on the ordinary night.
+
+    Counted in the daily line rather than raised as its own alarm (spec §6.4): the next pass
+    retries, so a locked file is not one of the four things §5.4 makes a `MAINTENANCE_FAILED`.
+    On the failed body too, or the fact would be lost whenever the pass failed for an unrelated
+    reason. Absent from every event written before the field existed, hence the `or ()`.
+    """
+    count = len(event.payload.get("undeletable") or ())
+    return f" {_count(count, 'archive')} could not be deleted." if count else ""
+
+
 def _windows(event: Event) -> str:
     """Which retention windows the pass ran under, and whether they were the published ones.
 
@@ -288,7 +300,10 @@ def maintenance(event: Event, _state: RuleState) -> Alert | None:
             at=event.ts,
             scope=MAINTENANCE_SCOPE,
             title="Housekeeping failed — backups or retention did not complete",
-            body=f"{text(event, 'detail') or 'no reason recorded'}. {_windows(event)}",
+            body=(
+                f"{text(event, 'detail') or 'no reason recorded'}."
+                f"{_undeleted(event)} {_windows(event)}"
+            ),
         )
     return Alert(
         kind=AlertKind.MAINTENANCE_OK,
@@ -298,8 +313,8 @@ def maintenance(event: Event, _state: RuleState) -> Alert | None:
         body=(
             f"backup {_file_name(text(event, 'backup'))}; "
             f"{_count(int(event.payload.get('compacted_rows', 0)), 'payload')} compacted; "
-            f"{_count(int(event.payload.get('deleted_archives', 0)), 'archive')} deleted. "
-            f"{_windows(event)}"
+            f"{_count(int(event.payload.get('deleted_archives', 0)), 'archive')} deleted."
+            f"{_undeleted(event)} {_windows(event)}"
         ),
     )
 

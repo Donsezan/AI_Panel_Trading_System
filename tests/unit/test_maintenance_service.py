@@ -8,7 +8,8 @@ trading, so a failed pass is a recorded fact rather than an exception.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+import threading
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -17,14 +18,27 @@ from tests.unit.test_maintenance_compaction import writer_of
 from tradebot.core.clock import ManualClock
 from tradebot.core.config import MaintenancePolicy
 from tradebot.core.events import Event, EventType
-from tradebot.maintenance.archive import ArchiveError, archive_path
+from tradebot.maintenance.archive import (
+    ArchiveError,
+    ArchiveResult,
+    archive_day,
+    archive_path,
+)
 from tradebot.maintenance.backup import BackupError
+from tradebot.maintenance.compaction import pending_days
 from tradebot.maintenance.service import MaintenanceService
 from tradebot.persistence.store import EventStore
 
 NOW = datetime(2026, 8, 20, 4, 0, tzinfo=UTC)
 LONG_AGO = NOW - timedelta(days=40)
+#: A second pending day, one behind `LONG_AGO`, so `pending_days` yields it first. With one day
+#: in the fixture, per-day and per-pass containment are indistinguishable.
+OLDER = NOW - timedelta(days=41)
 ANCIENT = NOW - timedelta(days=120)
+
+#: What `delete_aged` reports for a file something else has open. Its own behaviour is covered in
+#: `test_maintenance_archive.py`; what the *pass* does with it is covered here.
+LOCKED = "archive/sim/2026-01/2026-01-01.jsonl.gz: [Errno 13] Permission denied"
 
 
 def seat_event(at: datetime) -> Event:
@@ -39,6 +53,22 @@ def seat_event(at: datetime) -> Event:
 
 def refuse(*_args: object, **_kwargs: object) -> None:
     raise BackupError("no room")
+
+
+def unverifiable_on(day: date) -> object:
+    """`archive_day`, but one nominated day raises the way a corrupt file does.
+
+    Every other day is archived for real, which is the whole point: a containment claim only means
+    something when there is a good day behind the bad one to be contained *from*.
+    """
+
+    def wrapped(engine: object, root: Path, *, mode: str, day: date) -> ArchiveResult:
+        if day == corrupt:
+            raise ArchiveError("hash mismatch")
+        return archive_day(engine, root, mode=mode, day=day)  # type: ignore[arg-type]
+
+    corrupt = day
+    return wrapped
 
 
 def build(
@@ -220,20 +250,72 @@ class TestFailure:
     async def test_an_unverifiable_archive_compacts_nothing_for_that_day(
         self, store: EventStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """`raw_text` from 31 days ago is never the last copy of itself."""
-        await store.append(seat_event(LONG_AGO))
+        """`raw_text` from 31 days ago is never the last copy of itself.
 
-        def unverifiable(*_args: object, **_kwargs: object) -> None:
-            raise ArchiveError("hash mismatch")
-
-        monkeypatch.setattr("tradebot.maintenance.service.archive_day", unverifiable)
+        **Two** pending days, because with one the spec's per-day containment and a per-pass
+        give-up are indistinguishable — which is how this test passed for a pass that stopped at
+        the first bad day and took every day behind it with it. A day file is *verified* rather
+        than rewritten once it exists, so a corrupt one fails on this pass and on every pass
+        after: giving up at it stopped retention for good (spec §6.4).
+        """
+        await store.append(seat_event(OLDER), seat_event(LONG_AGO))
+        monkeypatch.setattr(
+            "tradebot.maintenance.service.archive_day", unverifiable_on(OLDER.date())
+        )
 
         report = await build(store, tmp_path).run_once()
 
         assert report is not None
         assert "hash mismatch" in report.failure
-        assert report.compacted_rows == 0
-        assert any("raw_text" in str(e.payload) for e in store.read_all())
+        assert (report.archived_days, report.compacted_rows) == (1, 1)
+        kept = {
+            e.ts: "raw_text" in str(e.payload) for e in store.read_types(EventType.SEAT_RESPONDED)
+        }
+        assert kept == {OLDER: True, LONG_AGO: False}
+
+    async def test_a_day_that_will_not_archive_does_not_stop_the_deletions(
+        self, store: EventStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Deletion is scoped by file name and depends on nothing the archive step did.
+
+        Returning at the first bad day skipped `delete_aged` as well, so one corrupt file also
+        stopped the 90-day deletion that makes OPERATIONS precondition 17 answerable — the
+        database growing while the thing that trims it silently no longer ran.
+        """
+        await store.append(seat_event(ANCIENT), seat_event(LONG_AGO))
+        monkeypatch.setattr(
+            "tradebot.maintenance.service.archive_day", unverifiable_on(LONG_AGO.date())
+        )
+
+        report = await build(store, tmp_path).run_once()
+
+        assert report is not None
+        assert "hash mismatch" in report.failure
+        assert report.deleted_archives == 1
+        assert not archive_path(tmp_path / "archive", "sim", ANCIENT.date()).exists()
+
+    async def test_many_failed_days_are_summarised_rather_than_recited(
+        self, store: EventStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`failure` reaches the event payload *and* the notification body, so it is bounded.
+
+        A permissions fault on the archive root fails every pending day at once, and a database
+        that has never run maintenance can have hundreds. The full list goes to the log; the
+        operator gets the count and one example.
+        """
+        await store.append(seat_event(OLDER), seat_event(LONG_AGO), seat_event(ANCIENT))
+        monkeypatch.setattr(
+            "tradebot.maintenance.service.archive_day",
+            lambda *_a, **_k: (_ for _ in ()).throw(OSError("read-only file system")),
+        )
+
+        report = await build(store, tmp_path).run_once()
+
+        assert report is not None
+        assert not report.ok
+        assert "3 of 3" in report.failure
+        assert "read-only file system" in report.failure
+        assert report.failure.count("read-only file system") == 1
 
     async def test_an_unclassified_defect_is_recorded_rather_than_raised(
         self, store: EventStore, tmp_path: Path
@@ -334,6 +416,67 @@ class TestTheLoop:
 
         with pytest.raises(asyncio.CancelledError):
             await task
+
+
+class TestNothingBlocksTheEventLoop:
+    """Housekeeping shares its loop with the supervisor, the monitor and the dashboard socket."""
+
+    async def test_the_pending_day_scan_runs_off_the_event_loop(
+        self, store: EventStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Two `LIKE '%...%'` predicates over `payload_json`, the largest column there is.
+
+        No index can serve them, so the scan is linear in the whole log's payload size — 26 ms on
+        an 8 MB sim database, and it grows with the log. The three filesystem steps around it
+        already hop to a thread for exactly this reason (spec §6.3); this one was missed.
+        """
+        threads: list[str] = []
+
+        def record(*args: object, **kwargs: object) -> list[date]:
+            threads.append(threading.current_thread().name)
+            return pending_days(*args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr("tradebot.maintenance.service.pending_days", record)
+
+        await build(store, tmp_path).run_once()
+
+        assert threads == [threads[0]] and threading.main_thread().name not in threads
+
+
+class TestAnUndeletableFile:
+    """Spec §6.4 gives it its own row: reported and skipped, and counted in the daily line."""
+
+    async def test_it_is_not_a_failed_pass(
+        self, store: EventStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """It is none of the four things §5.4 lists as a `MAINTENANCE_FAILED`.
+
+        Folding it into `failure` swapped the day's line for an alarm — and HIGH notices
+        deliberately never supersede, so a virus scanner holding one file stacked another red row
+        every night while the pass's real work went unreported.
+        """
+        monkeypatch.setattr(
+            "tradebot.maintenance.service.delete_aged", lambda *_a, **_k: ([], [LOCKED])
+        )
+
+        report = await build(store, tmp_path).run_once()
+
+        assert report is not None
+        assert report.ok
+        assert report.undeletable == (LOCKED,)
+
+    async def test_it_is_recorded_on_the_daily_line(
+        self, store: EventStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            "tradebot.maintenance.service.delete_aged", lambda *_a, **_k: ([], [LOCKED])
+        )
+
+        await build(store, tmp_path).run_once()
+
+        (recorded,) = store.read_types(EventType.MAINTENANCE_RAN)
+        assert recorded.payload["outcome"] == "ok"
+        assert recorded.payload["undeletable"] == [LOCKED]
 
 
 class TestNothingIsCompactedWithoutAnArchive:
