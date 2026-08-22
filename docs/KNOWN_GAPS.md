@@ -1,23 +1,31 @@
 # Known gaps
 
-Defects found while fixing the simulated feed and the frozen instrument universe (2026-08-19),
-verified but **not** fixed. Each one is a decision someone has to make, not a bug waiting for a
-free afternoon — so each is written with what it costs, what was actually observed, and what
-closing it would take.
+Defects found by audit, verified but **not** fixed. Each is written with what it costs, what was
+actually observed, and what closing it would take — because each is a decision someone has to make
+rather than a bug waiting for a free afternoon.
 
-None of these is caused by the two fixes that shipped alongside them
-([marketdata/synthetic.py](../tradebot/marketdata/synthetic.py), the live instrument universe).
-All three predate that work and would have been found by any audit of the same seam.
+The house rule applies to reading this file too: **fail-closed is not the same as safe.** Most of
+these resolve in the fail-closed direction and are still on this list, because a system that stops
+doing something for a reason nobody can name is an incident.
 
-The house rule applies to reading this file too: **fail-closed is not the same as safe.** Two of
-these three resolve in the fail-closed direction, and are still on this list, because a system that
-stops trading for a reason nobody can name is an incident.
+Two audits so far:
+
+- **§1–3, the instrument-universe seam** (2026-08-19). None is caused by the two fixes that shipped
+  alongside them ([marketdata/synthetic.py](../tradebot/marketdata/synthetic.py), the live
+  instrument universe); all three predate that work.
+- **§4–7, the maintenance package** (2026-08-22), found while checking Phase 13 pieces A and B
+  against their plans and spec. All four are in `tradebot/maintenance/`, which never touches the
+  money path — none of them can cause or prevent a trade. What they cost is the record.
 
 | # | Gap | Reaches | Direction |
 |---|---|---|---|
 | 1 | The mismatch kill threshold compares quantities to money, and sizes itself from explained lines | live · paper | **fails open and closed** |
 | 2 | Retiring a basket that holds a position is unguarded | every mode | fails closed, and traps |
 | 3 | The one-quote-currency rule is enforced only at boot | live · paper | fails open |
+| 4 | One unverifiable archive stops all retention, permanently | every mode | fails closed, and wedges |
+| 5 | `pending_days` scans every payload on the event loop | every mode | stalls, never wrong |
+| 6 | An undeletable archive file is reported as a failed pass | every mode | over-alerts |
+| 7 | `maintenance status` answers three of the six questions the spec gives it | every mode | silent omission |
 
 ---
 
@@ -190,9 +198,166 @@ Binance data, and it takes *Binance's* catalogue (ADR 0025) — and so does live
 
 ---
 
+## 4. One archive that will not verify stops every day behind it, for good
+
+**Where** — [maintenance/service.py:156-167](../tradebot/maintenance/service.py#L156)
+
+```python
+try:
+    for day in pending_days(self.store.engine, before=horizon):
+        archived, compacted = await self._archive_then_compact(day, now, archived, compacted)
+except (TradebotError, OSError) as exc:
+    return MaintenanceReport(..., failure=f"archive: {exc}")
+```
+
+The whole day loop is inside one `try`, and the handler `return`s. So the first day whose archive
+raises takes with it **every later day** *and* the `delete_aged` call on line 169, which never
+runs. Spec §6.4 asks for something narrower: an archive that fails verification means "nothing
+compacted **for that day**".
+
+A day file is verified rather than rewritten when it already exists
+([archive.py:84](../tradebot/maintenance/archive.py#L84)) — correct, and the reason the failure is
+permanent. A truncated or corrupt file fails `_verify` on this pass, on the next, and on every
+pass after, because nothing repairs it and nothing skips it.
+
+**Observed.** A copy of `data/sim.db` with five pending days, a corrupt file planted for the
+earliest, and one archive dated 2026-01-01 that is far past `archive_keep_days`:
+
+```
+pending days: ['2026-08-16', '2026-08-17', '2026-08-18', '2026-08-19', '2026-08-21']
+outcome : FAILED
+archived: 0  compacted: 0  deleted: 0
+later days archived despite the bad one: NONE
+aged archive still present (should have been deleted): True
+```
+
+Two further forced passes: `ok=False archived=0 compacted=0 deleted=0`, twice, and the aged file
+still there. **Retention stops entirely** — the database keeps growing, and the 90-day deletion
+that makes OPERATIONS precondition 17 answerable silently stops happening.
+
+**What it does *not* do.** Nothing is lost and nothing is wrongly deleted: the ordering that makes
+compaction safe is intact, and a day that was not archived is a day that was not compacted. Since
+Piece C it is also **not silent** — the pass records `outcome: failed` and the maintenance rule
+raises a HIGH `MAINTENANCE_FAILED` notice naming the file
+([ADR 0029](adr/0029-notifications-are-a-projection-of-the-alert-rules.md)). Before that it was one
+`WARNING` in a log file. The operator now learns about it; the wedge is what remains.
+
+**Why CI is green.** `test_an_unverifiable_archive_compacts_nothing_for_that_day`
+([test_maintenance_service.py:220](../tests/unit/test_maintenance_service.py#L220)) has exactly one
+pending day in its fixture, so per-day and per-pass containment are indistinguishable to it. The
+test name asserts the narrower behaviour the spec describes; the code implements the wider one.
+
+**To close it.** Move the `try` inside the loop, count the day as failed, and carry on — collecting
+failures the way `delete_aged` already does rather than returning at the first. Then let the pass
+reach `delete_aged` regardless, since deletion is scoped by file name and does not depend on
+anything the archive step did. Add the second day to that test.
+
+---
+
+## 5. `pending_days` scans every heavy payload, on the event loop
+
+**Where** — [maintenance/compaction.py:123-130](../tradebot/maintenance/compaction.py#L123), called
+from [service.py:157](../tradebot/maintenance/service.py#L157)
+
+```python
+heavy = [
+    and_(events.c.type == type_.value, events.c.payload_json.like(f'%"{c.heavy_key}"%'))
+    for type_, c in COMPACTORS.items()
+]
+```
+
+Two `LIKE '%...%'` predicates over `payload_json` — the largest column in the database, and the one
+compaction exists because of. There is no index that can serve them, so every `SEAT_RESPONDED` and
+`SNAPSHOT_FROZEN` payload is read, including the ones already compacted. Selecting on `heavy_key`
+rather than on the event type is deliberate and correct
+([ADR 0028](adr/0028-retention-is-archive-then-compact.md) — selecting by type recreates deleted
+archives); the cost of that choice is this scan.
+
+It is called **synchronously inside `async def _pass`**. Every other filesystem step in that method
+was deliberately moved off the loop — `take_backup`, `archive_day` and `delete_aged` each go through
+`asyncio.to_thread`, and the plan's own correction list says why (spec §6.3). This one was missed.
+
+**Measured**, on the 8.3 MB sim database with 5.41 MB of payload: **26 ms**. Extrapolating linearly
+on payload size, a year of continuously supervised sim at the observed ~23 MB/week is roughly 1.2 GB
+and therefore **~6 seconds** — once a day, with the event loop held. Extrapolation, not measurement:
+nobody has run this against a database that size.
+
+**What that costs.** The maintenance task shares its loop with the supervisor, the execution monitor
+and the dashboard's WebSocket. Six seconds is six seconds in which no open order is polled and no
+pane refreshes. It cannot produce a wrong answer — but "the bot stopped responding for six seconds
+every night at 04:00" is an incident report nobody will enjoy writing.
+
+**To close it.** `await asyncio.to_thread(pending_days, self.store.engine, before=horizon)`. One
+line, and it is the same hop the three calls around it already make. Worth considering separately:
+the scan re-reads compacted payloads forever, which a marker column or a `payload_json NOT LIKE
+'%"compacted"%'` prefilter would not fix cheaply — but it is a cost that grows with the log, so
+it is worth knowing about before the log is large.
+
+---
+
+## 6. A file that will not delete is reported as a failed housekeeping pass
+
+**Where** — [maintenance/service.py:169-181](../tradebot/maintenance/service.py#L169)
+
+`delete_aged` returns `(removed, failures)` and does the right thing: a file it cannot unlink is
+reported and skipped so one locked file does not stop the rest of the pass, and the next pass tries
+again. Then `_pass` folds those strings straight into `MaintenanceReport.failure`, and `failure`
+being non-empty is exactly what `ok` means:
+
+```python
+return MaintenanceReport(..., deleted_archives=len(removed), failure="; ".join(failures))
+```
+
+So a pass that backed up, archived and compacted everything correctly, and merely could not unlink
+one file that a virus scanner had open, is recorded as `outcome: failed`.
+
+Spec §6.4 puts an undeletable file in its own row — *"reported and skipped; the next pass retries;
+counted in the daily line"* — and §5.4 lists what `MAINTENANCE_FAILED` is for: a failed backup, an
+unverifiable archive, short disk headroom, an unclassified error. A locked file is none of them.
+
+**Since Piece C this is visible rather than theoretical.** It now raises a HIGH
+`MAINTENANCE_FAILED` notice, and suppresses the LOW `MAINTENANCE_OK` that would have carried the
+count — so the operator gets an alarm instead of the line the spec wanted, and the day's real work
+goes unreported. It also loses the supersession: HIGH notices deliberately do not supersede, so
+each night's locked file stacks another red row.
+
+**To close it.** Carry the deletion failures on the report as their own field, render them in the
+`MAINTENANCE_OK` body next to the deleted count, and leave `failure` for the things §5.4 names.
+
+---
+
+## 7. `maintenance status` answers three of the six questions the spec gives it
+
+**Where** — [__main__.py:934](../tradebot/__main__.py#L934)
+
+Spec §7: *"`status` prints the windows in force and where they came from, the last backup, the last
+compaction, the archive inventory and free disk."* It prints the database size, the backup count and
+newest, free bytes, and what the next backup needs. Missing:
+
+- **the windows in force, and whether they came from a published document or the defaults** — which
+  is the setting that governs how long financial records are kept, and the substance of OPERATIONS
+  precondition 17;
+- **the last compaction** — that is, whether the daily pass is running at all. A dead tick and a
+  healthy one look identical here;
+- **the archive inventory** — how many day files exist and what they span, which is the only place
+  to see what deletion has already taken.
+
+Verified by running it against a copy of `data/sim.db`. Nothing about this is unimplementable: the
+command deliberately builds no `Application` so it can be pointed at a database another process has
+open, but `open_database` already gives it a read-only route to the `maintenance` config document
+and the `MAINTENANCE_RAN` events, and the archive directory is a `glob`.
+
+**What it costs.** The one command an operator runs to answer "is housekeeping healthy" cannot
+answer it. Combined with §4, that is the sharp edge: retention can be wedged for weeks, and the
+command whose name suggests it would say so does not look.
+
+---
+
 ## What was checked and found sound
 
-So the boundary of this audit is legible rather than implied:
+So the boundary of these audits is legible rather than implied.
+
+From the instrument-universe audit (§1-3):
 
 - **`StartupSequence` keeping a boot snapshot is correct**, not a fourth instance of the frozen-
   universe defect. It completes DESIGN §8.2 before anything can be published, so the set it reads
@@ -203,6 +368,22 @@ So the boundary of this audit is legible rather than implied:
   backtest honest, and it is why the simulated venue's feed is a separate class rather than a
   relaxation of this one.
 
+From the maintenance audit (§4–7):
+
+- **The archive-then-compact ordering holds.** Nothing is compacted without a verified archive, on
+  a real pass over `data/sim.db`: 4 days archived, 1,354 rows rewritten, payload 5.41 MB → 2.18 MB,
+  and 2,403 → 2,405 events — no row deleted, the two added being the pass's own `MAINTENANCE_RAN`.
+- **Compaction is idempotent and does not resurrect deleted archives.** A second pass over the same
+  database reported 0/0/0 and did **not** recreate the three archive files the first pass had
+  deleted — the failure mode `pending_days` selecting on `heavy_key` exists to prevent (ADR 0028).
+- **The archive round trip is exact.** All 1,849 payloads in one day file re-serialise byte-identical
+  to the canonical JSON in the pre-compaction copy, including the 96 rows holding non-ASCII text.
+- **The pre-migration backup fires, and the data step is right.** A copy of `data/sim.db` at
+  revision 0007 upgraded to 0009 wrote `sim-pre-0007-<stamp>.db` **before** touching the schema —
+  named for the revision it was leaving — and carried `recorded_seq` up to the existing
+  `last_seq` of 1234 rather than 0, so no installation re-records its whole log on the first poll
+  after the upgrade.
+
 ## Related, already recorded
 
 - **Soak evidence gathered before Phase 12 Piece 1 ran under a drawdown gate that could not see
@@ -212,3 +393,9 @@ So the boundary of this audit is legible rather than implied:
   fills priced off the 1h series. A stated limitation of a feed that has never claimed to be a
   market model, not a defect — recorded here only so a reader who notices it on the chart does not
   file it as one.
+- **The maintenance package has no rung-3 scenario test.** Spec §8.9 asks for a simulated month —
+  cycles running, the clock crossing midnight, a backup appearing, and past day 31 the drill-down
+  showing the archive pointer instead of "No snapshot was frozen". Everything in
+  `tradebot/maintenance/` is covered at rung 1, at 100%. A bug waiting for a free afternoon rather
+  than a decision, which is why it is here and not in the table above — but §4 is exactly the kind
+  of defect a multi-day scenario would have caught and unit tests did not.
