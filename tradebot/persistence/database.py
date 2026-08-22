@@ -41,10 +41,26 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 def create_database(path: Path | None) -> Engine:
-    """Open (creating if needed) the database for one mode.
+    """Open (creating if needed) the database for one mode, at the head revision.
 
     Each mode uses its own file, so a paper ledger can never be read as a live one (PLAN §2.4).
     `None` gives an in-memory database for tests.
+    """
+    engine = open_database(path)
+    if path is None:
+        run_migrations(engine)
+    else:
+        run_migrations(engine, backup=backup_destination(path), mode=path.stem, clock=SystemClock())
+    return engine
+
+
+def open_database(path: Path | None) -> Engine:
+    """Open the database **without** migrating it.
+
+    Split out from `create_database` because taking a backup must never be the thing that upgrades
+    a schema: an operator copying `live.db` before a release, to have a rollback point for exactly
+    that release, would otherwise find the copy command had already performed the migration they
+    were making the point *for* (spec §4.5). `tradebot maintenance` is the only caller.
     """
     if path is None:
         # An in-memory database lives *inside its connection*, so every pooled connection would
@@ -73,12 +89,6 @@ def create_database(path: Path | None) -> Engine:
         cursor.execute("PRAGMA foreign_keys=ON")
         cursor.close()
 
-    if path is None:
-        run_migrations(engine)
-    else:
-        run_migrations(
-            engine, backup=backup_destination(path), mode=path.stem, clock=SystemClock()
-        )
     return engine
 
 

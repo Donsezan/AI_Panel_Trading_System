@@ -33,7 +33,7 @@ AT = datetime(2026, 8, 20, 4, 0, tzinfo=UTC)
 BEHIND = "0006"
 
 
-def _database_at(path: Path, revision: str) -> Engine:
+def database_at(path: Path, revision: str) -> Engine:
     """A real file database genuinely upgraded to `revision` and no further.
 
     Genuinely upgraded rather than having `alembic_version` rewritten: a rewound version number
@@ -49,7 +49,7 @@ def _database_at(path: Path, revision: str) -> Engine:
     return engine
 
 
-def _revision_of(engine: Engine) -> str:
+def revision_of(engine: Engine) -> str:
     with engine.connect() as connection:
         return str(connection.execute(text("SELECT version_num FROM alembic_version")).scalar())
 
@@ -122,11 +122,9 @@ class TestSomethingToLose:
         self, tmp_path: Path
     ) -> None:
         path = tmp_path / "sim.db"
-        engine = _database_at(path, BEHIND)
+        engine = database_at(path, BEHIND)
 
-        run_migrations(
-            engine, backup=backup_destination(path), mode="sim", clock=ManualClock(AT)
-        )
+        run_migrations(engine, backup=backup_destination(path), mode="sim", clock=ManualClock(AT))
 
         assert _copies(path) == [f"sim-pre-{BEHIND}-20260820T040000Z.db"]
 
@@ -139,15 +137,13 @@ class TestSomethingToLose:
         is the only reading that cannot pass by accident.
         """
         path = tmp_path / "sim.db"
-        engine = _database_at(path, BEHIND)
+        engine = database_at(path, BEHIND)
 
-        run_migrations(
-            engine, backup=backup_destination(path), mode="sim", clock=ManualClock(AT)
-        )
+        run_migrations(engine, backup=backup_destination(path), mode="sim", clock=ManualClock(AT))
 
         (copy,) = backup_destination(path).glob("*.db")
-        assert _revision_of(create_engine(f"sqlite:///{copy}", future=True)) == BEHIND
-        assert _revision_of(engine) != BEHIND
+        assert revision_of(create_engine(f"sqlite:///{copy}", future=True)) == BEHIND
+        assert revision_of(engine) != BEHIND
 
     def test_a_database_holding_tables_but_no_version_is_copied_rather_than_read_as_empty(
         self, tmp_path: Path
@@ -160,7 +156,7 @@ class TestSomethingToLose:
         on disk, which is the difference between a bad morning and an unrecoverable one.
         """
         path = tmp_path / "sim.db"
-        engine = _database_at(path, BEHIND)
+        engine = database_at(path, BEHIND)
         with engine.begin() as connection:
             connection.execute(text("DROP TABLE alembic_version"))
 
@@ -177,7 +173,7 @@ class TestFailClosed:
 
     def test_a_failing_backup_stops_the_migration(self, tmp_path: Path) -> None:
         path = tmp_path / "sim.db"
-        engine = _database_at(path, BEHIND)
+        engine = database_at(path, BEHIND)
 
         with pytest.raises(BackupError):
             run_migrations(
@@ -190,7 +186,7 @@ class TestFailClosed:
 
     def test_a_blocked_migration_leaves_the_schema_untouched(self, tmp_path: Path) -> None:
         path = tmp_path / "sim.db"
-        engine = _database_at(path, BEHIND)
+        engine = database_at(path, BEHIND)
 
         with pytest.raises(BackupError):
             run_migrations(
@@ -201,6 +197,6 @@ class TestFailClosed:
                 take=_refuse,
             )
 
-        assert _revision_of(engine) == BEHIND
+        assert revision_of(engine) == BEHIND
         columns = {column["name"] for column in inspect(engine).get_columns("alert_cursor")}
         assert "stale_streak" not in columns
