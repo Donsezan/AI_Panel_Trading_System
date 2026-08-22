@@ -8,14 +8,18 @@ load-bearing as its actions.
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from pathlib import Path
 
 import pytest
+from sqlalchemy import create_engine
+from tests.unit.test_migration_backup import BEHIND, database_at, revision_of
 
 from tradebot.__main__ import _race, main, parse_args
 from tradebot.app import Application
 from tradebot.core.enums import Mode
 from tradebot.dashboard.auth import TOKEN_ENV
+from tradebot.persistence.database import create_database
 from tradebot.risk.state import REARM_PHRASE
 
 
@@ -145,8 +149,6 @@ class TestRiskCommands:
 
 def _trip(data_root: Path) -> None:
     """Trip the persisted switch directly, as a real breach in a previous process would have."""
-    import sqlite3
-
     with sqlite3.connect(data_root / "sim.db") as connection:
         connection.execute("UPDATE risk_state SET kill_switch = 'tripped', reason = 'test'")
 
@@ -369,3 +371,70 @@ def _record_history(directory: Path) -> Path:
         )
     )
     return directory
+
+
+class TestMaintenanceCommands:
+    """Backups on demand — from a command that may be run while the bot is cycling.
+
+    Which is why it builds no `Application`: a second one would open a second writer against the
+    same file. It opens the database without migrating it for the mirror-image reason — the whole
+    point of copying `live.db` before a release is to have a rollback point *for* that release.
+    """
+
+    def test_a_backup_writes_a_copy_that_opens_as_a_database(
+        self, data_dir: list[str], tmp_path: Path
+    ) -> None:
+        create_database(tmp_path / "sim.db")
+
+        assert main(["maintenance", "backup", "--mode", "sim", *data_dir]) == 0
+
+        (copy,) = (tmp_path / "backups" / "sim").glob("*.db")
+        with sqlite3.connect(copy) as connection:
+            names = connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            assert "events" in {row[0] for row in names}
+
+    def test_a_refused_backup_exits_rather_than_raising(
+        self, data_dir: list[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A supervisor script has to be able to tell "no room" from "crashed"."""
+        create_database(tmp_path / "sim.db")
+        monkeypatch.setattr("tradebot.maintenance.backup.free_bytes", lambda _: 1024)
+
+        assert main(["maintenance", "backup", "--mode", "sim", *data_dir]) == 6
+
+    def test_the_backup_dir_flag_overrides_the_default_location(
+        self, data_dir: list[str], tmp_path: Path
+    ) -> None:
+        create_database(tmp_path / "sim.db")
+        elsewhere = tmp_path / "elsewhere"
+
+        exit_code = main(
+            ["maintenance", "backup", "--mode", "sim", "--backup-dir", str(elsewhere), *data_dir]
+        )
+
+        assert exit_code == 0
+        assert list(elsewhere.glob("*.db"))
+
+    def test_a_backup_never_migrates_the_database_it_copies(
+        self, data_dir: list[str], tmp_path: Path
+    ) -> None:
+        """The rollback point must be of the schema being left, not the one being moved to."""
+        database_at(tmp_path / "sim.db", BEHIND)
+
+        assert main(["maintenance", "backup", "--mode", "sim", *data_dir]) == 0
+
+        engine = create_engine(f"sqlite:///{tmp_path / 'sim.db'}", future=True)
+        assert revision_of(engine) == BEHIND
+
+    def test_status_reports_without_writing_anything(
+        self, data_dir: list[str], tmp_path: Path
+    ) -> None:
+        create_database(tmp_path / "sim.db")
+
+        assert main(["maintenance", "status", "--mode", "sim", *data_dir]) == 0
+        assert not (tmp_path / "backups").exists()
+
+    def test_a_database_that_is_not_there_is_a_misuse_not_a_crash(
+        self, data_dir: list[str], tmp_path: Path
+    ) -> None:
+        assert main(["maintenance", "status", "--mode", "sim", *data_dir]) == 2

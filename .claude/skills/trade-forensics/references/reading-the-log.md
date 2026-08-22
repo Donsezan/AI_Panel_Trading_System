@@ -11,10 +11,12 @@ file copy of a WAL database can:
 
 ```python
 import sqlite3
+
 src = sqlite3.connect("file:data/sim.db?mode=ro", uri=True)
 dst = sqlite3.connect(r"<SCRATCHPAD>/sim_copy.db")
 src.backup(dst)
-dst.close(); src.close()
+dst.close()
+src.close()
 ```
 
 Work only on the copy. Never write to it and then present the result as production state.
@@ -166,6 +168,7 @@ The file's shape — **`markets` is a list of dicts**, not a dict keyed by symbo
 
 ```python
 import json
+
 d = json.load(open("tradebot/marketdata/sim_markets.json"))
 for e in d["markets"]:
     if e["symbol"] in ("XRP/USDT", "LTC/USDT"):
@@ -182,6 +185,6 @@ Match the **heading tag**, not the bare words — the page's own prose names the
 searching for the words lands on explanatory text rather than the table:
 
 ```python
-i = page.find("<h2>Risk checks</h2>")      # not page.find("Risk checks")
+i = page.find("<h2>Risk checks</h2>")  # not page.find("Risk checks")
 j = page.find("<h2>Frozen snapshot</h2>")
 ```

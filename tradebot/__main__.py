@@ -11,6 +11,10 @@ an automatic re-arm would defeat the control entirely (DESIGN §6.6).
 `config` reads the versioned ConfigStore. It deliberately only reads: editing a limit is the
 dashboard's job, where the change can be reviewed against the same pydantic validators the engine
 uses, and a Tier-2 loosening can demand its extra confirmation (DESIGN §6.10).
+
+`maintenance` is the only command that may be run against a database another process is using. It
+wires no `Application` and takes no lock: a backup an operator cannot take during an incident is a
+backup they will not have.
 """
 
 from __future__ import annotations
@@ -55,12 +59,20 @@ from tradebot.core.logging import configure_logging, get_logger
 from tradebot.dashboard.app import create_dashboard
 from tradebot.dashboard.auth import assert_bind_allowed, require_token
 from tradebot.decision.presets import PANELS
+from tradebot.maintenance.backup import (
+    BACKUP_DIR_ENV,
+    BackupError,
+    backup_destination,
+    free_bytes,
+    required_bytes,
+    take_backup,
+)
 from tradebot.marketdata.catalogue import SIM_MARKETS, SIM_SYMBOLS, MarketSnapshot
 from tradebot.marketdata.factory import binance_spot_history
 from tradebot.marketdata.recorder import ReplayDataset
 from tradebot.marketdata.recorder import record as record_history
 from tradebot.news.rss import FEEDS
-from tradebot.persistence.database import SingleWriter, create_database
+from tradebot.persistence.database import SingleWriter, create_database, open_database
 from tradebot.risk.state import assert_rearm_phrase
 from tradebot.validation.backtest import BANNER, BacktestHarness
 from tradebot.validation.comparison import Comparison, ComparisonReport
@@ -93,6 +105,10 @@ EXIT_MISUSE = 2  # the command cannot be carried out as asked
 EXIT_RECOVERY_HALTED = 3  # DESIGN §8.2 left the process up but not trading
 EXIT_CYCLE_FAILED = 4  # a `--once` cycle failed; a supervised run would have retried it
 EXIT_GATES_FAILED = 5  # a promotion gate did not pass; the soak continues
+#: A code of its own rather than reusing 5: a supervisor script running a nightly backup has to be
+#: able to tell "there is no room on the volume" from "a promotion gate did not pass", and one
+#: number meaning both is one number nobody can act on.
+EXIT_BACKUP_REFUSED = 6
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -263,6 +279,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     _add_common(history)
     history.add_argument("kind", choices=[kind.value for kind in ConfigKind])
     history.add_argument("config_id", help="basket id, or 'global' for the Tier-2 policy")
+
+    maintenance = subparsers.add_parser("maintenance", help="backups and housekeeping")
+    maintenance_actions = maintenance.add_subparsers(dest="action", required=True)
+    for action, summary in (
+        ("backup", "take a consistent copy of this mode's database"),
+        ("status", "the backup inventory, the newest copy, and free disk"),
+    ):
+        action_parser = maintenance_actions.add_parser(action, help=summary)
+        _add_common(action_parser)
+        action_parser.add_argument(
+            "--backup-dir",
+            type=Path,
+            default=None,
+            help=(
+                f"where copies live; overrides {BACKUP_DIR_ENV} and the default "
+                "'backups/<mode>' beside the database"
+            ),
+        )
     return parser.parse_args(argv)
 
 
@@ -748,6 +782,75 @@ async def risk_command(args: argparse.Namespace) -> int:
         await application.shutdown()
 
 
+async def maintenance_command(args: argparse.Namespace) -> int:
+    """Housekeeping against one mode's database. Reads and copies; never trades.
+
+    Deliberately builds no `Application`. A backup has to be takeable **while the bot is running**,
+    and wiring a second one would open a second writer against the same file — the one thing
+    `SingleWriter` exists to make impossible (PLAN §2.6). It opens the database through
+    `open_database` for the mirror-image reason: the point of copying `live.db` before a release is
+    to have a rollback point *for* that release, so the copy command must never be what performs
+    the migration.
+    """
+    mode = Mode(args.mode)
+    configure_logging(mode=mode.value, level=logging.DEBUG if args.verbose else logging.INFO)
+    # One hop off the event loop for the whole command, rather than a thread per call inside it.
+    # Every step here is blocking filesystem work — `VACUUM INTO` on a multi-GB database is seconds
+    # to minutes of it — and this is the same body the daily tick will run from a process that *is*
+    # cycling baskets (spec §6.3).
+    return await asyncio.to_thread(_maintain, mode, args)
+
+
+def _maintain(mode: Mode, args: argparse.Namespace) -> int:
+    path = database_path(mode, args.data_dir)
+    if not path.exists():
+        logger.error("no database to maintain", extra={"path": str(path), "mode": mode.value})
+        return EXIT_MISUSE
+    destination = args.backup_dir or backup_destination(path)
+    return _MAINTENANCE_ACTIONS[args.action](mode, path, destination)
+
+
+def _maintenance_backup(mode: Mode, path: Path, destination: Path) -> int:
+    """One copy, now. A refusal is an exit code, never a traceback (spec §4.4)."""
+    engine = open_database(path)
+    try:
+        result = take_backup(engine, destination, mode=mode.value, clock=SystemClock())
+    except BackupError as exc:
+        logger.error("backup refused", extra={"error": str(exc), "destination": str(destination)})
+        return EXIT_BACKUP_REFUSED
+    finally:
+        engine.dispose()
+    logger.info(
+        "database backed up",
+        extra={"path": str(result.path), "bytes": result.size_bytes, "mode": mode.value},
+    )
+    return 0
+
+
+def _maintenance_status(mode: Mode, path: Path, destination: Path) -> int:
+    """The inventory, and whether the next copy would fit. Writes nothing, opens nothing.
+
+    `required_bytes` is reported beside `free_bytes` because the interesting question is not how
+    much room there is but whether tonight's backup will be refused — and nothing rotates, so that
+    answer only ever moves one way (spec D4).
+    """
+    copies = sorted(destination.glob("*.db")) if destination.exists() else []
+    logger.info(
+        "maintenance status",
+        extra={
+            "mode": mode.value,
+            "database": str(path),
+            "database_bytes": path.stat().st_size,
+            "backup_dir": str(destination),
+            "backups": len(copies),
+            "newest_backup": copies[-1].name if copies else "",
+            "free_bytes": free_bytes(destination if destination.exists() else path.parent),
+            "next_backup_needs_bytes": required_bytes(path),
+        },
+    )
+    return 0
+
+
 async def config_command(args: argparse.Namespace) -> int:
     """Read the versioned ConfigStore. Editing is the dashboard's job (DESIGN §6.10)."""
     application = await _open(args)
@@ -922,6 +1025,7 @@ _CONFIG_ACTIONS = {"list": _config_list, "history": _config_history}
 _BACKTEST_ACTIONS = {"fetch": _backtest_fetch, "run": _backtest_run}
 _CATALOGUE_ACTIONS = {"fetch": _catalogue_fetch}
 _REPORT_ACTIONS = {"promotion": _promotion_report, "shadow": _shadow_report}
+_MAINTENANCE_ACTIONS = {"backup": _maintenance_backup, "status": _maintenance_status}
 _COMMANDS = {
     "run": run_command,
     "serve": serve_command,
@@ -930,6 +1034,7 @@ _COMMANDS = {
     "backtest": backtest_command,
     "catalogue": catalogue_command,
     "report": report_command,
+    "maintenance": maintenance_command,
 }
 
 
