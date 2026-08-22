@@ -58,6 +58,10 @@ class EventType(StrEnum):
     KILL_SWITCH_CHANGED = "KILL_SWITCH_CHANGED"
     BASKET_STATUS_CHANGED = "BASKET_STATUS_CHANGED"
     CONFIG_CHANGED = "CONFIG_CHANGED"
+    #: One housekeeping pass: what it did, under which retention windows, and whether it failed.
+    #: Also what answers "is a run due" — derived from the log, never counted in memory, so a
+    #: restart can neither skip the day's backup nor take a second (spec §6.2).
+    MAINTENANCE_RAN = "MAINTENANCE_RAN"
 
 
 class Event(DomainModel):

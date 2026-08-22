@@ -21,10 +21,11 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
 
-from sqlalchemy import Connection, select, update
+from sqlalchemy import Connection, Engine, and_, func, or_, select, update
 
 from tradebot.core.events import EventType
 from tradebot.core.logging import get_logger
@@ -43,7 +44,21 @@ MARKER_KEY = "compacted"
 #: multi-second write: the writer is shared with the money path (PLAN §2.6).
 DEFAULT_CHUNK = 200
 
-Compactor = Callable[[dict[str, Any]], dict[str, Any] | None]
+Trim = Callable[[dict[str, Any]], dict[str, Any] | None]
+
+
+@dataclass(frozen=True, slots=True)
+class Compactor:
+    """How one event type is trimmed, and how to find rows that still need it.
+
+    `heavy_key` is the payload key whose presence means "there is still something to drop here".
+    It is used by `trim` *and* by `pending_days`, from one definition, so the rewrite and the
+    search for work can never disagree about what counts as compacted.
+    """
+
+    #: The key `trim` removes. Also the SQL predicate that finds rows still holding one.
+    heavy_key: str
+    trim: Trim
 
 
 def _drop_raw_text(payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -74,8 +89,8 @@ def _drop_snapshot(payload: dict[str, Any]) -> dict[str, Any] | None:
 #: The whole containment decision, as data. Two entries, and both were chosen by measuring: they
 #: are 88% of the log's payload bytes (spec §1.2).
 COMPACTORS: dict[EventType, Compactor] = {
-    EventType.SEAT_RESPONDED: _drop_raw_text,
-    EventType.SNAPSHOT_FROZEN: _drop_snapshot,
+    EventType.SEAT_RESPONDED: Compactor("raw_text", _drop_raw_text),
+    EventType.SNAPSHOT_FROZEN: Compactor("snapshot", _drop_snapshot),
 }
 
 
@@ -86,10 +101,45 @@ def compact_payload(
     compactor = COMPACTORS.get(type_)
     if compactor is None:
         return None
-    trimmed = compactor(payload)
+    trimmed = compactor.trim(payload)
     if trimmed is None:
         return None
     return {**trimmed, MARKER_KEY: marker}
+
+
+def pending_days(engine: Engine, *, before: date) -> list[date]:
+    """Days entirely before `before` that still hold something worth compacting, oldest first.
+
+    Selected on the registry's own `heavy_key` per type, so a day whose payloads have all been
+    trimmed drops out of the list. That is **not** an optimisation. Selecting on the event *type*
+    alone — the obvious reading — would revisit every past day on every pass forever, and once
+    that day's archive had been deleted at `archive_keep_days` the next pass would find the file
+    absent and **recreate it** from the already-compacted rows: a hollow archive holding none of
+    the payloads it is named for, reappearing every day, growing without bound and quietly
+    contradicting D1a's promise that deletion is final.
+
+    A seat that abstained never had a `raw_text`, so it never keeps a day alive here either.
+    """
+    heavy = [
+        and_(events.c.type == type_.value, events.c.payload_json.like(f'%"{c.heavy_key}"%'))
+        for type_, c in COMPACTORS.items()
+    ]
+    query = select(func.substr(events.c.ts, 1, 10)).where(or_(*heavy)).distinct()
+    with engine.connect() as connection:
+        stamps = [str(row[0]) for row in connection.execute(query)]
+    return sorted(day for stamp in stamps if (day := _as_day(stamp)) is not None and day < before)
+
+
+def _as_day(stamp: str) -> date | None:
+    """A stored timestamp's date, or `None` if it does not read as one.
+
+    A row nobody can date cannot be assigned to an archive file, so it is left alone rather than
+    guessed at — the same reasoning as `archive.delete_aged` parsing a name it will not assume.
+    """
+    try:
+        return date.fromisoformat(stamp)
+    except ValueError:
+        return None
 
 
 async def compact_day(

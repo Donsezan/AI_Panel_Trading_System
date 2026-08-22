@@ -25,6 +25,7 @@ from tradebot.maintenance.compaction import (
     MARKER_KEY,
     compact_day,
     compact_payload,
+    pending_days,
 )
 from tradebot.persistence.database import SingleWriter
 from tradebot.persistence.schema import PROJECTION_TABLES, cycles
@@ -386,3 +387,77 @@ class TestTheInvariant:
         for event in store.read_types(EventType.SNAPSHOT_FROZEN):
             assert "snapshot" not in event.payload
             assert event.payload["digest"]
+
+
+class TestPendingDays:
+    """Which days a pass still has work for. The answer that stops the pass growing forever."""
+
+    async def test_it_names_a_day_that_still_holds_a_transcript(self, store: EventStore) -> None:
+        await store.append(seat_event(NOON))
+
+        assert pending_days(store.engine, before=date(2026, 8, 1)) == [DAY]
+
+    async def test_a_day_inside_the_hot_window_is_not_named(self, store: EventStore) -> None:
+        await store.append(seat_event(NOON))
+
+        assert pending_days(store.engine, before=DAY) == []
+
+    async def test_a_fully_compacted_day_drops_out(self, store: EventStore) -> None:
+        """The whole point. Selecting on the event *type* alone would keep it forever.
+
+        And "forever" is not merely wasteful: once this day's archive is deleted at
+        `archive_keep_days`, the next pass would find the file absent and recreate it from the
+        already-compacted rows — a hollow archive, reappearing daily, contradicting D1a.
+        """
+        await store.append(seat_event(NOON))
+        await compact_day(writer_of(store), day=DAY, archive=ARCHIVE, at=NOON)
+
+        assert pending_days(store.engine, before=date(2026, 8, 1)) == []
+
+    async def test_a_day_of_nothing_but_abstentions_never_keeps_itself_alive(
+        self, store: EventStore
+    ) -> None:
+        """An abstention has no completion to drop, so it is not work and never becomes work."""
+        await store.append(seat_event(NOON, abstained_payload()))
+
+        assert pending_days(store.engine, before=date(2026, 8, 1)) == []
+
+    async def test_an_uncompactable_type_never_names_a_day(self, store: EventStore) -> None:
+        await store.append(
+            Event(
+                ts=NOON,
+                type=EventType.CYCLE_COMPLETED,
+                aggregate_id="c-1",
+                cycle_id="c-1",
+                payload={"outcome": "no_trade", "cost_usd": "0"},
+            )
+        )
+
+        assert pending_days(store.engine, before=date(2026, 8, 1)) == []
+
+    async def test_days_come_back_oldest_first(self, store: EventStore) -> None:
+        """The pass archives in order, so a crash mid-run leaves the oldest days done."""
+        await store.append(
+            seat_event(NEXT_DAY),
+            seat_event(NOON),
+            seat_event(datetime(2026, 7, 1, 9, 0, tzinfo=UTC)),
+        )
+
+        assert pending_days(store.engine, before=date(2026, 8, 1)) == [
+            date(2026, 7, 1),
+            DAY,
+            date(2026, 7, 20),
+        ]
+
+    async def test_a_snapshot_body_also_names_its_day(self, store: EventStore) -> None:
+        await store.append(
+            Event(
+                ts=NOON,
+                type=EventType.SNAPSHOT_FROZEN,
+                aggregate_id="c-1",
+                cycle_id="c-1",
+                payload=snapshot_payload(),
+            )
+        )
+
+        assert pending_days(store.engine, before=date(2026, 8, 1)) == [DAY]
