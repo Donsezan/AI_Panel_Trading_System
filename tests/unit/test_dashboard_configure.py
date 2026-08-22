@@ -16,6 +16,7 @@ import pytest
 from tests.conftest import DASHBOARD_TOKEN
 
 from tradebot.app import Application
+from tradebot.control.config_store import SINGLETON_ID
 from tradebot.core.enums import AssetClass, ConfigKind
 from tradebot.core.errors import VenueError
 from tradebot.core.events import EventType
@@ -26,7 +27,7 @@ from tradebot.dashboard.routes.configure import (
     fold_prices,
     unfold_prices,
 )
-from tradebot.dashboard.views import PACKAGE
+from tradebot.dashboard.views import ACTOR, PACKAGE
 from tradebot.interfaces.exchange import IdType, VenueMarket
 
 
@@ -1411,3 +1412,79 @@ async def test_an_instrument_another_basket_holds_is_named_on_the_row(
 
     assert "held by basket" not in body  # alpha holds SOL alone
     assert "held by basket" not in body_demo  # demo holds BTC and ETH alone
+
+
+class TestMaintenanceForm:
+    """Retention windows are edited beside the risk limits, as their own versioned document.
+
+    Its own document and its own form, deliberately: retention is not a risk limit, it versions
+    on its own schedule, and publishing a stop-loss must never republish a retention window.
+    """
+
+    async def test_the_windows_appear_on_the_parameters_page(
+        self, client: httpx.AsyncClient
+    ) -> None:
+        body = (await client.get("/configure/risk")).text
+
+        assert "compact_after_days" in body
+        assert "archive_keep_days" in body
+
+    async def test_the_irreversibility_is_stated_beside_the_field(
+        self, client: httpx.AsyncClient
+    ) -> None:
+        """Publishing 7 where 90 stood deletes 83 days of transcripts on the next tick."""
+        body = (await client.get("/configure/risk")).text
+
+        assert "Irreversible" in body
+
+    async def test_the_windows_can_be_published(
+        self, client: httpx.AsyncClient, sim_application: Application
+    ) -> None:
+        response = await client.post(
+            "/configure/maintenance",
+            data={"doc.compact_after_days": "45", "doc.archive_keep_days": "120"},
+        )
+
+        assert response.status_code in (200, 303)
+        record = sim_application.configs.latest(ConfigKind.MAINTENANCE, SINGLETON_ID)
+        assert record is not None
+        assert record.document.compact_after_days == 45
+        assert record.document.archive_keep_days == 120
+
+    async def test_inverted_windows_are_refused_with_the_reason(
+        self, client: httpx.AsyncClient, sim_application: Application
+    ) -> None:
+        response = await client.post(
+            "/configure/maintenance",
+            data={"doc.compact_after_days": "90", "doc.archive_keep_days": "30"},
+        )
+
+        assert "must exceed" in response.text
+        assert sim_application.configs.latest(ConfigKind.MAINTENANCE, SINGLETON_ID) is None
+
+    async def test_publishing_retention_does_not_touch_the_risk_policy(
+        self, client: httpx.AsyncClient, sim_application: Application
+    ) -> None:
+        before = sim_application.configs.global_risk()
+        assert before is not None
+
+        await client.post(
+            "/configure/maintenance",
+            data={"doc.compact_after_days": "45", "doc.archive_keep_days": "120"},
+        )
+
+        after = sim_application.configs.global_risk()
+        assert after is not None
+        assert after.ref.version == before.ref.version
+
+    async def test_the_edit_is_attributable(
+        self, client: httpx.AsyncClient, sim_application: Application
+    ) -> None:
+        """ "Who shortened retention, and when" is the point of it being a versioned document."""
+        await client.post(
+            "/configure/maintenance",
+            data={"doc.compact_after_days": "3", "doc.archive_keep_days": "7"},
+        )
+
+        (record,) = sim_application.configs.history(ConfigKind.MAINTENANCE, SINGLETON_ID)
+        assert record.actor == ACTOR

@@ -31,6 +31,7 @@ from typing import Any
 
 import uvicorn
 from fastapi import FastAPI
+from pydantic import ValidationError
 
 from tradebot.app import (
     DEFAULT_PANEL_ID,
@@ -53,6 +54,7 @@ from tradebot.control.basket_runner import CycleResult
 from tradebot.control.config_store import ConfigStore
 from tradebot.control.supervision import SupervisionController
 from tradebot.core.clock import ManualClock, SystemClock, ensure_utc
+from tradebot.core.config import MaintenancePolicy
 from tradebot.core.enums import ConfigKind, Mode
 from tradebot.core.errors import ConfigError, TradebotError
 from tradebot.core.logging import configure_logging, get_logger
@@ -285,6 +287,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     for action, summary in (
         ("backup", "take a consistent copy of this mode's database"),
         ("status", "the backup inventory, the newest copy, and free disk"),
+        ("compact", "run one housekeeping pass now: back up, archive, compact, delete"),
     ):
         action_parser = maintenance_actions.add_parser(action, help=summary)
         _add_common(action_parser)
@@ -297,6 +300,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                 "'backups/<mode>' beside the database"
             ),
         )
+    compact = maintenance_actions.choices["compact"]
+    compact.add_argument(
+        "--older-than",
+        type=int,
+        default=None,
+        metavar="DAYS",
+        help=(
+            "one-off override of compact_after_days for this pass only. Defaults to the published "
+            "maintenance document, and is recorded on the event as an override"
+        ),
+    )
+    compact.add_argument(
+        "--keep-days",
+        type=int,
+        default=None,
+        metavar="DAYS",
+        help="one-off override of archive_keep_days for this pass only. Deleting is irreversible",
+    )
     return parser.parse_args(argv)
 
 
@@ -488,26 +509,29 @@ async def _serve(application: Application) -> int:
 
 
 async def _race(application: Application, *named: tuple[str, Coroutine[Any, Any, Any]]) -> None:
-    """Run these alongside the alert tail until the first of them finishes, then stop them all.
+    """Run these alongside the housekeeping tasks until the first finishes, then stop them all.
 
-    The tail is started here rather than by each caller so there is exactly one answer to "is
-    alerting running?" — it runs whenever the process is doing anything long-lived, and it is a
-    no-op when no destination is configured (ADR 0019).
+    The alert tail is started here rather than by each caller so there is exactly one answer to
+    "is alerting running?" — it runs whenever the process is doing anything long-lived, and it is
+    a no-op when no destination is configured (ADR 0019). The maintenance tick joins it for the
+    same reason, and is absent only for an in-memory database, which no long-lived process has.
 
-    It is a **companion, not a racer**: that no-op returns immediately, so a process whose lifetime
-    the tail helped decide would exit the moment it started with alerting off — which is the
-    default for sim and paper.
+    Both are **companions, not racers**: the alert no-op returns immediately, so a process whose
+    lifetime either helped decide would exit the moment it started with alerting off — which is
+    the default for sim and paper.
     """
     tasks = [asyncio.create_task(coro, name=name) for name, coro in named]
-    tail = asyncio.create_task(application.alerts.run(), name="alerts")
+    companions = [asyncio.create_task(application.alerts.run(), name="alerts")]
+    if application.maintenance is not None:
+        companions.append(asyncio.create_task(application.maintenance.run(), name="maintenance"))
     try:
         await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
     except (KeyboardInterrupt, asyncio.CancelledError):
         logger.warning("interrupted; stopping")
     finally:
-        for task in (*tasks, tail):
+        for task in (*tasks, *companions):
             task.cancel()
-        await asyncio.gather(*tasks, tail, return_exceptions=True)
+        await asyncio.gather(*tasks, *companions, return_exceptions=True)
 
 
 def _report(application: Application, results: Sequence[CycleResult]) -> int:
@@ -794,20 +818,98 @@ async def maintenance_command(args: argparse.Namespace) -> int:
     """
     mode = Mode(args.mode)
     configure_logging(mode=mode.value, level=logging.DEBUG if args.verbose else logging.INFO)
-    # One hop off the event loop for the whole command, rather than a thread per call inside it.
-    # Every step here is blocking filesystem work — `VACUUM INTO` on a multi-GB database is seconds
-    # to minutes of it — and this is the same body the daily tick will run from a process that *is*
-    # cycling baskets (spec §6.3).
-    return await asyncio.to_thread(_maintain, mode, args)
-
-
-def _maintain(mode: Mode, args: argparse.Namespace) -> int:
     path = database_path(mode, args.data_dir)
     if not path.exists():
         logger.error("no database to maintain", extra={"path": str(path), "mode": mode.value})
         return EXIT_MISUSE
-    destination = args.backup_dir or backup_destination(path)
-    return _MAINTENANCE_ACTIONS[args.action](mode, path, destination)
+    return await _MAINTENANCE_ACTIONS[args.action](mode, args)
+
+
+async def _maintenance_backup_action(mode: Mode, args: argparse.Namespace) -> int:
+    """Take one copy, off the event loop.
+
+    One hop for the whole body: `VACUUM INTO` on a multi-GB database is seconds to minutes of
+    blocking I/O, and this is the same call the daily tick makes from a process that *is* cycling
+    baskets (spec §6.3).
+    """
+    path = database_path(mode, args.data_dir)
+    return await asyncio.to_thread(
+        _maintenance_backup, mode, path, args.backup_dir or backup_destination(path)
+    )
+
+
+async def _maintenance_status_action(mode: Mode, args: argparse.Namespace) -> int:
+    path = database_path(mode, args.data_dir)
+    return await asyncio.to_thread(
+        _maintenance_status, mode, path, args.backup_dir or backup_destination(path)
+    )
+
+
+async def _maintenance_compact_action(_mode: Mode, args: argparse.Namespace) -> int:
+    """One deliberate pass now, under the published windows or a one-off override.
+
+    Unlike `backup` and `status` this *does* wire an `Application`: a pass reads the published
+    retention policy and writes through the same single writer a cycle uses. It also forces the
+    pass — dueness is the *tick's* rule, and a human who typed the command meant it.
+
+    The overrides go through `MaintenancePolicy` rather than being applied raw, so the CLI
+    restates no rule and a window it accepts is one the daily tick would accept too (spec §7).
+
+    The mode is unused here because `_open` re-reads it from `args` while wiring; the parameter
+    stays so every action in the table has one signature.
+    """
+    override, refusal = _window_override(args)
+    if refusal:
+        logger.error("refusing the requested retention windows", extra={"error": refusal})
+        return EXIT_MISUSE
+
+    application = await _open(args)
+    try:
+        service = application.maintenance
+        if service is None:  # pragma: no cover - only an in-memory database lacks one
+            logger.error("this database has no maintenance service")
+            return EXIT_MISUSE
+        report = await service.run_once(force=True, override=override)
+        if report is None:  # pragma: no cover - `force=True` never returns None
+            return 0
+        logger.info(
+            "maintenance pass finished",
+            extra={
+                "outcome": "ok" if report.ok else "failed",
+                "detail": report.failure,
+                "backup": str(report.backup) if report.backup else "",
+                "archived_days": report.archived_days,
+                "compacted_rows": report.compacted_rows,
+                "deleted_archives": report.deleted_archives,
+                "overridden": override is not None,
+            },
+        )
+        return 0 if report.ok else EXIT_BACKUP_REFUSED
+    finally:
+        await application.shutdown()
+
+
+def _window_override(args: argparse.Namespace) -> tuple[MaintenancePolicy | None, str]:
+    """The one-off windows as a validated policy, or the model's own refusal as text.
+
+    `None` with no refusal means "no flags given": use the published document. Both windows
+    default from `MaintenancePolicy`, so passing only one still gets the other's designed value
+    rather than a half-specified pass.
+    """
+    older, keep = args.older_than, args.keep_days
+    if older is None and keep is None:
+        return None, ""
+    defaults = MaintenancePolicy()
+    try:
+        return (
+            MaintenancePolicy(
+                compact_after_days=older if older is not None else defaults.compact_after_days,
+                archive_keep_days=keep if keep is not None else defaults.archive_keep_days,
+            ),
+            "",
+        )
+    except ValidationError as exc:
+        return None, "; ".join(str(error["msg"]) for error in exc.errors())
 
 
 def _maintenance_backup(mode: Mode, path: Path, destination: Path) -> int:
@@ -1025,7 +1127,11 @@ _CONFIG_ACTIONS = {"list": _config_list, "history": _config_history}
 _BACKTEST_ACTIONS = {"fetch": _backtest_fetch, "run": _backtest_run}
 _CATALOGUE_ACTIONS = {"fetch": _catalogue_fetch}
 _REPORT_ACTIONS = {"promotion": _promotion_report, "shadow": _shadow_report}
-_MAINTENANCE_ACTIONS = {"backup": _maintenance_backup, "status": _maintenance_status}
+_MAINTENANCE_ACTIONS = {
+    "backup": _maintenance_backup_action,
+    "status": _maintenance_status_action,
+    "compact": _maintenance_compact_action,
+}
 _COMMANDS = {
     "run": run_command,
     "serve": serve_command,
