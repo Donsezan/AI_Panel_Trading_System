@@ -313,7 +313,13 @@ alert_cursor = Table(
     "alert_cursor",
     metadata,
     Column("scope", String(32), primary_key=True),
+    #: How far **delivery** has got. Advanced only after a sink has taken the notification,
+    #: which is what makes delivery at-least-once (ADR 0019). Indexes `NOTIFICATION_RAISED`.
     Column("last_seq", Integer, nullable=False, default=0),
+    #: How far **recording** has got, over the alert source types. A separate cursor because the
+    #: two fail differently: a dead webhook must not withhold what the operator could already see
+    #: on screen, and a retry must not append a second notification (spec 5.2).
+    Column("recorded_seq", Integer, nullable=False, default=0),
     #: The session day the last daily summary covered. Empty means none has been sent, which is
     #: how the first poll of a fresh database avoids summarising a day it only saw the end of.
     Column("last_summary_day", String(10), default=""),
