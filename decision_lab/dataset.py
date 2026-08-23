@@ -30,13 +30,13 @@ import hashlib
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Final
+from typing import Final, Protocol
 
 from pydantic import ConfigDict, Field
 
 from decision_lab.params import COVERAGE_FILE
 from tradebot.core.clock import Clock
-from tradebot.core.errors import ConfigError
+from tradebot.core.errors import ConfigError, TradebotError
 from tradebot.core.instrument import Instrument
 from tradebot.core.market import Candle, CandleSeries, timeframe_interval
 from tradebot.core.schema import DomainModel, UtcDatetime
@@ -257,3 +257,148 @@ def require_verified(directory: Path) -> CoverageAudit:
             f"`python -m decision_lab dataset verify --data {directory}`"
         )
     return audit_
+
+
+# --------------------------------------------------------------------------- repair
+
+#: What a hole is called when the venue answered and had nothing to give.
+NO_BARS: Final = "venue served no bars on re-request"
+#: What a hole is called when the venue could not be asked at all.
+VENUE_FAILED: Final = "venue call failed"
+
+
+class HistoryProvider(Protocol):
+    """The read side of a venue, as `binance_spot_history` returns it.
+
+    A protocol rather than the concrete `VenueMarketData`, so the tests drive repair against a
+    fake book and the whole suite stays offline (§16).
+    """
+
+    async def get_candles(
+        self,
+        instrument: Instrument,
+        timeframe: str,
+        limit: int,
+        end: datetime | None = None,
+    ) -> CandleSeries: ...
+
+
+async def refetch(
+    provider: HistoryProvider,
+    instrument: Instrument,
+    timeframe: str,
+    *,
+    since: datetime,
+    until: datetime,
+) -> tuple[Candle, ...]:
+    """Re-ask the venue for exactly one hole.
+
+    One call, not a pager: a hole left by a dropped page is at most one page wide by
+    construction, and `end=until` is the same point-in-time cutoff the recorder used. Asking for
+    a margin of two extra bars and filtering makes the boundary bars unambiguous.
+    """
+    interval = timeframe_interval(timeframe)
+    wanted = int((until - since) // interval) + 2
+    series = await provider.get_candles(instrument, timeframe, wanted, end=until)
+    return tuple(c for c in series.candles if since <= c.open_time and c.close_time <= until)
+
+
+async def repair(
+    dataset: ReplayDataset,
+    provider: HistoryProvider,
+    clock: Clock,
+    *,
+    venue_id: str = "binance",
+) -> CoverageAudit:
+    """Audit, re-ask the venue for each hole, patch what it has, record what it never published.
+
+    In-place on the CSVs, so `ReplayDataset.load` reads the corrected data unchanged and the
+    bot's own backtests benefit from the same fix. `dataset.json` is not touched, and the digest
+    on the returned audit is taken **after** the rewrite — one taken before would make
+    `require_verified` refuse the dataset this pass had just fixed.
+    """
+    series: dict[str, SeriesCoverage] = {}
+    for instrument in dataset.instruments:
+        for timeframe in dataset.timeframes:
+            key = series_key(instrument.key, timeframe)
+            series[key] = await _repair_one(dataset, instrument, timeframe, provider, venue_id)
+    return CoverageAudit(
+        audited_at=clock.now(),
+        dataset_digest=dataset_digest(dataset.directory),
+        series=series,
+    )
+
+
+async def _repair_one(
+    dataset: ReplayDataset,
+    instrument: Instrument,
+    timeframe: str,
+    provider: HistoryProvider,
+    venue_id: str,
+) -> SeriesCoverage:
+    loaded = await read_series(dataset, instrument, timeframe)
+    if not loaded.gaps:
+        return SeriesCoverage(expected=expected_bars(loaded), present=len(loaded))
+
+    refused = _unrepairable_reason(instrument, venue_id)
+    merged = {candle.open_time: candle for candle in loaded.candles}
+    unexplained: list[KnownHole] = []
+    repaired = 0
+    for since, until in loaded.gaps:
+        if refused:
+            unexplained.append(_hole(since, until, refused))
+            continue
+        try:
+            found = await refetch(provider, instrument, timeframe, since=since, until=until)
+        except TradebotError as error:
+            # Contained per hole, like the maintenance pass's per-day scope: one outage must not
+            # cost the audit of every other series, and the reason is recorded rather than
+            # swallowed, so the operator sees why this one was not repaired.
+            unexplained.append(_hole(since, until, f"{VENUE_FAILED}: {error}"))
+            continue
+        if not found:
+            unexplained.append(_hole(since, until, NO_BARS))
+            continue
+        merged.update({candle.open_time: candle for candle in found})
+        repaired += len(found)
+
+    if not repaired:
+        return SeriesCoverage(
+            expected=expected_bars(loaded),
+            present=len(loaded),
+            known_holes=tuple(unexplained),
+        )
+
+    ordered = tuple(candle for _, candle in sorted(merged.items()))
+    write_series(csv_path(dataset.directory, instrument, timeframe), ordered)
+    # A partial repair leaves a narrower hole than the one that was asked about, so the holes are
+    # re-derived from the corrected series rather than trusted from the loop above. The reasons
+    # collected there are carried across by boundary where they still apply.
+    patched = loaded.model_copy(update={"candles": ordered})
+    return SeriesCoverage(
+        expected=expected_bars(patched),
+        present=len(patched),
+        repaired=repaired,
+        known_holes=holes_of(
+            patched, SeriesCoverage(expected=0, present=0, known_holes=tuple(unexplained))
+        ),
+    )
+
+
+def _hole(since: datetime, until: datetime, reason: str) -> KnownHole:
+    return KnownHole(**{"from": since, "to": until, "reason": reason})
+
+
+def _unrepairable_reason(instrument: Instrument, venue_id: str) -> str:
+    """Why this series cannot be repaired at all, or `""` when it can be.
+
+    A venue mismatch is the one that matters: the history provider answers for exactly one venue,
+    and asking it about an instrument listed somewhere else would write another venue's prices
+    into this one's series — a fabricated bar arriving by a different road than interpolation.
+    """
+    if instrument.venue != venue_id:
+        return (
+            f"no history provider for venue {instrument.venue!r}; the configured provider "
+            f"answers for {venue_id!r} only"
+        )
+    return ""
