@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from decision_lab import cli
+from decision_lab.calibration_days import read as read_days
 from decision_lab.dataset import read_audit
 from decision_lab.tests import factories as f
 
@@ -48,6 +49,60 @@ def test_an_unknown_command_is_misuse() -> None:
     with pytest.raises(SystemExit) as exit_:
         cli.main(["nonsense"])
     assert exit_.value.code == cli.EXIT_MISUSE
+
+
+def pin_a_day_set(directory: Path) -> int:
+    """Sixty days with the shock counts `test_calibration_days` explains, verified and pinned."""
+    bars = f.shocked_walk(days=60, shock_up=(3, 11, 19, 27), shock_down=(7, 15, 23))
+    f.write_dataset(directory, {(f.instrument(), "1h"): bars})
+    assert cli.main(["dataset", "verify", "--data", str(directory)]) == cli.EXIT_OK
+    return cli.main(["dataset", "days", "--data", str(directory)])
+
+
+def test_days_pins_nine_days_and_writes_the_file(tmp_path: Path) -> None:
+    assert pin_a_day_set(tmp_path) == cli.EXIT_OK
+
+    days = read_days(tmp_path)
+    assert len(days.all_days) == 9
+    assert days.dataset_digest == read_audit(tmp_path).dataset_digest
+
+
+def test_a_second_run_reports_the_pinned_set_rather_than_redrawing_it(tmp_path: Path) -> None:
+    """The file is the authority. Redrawing on every invocation would make it decoration."""
+    pin_a_day_set(tmp_path)
+    first = read_days(tmp_path)
+
+    assert cli.main(["dataset", "days", "--data", str(tmp_path), "--seed", "999"]) == cli.EXIT_OK
+
+    assert read_days(tmp_path) == first
+
+
+def test_reselect_is_what_moves_the_digest(tmp_path: Path) -> None:
+    pin_a_day_set(tmp_path)
+    first = read_days(tmp_path)
+
+    code = cli.main(["dataset", "days", "--data", str(tmp_path), "--seed", "999", "--reselect"])
+
+    assert code == cli.EXIT_OK
+    assert read_days(tmp_path).dayset_digest != first.dayset_digest
+
+
+def test_pinning_a_day_over_an_existing_set_needs_reselect_too(tmp_path: Path) -> None:
+    """`--pin` moves `dayset_digest` exactly as `--reselect` does, so it may not do it quietly."""
+    pin_a_day_set(tmp_path)
+    first = read_days(tmp_path)
+
+    code = cli.main(["dataset", "days", "--data", str(tmp_path), "--pin", "2024-01-08"])
+
+    assert code == cli.EXIT_DATASET
+    assert read_days(tmp_path) == first
+
+
+def test_days_refuses_an_unverified_dataset(tmp_path: Path) -> None:
+    """The pools are drawn from a distribution a hole would have moved (§4.4)."""
+    f.write_dataset(tmp_path, {(f.instrument(), "1h"): f.shocked_walk(days=60)})
+
+    assert cli.main(["dataset", "days", "--data", str(tmp_path)]) == cli.EXIT_DATASET
 
 
 def test_verify_without_repair_never_reaches_the_network(

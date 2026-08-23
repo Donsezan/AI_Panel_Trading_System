@@ -19,13 +19,18 @@ import argparse
 import asyncio
 import logging
 from collections.abc import Callable, Coroutine
+from datetime import date
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from decision_lab import calibration_days as cd
 from decision_lab import dataset as ds
+from decision_lab.params import DAYSET_FILE, DEFAULT_SEED, DEFAULT_SHOCK_PERCENTILE
 from tradebot.core.clock import SystemClock
-from tradebot.core.errors import ConfigError, TradebotError
+from tradebot.core.errors import ConfigError, MoneyError, TradebotError
 from tradebot.core.logging import configure_logging, get_logger
+from tradebot.core.money import to_decimal
 from tradebot.interfaces.exchange import VenueTransport
 from tradebot.marketdata.recorder import MANIFEST, ReplayDataset
 
@@ -68,7 +73,55 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     verify.add_argument("--verbose", action="store_true")
 
+    days = dataset_actions.add_parser(
+        "days", help="select and pin the nine calibration days, or show the pinned set"
+    )
+    days.add_argument("--data", type=Path, required=True, help="dataset directory")
+    days.add_argument("--seed", type=int, default=DEFAULT_SEED)
+    days.add_argument(
+        "--reference-instrument",
+        default="",
+        help="whose volatility distribution the days are drawn from; defaults to the first in "
+        "the manifest. A day violent for one instrument and calm for another is a legitimate "
+        "test and a different one, so it is recorded and printed on every report",
+    )
+    days.add_argument("--scoring-timeframe", default="")
+    days.add_argument(
+        "--shock-percentile",
+        type=_decimal_arg,
+        default=DEFAULT_SHOCK_PERCENTILE,
+        help="at or above this percentile of the reference instrument's own distribution is a "
+        "shock. Loosen it when a dataset's shock pools come up thin",
+    )
+    days.add_argument(
+        "--reselect",
+        action="store_true",
+        help="replace an existing pinned set. An explicit act: it moves dayset_digest and "
+        "therefore every recorded run identity derived from it",
+    )
+    days.add_argument(
+        "--pin",
+        action="append",
+        default=[],
+        type=date.fromisoformat,
+        metavar="YYYY-MM-DD",
+        help="add a day by hand",
+    )
+    days.add_argument("--verbose", action="store_true")
+
     return parser.parse_args(argv)
+
+
+def _decimal_arg(value: str) -> Decimal:
+    """A `Decimal` command-line value, refused by argparse rather than by a traceback.
+
+    `to_decimal` raises `MoneyError`, which argparse does not recognise as bad input — it would
+    escape as an unhandled `ArithmeticError` and lose the usage message.
+    """
+    try:
+        return to_decimal(value)
+    except MoneyError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
 
 
 def _load(directory: Path, clock: SystemClock) -> ReplayDataset:
@@ -126,10 +179,59 @@ def _history_provider(clock: SystemClock) -> tuple[ds.HistoryProvider, VenueTran
     return binance_spot_history(clock)
 
 
+async def dataset_days(args: argparse.Namespace) -> int:
+    """Select and pin the nine calibration days, or report the set already pinned.
+
+    Replacing a pinned set is `--reselect` and nothing else, `--pin` included: the digest it moves
+    is the identity every §11 run is recorded under, so a command that quietly replaced it would
+    invalidate results nobody was told about.
+    """
+    clock = SystemClock()
+    audit = ds.require_verified(args.data)
+
+    if (args.data / DAYSET_FILE).is_file() and not args.reselect:
+        if args.pin:
+            raise ConfigError(
+                f"{args.data} already holds a pinned day set, and --pin would replace it. Pass "
+                "--reselect as well to say so: the new set has a different dayset_digest, and "
+                "every run recorded under the old one stops being comparable"
+            )
+        pinned = cd.require_pinned(args.data)
+        logger.info("calibration days already pinned", extra=_days_fields(pinned))
+        return EXIT_OK
+
+    dataset = _load(args.data, clock)
+    days = await cd.select(
+        dataset,
+        audit,
+        clock,
+        seed=args.seed,
+        reference_instrument=args.reference_instrument or dataset.instruments[0].key,
+        scoring_timeframe=args.scoring_timeframe or dataset.timeframes[0],
+        thresholds=cd.Thresholds(shock_percentile=args.shock_percentile),
+        pinned=tuple(args.pin),
+    )
+    cd.write(args.data, days)
+    logger.info("calibration days pinned", extra=_days_fields(days))
+    return EXIT_OK
+
+
+def _days_fields(days: cd.CalibrationDays) -> dict[str, Any]:
+    return {
+        "digest": days.dayset_digest,
+        "reference": days.reference_instrument,
+        "seed": days.seed,
+        "days": {
+            pool: [day.isoformat() for day in dates] for pool, dates in sorted(days.days.items())
+        },
+    }
+
+
 #: Command → coroutine. Dispatch over a table rather than a chain of `if`s, per the repo's own
 #: convention (CLAUDE.md, "prefer dispatch over branching").
 COMMANDS: dict[tuple[str, str], Callable[[argparse.Namespace], Coroutine[Any, Any, int]]] = {
     ("dataset", "verify"): dataset_verify,
+    ("dataset", "days"): dataset_days,
 }
 
 
