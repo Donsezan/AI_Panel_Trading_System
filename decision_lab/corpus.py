@@ -24,7 +24,9 @@ Failure semantics: an unverified dataset refuses (§4.4). A `SNAPSHOT_FROZEN` wh
 compacted away refuses by name rather than yielding an empty context — a corpus of blanks scores
 perfectly and means nothing. A build whose identity already exists is **reused**, never appended
 to; one whose window differs under that same identity refuses, because §5.4 deliberately leaves
-the window out of `corpus_id` and two windows must not collide on one.
+the window out of `corpus_id` and two windows must not collide on one. A build interrupted before
+it wrote its meta also refuses, and keeps the database it left: that log is the record of why the
+pass failed.
 """
 
 from __future__ import annotations
@@ -219,6 +221,7 @@ async def build(
         return built
 
     directory.mkdir(parents=True, exist_ok=True)
+    _refuse_interrupted(directory / CORPUS_DB)
     application = await build_sim(
         clock=clock,
         db_path=directory / CORPUS_DB,
@@ -267,6 +270,30 @@ async def build(
         extra={"corpus_id": identity, "entries": len(entries), "cycles": report.ran_cycles},
     )
     return Corpus(meta=meta, entries=entries)
+
+
+def _refuse_interrupted(database: Path) -> None:
+    """Refuse to build on top of the database a previous pass left behind.
+
+    Reached only when `_existing` found no `corpus.json`, so this file belongs to a pass that died
+    before it could write one — a reference pass that raised, or a process that was killed.
+    Building onto it would append a *second* pass into the same log and double every entry, which
+    is the corruption `_existing` refuses for a completed corpus, arriving by the other door.
+
+    Refusing rather than deleting, for two reasons. That database is the **record of why the pass
+    failed**: its event log is the only account of the cycle that raised, and deleting it to make
+    room for a retry destroys the evidence at exactly the moment somebody needs it. And on Windows
+    it cannot be deleted from this process anyway — `Application.shutdown` closes the writer but
+    never disposes the engine, so the pooled SQLite connection holds the file until exit.
+    """
+    if not database.is_file():
+        return
+    raise ConfigError(
+        f"{database} already exists but its corpus has no {CORPUS_META}, so a previous build was "
+        "interrupted. Its event log is the record of why that pass failed — read it before you "
+        "discard it. Building over it would append a second reference pass into the same log and "
+        "double every entry; remove the directory once you are done with it to build again"
+    )
 
 
 def _existing(

@@ -19,15 +19,21 @@ import argparse
 import asyncio
 import logging
 from collections.abc import Callable, Coroutine
-from datetime import date
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 from decision_lab import calibration_days as cd
+from decision_lab import corpus as cp
 from decision_lab import dataset as ds
-from decision_lab.params import DAYSET_FILE, DEFAULT_SEED, DEFAULT_SHOCK_PERCENTILE
-from tradebot.core.clock import SystemClock
+from decision_lab.params import (
+    CADENCE_SECONDS,
+    DAYSET_FILE,
+    DEFAULT_SEED,
+    DEFAULT_SHOCK_PERCENTILE,
+)
+from tradebot.core.clock import SystemClock, ensure_utc
 from tradebot.core.errors import ConfigError, MoneyError, TradebotError
 from tradebot.core.logging import configure_logging, get_logger
 from tradebot.core.money import to_decimal
@@ -108,6 +114,36 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="add a day by hand",
     )
     days.add_argument("--verbose", action="store_true")
+
+    corpus = commands.add_parser("corpus", help="build the frozen decision contexts a sweep reads")
+    corpus_actions = corpus.add_subparsers(dest="action", required=True)
+
+    corpus_build_parser = corpus_actions.add_parser(
+        "build", help="run one reference pass and index it"
+    )
+    corpus_build_parser.add_argument("--data", type=Path, required=True, help="dataset directory")
+    corpus_build_parser.add_argument(
+        "--every",
+        default="4h",
+        choices=tuple(CADENCE_SECONDS),
+        help="cycle cadence. A corpus property, not a sweep one: every candidate in one sweep "
+        "sees one cadence, so a cadence comparison is N corpora (§5.5)",
+    )
+    corpus_build_parser.add_argument(
+        "--reference-panel",
+        default="sim",
+        help="whose deliberation supplies the positions in the snapshots. `sim` and `stub` are "
+        "offline and free; a real panel is available when the positions themselves need to be "
+        "the ones a real panel would have held (§5.2)",
+    )
+    corpus_build_parser.add_argument("--start-equity", type=_decimal_arg, default=Decimal(10_000))
+    corpus_build_parser.add_argument(
+        "--since", default=None, help="window start; defaults to the data's"
+    )
+    corpus_build_parser.add_argument(
+        "--until", default=None, help="window end; defaults to the data's"
+    )
+    corpus_build_parser.add_argument("--verbose", action="store_true")
 
     return parser.parse_args(argv)
 
@@ -227,11 +263,48 @@ def _days_fields(days: cd.CalibrationDays) -> dict[str, Any]:
     }
 
 
+async def corpus_build(args: argparse.Namespace) -> int:
+    """Build the corpus. Refuses an unverified dataset before doing any work."""
+    built = await cp.build(
+        data_dir=args.data,
+        reference_panel=args.reference_panel,
+        cadence_seconds=CADENCE_SECONDS[args.every],
+        start_equity=args.start_equity,
+        since=_moment(args.since),
+        until=_moment(args.until),
+    )
+    logger.info(
+        "corpus ready",
+        extra={
+            "corpus_id": built.meta.corpus_id,
+            "entries": len(built.entries),
+            "cadence": args.every,
+            "panel": args.reference_panel,
+            "news": "blind" if built.meta.news_blind else built.meta.archive_digest,
+        },
+    )
+    return EXIT_OK
+
+
+def _moment(value: str | None) -> datetime | None:
+    """An optional ISO window edge, UTC-aware. A bare date is midnight UTC, never local time.
+
+    Four lines rather than an import: the bot's equivalent is `tradebot.__main__._moment`, and
+    reaching into another module's private for a date parse is the dependency `csv_path` avoids
+    for a filename.
+    """
+    if not value:
+        return None
+    parsed = datetime.fromisoformat(value)
+    return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else ensure_utc(parsed)
+
+
 #: Command → coroutine. Dispatch over a table rather than a chain of `if`s, per the repo's own
 #: convention (CLAUDE.md, "prefer dispatch over branching").
 COMMANDS: dict[tuple[str, str], Callable[[argparse.Namespace], Coroutine[Any, Any, int]]] = {
     ("dataset", "verify"): dataset_verify,
     ("dataset", "days"): dataset_days,
+    ("corpus", "build"): corpus_build,
 }
 
 

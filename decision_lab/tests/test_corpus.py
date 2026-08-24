@@ -19,6 +19,7 @@ import pytest
 
 from decision_lab import corpus as cp
 from decision_lab import dataset as ds
+from decision_lab.params import CORPUS_META
 from decision_lab.tests import factories as f
 from tradebot.core.clock import ManualClock
 from tradebot.core.errors import ConfigError
@@ -164,6 +165,26 @@ async def test_rebuilding_an_identical_corpus_reuses_it(verified: Path, tmp_path
 
     assert second.meta == first.meta
     assert len(second.entries) == len(first.entries)
+
+
+async def test_an_interrupted_build_refuses_rather_than_appending_to_it(
+    verified: Path, tmp_path: Path
+) -> None:
+    """A pass that died leaves a `corpus.db` with no meta. Building onto it would append a second
+    reference pass into the same log and double every entry.
+
+    Refused rather than replaced, because that log is the record of *why* the pass failed — the
+    only account of the cycle that raised.
+    """
+    workspace = tmp_path / "ws"
+    reference = await build(verified, workspace)
+    directory = workspace / reference.meta.corpus_id
+    (directory / CORPUS_META).unlink()  # what a crash between the pass and the meta leaves
+
+    with pytest.raises(ConfigError, match="interrupted"):
+        await build(verified, workspace)
+
+    assert (directory / cp.CORPUS_DB).is_file(), "the evidence is kept, not discarded"
 
 
 async def test_a_narrowed_window_under_the_same_identity_refuses(
