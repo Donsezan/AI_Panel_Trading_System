@@ -1,0 +1,14 @@
+# Inherits the repo's rules; only the import classification and the tests' exemptions differ.
+# `pyproject.toml` is a `tradebot` file and spec §2.1 keeps it untouched, so both overrides live
+# here instead. ruff resolves configuration per file, so the root `ruff check .` picks this up.
+extend = "../pyproject.toml"
+src = ["..", "../tradebot"]
+
+[lint.isort]
+known-first-party = ["tradebot", "decision_lab"]
+
+[lint.extend-per-file-ignores]
+# The root's own `tests/**` row, restated for this package: its pattern is anchored at the repo
+# root and does not reach `decision_lab/tests`. Same three rules, same reasons — bandit's
+# heuristics, unused fixture arguments, and hand-written naive-free datetimes in fixtures.
+"tests/**" = ["S", "ARG", "DTZ"]

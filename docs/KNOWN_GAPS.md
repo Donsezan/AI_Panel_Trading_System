@@ -17,12 +17,16 @@ Two audits so far:
 - **§4–7, the maintenance package** (2026-08-22). All four have since been **fixed** — see
   *Closed* below. They are kept in this file's history rather than deleted from it, because the
   boundary of an audit is only legible if what it found and what became of it are both recorded.
+- **§8, protective legs against a reduced position** (2026-08-25). Not an audit: found by the
+  first long reference pass through `decision_lab`, over six months of recorded Binance data with
+  a panel that takes partial exits. It predates that work — no bot file was changed by it.
 
 | # | Gap | Reaches | Direction |
 |---|---|---|---|
 | 1 | The mismatch kill threshold compares quantities to money, and sizes itself from explained lines | live · paper | **fails open and closed** |
 | 2 | Retiring a basket that holds a position is unguarded | every mode | fails closed, and traps |
 | 3 | The one-quote-currency rule is enforced only at boot | live · paper | fails open |
+| 4 | Protective legs are sized to the entry, so a partial exit leaves them oversized | live · paper · sim | fails closed, at the venue |
 
 ---
 
@@ -269,6 +273,69 @@ From the maintenance audit (whose four findings are now closed above):
   named for the revision it was leaving — and carried `recorded_seq` up to the existing
   `last_seq` of 1234 rather than 0, so no installation re-records its whole log on the first poll
   after the upgrade.
+
+## 4. Protective legs track the entry order, not the position
+
+**Where** — [execution/monitor.py:146](../tradebot/execution/monitor.py#L146)
+
+```python
+async def _maintain(self, group: _Tracked) -> None:
+    """Keep the protective legs matched to what the entry has actually filled."""
+    entry = group.order
+    if entry.filled_qty > ZERO and entry.filled_qty != group.protected_qty:
+        await self._replace_legs(group)
+```
+
+`_Tracked.protected_qty` is, by its own comment, the *entry* quantity the current legs guard. The
+monitor has no view of the position. So a SELL taken by any other path — another cycle's exit
+decision, an ADR 0015 operator close — reduces the holding while the legs already resting at the
+venue keep their original size. Nothing resizes them and nothing cancels them: `_replace_legs`
+fires only when the *entry* fills further, and `_close_group` only when one of that group's own
+legs fills.
+
+The `self._polling` lock two screens up names this exact hazard — *"twice the exit quantity against
+one position, which in a long-only system is an accidental short (R13)"* — and guards only its
+concurrent-poll variant. This is the same arithmetic reached by a partial exit instead.
+
+**Observed**, in the event log of a reference pass over recorded BTC/ETH 1h data,
+2024-01-01 → 2024-07-01, on `--reference-panel sim`:
+
+```
+2024-01-03 16:00  BUY  0.0351 fills          position 0.0351
+2024-01-03 16:00  legs armed: stop 0.0351 @ trigger 2170.66, take-profit 0.0351 @ 2348.37
+2024-01-04 12:00  SELL 0.0087 fills          position 0.0264   ← legs untouched at 0.0351
+2024-01-07 12:00  BUY  0.0852 fills          position 0.1116   ← a second group, its own 0.0852
+2024-01-08 00:00  that group's stop fills    position 0.0264
+2024-01-08 ~03:00 ETH low 2166.38 trips the stale 2170.66 stop
+```
+
+```
+ReconciliationMismatchError: sell of 0.03510000 exceeds holding 0.02640000 on binance:ETH/USDT;
+v1 is long-only, so this is ledger corruption rather than a short
+```
+
+`Ledger._apply_sell` refused, which is the guard working. But it fires at the wrong end: **the
+oversized order is already resting at the venue** by then, placed hours or days earlier.
+
+**What it costs.** On Binance spot the venue rejects the stop for insufficient balance at the
+moment it triggers — so the position is unguarded during exactly the move the stop existed for,
+and the local ledger and the venue disagree about what is protected. On a venue that permits the
+sell, it oversells into a short the risk engine believes cannot exist. The sim/backtest case is
+milder and still fatal to the run: the pass raises and stops, which is how this was found.
+
+**Reachable from ordinary automated trading.** The reducing order here was a plain cycle SELL
+(`sim-R7GB2OIBDAQWPVTG`, its own group), not a manual close. Any basket whose panel takes partial
+exits reaches it; the demo's `stub` panel never does, which is why hundreds of prior backtests and
+the whole scenario suite have not.
+
+**Closing it** means giving the monitor the position rather than the entry: resize or cancel a
+group's legs whenever the holding it guards falls below `protected_qty`, from wherever the
+reduction came. `Ledger` already emits `POSITION_UPDATED` on every fill, so the signal exists. The
+awkward part is ownership — the monitor is deliberately venue-scoped and basket-agnostic, while
+positions belong to the portfolio, so the resize has to be driven by the position rather than
+polled per group. A rung-3 scenario driving an entry, a partial discretionary exit, and then a
+bar through the original stop is the test this needs, and its absence is why the defect survived.
+
 
 ## Related, already recorded
 

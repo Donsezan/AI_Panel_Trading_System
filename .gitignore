@@ -11,6 +11,11 @@ data/
 # justified is filed, not in the tree it was generated from (PLAN Phase 7).
 reports/
 
+# The tuning tool's scratch space: corpus databases, sweep caches, results and the registry.
+# Reproducible from a dataset and a config, and large enough that committing it is a mistake.
+decision_lab/workspace/
+decision_lab/reports/
+
 # Python
 .venv/
 __pycache__/
