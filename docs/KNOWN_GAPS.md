@@ -9,17 +9,21 @@ The house rule applies to reading this file too: **fail-closed is not the same a
 these resolve in the fail-closed direction and are still on this list, because a system that stops
 doing something for a reason nobody can name is an incident.
 
-Two audits so far:
+Four passes so far:
 
 - **§1–3, the instrument-universe seam** (2026-08-19). None is caused by the two fixes that shipped
   alongside them ([marketdata/synthetic.py](../tradebot/marketdata/synthetic.py), the live
   instrument universe); all three predate that work.
-- **§4–7, the maintenance package** (2026-08-22). All four have since been **fixed** — see
+- **M1–M4, the maintenance package** (2026-08-22). All four have since been **fixed** — see
   *Closed* below. They are kept in this file's history rather than deleted from it, because the
   boundary of an audit is only legible if what it found and what became of it are both recorded.
-- **§8, protective legs against a reduced position** (2026-08-25). Not an audit: found by the
+- **§4, protective legs against a reduced position** (2026-08-25). Not an audit: found by the
   first long reference pass through `decision_lab`, over six months of recorded Binance data with
   a panel that takes partial exits. It predates that work — no bot file was changed by it.
+- **§5–8, found while designing gap 4's fix** (2026-08-27). Not an audit either: four things
+  the fix had to reason about and then leave alone. §5 and §6 are the parts of the same seam
+  that monitor-side scope deliberately excludes; §7 and §8 are what an operator is actually
+  told when the discrepancy §6 can cause is the one that gets caught.
 
 | # | Gap | Reaches | Direction |
 |---|---|---|---|
@@ -27,6 +31,10 @@ Two audits so far:
 | 2 | Retiring a basket that holds a position is unguarded | every mode | fails closed, and traps |
 | 3 | The one-quote-currency rule is enforced only at boot | live · paper | fails open |
 | 4 | Protective legs are sized to the entry, so a partial exit leaves them oversized | live · paper · sim | fails closed, at the venue |
+| 5 | The monitor polls only inside a cycle that placed orders | every mode | **fails open** |
+| 6 | Nothing releases protective legs before a discretionary exit | live · paper on a venue | fails closed, and traps |
+| 7 | The mismatch alert names no instrument and no quantity | live · paper | fires, but says too little |
+| 8 | The kill-switch reason carries the explained lines and no absolute figures | every mode | fires, but says too little |
 
 ---
 
@@ -199,81 +207,6 @@ Binance data, and it takes *Binance's* catalogue (ADR 0025) — and so does live
 
 ---
 
-## Closed — the maintenance audit's four (2026-08-23)
-
-All four were in `tradebot/maintenance/`, which never touches the money path; none could cause or
-prevent a trade, and what they cost was the record. Each is now covered by a test that fails
-against the old code, and the whole set was re-verified on a copy of the operator's `data/sim.db`.
-
-**§4 — one archive that would not verify stopped every day behind it, permanently.** The day loop
-sat inside one `try` whose handler returned, so the first bad day took every later day *and* the
-`delete_aged` call with it. A day file that exists is verified rather than rewritten, so a corrupt
-one failed on every pass forever: retention stopped entirely while the database kept growing.
-Containment is now per day, as spec §6.4 always described it, and deletion runs regardless because
-it is scoped by file name and depends on nothing the archive step did. Reproduced and re-checked on
-the real database: with a corrupt file planted for the earliest of five pending days, the pass went
-from `archived 0, compacted 0, deleted 0` to `archived 3, compacted 1351, deleted 1`, with the
-corrupt day's payloads still in the database and its archive still not recreated on the next pass.
-The failure summary on the report is bounded now, because it reaches the event payload *and* the
-notification body and one permissions fault fails every pending day at once.
-
-**§5 — `pending_days` scanned every heavy payload on the event loop.** Two unindexable
-`LIKE '%...%'` predicates over `payload_json`, measured at 26 ms on the 8.3 MB sim database and
-growing with the log, run synchronously inside `async def _pass` while the three filesystem steps
-around it already hopped to a thread. It now takes the same hop (spec §6.3).
-
-**§6 — a file that would not delete was reported as a failed pass.** `delete_aged`'s failure
-strings were folded into `MaintenanceReport.failure`, which is exactly what `ok` means, so one
-locked file turned a good night into a HIGH `MAINTENANCE_FAILED` — none of the four things spec
-§5.4 names — and suppressed the LOW line carrying the day's real work. HIGH notices deliberately do
-not supersede, so each night stacked another red row. They now ride on their own `undeletable`
-field, are counted in the daily line as §6.4 asks, and appear on the failed body too so the fact is
-not lost when a pass failed for an unrelated reason.
-
-**§7 — `maintenance status` answered three of its six questions.** It now prints the windows in
-force *and whether they came from a published document or the defaults*, the last pass with what it
-did, and the archive inventory with its span, beside the backup and disk figures it already had. It
-opens the database to do so, which `maintenance backup` beside it already did: `open_database` never
-migrates, the reads write nothing, and the schema is WAL — so the command stays pointable at a file
-another process has open, which is its whole premise.
-
-**One observation from §5 was deliberately not acted on.** The scan re-reads already-compacted
-payloads forever, because selecting on `heavy_key` rather than on the event type is what stops a
-deleted archive being recreated (ADR 0028). A marker-column prefilter would narrow it, and the cost
-grows with the log — but it is now off the event loop, which is what made it urgent. Worth knowing
-about before the log is large.
-
-## What was checked and found sound
-
-So the boundary of these audits is legible rather than implied.
-
-From the instrument-universe audit (§1-3):
-
-- **`StartupSequence` keeping a boot snapshot is correct**, not a fourth instance of the frozen-
-  universe defect. It completes DESIGN §8.2 before anything can be published, so the set it reads
-  is the set that exists.
-- **`_instrument()` still refuses an unknown key** in both venue adapters after the universe was
-  made live, with the message naming the adapter. Fail-closed did not become fail-open.
-- **`ReplayMarketData` still refuses a series it was not given.** That refusal is what keeps a
-  backtest honest, and it is why the simulated venue's feed is a separate class rather than a
-  relaxation of this one.
-
-From the maintenance audit (whose four findings are now closed above):
-
-- **The archive-then-compact ordering holds.** Nothing is compacted without a verified archive, on
-  a real pass over `data/sim.db`: 4 days archived, 1,354 rows rewritten, payload 5.41 MB → 2.18 MB,
-  and 2,403 → 2,405 events — no row deleted, the two added being the pass's own `MAINTENANCE_RAN`.
-- **Compaction is idempotent and does not resurrect deleted archives.** A second pass over the same
-  database reported 0/0/0 and did **not** recreate the three archive files the first pass had
-  deleted — the failure mode `pending_days` selecting on `heavy_key` exists to prevent (ADR 0028).
-- **The archive round trip is exact.** All 1,849 payloads in one day file re-serialise byte-identical
-  to the canonical JSON in the pre-compaction copy, including the 96 rows holding non-ASCII text.
-- **The pre-migration backup fires, and the data step is right.** A copy of `data/sim.db` at
-  revision 0007 upgraded to 0009 wrote `sim-pre-0007-<stamp>.db` **before** touching the schema —
-  named for the revision it was leaving — and carried `recorded_seq` up to the existing
-  `last_seq` of 1234 rather than 0, so no installation re-records its whole log on the first poll
-  after the upgrade.
-
 ## 4. Protective legs track the entry order, not the position
 
 **Where** — [execution/monitor.py:146](../tradebot/execution/monitor.py#L146)
@@ -336,6 +269,224 @@ positions belong to the portfolio, so the resize has to be driven by the positio
 polled per group. A rung-3 scenario driving an entry, a partial discretionary exit, and then a
 bar through the original stop is the test this needs, and its absence is why the defect survived.
 
+
+## 5. The monitor polls only inside a cycle that placed orders
+
+**Where** — the module docstring of [execution/monitor.py](../tradebot/execution/monitor.py),
+against [basket_runner.py:256](../tradebot/control/basket_runner.py#L256)
+
+The docstring says the monitor polls the venue "**only while orders are actually open**, because a
+polling storm against a venue is a rate-limit ban waiting to happen". That describes a loop which
+does not exist. `poll()` has exactly two production callers:
+
+- `BasketRunner._settle`, which returns *before* polling when the cycle placed no orders
+- `BacktestHarness.run`
+
+`settle()` — whose own docstring says "`--once` and the scenario tests use this instead of a
+background task" — has **no** production caller at all. `run --once` goes through
+`Supervisor.run_once` → `BasketWorker.cycle` → `BasketRunner._settle` like every other cycle, and
+the only two callers of `settle()` are in `tests/unit/test_monitor.py`. `manual_close` submits and
+tracks its order and never polls. `Supervisor.serve` runs `_check_drift` and `_sweep_portfolio` and
+never touches the monitor; `PortfolioWatch` refreshes *marks*, not orders; `reconcile()` runs at
+startup only (§1).
+
+So everything the monitor owns advances only when some basket places an order. In `data/sim.db`
+that is 41 orders across 196 cycles — the great majority of cycles poll nothing.
+
+**What it costs.** A venue-held stop exists precisely because it fires *between* cycles
+(ADR 0004). When it does, nothing books the fill until the next order-placing cycle, and until
+then `Ledger.position` reports a holding that is gone:
+
+- `risk.aggregate.aggregate` values a position that no longer exists, so equity and the drawdown
+  baseline are wrong in whichever direction the market moved — ADR 0027's own argument, arriving
+  through a different door.
+- `_size_sell` sizes reduce-only from it and `LongOnlyRule` caps against it, so a SELL can be
+  approved for quantity the venue no longer holds, and `Ledger._apply_sell` then refuses it as
+  ledger corruption. That is §4's failure reached from the other side.
+- TTL is bot-enforced, because Binance spot has no venue-side good-till-time. An order past its
+  deadline keeps resting until something polls.
+
+Gap 4's fix inherits this latency exactly: legs are resized at the next poll, so a manual close's
+reduction is corrected promptly only if a basket happens to trade soon afterwards.
+
+**To close it.** A monitor tick in `Supervisor.serve` beside `_check_drift` and `_sweep_portfolio`
+— the loop that already exists for this class of between-cycle work — and a poll after
+`manual_close` submits. Whether `settle()` is then deleted or wired is the same "the docstring or
+the code" decision §1 ends on.
+
+---
+
+## 6. Nothing releases protective legs before a discretionary exit
+
+**Where** — [manual_close.py:216](../tradebot/control/manual_close.py#L216) and
+[basket_runner.py:293](../tradebot/control/basket_runner.py#L293)
+
+Both submit a reducing SELL and then `monitor.track` it. Neither cancels the protective legs
+already resting on that instrument, and nothing else does either.
+
+On Binance spot a resting protective SELL **reserves the base asset** for as long as it rests.
+`closable()` offers an operator the whole `position.qty`, so closing a fully protected position
+asks the venue to sell coins its own stop is already holding, and the venue refuses for
+insufficient balance. The better protected the position, the more certainly the exit is refused —
+which inverts the intent of ADR 0015, where an operator exit is the one act the metering rules
+stand aside for.
+
+**Why no test and no soak has seen it.** `SimBroker` models the reservation
+([sim.py:428](../tradebot/execution/brokers/sim.py#L428)) but never refuses an order for
+insufficient free funds: `submit` rejects exactly one thing, a duplicate `client_order_id`, and
+free balance is allowed to go negative. So the simulated venue cannot express this, and paper's
+primary venue **is** `SimBroker` (ADR 0020). Derived from the venue's documented semantics rather
+than observed — live has never run.
+
+**Reach.** Live, and paper only when `--broker binance` puts orders at the testnet. Not sim.
+
+**To close it.** Cancel the instrument's resting protective legs before submitting a discretionary
+exit, then let the monitor re-arm whatever remains. The unprotected window between the two is real
+and has to be argued for rather than discovered — though it is the same window `_replace_legs`
+already opens on every resize, which is a precedent rather than an excuse.
+
+---
+
+## 7. The mismatch alert names no instrument and no quantity
+
+**Where** — [ops/rules.py:112](../tradebot/ops/rules.py#L112)
+
+```python
+body=(
+    "The ledger and the venue disagree and nothing explains the difference. Affected "
+    "baskets are halted; above tolerance this trips the kill switch. The venue is the "
+    "source of truth — do not resume until the difference is understood."
+),
+```
+
+The body is a fixed string. The `RECONCILED` event written beside it carries the whole diff —
+every line's `scope`, `ours`, `theirs`, derived `delta` and classification — and it is appended
+unconditionally, clean or not ([reconciler.py:340](../tradebot/ledger/reconciler.py#L340)). None of
+it reaches the message.
+
+**What it costs.** `RECON_MISMATCH` is `Severity.HIGH`: webhook, Telegram, the dashboard bell. It
+is the thing that wakes someone. It tells them the books are wrong and that baskets are halted, and
+nothing about *which instrument* or *how much* — so the first act after being woken is always to
+open a dashboard and find out whether this is dust or the whole portfolio. That is the distance
+between an alert and a page.
+
+**To close it.** Render the differences into the body, and **bound it**. The maintenance package
+learned this one the expensive way (closed M1 above): a body reaches the event payload *and* the
+notification, so an unbounded summary fails both paths at once. The full list belongs in a
+`WARNING`.
+
+---
+
+## 8. The kill-switch reason carries the explained lines and no absolute figures
+
+**Where** — [startup.py:225](../tradebot/control/startup.py#L225) →
+[watchdog.py:190](../tradebot/risk/watchdog.py#L190), over
+[reconciler.py:81](../tradebot/ledger/reconciler.py#L81)
+
+```python
+await self._watchdog.trip(report.classification.value, report.detail)
+```
+
+```python
+@property
+def detail(self) -> str:
+    return "; ".join(f"{d.scope}: {d.detail}" for d in self.differences if d.detail)
+```
+
+`risk_state.reason` becomes `f"{rule}: {detail}"`. It is the durable record of why trading stopped,
+and the sentence an operator reads before typing `RE-ARM TRADING`. Two things are wrong with it:
+
+- **It joins the explained lines too.** The classifier chain is total — every branch returns a
+  detail, including `DRIFT`'s "within tolerance" and `EXTERNAL_CHANGE`'s "unexplained increase" —
+  and `_report` filters out only `MATCH`. So a trip caused by one shortfall reads as
+  `mismatch: sim:BTC/USDT: unexplained difference of -0.1; USDT: 41000 within 0.5% drift
+  tolerance`. That is §1's "`worst` ranges over explained lines" fault one layer up, in the
+  sentence a human acts on rather than in the arithmetic behind it.
+- **No line carries `ours` or `theirs`.** `unexplained difference of -0.5` does not say whether
+  that is half a coin out of fifty or the entire holding, and which of those it is decides
+  everything about the next hour.
+
+**To close it.** Put `ours`, `theirs` and the delta on each rendered line, and narrow the join to
+the lines that caused the classification — the same scoping §1 asks for in `worst`. Both are one
+change in `Difference` / `ReconcileReport.detail`, and both want asserting rather than eyeballing:
+there is currently no test over the text of the reason a human is asked to act on.
+
+---
+
+## Closed — the maintenance audit's four (2026-08-23)
+
+All four were in `tradebot/maintenance/`, which never touches the money path; none could cause or
+prevent a trade, and what they cost was the record. Each is now covered by a test that fails
+against the old code, and the whole set was re-verified on a copy of the operator's `data/sim.db`.
+
+**M1 — one archive that would not verify stopped every day behind it, permanently.** The day loop
+sat inside one `try` whose handler returned, so the first bad day took every later day *and* the
+`delete_aged` call with it. A day file that exists is verified rather than rewritten, so a corrupt
+one failed on every pass forever: retention stopped entirely while the database kept growing.
+Containment is now per day, as spec §6.4 always described it, and deletion runs regardless because
+it is scoped by file name and depends on nothing the archive step did. Reproduced and re-checked on
+the real database: with a corrupt file planted for the earliest of five pending days, the pass went
+from `archived 0, compacted 0, deleted 0` to `archived 3, compacted 1351, deleted 1`, with the
+corrupt day's payloads still in the database and its archive still not recreated on the next pass.
+The failure summary on the report is bounded now, because it reaches the event payload *and* the
+notification body and one permissions fault fails every pending day at once.
+
+**M2 — `pending_days` scanned every heavy payload on the event loop.** Two unindexable
+`LIKE '%...%'` predicates over `payload_json`, measured at 26 ms on the 8.3 MB sim database and
+growing with the log, run synchronously inside `async def _pass` while the three filesystem steps
+around it already hopped to a thread. It now takes the same hop (spec §6.3).
+
+**M3 — a file that would not delete was reported as a failed pass.** `delete_aged`'s failure
+strings were folded into `MaintenanceReport.failure`, which is exactly what `ok` means, so one
+locked file turned a good night into a HIGH `MAINTENANCE_FAILED` — none of the four things spec
+§5.4 names — and suppressed the LOW line carrying the day's real work. HIGH notices deliberately do
+not supersede, so each night stacked another red row. They now ride on their own `undeletable`
+field, are counted in the daily line as §6.4 asks, and appear on the failed body too so the fact is
+not lost when a pass failed for an unrelated reason.
+
+**M4 — `maintenance status` answered three of its six questions.** It now prints the windows in
+force *and whether they came from a published document or the defaults*, the last pass with what it
+did, and the archive inventory with its span, beside the backup and disk figures it already had. It
+opens the database to do so, which `maintenance backup` beside it already did: `open_database` never
+migrates, the reads write nothing, and the schema is WAL — so the command stays pointable at a file
+another process has open, which is its whole premise.
+
+**One observation from M2 was deliberately not acted on.** The scan re-reads already-compacted
+payloads forever, because selecting on `heavy_key` rather than on the event type is what stops a
+deleted archive being recreated (ADR 0028). A marker-column prefilter would narrow it, and the cost
+grows with the log — but it is now off the event loop, which is what made it urgent. Worth knowing
+about before the log is large.
+
+## What was checked and found sound
+
+So the boundary of these audits is legible rather than implied.
+
+From the instrument-universe audit (§1-3):
+
+- **`StartupSequence` keeping a boot snapshot is correct**, not a fourth instance of the frozen-
+  universe defect. It completes DESIGN §8.2 before anything can be published, so the set it reads
+  is the set that exists.
+- **`_instrument()` still refuses an unknown key** in both venue adapters after the universe was
+  made live, with the message naming the adapter. Fail-closed did not become fail-open.
+- **`ReplayMarketData` still refuses a series it was not given.** That refusal is what keeps a
+  backtest honest, and it is why the simulated venue's feed is a separate class rather than a
+  relaxation of this one.
+
+From the maintenance audit (whose four findings are now closed above as M1–M4):
+
+- **The archive-then-compact ordering holds.** Nothing is compacted without a verified archive, on
+  a real pass over `data/sim.db`: 4 days archived, 1,354 rows rewritten, payload 5.41 MB → 2.18 MB,
+  and 2,403 → 2,405 events — no row deleted, the two added being the pass's own `MAINTENANCE_RAN`.
+- **Compaction is idempotent and does not resurrect deleted archives.** A second pass over the same
+  database reported 0/0/0 and did **not** recreate the three archive files the first pass had
+  deleted — the failure mode `pending_days` selecting on `heavy_key` exists to prevent (ADR 0028).
+- **The archive round trip is exact.** All 1,849 payloads in one day file re-serialise byte-identical
+  to the canonical JSON in the pre-compaction copy, including the 96 rows holding non-ASCII text.
+- **The pre-migration backup fires, and the data step is right.** A copy of `data/sim.db` at
+  revision 0007 upgraded to 0009 wrote `sim-pre-0007-<stamp>.db` **before** touching the schema —
+  named for the revision it was leaving — and carried `recorded_seq` up to the existing
+  `last_seq` of 1234 rather than 0, so no installation re-records its whole log on the first poll
+  after the upgrade.
 
 ## Related, already recorded
 
