@@ -126,9 +126,16 @@ cancellation followed by silence and the state has to be inferred from an absenc
 ## 2. The design
 
 One file changes materially — [execution/monitor.py](../../../tradebot/execution/monitor.py) — plus a
-one-method addition to [execution/service.py](../../../tradebot/execution/service.py). `protective.py`
-is unchanged: `plan_legs` already sizes to a quantity it is given and already reports its own refusal
-reason.
+one-method addition to [execution/service.py](../../../tradebot/execution/service.py).
+
+[execution/protective.py](../../../tradebot/execution/protective.py) needs one signature change.
+`plan_legs` does not take the quantity to guard; it reads `entry.filled_qty` itself, which is this
+defect one level down — the sizing decision is made in the place that cannot see the position. It
+gains a **required** keyword `qty: Decimal`, and `LegPlan`'s refusal for a zero quantity stops
+naming fills, because a zero target now means "the holding does not reach this group" as often as it
+means "the entry has not filled". Required rather than defaulted: an optional `qty` that falls back
+to `entry.filled_qty` would let a future caller re-introduce exactly this bug by omission. Its
+refusal reasons and its `min_qty` / `min_notional` handling are otherwise untouched.
 
 ### 2.1 State: what is remembered, what is derived
 
@@ -294,7 +301,7 @@ fires.
 
 ## 5. Order of work
 
-1. `ExecutionService.held`, with its docstring naming D2.
+1. `ExecutionService.held`, with its docstring naming D2, and `plan_legs`' required `qty` keyword.
 2. `_Tracked`: delete `protected_qty`, add `resting_qty` and `unprotected_at` **together**. The two
    replacements are not separable — see §3's last rule. Existing tests stay green; this step is
    behaviour-preserving on its own.
@@ -314,7 +321,9 @@ fires.
 - The six-month `decision_lab` reference pass on `--reference-panel sim` runs to completion.
 - No `unprotected_position` event in that pass attributable to a discretionary SELL.
 - `KNOWN_GAPS.md` §4 moved to *Closed* with its evidence; §5–§8 left open.
-- `git diff --stat` touches only `tradebot/execution/`, the two test files, and the two docs.
+- `git diff --stat` touches only `tradebot/execution/` (`monitor.py`, `service.py`, `protective.py`,
+  and one stale comment in `brokers/binance.py`), `tests/unit/test_monitor.py`,
+  `tests/unit/test_protective.py`, one new scenario test, and the two docs.
 
 ---
 
