@@ -352,11 +352,17 @@ already opens on every resize, which is a precedent rather than an excuse.
 **Where** — [ops/rules.py:112](../tradebot/ops/rules.py#L112)
 
 ```python
-body=(
-    "The ledger and the venue disagree and nothing explains the difference. Affected "
-    "baskets are halted; above tolerance this trips the kill switch. The venue is the "
-    "source of truth — do not resume until the difference is understood."
-),
+Alert(
+    kind=AlertKind.RECON_MISMATCH,
+    at=event.ts,
+    scope=venue,
+    title=f"Reconciliation mismatch on {venue or 'the venue'}",
+    body=(
+        "The ledger and the venue disagree and nothing explains the difference. Affected "
+        "baskets are halted; above tolerance this trips the kill switch. The venue is the "
+        "source of truth — do not resume until the difference is understood."
+    ),
+)
 ```
 
 The body is a fixed string. The `RECONCILED` event written beside it carries the whole diff —
