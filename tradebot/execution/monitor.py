@@ -159,6 +159,7 @@ class ExecutionMonitor:
             group.instrument,
             capabilities,
             at=self._clock.now(),
+            qty=entry.filled_qty,
             revision=group.revision + 1,
         )
         if not plan.protected:

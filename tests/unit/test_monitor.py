@@ -381,3 +381,27 @@ class TestLifecycle:
         monitor.prune()
 
         assert any(order.role.is_protective for order in monitor.tracked)
+
+
+class TestHeld:
+    async def test_held_answers_from_the_ledger(
+        self,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+    ) -> None:
+        """Deliberately the ledger and not the venue — design D2.
+
+        A monitor that asked the venue and quietly resized to its figure would absorb the one
+        alarm `Reconciler` exists to raise (ADR 0006, KNOWN_GAPS §1).
+        """
+        service = ExecutionService(broker, store, ledger, clock)
+        assert service.held(instrument.key) == Decimal(0)
+
+        broker.observe(tick(instrument, clock, last="49000"))
+        await service.submit(entry_intent(instrument, clock), instrument)
+
+        assert service.held(instrument.key) == ledger.position(instrument.key).qty
+        assert service.held(instrument.key) > Decimal(0)
