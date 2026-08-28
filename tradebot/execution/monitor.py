@@ -52,11 +52,27 @@ class _Tracked:
     order: Order
     instrument: Instrument
     #: How many times this group's protective legs have been replaced, so each replacement gets
-    #: its own deterministic `client_order_id`.
+    #: its own deterministic `client_order_id`. The one thing here that cannot be derived: two
+    #: replacements at the same size must not collide.
     revision: int = 0
     legs: dict[str, Order] = field(default_factory=dict)
-    #: Entry quantity the current legs guard. `None` until an entry fill has been protected.
-    protected_qty: Decimal | None = None
+    #: The target last reported as unguardable, so that report fires once per target rather than
+    #: once per poll. A de-duplication marker; nothing reasons from it.
+    unprotected_at: Decimal | None = None
+
+    @property
+    def resting_qty(self) -> Decimal:
+        """How much of the holding the venue is currently guarding for this group.
+
+        A `max`, never a sum: with OCO the stop and the take-profit rest at the same size and the
+        venue's order list reserves the coins once, not twice — summing would halve every group on
+        the first poll after arming. Read off the legs `poll` has just re-synced, so this is the
+        venue's own answer rather than a counter that can drift (design D2).
+        """
+        return max(
+            (leg.remaining_qty for leg in self.legs.values() if leg.state.is_open),
+            default=ZERO,
+        )
 
 
 class ExecutionMonitor:
@@ -146,7 +162,8 @@ class ExecutionMonitor:
     async def _maintain(self, group: _Tracked) -> None:
         """Keep the protective legs matched to what the entry has actually filled."""
         entry = group.order
-        if entry.filled_qty > ZERO and entry.filled_qty != group.protected_qty:
+        target = entry.filled_qty
+        if target > ZERO and target != group.resting_qty and target != group.unprotected_at:
             await self._replace_legs(group)
         if any(leg.state is OrderState.FILLED for leg in group.legs.values()):
             await self._close_group(group)
@@ -171,13 +188,13 @@ class ExecutionMonitor:
         placed = await self._execution.submit_group(plan.intents, group.instrument)
         for leg in placed:
             group.legs[leg.client_order_id] = leg
-        group.protected_qty = entry.filled_qty
+        group.unprotected_at = None
         events = self._execution.events_for(entry)
         await self._store.append(events.protective_placed(entry, tuple(placed)))
 
     async def _record_unprotected(self, group: _Tracked, reason: str) -> None:
         entry = group.order
-        group.protected_qty = entry.filled_qty
+        group.unprotected_at = entry.filled_qty
         events = self._execution.events_for(entry)
         await self._store.append(
             events.protective_placed(entry, (), detail=reason),

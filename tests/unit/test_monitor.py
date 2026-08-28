@@ -19,6 +19,7 @@ from tradebot.core.orders import OrderIntent, ProtectivePlan
 from tradebot.execution.brokers.sim import SimBroker, Tick
 from tradebot.execution.monitor import ExecutionMonitor
 from tradebot.execution.service import ExecutionService
+from tradebot.interfaces.broker import OrderRef
 from tradebot.ledger.portfolio import Ledger
 from tradebot.persistence.store import EventStore
 
@@ -209,6 +210,44 @@ class TestProtectiveGroups:
         assert {leg.role for leg in legs} == {OrderRole.STOP_LOSS, OrderRole.TAKE_PROFIT}
         assert all(leg.state.is_open for leg in legs)
         assert all(leg.group_id == "sim-ENTRY" for leg in legs)
+
+    async def test_the_guarded_quantity_is_read_off_the_legs_not_remembered(
+        self,
+        monitor: ExecutionMonitor,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+    ) -> None:
+        """Design D2: `poll` already re-reads every leg from the venue, so a counter beside that
+        answer is a second opinion that can drift — and its drift *is* KNOWN_GAPS §4."""
+        broker.observe(tick(instrument, clock, last="49000"))
+        await submit_entry(monitor, broker, store, ledger, clock, instrument, ttl=None)
+        await monitor.poll()
+
+        group = monitor._tracked["sim-ENTRY"]
+        assert group.resting_qty == Decimal("0.5")
+
+        # Both legs are cancelled at the venue directly, bypassing the monitor: SimBroker's
+        # venue-native OCO cancels a sibling only on a *fill* (`_cancel_siblings`, called from
+        # `_fill`) — ADR 0011 scopes that guarantee to the R13 hazard of both legs paying out, not
+        # to a stray cancel — so cancelling one leg here would leave the other resting at its own
+        # 0.5 and the group's `resting_qty` unchanged, telling us nothing.
+        for leg in group.legs.values():
+            await broker.cancel(
+                OrderRef(client_order_id=leg.client_order_id, instrument_key=instrument.key)
+            )
+        clock.advance(30)
+        # `monitor._sync` only, not `monitor.poll()`: a full poll's `_maintain` would see the
+        # entry's fill still unguarded and re-arm fresh legs at the same 0.5 in the same sweep —
+        # correct behaviour, but it would re-cover the gap this test exists to observe. Reaching
+        # into `_sync` isolates "re-read the venue" from "act on what was read", which `poll`
+        # deliberately does not separate in production.
+        for client_order_id, leg in list(group.legs.items()):
+            group.legs[client_order_id] = await monitor._sync(group, leg)
+
+        assert group.resting_qty < Decimal("0.5"), "a leg cancelled at the venue is not guarding"
 
     async def test_legs_are_replaced_when_more_of_the_entry_fills(
         self,
