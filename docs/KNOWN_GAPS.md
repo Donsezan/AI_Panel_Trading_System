@@ -9,7 +9,7 @@ The house rule applies to reading this file too: **fail-closed is not the same a
 these resolve in the fail-closed direction and are still on this list, because a system that stops
 doing something for a reason nobody can name is an incident.
 
-Four passes so far:
+Five passes so far:
 
 - **§1–3, the instrument-universe seam** (2026-08-19). None is caused by the two fixes that shipped
   alongside them ([marketdata/synthetic.py](../tradebot/marketdata/synthetic.py), the live
@@ -19,22 +19,27 @@ Four passes so far:
   boundary of an audit is only legible if what it found and what became of it are both recorded.
 - **§4, protective legs against a reduced position** (2026-08-25). Not an audit: found by the
   first long reference pass through `decision_lab`, over six months of recorded Binance data with
-  a panel that takes partial exits. It predates that work — no bot file was changed by it.
+  a panel that takes partial exits. It predates that work — no bot file was changed by it. Since
+  **fixed** — see *Closed* below.
 - **§5–8, found while designing gap 4's fix** (2026-08-27). Not an audit either: four things
   the fix had to reason about and then leave alone. §5 and §6 are the parts of the same seam
   that monitor-side scope deliberately excludes; §7 and §8 are what an operator is actually
   told when the discrepancy §6 can cause is the one that gets caught.
+- **§9, found while closing gap 4** (2026-08-28). Verifying the fix on the reference pass that
+  found the original defect turned up the one class of group it cannot reach — not a new defect,
+  the fix's own documented boundary, written up because it is the exact shape of the thing §4
+  closed and now waits on a migration instead.
 
 | # | Gap | Reaches | Direction |
 |---|---|---|---|
 | 1 | The mismatch kill threshold compares quantities to money, and sizes itself from explained lines | live · paper | **fails open and closed** |
 | 2 | Retiring a basket that holds a position is unguarded | every mode | fails closed, and traps |
 | 3 | The one-quote-currency rule is enforced only at boot | live · paper | fails open |
-| 4 | Protective legs are sized to the entry, so a partial exit leaves them oversized | live · paper · sim | fails closed, at the venue |
 | 5 | The monitor polls only inside a cycle that placed orders | every mode | **fails open** |
 | 6 | Nothing releases protective legs before a discretionary exit | live · paper on a venue | fails closed, and traps |
 | 7 | The mismatch alert names no instrument and no quantity | live · paper | fires, but says too little |
 | 8 | The kill-switch reason carries the explained lines and no absolute figures | every mode | fires, but says too little |
+| 9 | A group adopted at startup carries no protective plan, so the position-tracking fix cannot resize or cancel its legs | live · paper · sim | fails closed, at the venue |
 
 ---
 
@@ -207,69 +212,6 @@ Binance data, and it takes *Binance's* catalogue (ADR 0025) — and so does live
 
 ---
 
-## 4. Protective legs track the entry order, not the position
-
-**Where** — [execution/monitor.py:146](../tradebot/execution/monitor.py#L146)
-
-```python
-async def _maintain(self, group: _Tracked) -> None:
-    """Keep the protective legs matched to what the entry has actually filled."""
-    entry = group.order
-    if entry.filled_qty > ZERO and entry.filled_qty != group.protected_qty:
-        await self._replace_legs(group)
-```
-
-`_Tracked.protected_qty` is, by its own comment, the *entry* quantity the current legs guard. The
-monitor has no view of the position. So a SELL taken by any other path — another cycle's exit
-decision, an ADR 0015 operator close — reduces the holding while the legs already resting at the
-venue keep their original size. Nothing resizes them and nothing cancels them: `_replace_legs`
-fires only when the *entry* fills further, and `_close_group` only when one of that group's own
-legs fills.
-
-The `self._polling` lock two screens up names this exact hazard — *"twice the exit quantity against
-one position, which in a long-only system is an accidental short (R13)"* — and guards only its
-concurrent-poll variant. This is the same arithmetic reached by a partial exit instead.
-
-**Observed**, in the event log of a reference pass over recorded BTC/ETH 1h data,
-2024-01-01 → 2024-07-01, on `--reference-panel sim`:
-
-```
-2024-01-03 16:00  BUY  0.0351 fills          position 0.0351
-2024-01-03 16:00  legs armed: stop 0.0351 @ trigger 2170.66, take-profit 0.0351 @ 2348.37
-2024-01-04 12:00  SELL 0.0087 fills          position 0.0264   ← legs untouched at 0.0351
-2024-01-07 12:00  BUY  0.0852 fills          position 0.1116   ← a second group, its own 0.0852
-2024-01-08 00:00  that group's stop fills    position 0.0264
-2024-01-08 ~03:00 ETH low 2166.38 trips the stale 2170.66 stop
-```
-
-```
-ReconciliationMismatchError: sell of 0.03510000 exceeds holding 0.02640000 on binance:ETH/USDT;
-v1 is long-only, so this is ledger corruption rather than a short
-```
-
-`Ledger._apply_sell` refused, which is the guard working. But it fires at the wrong end: **the
-oversized order is already resting at the venue** by then, placed hours or days earlier.
-
-**What it costs.** On Binance spot the venue rejects the stop for insufficient balance at the
-moment it triggers — so the position is unguarded during exactly the move the stop existed for,
-and the local ledger and the venue disagree about what is protected. On a venue that permits the
-sell, it oversells into a short the risk engine believes cannot exist. The sim/backtest case is
-milder and still fatal to the run: the pass raises and stops, which is how this was found.
-
-**Reachable from ordinary automated trading.** The reducing order here was a plain cycle SELL
-(`sim-R7GB2OIBDAQWPVTG`, its own group), not a manual close. Any basket whose panel takes partial
-exits reaches it; the demo's `stub` panel never does, which is why hundreds of prior backtests and
-the whole scenario suite have not.
-
-**Closing it** means giving the monitor the position rather than the entry: resize or cancel a
-group's legs whenever the holding it guards falls below `protected_qty`, from wherever the
-reduction came. `Ledger` already emits `POSITION_UPDATED` on every fill, so the signal exists. The
-awkward part is ownership — the monitor is deliberately venue-scoped and basket-agnostic, while
-positions belong to the portfolio, so the resize has to be driven by the position rather than
-polled per group. A rung-3 scenario driving an entry, a partial discretionary exit, and then a
-bar through the original stop is the test this needs, and its absence is why the defect survived.
-
-
 ## 5. The monitor polls only inside a cycle that placed orders
 
 **Where** — the module docstring of [execution/monitor.py](../tradebot/execution/monitor.py),
@@ -419,6 +361,63 @@ there is currently no test over the text of the reason a human is asked to act o
 
 ---
 
+## 9. A group adopted at startup carries no protective plan, so the position-tracking fix cannot reach it
+
+**Where** — [persistence/schema.py:133](../tradebot/persistence/schema.py#L133), the `orders`
+table, and [startup.py:282](../tradebot/control/startup.py#L282), `_persisted_open_orders`'s
+`Order(...)` construction
+
+```python
+orders = Table(
+    "orders",
+    metadata,
+    Column("client_order_id", String(64), primary_key=True),
+    ...
+    Column("role", String(16), nullable=False, default="entry"),
+    Column("group_id", String(64), nullable=False, default=""),
+    Column("qty", DecimalText, nullable=False),
+    ...
+)
+```
+
+No `protective` column. `_persisted_open_orders` rebuilds each recovered row as `Order(...)`
+without one either, so every order a restart adopts carries `protective=None` — indistinguishable,
+to the fix closed below, from a reducing order that legitimately needs no legs at all. Its own
+`_protectable` docstring says why that pairing is deliberate: *"A group whose entry carries no
+`ProtectivePlan` is not one of them: a reducing SELL is the exit... Running one through `plan_legs`
+is what made every filled discretionary SELL file an `unprotected_position` for an order that needs
+none."* `_maintain` takes the same branch for both and does nothing:
+
+```python
+if target is None:
+    # Outside the allocation, which is not the same fact as a target of zero. ...
+    # Conflating them cancels the legs of every group adopted at startup, because the
+    # `orders` projection does not persist `protective` and `_persisted_open_orders`
+    # rebuilds the entry without it.
+    return
+```
+
+**What it costs.** The fix below resizes or cancels a group's legs by comparing what they guard
+against the position — but only for a group whose entry still carries the `ProtectivePlan` it was
+armed with. A restart discards that plan. So a group adopted at startup is invisible to the resize
+path: the monitor can neither shrink its legs nor release them, only — correctly, given what it
+knows — leave them alone. **The original defect survives a restart for exactly these groups**: a
+reduction taken after the restart leaves their legs resting at the pre-restart size, and when one
+later triggers, it oversells exactly as the closed entry below describes — `Ledger._apply_sell`
+refusing a fill against a position that has moved on.
+
+**Reach.** Any process that restarts with an open protective group and then reduces that position
+before the group's own legs settle by other means — live and paper across every restart, and sim
+whenever a soak or a `decision_lab` pass is resumed rather than run start-to-finish. Not reachable
+within one uninterrupted process: every group armed after startup carries its own plan, and the fix
+applies to it normally.
+
+**To close it.** Persist `protective` on the `orders` table and thread it through
+`_persisted_open_orders`'s `Order(...)` construction — an Alembic migration, out of scope for the
+branch that closed the entry below. See it for the fix this sits beside.
+
+---
+
 ## Closed — the maintenance audit's four (2026-08-23)
 
 All four were in `tradebot/maintenance/`, which never touches the money path; none could cause or
@@ -462,6 +461,56 @@ payloads forever, because selecting on `heavy_key` rather than on the event type
 deleted archive being recreated (ADR 0028). A marker-column prefilter would narrow it, and the cost
 grows with the log — but it is now off the event loop, which is what made it urgent. Worth knowing
 about before the log is large.
+
+## Closed — protective legs track the position (2026-08-28)
+
+**4 — protective legs were sized to the entry order's own fills, not to the position they
+guarded.** `_maintain` compared a venue-held group's legs against `entry.filled_qty`. A SELL taken
+by any other path — another cycle's own exit decision, an ADR 0015 operator close — reduced the
+holding while the legs already resting at the venue kept their pre-reduction size, guarding coins
+that were no longer there. Found by the first long `decision_lab` reference pass over six months of
+recorded BTC/ETH 1h data (2024-01-01 → 2024-07-01, `--reference-panel sim`): an entry filled 0.0351
+ETH and armed a stop and a take-profit at that size; a later cycle's own partial exit sold 0.0087,
+leaving 0.0264 held while the legs stayed at 0.0351; four days on, a bar crossed the stale stop's
+trigger and `Ledger._apply_sell` refused it — `sell of 0.03510000 exceeds holding 0.02640000 on
+binance:ETH/USDT; v1 is long-only, so this is ledger corruption rather than a short` — which is how
+the pass, and the defect, stopped.
+
+`_maintain` now reads the position, not the entry. `ExecutionMonitor._targets` computes each
+instrument's held quantity minus what its own working sells already commit, allocates it across
+that instrument's groups tightest-stop-first, and resizes or cancels every group's legs to match —
+from wherever the reduction came, not only a further fill on the entry it guards. A leg that cannot
+be resized (below the venue's minimums, or a placement failure) is cancelled rather than left
+resting oversized, and the attempt is recorded as an `unprotected_position` `RISK_EVENT` rather than
+silently dropped.
+
+**Re-verified two ways.** A rung-3 scenario
+([tests/scenario/test_protective_resize.py](../tests/scenario/test_protective_resize.py)) drives an
+entry, a partial discretionary exit, and then a bar through the original stop, end to end through
+the real loop. Against the pre-fix monitor it fails exactly as the reference pass did — `sell of
+0.00498 exceeds holding 0.00374 on sim:BTC/USDT` — and passes against the fix.
+
+And on the same six-month reference pass that found the defect: the original mechanism — a
+stale-sized leg outliving a partial exit — did not recur, and the fix's resize path did the work it
+exists for. One cycle sold a quarter of a 0.11220000 ETH position (`reduce-only: 0.25 of 0.11220000
+held`), leaving 0.08420000 held; the monitor cancelled both legs of the old group (`reason:
+resized_to_position`) and armed a new stop and take-profit at exactly 0.08420000 — the same
+arithmetic the pre-fix run corrupted, now correct. Three unseeded attempts (the panel's `varied-*`
+seats draw without a seed, so no two passes trade identically): one built the full corpus without
+raising — `ran_cycles: 67` of `planned_cycles: 1080`, the basket auto-paused on
+`max_consecutive_losses` partway through (a Tier-2 rule, not a fault) — with exactly one
+`RISK_EVENT` in its whole log, that pause, and zero `unprotected_position`. The other two still
+halted before the window closed, each on the same `sell of <qty> exceeds holding <qty>` shape — but
+neither reproduces this defect: in both, the surviving `orders` row shows the *original* protective
+leg still `open`, and the quantity refused is that leg's full size, not a resized one. The leg had
+already matched at the venue on the same bar the panel's own reducing order was sized against, and
+the monitor's next poll — which runs after a cycle's own order, not before it — was what tried to
+book it, against a ledger that had moved on in between. That is §5's mechanism, not this one; §5 is
+open and out of scope here.
+
+**What the fix does not reach.** A group adopted at startup carries no `ProtectivePlan` — the
+`orders` projection has no column for one — so the resize path above cannot see it. §9 records the
+boundary; the original defect survives a restart for exactly those groups.
 
 ## What was checked and found sound
 
