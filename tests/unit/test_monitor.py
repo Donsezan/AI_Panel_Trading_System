@@ -10,13 +10,17 @@ from datetime import timedelta
 from decimal import Decimal
 
 import pytest
+from hypothesis import HealthCheck, given, settings
+from hypothesis import strategies as st
 
 from tradebot.core.clock import ManualClock
 from tradebot.core.enums import OrderRole, OrderState, OrderType, Side
 from tradebot.core.errors import RetryableError
 from tradebot.core.events import EventType
 from tradebot.core.instrument import Instrument
-from tradebot.core.orders import Fill, OrderIntent, ProtectivePlan
+from tradebot.core.money import ZERO
+from tradebot.core.orders import Fill, Order, OrderIntent, ProtectivePlan
+from tradebot.core.portfolio import Position
 from tradebot.execution.brokers.sim import SimBroker, Tick
 from tradebot.execution.monitor import ExecutionMonitor
 from tradebot.execution.service import ExecutionService
@@ -827,3 +831,98 @@ class TestLegsTrackThePosition:
             "unprotected_position",
             "unprotected_position",
         ], "the second time it becomes unguardable is a second fact, not a repeat"
+
+
+def _monitor_over(
+    broker: SimBroker,
+    store: EventStore,
+    clock: ManualClock,
+    instrument: Instrument,
+    holding: Decimal,
+) -> ExecutionMonitor:
+    ledger = Ledger(clock, venue="sim", balances={"USDT": Decimal(100_000)})
+    ledger.adopt_position(Position(instrument_key=instrument.key, qty=holding))
+    return ExecutionMonitor(broker, ExecutionService(broker, store, ledger, clock), store, clock)
+
+
+def _filled_entry(
+    instrument: Instrument, clock: ManualClock, *, coid: str, filled: Decimal, stop: Decimal
+) -> Order:
+    """An entry that has already filled `filled`, with its stop at `stop`.
+
+    The lifecycle table in `orders.py` has no PENDING_SUBMIT → FILLED edge — a fresh order must
+    pass through SUBMITTED first (DESIGN §6.7's "an order in an impossible state must never reach
+    a venue"). `submit_group` is what does that on a real path; here it is one explicit
+    `transition_to` so the helper stays a plain constructor with no venue involved.
+    """
+    intent = OrderIntent(
+        client_order_id=coid,
+        basket_id="b1",
+        cycle_id="c1",
+        instrument_key=instrument.key,
+        side=Side.BUY,
+        qty=filled,
+        order_type=OrderType.LIMIT,
+        limit_price=Decimal("50000"),
+        protective=ProtectivePlan(stop_price=stop, take_profit_price=stop + Decimal("10000")),
+        created_at=clock.now(),
+    )
+    order = Order.from_intent(intent).transition_to(OrderState.SUBMITTED, at=clock.now())
+    return order.with_fill(
+        Fill(
+            fill_id=f"{coid}-1",
+            client_order_id=coid,
+            instrument_key=instrument.key,
+            side=Side.BUY,
+            qty=filled,
+            price=Decimal("50000"),
+            filled_at=clock.now(),
+        )
+    )
+
+
+class TestAllocationInvariant:
+    @given(
+        fills=st.lists(
+            st.decimals(min_value=Decimal("0.001"), max_value=Decimal("10"), places=3),
+            min_size=1,
+            max_size=5,
+        ),
+        stops=st.lists(
+            st.decimals(min_value=Decimal("100"), max_value=Decimal("60000"), places=2),
+            min_size=5,
+            max_size=5,
+            unique=True,
+        ),
+        holding=st.decimals(min_value=Decimal(0), max_value=Decimal("20"), places=3),
+    )
+    @settings(
+        max_examples=200,
+        deadline=None,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    def test_the_total_allocated_never_exceeds_the_holding(
+        self,
+        broker: SimBroker,
+        store: EventStore,
+        clock: ManualClock,
+        instrument: Instrument,
+        fills: list[Decimal],
+        stops: list[Decimal],
+        holding: Decimal,
+    ) -> None:
+        """Spec §3. Whatever the reduction was and wherever it came from, the sum of what the
+        groups may guard is at most what is held. This is the property KNOWN_GAPS §4 violated."""
+        monitor = _monitor_over(broker, store, clock, instrument, holding)
+        for index, fill in enumerate(fills):
+            monitor.track(
+                _filled_entry(instrument, clock, coid=f"g{index}", filled=fill, stop=stops[index]),
+                instrument,
+            )
+
+        targets = monitor._targets()
+
+        assert sum(targets.values(), start=ZERO) <= holding
+        for index, fill in enumerate(fills):
+            assert targets[f"g{index}"] <= fill, "a group never guards more than its own fill"
+        assert all(target >= ZERO for target in targets.values())
