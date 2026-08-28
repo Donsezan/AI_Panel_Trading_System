@@ -33,7 +33,7 @@ from tradebot.core.clock import Clock
 from tradebot.core.enums import OrderRole, OrderState, RiskTier, Side
 from tradebot.core.instrument import Instrument
 from tradebot.core.logging import get_logger
-from tradebot.core.money import ZERO
+from tradebot.core.money import ZERO, multiply
 from tradebot.core.orders import Order
 from tradebot.execution.protective import plan_legs
 from tradebot.execution.service import ExecutionService
@@ -46,16 +46,17 @@ logger = get_logger(__name__)
 #: until then it is a floor slow enough that a burst cannot approach any venue's limit.
 DEFAULT_POLL_INTERVAL = timedelta(seconds=10)
 
-#: Which end of the stop-price ordering is funded first when the holding cannot cover every group
-#: on an instrument, keyed on the side that *opened* the position. A long is opened BUY and its
-#: stops sit below the market, so the tightest — the one that fires first on the way down — is the
-#: highest, and `reverse=True` funds it first (design D3).
+#: Sign applied to a group's stop trigger when ranking, keyed on the side that *opened* the
+#: position. A long is opened BUY and its stops sit below the market, so the tightest — the one
+#: that fires first on the way down — is the highest, and negating sorts it first. A short's
+#: tightest stop is the lowest, so it sorts unnegated. Per group rather than per list: the
+#: direction is a property of the position, not of whichever group happened to be tracked first.
 #:
 #: A table rather than an `if`, as `_EXIT_SIDE` and `_OFFSET_SIGN` are in `protective.py`. v1 is
 #: long-only so only the BUY row is ever taken; the table keeps the module honest rather than
 #: assuming. Age was the first proposal and is a proxy that inverts in a falling market — an entry
 #: at 100 stopped at 95 and a later one at 90 stopped at 85, newest-first keeps the 85.
-_TIGHTEST_FIRST: dict[Side, bool] = {Side.BUY: True, Side.SELL: False}
+_RANK_SIGN: dict[Side, Decimal] = {Side.BUY: Decimal(-1), Side.SELL: Decimal(1)}
 
 
 @dataclass(slots=True)
@@ -164,7 +165,7 @@ class ExecutionMonitor:
             # post-fill one (design §2.4).
             targets = self._targets()
             for group in list(self._tracked.values()):
-                await self._maintain(group, targets.get(group.order.group_id, ZERO))
+                await self._maintain(group, targets.get(group.order.group_id))
 
     async def _sync(self, group: _Tracked, order: Order) -> Order:
         if not order.state.is_open:
@@ -176,7 +177,7 @@ class ExecutionMonitor:
             )
         return order
 
-    async def _maintain(self, group: _Tracked, target: Decimal) -> None:
+    async def _maintain(self, group: _Tracked, target: Decimal | None) -> None:
         """Keep the protective legs matched to the *position*, not to this entry's fills.
 
         KNOWN_GAPS §4: the legs tracked `entry.filled_qty`, so a SELL from any other path — another
@@ -189,6 +190,13 @@ class ExecutionMonitor:
         # already gone flat and then cancels it.
         if any(leg.state is OrderState.FILLED for leg in group.legs.values()):
             await self._close_group(group)
+            return
+        if target is None:
+            # Outside the allocation, which is not the same fact as a target of zero. Zero means
+            # "the holding behind this group is gone, release its legs"; `None` means there is
+            # nothing here to size — the entry carries no protective plan. Conflating them cancels
+            # the legs of every group adopted at startup, because the `orders` projection does not
+            # persist `protective` and `_persisted_open_orders` rebuilds the entry without it.
             return
         if target != group.resting_qty and target != group.unprotected_at:
             await self._replace_legs(group, target)
@@ -272,7 +280,14 @@ class ExecutionMonitor:
         discretionary SELL file an `unprotected_position` for an order that needs none.
         """
         ranked = [
-            ((plan.stop_price, group.order.created_at, group.order.client_order_id), group)
+            (
+                (
+                    multiply(plan.stop_price, _RANK_SIGN[group.order.side]),
+                    group.order.created_at,
+                    group.order.client_order_id,
+                ),
+                group,
+            )
             for group in self._tracked.values()
             if group.order.instrument_key == instrument_key
             and (plan := group.order.protective) is not None
@@ -284,19 +299,22 @@ class ExecutionMonitor:
             # guarding a position which is still open.
             and not any(leg.state is OrderState.FILLED for leg in group.legs.values())
         ]
-        if not ranked:
-            return []
         # Ties break on creation then id because startup adopts orders from the database in
-        # arbitrary order, and the allocation must survive a restart unchanged.
-        ranked.sort(key=lambda pair: pair[0], reverse=_TIGHTEST_FIRST[ranked[0][1].order.side])
+        # arbitrary order, and the allocation must survive a restart unchanged. Ascending, because
+        # `_RANK_SIGN` already points the tightest stop at the smallest key for whichever side
+        # opened it — a `reverse` flag here would have to know the side too, and be right about it.
+        ranked.sort(key=lambda pair: pair[0])
         return [group for _, group in ranked]
 
     def _committed(self, instrument_key: str) -> Decimal:
-        """Quantity our own working sells already commit, outside the protective legs.
+        """Quantity our own working sells already commit, outside a group's *own* protective legs.
 
         A discretionary exit or an ADR 0015 operator close still resting reserves the base asset at
-        the venue exactly as a stop does. Only entries are considered — `legs` holds protective
-        orders by construction, and those are what the budget is being divided among.
+        the venue exactly as a stop does — and so does a protective leg that ended up as a group's
+        `order`. That happens: `track()` makes a recovered leg the group's own `order` when its
+        entry was already terminal and so was never re-adopted, and that leg's reservation is as
+        real as an entry's. What must never be double-counted is a group's own `legs`, which this
+        sum never reads — that is what the budget `_targets` computes is being divided among.
         """
         return sum(
             (

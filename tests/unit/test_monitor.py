@@ -673,3 +673,42 @@ class TestLegsTrackThePosition:
             if leg.role is OrderRole.STOP_LOSS and leg.state.is_open
         }
         assert live == {"sim-WIDE": Decimal("0.3")}, "the surviving position stays guarded"
+
+    async def test_a_group_recovered_without_its_protective_plan_keeps_its_legs(
+        self,
+        monitor: ExecutionMonitor,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+    ) -> None:
+        """Fix round 1, finding 1. `orders` has no `protective` column, so every order a restart
+        recovers has `protective=None` — including one guarding a live position with legs already
+        resting at the venue (`startup._persisted_open_orders`). Absent from the allocation must
+        not read the same as a target of zero: the first poll after every restart would otherwise
+        cancel the legs of every group it adopted, silently — no `unprotected_position` event,
+        because the zero-target path in `_replace_legs` is "released to position", not "flagged"."""
+        broker.observe(tick(instrument, clock, last="49000"))
+        await submit_entry(monitor, broker, store, ledger, clock, instrument, ttl=None)
+        await monitor.poll()
+        group = monitor._tracked["sim-ENTRY"]
+        assert group.resting_qty == Decimal("0.5")
+        before = {leg.client_order_id for leg in group.legs.values() if leg.state.is_open}
+
+        # What a restart actually hands back: the same entry, still holding the position, with
+        # its legs still resting at the venue, but no protective plan — the `orders` projection
+        # never persisted one.
+        group.order = group.order.model_copy(update={"protective": None})
+        clock.advance(30)
+        broker.observe(tick(instrument, clock, last="49000"))
+        await monitor.poll()
+
+        live = {
+            leg.client_order_id
+            for leg in group.legs.values()
+            if leg.role.is_protective and leg.state.is_open
+        }
+        assert live == before, "a plan a restart cannot recover must not cost the position its legs"
+        risk = [e for e in store.read_all() if e.type is EventType.RISK_EVENT]
+        assert not risk, "nothing changed, so nothing is flagged"
