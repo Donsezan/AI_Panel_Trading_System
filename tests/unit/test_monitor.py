@@ -13,6 +13,7 @@ import pytest
 
 from tradebot.core.clock import ManualClock
 from tradebot.core.enums import OrderRole, OrderState, OrderType, Side
+from tradebot.core.errors import RetryableError
 from tradebot.core.events import EventType
 from tradebot.core.instrument import Instrument
 from tradebot.core.orders import Fill, OrderIntent, ProtectivePlan
@@ -712,3 +713,117 @@ class TestLegsTrackThePosition:
         assert live == before, "a plan a restart cannot recover must not cost the position its legs"
         risk = [e for e in store.read_all() if e.type is EventType.RISK_EVENT]
         assert not risk, "nothing changed, so nothing is flagged"
+
+    async def test_a_shrink_below_venue_minimums_cancels_the_legs_and_reports(
+        self,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+    ) -> None:
+        """Today the reason is recorded and the legs are left resting — an oversized order at the
+        venue *and* a report saying the position is unguarded, both false (design §2.3)."""
+        service = ExecutionService(broker, store, ledger, clock)
+        monitor = ExecutionMonitor(broker, service, store, clock)
+        broker.observe(tick(instrument, clock, last="49000"))
+        order = await service.submit(entry_intent(instrument, clock, ttl=None), instrument)
+        monitor.track(order, instrument)
+        await monitor.poll()
+
+        # 0.0001 BTC at 49 000 is 4.90, below the instrument's min_notional of 10.
+        book(ledger, external_sell(instrument, clock, qty="0.4999"), instrument)
+        clock.advance(30)
+        await monitor.poll()
+
+        assert not [
+            leg for leg in monitor.tracked if leg.role.is_protective and leg.state.is_open
+        ], "an oversized leg must not outlive the holding it was sized for"
+        risk = [e for e in store.read_all() if e.type is EventType.RISK_EVENT]
+        assert [e.payload["rule"] for e in risk] == ["unprotected_position"]
+
+    async def test_a_failed_placement_after_the_cancel_is_recorded_before_it_propagates(
+        self,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+    ) -> None:
+        """The window is forced by the venue (design D4); what must not happen is a cancellation
+        followed by silence, leaving the state to be inferred from an absence."""
+
+        class _FailingGroupBroker(SimBroker):
+            fail_group = False
+
+            async def submit_group(self, intents):  # type: ignore[no-untyped-def]
+                if self.fail_group:
+                    self.fail_group = False
+                    raise RetryableError("venue unavailable")
+                return await super().submit_group(intents)
+
+        broker = _FailingGroupBroker(clock, balances={"USDT": Decimal(100_000)})
+        service = ExecutionService(broker, store, ledger, clock)
+        monitor = ExecutionMonitor(broker, service, store, clock)
+        broker.observe(tick(instrument, clock, last="49000"))
+        order = await service.submit(entry_intent(instrument, clock, ttl=None), instrument)
+        monitor.track(order, instrument)
+        await monitor.poll()
+
+        book(ledger, external_sell(instrument, clock, qty="0.2"), instrument)
+        broker.fail_group = True
+        clock.advance(30)
+        with pytest.raises(RetryableError):
+            await monitor.poll()
+
+        risk = [e for e in store.read_all() if e.type is EventType.RISK_EVENT]
+        assert [e.payload["rule"] for e in risk] == ["unprotected_position"]
+        assert "venue unavailable" in risk[0].payload["detail"]
+
+    async def test_a_successful_placement_re_arms_the_report(
+        self,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+    ) -> None:
+        """`unprotected_at` is cleared when legs are placed (design §2.3). Without that, a position
+        that becomes unguardable, recovers, and becomes unguardable again at the same size is
+        reported once and never again."""
+        service = ExecutionService(broker, store, ledger, clock)
+        monitor = ExecutionMonitor(broker, service, store, clock)
+        broker.observe(tick(instrument, clock, last="49000"))
+        order = await service.submit(entry_intent(instrument, clock, ttl=None), instrument)
+        monitor.track(order, instrument)
+        await monitor.poll()
+
+        # Down to dust: 0.0001 at 49 000 is 4.90, under the instrument's min_notional of 10.
+        book(ledger, external_sell(instrument, clock, qty="0.4999"), instrument)
+        clock.advance(30)
+        await monitor.poll()
+
+        # Back up, guardable again, then down to the same dust a second time.
+        book(
+            ledger,
+            Fill(
+                fill_id="refill",
+                client_order_id="sim-ELSEWHERE",
+                instrument_key=instrument.key,
+                side=Side.BUY,
+                qty=Decimal("0.4999"),
+                price=Decimal("49000"),
+                filled_at=clock.now(),
+            ),
+            instrument,
+        )
+        clock.advance(30)
+        await monitor.poll()
+        book(ledger, external_sell(instrument, clock, qty="0.4999"), instrument)
+        clock.advance(30)
+        await monitor.poll()
+
+        risk = [e for e in store.read_all() if e.type is EventType.RISK_EVENT]
+        assert [e.payload["rule"] for e in risk] == [
+            "unprotected_position",
+            "unprotected_position",
+        ], "the second time it becomes unguardable is a second fact, not a repeat"

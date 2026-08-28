@@ -220,12 +220,29 @@ class ExecutionMonitor:
             revision=group.revision + 1,
         )
         if not plan.protected:
+            # Cancel *first*. What is resting was sized for a larger holding: if it triggered the
+            # venue would reject it for insufficient balance, so leaving it is a false protection
+            # on top of a true report (design §2.3).
+            await self._cancel_legs(group, reason="below_venue_minimums")
             await self._record_unprotected(group, plan.unprotected_reason, target)
             return
 
         await self._cancel_legs(group, reason="resized_to_position")
         group.revision += 1
-        placed = await self._execution.submit_group(plan.intents, group.instrument)
+        try:
+            placed = await self._execution.submit_group(plan.intents, group.instrument)
+        except Exception as error:
+            # The legs are already cancelled, so the position is bare until the next poll retries.
+            # The venue error still reaches the caller's retry budget — what changes is that the
+            # log says what state this left behind instead of showing a cancel and then nothing.
+            #
+            # `except Exception` is deliberate and is not a swallow: it records and then
+            # re-raises, so the error's class still governs handling exactly as before —
+            # `RetryableError` / `FailClosedError` / `FatalError` reach the caller unchanged.
+            # Narrowing this to those three types would silently skip the recording for any
+            # *unexpected* exception, which is the precise absence this task exists to close.
+            await self._record_unprotected(group, f"placement failed: {error}", target)
+            raise
         for leg in placed:
             group.legs[leg.client_order_id] = leg
         group.unprotected_at = None
