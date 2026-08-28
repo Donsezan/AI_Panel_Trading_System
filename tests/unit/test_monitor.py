@@ -15,7 +15,7 @@ from tradebot.core.clock import ManualClock
 from tradebot.core.enums import OrderRole, OrderState, OrderType, Side
 from tradebot.core.events import EventType
 from tradebot.core.instrument import Instrument
-from tradebot.core.orders import OrderIntent, ProtectivePlan
+from tradebot.core.orders import Fill, OrderIntent, ProtectivePlan
 from tradebot.execution.brokers.sim import SimBroker, Tick
 from tradebot.execution.monitor import ExecutionMonitor
 from tradebot.execution.service import ExecutionService
@@ -73,19 +73,45 @@ def entry_intent(
     qty: str = "0.5",
     ttl: int | None = 60,
     plan: ProtectivePlan | None = PLAN,
+    coid: str = "sim-ENTRY",
+    side: Side = Side.BUY,
 ) -> OrderIntent:
     return OrderIntent(
-        client_order_id="sim-ENTRY",
+        client_order_id=coid,
         basket_id="b1",
         cycle_id="c1",
         instrument_key=instrument.key,
-        side=Side.BUY,
+        side=side,
         qty=Decimal(qty),
         order_type=OrderType.LIMIT,
         limit_price=Decimal(price),
         protective=plan,
         ttl_seconds=ttl,
         created_at=clock.now(),
+    )
+
+
+def external_sell(instrument: Instrument, clock: ManualClock, *, qty: str) -> Fill:
+    """A reduction booked by some other path: another cycle's exit, or an operator close.
+
+    KNOWN_GAPS §4's own case was a plain cycle SELL (`sim-R7GB2OIBDAQWPVTG`), not a manual close.
+    """
+    return Fill(
+        fill_id=f"external-{qty}",
+        client_order_id="sim-ELSEWHERE",
+        instrument_key=instrument.key,
+        side=Side.SELL,
+        qty=Decimal(qty),
+        price=Decimal("49000"),
+        filled_at=clock.now(),
+    )
+
+
+def book(ledger: Ledger, fill: Fill, instrument: Instrument) -> None:
+    ledger.apply_fill(
+        fill,
+        base_currency=instrument.base_currency,
+        quote_currency=instrument.quote_currency,
     )
 
 
@@ -449,3 +475,201 @@ class TestHeld:
 
         assert service.held(instrument.key) == ledger.position(instrument.key).qty
         assert service.held(instrument.key) > Decimal(0)
+
+
+class TestLegsTrackThePosition:
+    """KNOWN_GAPS §4. The monitor had no view of the position, so a SELL from any other path
+    reduced the holding while the legs kept their original size."""
+
+    async def test_legs_shrink_when_the_position_is_reduced_elsewhere(
+        self,
+        monitor: ExecutionMonitor,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+    ) -> None:
+        broker.observe(tick(instrument, clock, last="49000"))
+        await submit_entry(monitor, broker, store, ledger, clock, instrument, ttl=None)
+        await monitor.poll()
+        assert ledger.position(instrument.key).qty == Decimal("0.5")
+
+        book(ledger, external_sell(instrument, clock, qty="0.2"), instrument)
+        clock.advance(30)
+        broker.observe(tick(instrument, clock, last="49000"))
+        await monitor.poll()
+
+        live = [leg for leg in monitor.tracked if leg.role.is_protective and leg.state.is_open]
+        assert live, "the position still exists, so it is still guarded"
+        assert {leg.qty for leg in live} == {Decimal("0.3")}
+
+    async def test_a_position_closed_elsewhere_releases_the_legs_without_flagging_it(
+        self,
+        monitor: ExecutionMonitor,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+    ) -> None:
+        """Zero is not "unprotected": that event means money is at risk with no stop behind it,
+        and this group now guards nothing and risks nothing (design §2.3)."""
+        broker.observe(tick(instrument, clock, last="49000"))
+        await submit_entry(monitor, broker, store, ledger, clock, instrument, ttl=None)
+        await monitor.poll()
+
+        book(ledger, external_sell(instrument, clock, qty="0.5"), instrument)
+        clock.advance(30)
+        broker.observe(tick(instrument, clock, last="49000"))
+        await monitor.poll()
+
+        assert not [leg for leg in monitor.tracked if leg.role.is_protective and leg.state.is_open]
+        risk = [e for e in store.read_all() if e.type is EventType.RISK_EVENT]
+        assert not risk, "nothing is at risk, so nothing is flagged"
+
+    @pytest.mark.parametrize("tight_first", [True, False])
+    async def test_the_tighter_stop_keeps_its_cover_whichever_was_opened_first(
+        self,
+        monitor: ExecutionMonitor,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+        tight_first: bool,
+    ) -> None:
+        """Design D3. For a long the tightest stop is the *highest* — it fires first on the way
+        down, so it is the cover worth keeping. Parametrized because age is a proxy that inverts:
+        one order of these two fails under oldest-first, the other under newest-first."""
+        tight = ("sim-TIGHT", ProtectivePlan(stop_price=Decimal("48000")))
+        wide = ("sim-WIDE", ProtectivePlan(stop_price=Decimal("45000")))
+        broker.observe(tick(instrument, clock, last="49000"))
+        for coid, plan in (tight, wide) if tight_first else (wide, tight):
+            await submit_entry(
+                monitor,
+                broker,
+                store,
+                ledger,
+                clock,
+                instrument,
+                coid=coid,
+                qty="0.3",
+                plan=plan,
+                ttl=None,
+            )
+            clock.advance(1)
+        await monitor.poll()
+        assert ledger.position(instrument.key).qty == Decimal("0.6")
+
+        book(ledger, external_sell(instrument, clock, qty="0.2"), instrument)
+        clock.advance(30)
+        broker.observe(tick(instrument, clock, last="49000"))
+        await monitor.poll()
+
+        guarded = {
+            leg.group_id: leg.qty
+            for leg in monitor.tracked
+            if leg.role is OrderRole.STOP_LOSS and leg.state.is_open
+        }
+        assert guarded == {"sim-TIGHT": Decimal("0.3"), "sim-WIDE": Decimal("0.1")}
+
+    async def test_a_working_discretionary_sell_reduces_the_budget(
+        self,
+        monitor: ExecutionMonitor,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+    ) -> None:
+        """A resting exit reserves the base asset exactly as a stop does. Ignoring it commits
+        0.5 + 0.2 against a holding of 0.5, and a real venue rejects one of them (design §2.2)."""
+        service = ExecutionService(broker, store, ledger, clock)
+        broker.observe(tick(instrument, clock, last="49000"))
+        await submit_entry(monitor, broker, store, ledger, clock, instrument, ttl=None)
+        await monitor.poll()
+
+        # Well above the market, so it rests rather than crossing.
+        exit_order = await service.submit(
+            entry_intent(
+                instrument,
+                clock,
+                coid="sim-EXIT",
+                qty="0.2",
+                price="60000",
+                side=Side.SELL,
+                plan=None,
+                ttl=None,
+            ),
+            instrument,
+        )
+        monitor.track(exit_order, instrument)
+        clock.advance(30)
+        await monitor.poll()
+
+        stops = [
+            leg.qty
+            for leg in monitor.tracked
+            if leg.role is OrderRole.STOP_LOSS and leg.state.is_open
+        ]
+        assert stops == [Decimal("0.3")]
+        risk = [e for e in store.read_all() if e.type is EventType.RISK_EVENT]
+        assert not risk, "a reducing SELL is the exit; it needs no protection and reports none"
+
+    async def test_a_filled_stop_does_not_starve_the_surviving_group(
+        self,
+        monitor: ExecutionMonitor,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+    ) -> None:
+        """Two groups each hold 0.3 of a 0.6 position; the tighter stop fires on its own — no
+        external SELL involved — and takes the position to 0.3. Ranking a *closing* group ahead
+        of a live one in `_targets` would still hand it the whole remaining budget: it would
+        re-arm a fresh group against a holding it no longer has, and starve the surviving group to
+        a target of 0 — cancelling its legs and leaving the surviving 0.3 unguarded. This is the
+        case where the bug silently leaves real money unguarded, rather than merely over-cancelling
+        or under-sizing."""
+        tight = ("sim-TIGHT", ProtectivePlan(stop_price=Decimal("48000")))
+        wide = ("sim-WIDE", ProtectivePlan(stop_price=Decimal("45000")))
+        broker.observe(tick(instrument, clock, last="49000"))
+        for coid, plan in (tight, wide):
+            await submit_entry(
+                monitor,
+                broker,
+                store,
+                ledger,
+                clock,
+                instrument,
+                coid=coid,
+                qty="0.3",
+                plan=plan,
+                ttl=None,
+            )
+            clock.advance(1)
+        await monitor.poll()
+        assert ledger.position(instrument.key).qty == Decimal("0.6")
+        guarded_before = {
+            leg.group_id: leg.qty
+            for leg in monitor.tracked
+            if leg.role is OrderRole.STOP_LOSS and leg.state.is_open
+        }
+        assert guarded_before == {"sim-TIGHT": Decimal("0.3"), "sim-WIDE": Decimal("0.3")}
+
+        # A bar whose low crosses TIGHT's trigger (48000) but stays above WIDE's (45000): only
+        # the tighter stop arms and fills. `high` clears TIGHT's limit (48000 less the 0.5%
+        # offset, 47760) so the armed leg actually trades through rather than resting untriggered.
+        clock.advance(30)
+        broker.observe(tick(instrument, clock, last="47000", high="49000", low="47000"))
+        await monitor.poll()
+
+        assert ledger.position(instrument.key).qty == Decimal("0.3"), "the tight stop filled"
+        live = {
+            leg.group_id: leg.qty
+            for leg in monitor.tracked
+            if leg.role is OrderRole.STOP_LOSS and leg.state.is_open
+        }
+        assert live == {"sim-WIDE": Decimal("0.3")}, "the surviving position stays guarded"
