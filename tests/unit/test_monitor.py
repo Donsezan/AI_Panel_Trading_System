@@ -228,26 +228,31 @@ class TestProtectiveGroups:
 
         group = monitor._tracked["sim-ENTRY"]
         assert group.resting_qty == Decimal("0.5")
+        first = {leg.client_order_id for leg in group.legs.values()}
 
-        # Both legs are cancelled at the venue directly, bypassing the monitor: SimBroker's
-        # venue-native OCO cancels a sibling only on a *fill* (`_cancel_siblings`, called from
-        # `_fill`) — ADR 0011 scopes that guarantee to the R13 hazard of both legs paying out, not
-        # to a stray cancel — so cancelling one leg here would leave the other resting at its own
-        # 0.5 and the group's `resting_qty` unchanged, telling us nothing.
+        # Both legs, cancelled directly at the venue: SimBroker's OCO cancels a sibling only on a
+        # *fill* (`_cancel_siblings`, called from `_fill`) — ADR 0011 scopes that guarantee to the
+        # R13 hazard of both legs paying out, not to a stray cancel — so cancelling only one leg
+        # would leave the other resting at its own 0.5 and prove nothing about `resting_qty`.
         for leg in group.legs.values():
             await broker.cancel(
                 OrderRef(client_order_id=leg.client_order_id, instrument_key=instrument.key)
             )
         clock.advance(30)
-        # `monitor._sync` only, not `monitor.poll()`: a full poll's `_maintain` would see the
-        # entry's fill still unguarded and re-arm fresh legs at the same 0.5 in the same sweep —
-        # correct behaviour, but it would re-cover the gap this test exists to observe. Reaching
-        # into `_sync` isolates "re-read the venue" from "act on what was read", which `poll`
-        # deliberately does not separate in production.
-        for client_order_id, leg in list(group.legs.items()):
-            group.legs[client_order_id] = await monitor._sync(group, leg)
+        await monitor.poll()
 
-        assert group.resting_qty < Decimal("0.5"), "a leg cancelled at the venue is not guarding"
+        # A remembered counter would still read 0.5 here, see no change from the fill it recorded
+        # long ago, and do nothing — the position would sit unguarded until the entry's own fill
+        # next moved. Reading the venue's live answer instead means `poll` notices the gap itself
+        # and `_maintain` re-arms it: a fresh pair of legs at the same target quantity, sharing no
+        # id with the pair that was just cancelled.
+        live = {
+            leg.client_order_id
+            for leg in group.legs.values()
+            if leg.role.is_protective and leg.state.is_open
+        }
+        assert live and not live & first, "fresh legs were placed, not the cancelled ones"
+        assert all(group.legs[client_order_id].qty == Decimal("0.5") for client_order_id in live)
 
     async def test_legs_are_replaced_when_more_of_the_entry_fills(
         self,

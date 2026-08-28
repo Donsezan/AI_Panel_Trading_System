@@ -161,12 +161,17 @@ class ExecutionMonitor:
 
     async def _maintain(self, group: _Tracked) -> None:
         """Keep the protective legs matched to what the entry has actually filled."""
+        # A leg filling ends the group, so there is nothing left to resize. Checked first: with
+        # `resting_qty` read live, a filled leg and its cancelled OCO sibling both leave `is_open`,
+        # so a replace check ahead of this one arms a fresh group against a position that has
+        # already gone flat and then cancels it — two venue orders and a false PROTECTIVE_PLACED.
+        if any(leg.state is OrderState.FILLED for leg in group.legs.values()):
+            await self._close_group(group)
+            return
         entry = group.order
         target = entry.filled_qty
         if target > ZERO and target != group.resting_qty and target != group.unprotected_at:
             await self._replace_legs(group)
-        if any(leg.state is OrderState.FILLED for leg in group.legs.values()):
-            await self._close_group(group)
 
     async def _replace_legs(self, group: _Tracked) -> None:
         entry = group.order
