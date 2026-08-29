@@ -64,3 +64,8 @@ CORPUS_META: Final = "corpus.json"
 def workspace_root() -> Path:
     """Scratch databases, caches and results. Gitignored, and never `data/` (§2.1)."""
     return Path(__file__).parent / "workspace"
+
+
+def reports_dir() -> Path:
+    """Where a tuning result is filed. Never printed — a result outlives the process (§14)."""
+    return Path(__file__).parent / "reports"
