@@ -27,6 +27,7 @@ Failure semantics:
 from __future__ import annotations
 
 from collections.abc import Sequence
+from decimal import Decimal
 
 from tradebot.core.clock import Clock
 from tradebot.core.enums import OrderState, RiskTier
@@ -61,6 +62,16 @@ class ExecutionService:
     def events_for(self, order: Order) -> EventFactory:
         """Correlate events with the cycle the order came from, even long after it ended."""
         return EventFactory(clock=self._clock, basket_id=order.basket_id, cycle_id=order.cycle_id)
+
+    def held(self, instrument_key: str) -> Decimal:
+        """What the ledger says is held. Deliberately *not* the venue's answer (design D2).
+
+        `ExecutionMonitor` sizes protective legs from this. Asking the venue here would make the
+        monitor a second reconciler: a venue-versus-us difference is `Reconciler`'s to classify and
+        escalate (ADR 0006), and silently resizing the legs to the venue's figure would absorb that
+        alarm — tidy screen, nothing told, discrepancy invisible.
+        """
+        return self._ledger.position(instrument_key).qty
 
     async def submit(self, intent: OrderIntent, instrument: Instrument) -> Order:
         """Record the intent, submit it, and fold in whatever the venue reports back."""

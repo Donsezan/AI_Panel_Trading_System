@@ -7,8 +7,9 @@ number nobody is honouring.
 
 Two rules here exist to stop the protection from becoming the hazard:
 
-* **Legs are sized to what actually filled**, never to what was ordered. A leg for the full
-  order quantity after a half fill would try to sell more than is held.
+* **Legs are sized to the quantity the caller asks for**, which is the caller's view of the
+  *position* — never to what was ordered, and since KNOWN_GAPS §4 never to what this entry
+  filled either. A leg for more than is held tries to sell what is not there.
 * **Without venue-side OCO, only the stop is placed.** Two unlinked exit orders on one holding
   can both fill, and the second sells a position that is no longer there — a short in a
   long-only system. A take-profit is an optimisation; a double sell is an incident.
@@ -61,18 +62,24 @@ def plan_legs(
     capabilities: BrokerCapabilities,
     *,
     at: UtcDatetime,
+    qty: Decimal,
     revision: int = 0,
 ) -> LegPlan:
-    """Build the protective legs guarding `entry`'s filled quantity."""
+    """Build the protective legs guarding `qty` of the position `entry` opened.
+
+    `qty` is **required and never defaulted to `entry.filled_qty`**. Only the caller can see the
+    position, and a leg sized from the entry alone is KNOWN_GAPS §4: a partial exit taken by any
+    other path leaves it oversized and resting at the venue. An optional parameter falling back to
+    the entry would let a future caller re-introduce that by omission (design §2).
+    """
     plan = entry.protective
     if plan is None:
         return LegPlan(unprotected_reason="no protective plan on the entry")
     if not capabilities.protective_orders:
         return LegPlan(unprotected_reason=f"{capabilities.venue_id} holds no protective orders")
 
-    qty = entry.filled_qty
     if qty <= ZERO:
-        return LegPlan(unprotected_reason="entry has no fills to protect")
+        return LegPlan(unprotected_reason="no quantity to protect")
 
     side = _EXIT_SIDE[entry.side]
     roles: list[tuple[OrderRole, Decimal]] = [(OrderRole.STOP_LOSS, plan.stop_price)]

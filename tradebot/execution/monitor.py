@@ -30,10 +30,10 @@ from datetime import timedelta
 from decimal import Decimal
 
 from tradebot.core.clock import Clock
-from tradebot.core.enums import OrderRole, OrderState, RiskTier
+from tradebot.core.enums import OrderRole, OrderState, RiskTier, Side
 from tradebot.core.instrument import Instrument
 from tradebot.core.logging import get_logger
-from tradebot.core.money import ZERO
+from tradebot.core.money import ZERO, multiply
 from tradebot.core.orders import Order
 from tradebot.execution.protective import plan_legs
 from tradebot.execution.service import ExecutionService
@@ -46,17 +46,57 @@ logger = get_logger(__name__)
 #: until then it is a floor slow enough that a burst cannot approach any venue's limit.
 DEFAULT_POLL_INTERVAL = timedelta(seconds=10)
 
+#: Sign applied to a group's stop trigger when ranking, keyed on the side that *opened* the
+#: position. A long is opened BUY and its stops sit below the market, so the tightest — the one
+#: that fires first on the way down — is the highest, and negating sorts it first. A short's
+#: tightest stop is the lowest, so it sorts unnegated. Per group rather than per list: the
+#: direction is a property of the position, not of whichever group happened to be tracked first.
+#:
+#: A table rather than an `if`, as `_EXIT_SIDE` and `_OFFSET_SIGN` are in `protective.py`. v1 is
+#: long-only so only the BUY row is ever taken; the table keeps the module honest rather than
+#: assuming. Age was the first proposal and is a proxy that inverts in a falling market — an entry
+#: at 100 stopped at 95 and a later one at 90 stopped at 85, newest-first keeps the 85.
+_RANK_SIGN: dict[Side, Decimal] = {Side.BUY: Decimal(-1), Side.SELL: Decimal(1)}
+
 
 @dataclass(slots=True)
 class _Tracked:
     order: Order
     instrument: Instrument
     #: How many times this group's protective legs have been replaced, so each replacement gets
-    #: its own deterministic `client_order_id`.
+    #: its own deterministic `client_order_id`. The one thing here that cannot be derived: two
+    #: replacements at the same size must not collide.
     revision: int = 0
     legs: dict[str, Order] = field(default_factory=dict)
-    #: Entry quantity the current legs guard. `None` until an entry fill has been protected.
-    protected_qty: Decimal | None = None
+    #: The target the legs now resting for this group were last *requested* for — zero when none
+    #: of ours rest, which is the same fact as "requested for nothing". Deliberately the request
+    #: and not `resting_qty`: `plan_legs` floors its quantity to `lot_size`, so a target that is
+    #: not a lot multiple can never equal the venue's answer, and a trigger comparing the two
+    #: cancels and re-places both legs on every poll for ever (design D2, review C2).
+    #: `binance.parse_account` builds a `Position.qty` straight from `free + locked`, which after
+    #: a base-asset fee is routinely off the `stepSize` grid — so that is a reconciled live
+    #: account, not a hypothetical.
+    requested_qty: Decimal = ZERO
+    #: The target whose *deterministic* refusal — below `min_qty` / `min_notional` — has already
+    #: been reported, so that report fires once per target rather than once per poll. `_maintain`
+    #: does reason from it, and that is sound only because it is set on that one path: the same
+    #: target refuses identically next poll, so a retry buys nothing. A *venue* failure never sets
+    #: it, because that one must be retried (review C1).
+    unprotected_at: Decimal | None = None
+
+    @property
+    def resting_qty(self) -> Decimal:
+        """How much of the holding the venue is currently guarding for this group.
+
+        A `max`, never a sum: with OCO the stop and the take-profit rest at the same size and the
+        venue's order list reserves the coins once, not twice — summing would halve every group on
+        the first poll after arming. Read off the legs `poll` has just re-synced, so this is the
+        venue's own answer rather than a counter that can drift (design D2).
+        """
+        return max(
+            (leg.remaining_qty for leg in self.legs.values() if leg.state.is_open),
+            default=ZERO,
+        )
 
 
 class ExecutionMonitor:
@@ -131,7 +171,13 @@ class ExecutionMonitor:
                 group.order = await self._sync(group, group.order)
                 for client_order_id, leg in list(group.legs.items()):
                     group.legs[client_order_id] = await self._sync(group, leg)
-                await self._maintain(group)
+            # After the sync loop, never inside it: `_sync` books fills as it reads them, so a stop
+            # that filled this sweep has already reduced the position. Computing per group inside
+            # the loop would size some groups against a pre-fill holding and others against a
+            # post-fill one (design §2.4).
+            targets = self._targets()
+            for group in list(self._tracked.values()):
+                await self._maintain(group, targets.get(group.order.group_id))
 
     async def _sync(self, group: _Tracked, order: Order) -> Order:
         if not order.state.is_open:
@@ -143,15 +189,65 @@ class ExecutionMonitor:
             )
         return order
 
-    async def _maintain(self, group: _Tracked) -> None:
-        """Keep the protective legs matched to what the entry has actually filled."""
-        entry = group.order
-        if entry.filled_qty > ZERO and entry.filled_qty != group.protected_qty:
-            await self._replace_legs(group)
+    async def _maintain(self, group: _Tracked, target: Decimal | None) -> None:
+        """Keep the protective legs matched to the *position*, not to this entry's fills.
+
+        KNOWN_GAPS §4: the legs tracked `entry.filled_qty`, so a SELL from any other path — another
+        cycle's exit decision, an ADR 0015 operator close — reduced the holding while the legs kept
+        their original size, and the oversized order rested at the venue until it triggered.
+        """
+        # A leg filling ends the group, so there is nothing left to resize. Checked first: with
+        # `resting_qty` read live, a filled leg and its cancelled OCO sibling both leave `is_open`,
+        # so a replace check ahead of this one arms a fresh group against a position that has
+        # already gone flat and then cancels it.
         if any(leg.state is OrderState.FILLED for leg in group.legs.values()):
             await self._close_group(group)
+            return
+        if target is None:
+            # Outside the allocation, which is not the same fact as a target of zero. Zero means
+            # "the holding behind this group is gone, release its legs"; `None` means there is
+            # nothing here to size — the entry carries no protective plan. Conflating them cancels
+            # the legs of every group adopted at startup, because the `orders` projection does not
+            # persist `protective` and `_persisted_open_orders` rebuilds the entry without it.
+            return
+        if target == group.unprotected_at:
+            # A deterministic refusal that has already been reported, and already acted on — the
+            # legs were cancelled when it was found. `plan_legs` is a pure function of the target
+            # and the venue's rules, so the same target refuses again: retrying it would file the
+            # same `unprotected_position` every poll. This is the *only* suppression, and it is
+            # sound only because nothing else sets the marker — a venue failure is transient and
+            # must be retried (review C1).
+            return
+        if self._needs_new_legs(group, target):
+            await self._replace_legs(group, target)
 
-    async def _replace_legs(self, group: _Tracked) -> None:
+    def _needs_new_legs(self, group: _Tracked, target: Decimal) -> bool:
+        """Whether the legs must be cancelled and re-placed to guard `target`.
+
+        Two clauses, and each is load-bearing:
+
+        * **The requested target moved.** Compared against what the resting legs were *requested*
+          for, never against `resting_qty`, because those are not the same kind of number:
+          `plan_legs` floors its quantity to `lot_size`, so a target that is not a lot multiple
+          can never equal the venue's answer and would replace the legs on every poll for ever
+          (review C2). Like against like, so a position that is not moving is a group that is not
+          moving.
+        * **The legs vanished while something is still held.** Design D2: legs cancelled at the
+          venue — by the venue itself, or by an operator in its own UI — are re-armed on the next
+          poll. The first clause alone would see an unchanged target, do nothing, and leave the
+          position bare with the monitor believing it guarded.
+        """
+        return target != group.requested_qty or (target > ZERO and group.resting_qty <= ZERO)
+
+    async def _replace_legs(self, group: _Tracked, target: Decimal) -> None:
+        if target <= ZERO:
+            # Nothing is held behind this group any more. Not "unprotected" — that event means
+            # money is at risk with no stop, and this guards nothing and risks nothing (§2.3).
+            await self._cancel_legs(group, reason="released_to_position")
+            group.requested_qty = ZERO
+            group.unprotected_at = None
+            return
+
         entry = group.order
         capabilities = self._broker.capabilities()
         plan = plan_legs(
@@ -159,24 +255,63 @@ class ExecutionMonitor:
             group.instrument,
             capabilities,
             at=self._clock.now(),
+            qty=target,
             revision=group.revision + 1,
         )
         if not plan.protected:
+            # Cancel *first*. What is resting was sized for a larger holding: if it triggered the
+            # venue would reject it for insufficient balance, so leaving it is a false protection
+            # on top of a true report (design §2.3).
+            await self._cancel_legs(group, reason="below_venue_minimums")
+            group.requested_qty = ZERO
+            # Deterministic, so the repeat is worth suppressing: the same target below the same
+            # minimums refuses identically next poll. Set at this call site rather than inside
+            # `_record_unprotected`, which both refusal paths share — the venue-failure path below
+            # must leave no marker behind (review C1).
+            group.unprotected_at = target
             await self._record_unprotected(group, plan.unprotected_reason)
             return
 
-        await self._cancel_legs(group, reason="resized_to_entry_fill")
+        await self._cancel_legs(group, reason="resized_to_position")
+        # From here until `submit_group` returns, nothing of ours rests. Recorded before the call
+        # because it has to survive the exception below: the retry on the next poll is the only
+        # thing that re-arms a bare position, and it is driven off this field.
+        group.requested_qty = ZERO
         group.revision += 1
-        placed = await self._execution.submit_group(plan.intents, group.instrument)
+        try:
+            placed = await self._execution.submit_group(plan.intents, group.instrument)
+        except Exception as error:
+            # The legs are already cancelled, so the position is bare until the next poll retries
+            # — and it does retry, because nothing on this path suppresses it: `requested_qty` is
+            # back to zero against a non-zero target, and `unprotected_at` is deliberately left
+            # alone. A venue error is transient; de-duplicating it the way a below-minimums
+            # refusal is de-duplicated disarms the position permanently on one 5xx (review C1).
+            # The venue error still reaches the caller's retry budget — what changes is that the
+            # log says what state this left behind instead of showing a cancel and then nothing.
+            #
+            # `except Exception` is deliberate and is not a swallow: it records and then
+            # re-raises, so the error's class still governs handling exactly as before —
+            # `RetryableError` / `FailClosedError` / `FatalError` reach the caller unchanged.
+            # Narrowing this to those three types would silently skip the recording for any
+            # *unexpected* exception, which is the precise absence this task exists to close.
+            await self._record_unprotected(group, f"placement failed: {error}")
+            raise
         for leg in placed:
             group.legs[leg.client_order_id] = leg
-        group.protected_qty = entry.filled_qty
+        group.requested_qty = target
+        group.unprotected_at = None
         events = self._execution.events_for(entry)
         await self._store.append(events.protective_placed(entry, tuple(placed)))
 
     async def _record_unprotected(self, group: _Tracked, reason: str) -> None:
+        """Say that this position is bare, whichever way it got there.
+
+        Shared by both refusal paths and *reports only*: the operator needs to know the guard is
+        missing whether the plan refused or the venue did. Which of the two it was decides whether
+        the attempt repeats, and that is the caller's to record — a marker set here would be set
+        for both (review C1).
+        """
         entry = group.order
-        group.protected_qty = entry.filled_qty
         events = self._execution.events_for(entry)
         await self._store.append(
             events.protective_placed(entry, (), detail=reason),
@@ -191,6 +326,82 @@ class ExecutionMonitor:
         logger.warning(
             "position left without a venue-held stop",
             extra={"client_order_id": entry.client_order_id, "reason": reason},
+        )
+
+    def _targets(self) -> dict[str, Decimal]:
+        """How much of each instrument's holding each group's legs may guard.
+
+        The invariant this exists for is that the sum over one instrument's groups never exceeds
+        the holding — KNOWN_GAPS §4 is what its absence cost. A per-*group* clamp makes it worse:
+        two groups guarding 0.0351 and 0.0852 against a position of 0.1116 would each resize to
+        0.1116 and 0.0852, resting 0.1968 against 0.1116.
+        """
+        targets: dict[str, Decimal] = {}
+        for instrument_key in {group.order.instrument_key for group in self._tracked.values()}:
+            groups = self._protectable(instrument_key)
+            budget = max(
+                ZERO, self._execution.held(instrument_key) - self._committed(instrument_key)
+            )
+            for group in groups:
+                target = min(group.order.filled_qty, budget)
+                targets[group.order.group_id] = target
+                budget -= target
+        return targets
+
+    def _protectable(self, instrument_key: str) -> list[_Tracked]:
+        """This instrument's groups that can hold legs at all, tightest stop first.
+
+        A group whose entry carries no `ProtectivePlan` is not one of them: a reducing SELL *is*
+        the exit and an unprotected venue was charged the sizing haircut instead (`protective_plan`
+        returns `None` for both). Running one through `plan_legs` is what made every filled
+        discretionary SELL file an `unprotected_position` for an order that needs none.
+        """
+        ranked = [
+            (
+                (
+                    multiply(plan.stop_price, _RANK_SIGN[group.order.side]),
+                    group.order.created_at,
+                    group.order.client_order_id,
+                ),
+                group,
+            )
+            for group in self._tracked.values()
+            if group.order.instrument_key == instrument_key
+            and (plan := group.order.protective) is not None
+            # A group whose leg has already filled is closing, not live — `_maintain` tears it
+            # down this same poll regardless of what target it is handed. Leaving it in the
+            # ranking would still allocate it budget a group that is still guarding a position
+            # needs: it would re-arm a fresh group against a holding it no longer has, and starve
+            # the live group behind it in the ranking to a target of 0 — cancelling legs that were
+            # guarding a position which is still open.
+            and not any(leg.state is OrderState.FILLED for leg in group.legs.values())
+        ]
+        # Ties break on creation then id because startup adopts orders from the database in
+        # arbitrary order, and the allocation must survive a restart unchanged. Ascending, because
+        # `_RANK_SIGN` already points the tightest stop at the smallest key for whichever side
+        # opened it — a `reverse` flag here would have to know the side too, and be right about it.
+        ranked.sort(key=lambda pair: pair[0])
+        return [group for _, group in ranked]
+
+    def _committed(self, instrument_key: str) -> Decimal:
+        """Quantity our own working sells already commit, outside a group's *own* protective legs.
+
+        A discretionary exit or an ADR 0015 operator close still resting reserves the base asset at
+        the venue exactly as a stop does — and so does a protective leg that ended up as a group's
+        `order`. That happens: `track()` makes a recovered leg the group's own `order` when its
+        entry was already terminal and so was never re-adopted, and that leg's reservation is as
+        real as an entry's. What must never be double-counted is a group's own `legs`, which this
+        sum never reads — that is what the budget `_targets` computes is being divided among.
+        """
+        return sum(
+            (
+                group.order.remaining_qty
+                for group in self._tracked.values()
+                if group.order.instrument_key == instrument_key
+                and group.order.side is Side.SELL
+                and group.order.state.is_open
+            ),
+            start=ZERO,
         )
 
     async def _close_group(self, group: _Tracked) -> None:

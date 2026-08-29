@@ -446,7 +446,7 @@ class BinanceSpotBroker:
         """Map our two legs onto Binance's above/below OCO vocabulary.
 
         An OCO list carries **one** quantity for both legs, so legs that disagree cannot be
-        expressed. They never should: `plan_legs` sizes both to the same filled quantity. If they
+        expressed. They never should: `plan_legs` sizes both legs to the same quantity. If they
         ever differ, sending the larger would place an exit for more than is held, so this refuses
         instead.
         """
