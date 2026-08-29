@@ -406,6 +406,17 @@ reduction taken after the restart leaves their legs resting at the pre-restart s
 later triggers, it oversells exactly as the closed entry below describes — `Ledger._apply_sell`
 refusing a fill against a position that has moved on.
 
+**And while the recovered entry is still *open*, those legs are invisible to `_committed` as
+well** — so the coins they reserve are handed to a sibling group and guarded twice. `_committed`
+sums a group's own `order` when it is a working SELL and deliberately never its `legs`, because a
+group's legs are what the budget is being divided among. A recovered group is skipped by
+`_protectable` (no plan) and so gets no share of that budget, yet its legs still reserve the base
+asset at the venue: `_targets` therefore divides the *whole* holding among the instrument's other
+groups, and one of them can arm legs on top of what the recovered pair already holds — 0.5 resting
+from before the restart plus a fresh 0.15 against 0.35 actually held. The other recovery shape does
+not have this problem: a leg whose entry was already terminal becomes the group's own `order`, and
+`_committed` counts it.
+
 **Reach.** Any process that restarts with an open protective group and then reduces that position
 before the group's own legs settle by other means — live and paper across every restart, and sim
 whenever a soak or a `decision_lab` pass is resumed rather than run start-to-finish. Not reachable

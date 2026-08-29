@@ -134,6 +134,20 @@ async def test_a_partial_exit_resizes_the_legs_before_the_stop_fires(
         # the pre-fix run on a plain `AssertionError` before it ever reaches the venue-held stop
         # actually firing oversized, which is the ledger-corrupting failure below.
 
+        # What the stop actually rests at, read now because the crash bar is about to consume
+        # it: once the leg fills it leaves `is_open` and there is nothing left to measure. The
+        # *assertion* stays at the end so the inverted gate is undisturbed — checking it here
+        # would stop a pre-fix run on a plain `AssertionError` before it ever reached the
+        # oversized stop firing, which is the ledger-corrupting failure this test exists for.
+        guarded = max(
+            (
+                order.remaining_qty
+                for order in harness.monitor.tracked
+                if order.role is OrderRole.STOP_LOSS and order.state.is_open
+            ),
+            default=ZERO,
+        )
+
         # Two days clears the longest (1d) bar duration on every timeframe, so the crash bar
         # appended in `crashing_market` becomes the latest closed bar everywhere at once.
         clock.advance(timedelta(days=2).total_seconds())
@@ -153,5 +167,9 @@ async def test_a_partial_exit_resizes_the_legs_before_the_stop_fires(
         assert filled, "the crash bar crossed the trigger"
         assert filled[0].filled_qty <= reduced, "no exit sells more than was held"
         assert harness.ledger.position(key).is_flat
+        # The resize itself, not merely its absence of harm: `filled_qty <= reduced` above is
+        # satisfied by any undersized leg, and `is_flat` only forces equality once the stop has
+        # already sold whatever it rested at. This is the number KNOWN_GAPS §4 got wrong.
+        assert guarded == reduced, "the leg was resized to the surviving position, exactly"
     finally:
         harness.close()
