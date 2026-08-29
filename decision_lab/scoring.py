@@ -298,13 +298,13 @@ class RegimeMetrics(DomainModel):
     unscored: dict[str, int] = Field(default_factory=dict)
 
 
-def _ratio(numerator: int | Decimal, denominator: int | Decimal) -> Decimal:
+def ratio(numerator: int | Decimal, denominator: int | Decimal) -> Decimal:
     """Zero rather than a refusal on an empty denominator: an empty regime is a row of zeroes,
     and `§8.3` requires the row to exist so 'never happened' does not read as 'not measured'."""
     return divide(Decimal(numerator), Decimal(denominator)) if denominator else ZERO
 
 
-def _mean(values: Sequence[Decimal]) -> Decimal:
+def mean(values: Sequence[Decimal]) -> Decimal:
     return divide(sum(values, start=ZERO), Decimal(len(values))) if values else ZERO
 
 
@@ -327,23 +327,23 @@ def summarise(decisions: Sequence[ScoredDecision], *, regime: str) -> RegimeMetr
         decisions=len(decisions),
         scored=len(scored),
         correct=len(correct),
-        accuracy=_ratio(len(correct), len(scored)),
-        action_rate=_ratio(len(acted), len(scored)),
-        precision_on_action=_ratio(len(acted_correct), len(acted)),
+        accuracy=ratio(len(correct), len(scored)),
+        action_rate=ratio(len(acted), len(scored)),
+        precision_on_action=ratio(len(acted_correct), len(acted)),
         # Zero when either side is empty: a panel with no wrong calls has no *gap*, and reporting
         # its correct-side mean as one would flatter it.
         mean_conviction_gap=(
-            _mean([d.conviction for d in correct]) - _mean([d.conviction for d in wrong])
+            mean([d.conviction for d in correct]) - mean([d.conviction for d in wrong])
             if correct and wrong
             else ZERO
         ),
         regret_total=sum(regrets, start=ZERO),
-        regret_per_decision=_mean(regrets),
+        regret_per_decision=mean(regrets),
         # Over *every* decision, not the scored ones: degradation is the reason a decision is
         # missing, so measuring it against what survived would hide it.
-        degradation_rate=_ratio(sum(1 for d in decisions if d.degraded), len(decisions)),
+        degradation_rate=ratio(sum(1 for d in decisions if d.degraded), len(decisions)),
         cost_usd=cost,
-        cost_per_scored=_ratio(cost, len(scored)),
+        cost_per_scored=ratio(cost, len(scored)),
         unscored=unscored,
     )
 
@@ -378,7 +378,7 @@ def score_records(
         # `basket` mode answers for N instruments in one provider call, so the cycle's cost is
         # already de-duplicated by `total_cost` and is split evenly across the instruments it
         # answered for rather than counted once per instrument.
-        per_instrument = _ratio(record.cost_usd, len(record.snapshot.instruments))
+        per_instrument = ratio(record.cost_usd, len(record.snapshot.instruments))
         for context in record.snapshot.instruments:
             decision = record.decision_for(context.instrument.key)
             if decision is None:
