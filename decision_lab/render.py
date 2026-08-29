@@ -1,0 +1,250 @@
+"""The report, as Markdown (spec §14).
+
+Markdown rather than a dashboard page or JSON, for the reason `validation/render.py` gives: a
+result that justified a decision gets attached to that decision, read six months later, and
+diffed against the next one. Plain text does that; a rendered view does not. Never printed.
+
+Every report opens with its banners. The `BacktestHarness` contamination banner is verbatim and
+unconditional — every model in `validation/cutoffs.py` was trained on this period, and a tool that
+only warned when it thought it mattered would be a tool nobody could quote. Then `NEWS-BLIND RUN`
+where it applies, then the tool's own line stating it is a comparison instrument and not evidence
+of alpha.
+
+Then the experiment's identity, in full, because a result whose provenance is not on the page is
+not reproducible. Then, per regime — `NORMAL`, `SHOCK_UP`, `SHOCK_DOWN` and one row per named
+window — the tables. Never a pooled `SHOCK`: it averages "did the seats catch the move" with "did
+the seats protect capital" and hides both.
+
+Numbers are formatted from `Decimal` directly; no value passes through a float on its way to being
+read, which `test_discipline.py` asserts structurally.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterable, Sequence
+from datetime import datetime
+from decimal import Decimal
+from pathlib import Path
+
+from decision_lab.scoring import RegimeMetrics, ScoringParams
+from decision_lab.seats import FINAL, ROUND_ZERO, SeatMetrics, rounds_are_identical
+from tradebot.core.schema import DomainModel, Money, UtcDatetime
+from tradebot.validation.backtest import BANNER
+
+#: The tool's own standing disclaimer. §1.1: it compares configurations an operator wrote; it
+#: does not search, does not optimise, and has no authority over anything.
+DISCLAIMER = (
+    "**This is a comparison instrument, not evidence of alpha.** It ranks configurations against "
+    "one another on recorded history. It is not a promotion gate — `validation/promotion.py` "
+    "remains the only thing that answers whether anything may be promoted, and it reads the "
+    "production log."
+)
+
+NEWS_BLIND = (
+    "**NEWS-BLIND RUN** — no news archive was wired, so every snapshot records "
+    '"no sources configured". A shock block therefore measures the panel\'s reaction to a violent '
+    "price move rather than to the reporting of an event."
+)
+
+
+class LabReport(DomainModel):
+    """Everything one report says. One object, so the notebook and the renderer agree."""
+
+    generated_at: UtcDatetime
+    corpus_id: str
+    dataset_directory: str
+    dataset_digest: str
+    dayset_digest: str = ""
+    reference_instrument: str
+    reference_panel_id: str
+    reference_config_digest: str
+    cadence_seconds: int
+    scoring: ScoringParams
+    vol_window_bars: int
+    shock_percentile: Money
+    named_windows: tuple[str, ...] = ()
+    start_equity: Money
+    news_blind: bool = True
+    panel_models: tuple[str, ...] = ()
+    cycles: int = 0
+    regimes: tuple[RegimeMetrics, ...] = ()
+    seats: tuple[SeatMetrics, ...] = ()
+
+
+def report_markdown(report: LabReport) -> str:
+    sections = [
+        "# decision_lab — decision quality over recorded history",
+        "",
+        BANNER,
+        "",
+        DISCLAIMER,
+    ]
+    if report.news_blind:
+        sections += ["", NEWS_BLIND]
+    sections += [
+        "",
+        _identity(report),
+        "",
+        "## Panel, by regime",
+        "",
+        _regime_table(report.regimes),
+        "",
+        _unscored(report.regimes),
+        "",
+        "## Seats, by regime",
+        "",
+        _seat_tables(report.seats),
+    ]
+    return "\n".join(sections).rstrip() + "\n"
+
+
+def _identity(report: LabReport) -> str:
+    rows = [
+        ("generated", _stamp(report.generated_at)),
+        ("corpus", report.corpus_id),
+        ("dataset", f"{report.dataset_directory} (`{report.dataset_digest}`)"),
+        ("day set", report.dayset_digest or "not pinned"),
+        ("reference instrument", report.reference_instrument),
+        ("reference panel", f"{report.reference_panel_id} (`{report.reference_config_digest}`)"),
+        ("panel models", ", ".join(report.panel_models) or "none recorded"),
+        ("cadence", f"{report.cadence_seconds}s"),
+        ("cycles", str(report.cycles)),
+        ("scoring timeframe", report.scoring.timeframe),
+        ("band", f"{report.scoring.band_k} × ATR"),
+        ("forward horizon", f"{report.scoring.horizon_bars} bars"),
+        ("ATR lookback", f"{report.scoring.atr_lookback_bars} bars"),
+        ("volatility window", f"{report.vol_window_bars} bars"),
+        ("shock percentile", str(report.shock_percentile)),
+        ("named windows", ", ".join(report.named_windows) or "none"),
+        ("starting equity", str(report.start_equity)),
+    ]
+    return "## Experiment\n\n" + _table(("", ""), [[label, value] for label, value in rows])
+
+
+def _regime_table(regimes: Sequence[RegimeMetrics]) -> str:
+    headers = (
+        "regime",
+        "scored",
+        "accuracy",
+        "action rate",
+        "precision on action",
+        "conviction gap",
+        "regret/decision",
+        "degraded",
+        "$/scored",
+    )
+    rows = [
+        [
+            metrics.regime,
+            str(metrics.scored),
+            _pct(metrics.accuracy),
+            _pct(metrics.action_rate),
+            _pct(metrics.precision_on_action),
+            _num(metrics.mean_conviction_gap),
+            _num(metrics.regret_per_decision),
+            _pct(metrics.degradation_rate),
+            _num(metrics.cost_per_scored),
+        ]
+        for metrics in regimes
+    ]
+    note = (
+        "\n\n`regret/decision` is the oracle's capture minus the panel's, in band units. It is a "
+        "**ranking aid and is unreachable by construction**: the oracle exits at the high of every "
+        "window and no risk-managed system can match it.\n\n"
+        "`SHOCK_UP` and `SHOCK_DOWN` are never pooled. An up-shock asks whether the seats caught "
+        "the move; a down-shock asks whether they protected capital. **Read `SHOCK_DOWN` first** — "
+        "a long-only system's worst outcome is not a missed rally."
+    )
+    return _table(headers, rows) + note
+
+
+def _unscored(regimes: Sequence[RegimeMetrics]) -> str:
+    rows = [
+        [metrics.regime, reason, str(count)]
+        for metrics in regimes
+        for reason, count in sorted(metrics.unscored.items())
+    ]
+    if not rows:
+        return "Every decision was scored."
+    return (
+        "### Unscored\n\nCounted with its reason, never dropped — a run that dropped them would "
+        "report accuracy over a subset it chose after the fact.\n\n"
+        + _table(("regime", "reason", "count"), rows)
+    )
+
+
+def _seat_tables(seats: Sequence[SeatMetrics]) -> str:
+    if not seats:
+        return "No seat responses were recorded."
+    identical = rounds_are_identical(seats)
+    shown = [s for s in seats if s.round_label == FINAL] if identical else list(seats)
+    headers = (
+        "seat",
+        "regime",
+        "round",
+        "votes",
+        "accuracy",
+        "precision on action",
+        "abstained",
+        "fell back",
+        "swing rate",
+        "marginal",
+        "$/vote",
+        "ms/vote",
+    )
+    rows = [
+        [
+            metrics.seat_id,
+            metrics.regime,
+            metrics.round_label,
+            str(metrics.scored),
+            _pct(metrics.accuracy),
+            _pct(metrics.precision_on_action),
+            _pct(metrics.abstention_rate),
+            _pct(metrics.fallback_rate),
+            _pct(metrics.swing_rate) if metrics.round_label == FINAL else "—",
+            str(metrics.marginal_contribution) if metrics.round_label == FINAL else "—",
+            _num(metrics.cost_per_vote),
+            str(metrics.latency_ms_per_vote),
+        ]
+        for metrics in shown
+    ]
+    note = (
+        "\n\nUnder `blind_then_debate` a seat's later votes are contaminated by its peers **by "
+        f"design** — that is what the debate is for. `{ROUND_ZERO}` is the seat's own independent "
+        f"opinion; `{FINAL}` is the seat after persuasion. *Which seat reasons well* and *which "
+        "seat is easily talked round* are different questions.\n\n"
+        "`swing rate` is how often removing this seat would have changed the panel's decision — "
+        "what separates a seat carrying weight from one padding a majority. `marginal` is right "
+        "dissents against a wrong panel minus wrong dissents against a right one."
+    )
+    if identical:
+        note = (
+            "\n\nThis panel ran `single_round`, so round 0 **is** the final vote; one table is "
+            "shown rather than the same numbers twice." + note
+        )
+    return _table(headers, rows) + note
+
+
+def _table(headers: Sequence[str], rows: Iterable[Sequence[str]]) -> str:
+    lines = ["| " + " | ".join(headers) + " |", "|" + "---|" * len(headers)]
+    lines += ["| " + " | ".join(row) + " |" for row in rows]
+    return "\n".join(lines)
+
+
+def _pct(value: Decimal) -> str:
+    return f"{(value * Decimal(100)).quantize(Decimal('0.1'))}%"
+
+
+def _num(value: Decimal | None) -> str:
+    return "—" if value is None else str(value.quantize(Decimal("0.0001")))
+
+
+def _stamp(moment: datetime) -> str:
+    return moment.isoformat()
+
+
+def write_report(report: LabReport, path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(report_markdown(report), encoding="utf-8")
+    return path

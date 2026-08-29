@@ -27,11 +27,17 @@ from typing import Any
 from decision_lab import calibration_days as cd
 from decision_lab import corpus as cp
 from decision_lab import dataset as ds
+from decision_lab import records as rc
+from decision_lab import regimes as rg
+from decision_lab import render as rd
+from decision_lab import scoring as sc
+from decision_lab import seats as st
 from decision_lab.params import (
     CADENCE_SECONDS,
     DAYSET_FILE,
     DEFAULT_SEED,
     DEFAULT_SHOCK_PERCENTILE,
+    reports_dir,
 )
 from tradebot.core.clock import SystemClock, ensure_utc
 from tradebot.core.errors import ConfigError, MoneyError, TradebotError
@@ -144,6 +150,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--until", default=None, help="window end; defaults to the data's"
     )
     corpus_build_parser.add_argument("--verbose", action="store_true")
+
+    report_ = commands.add_parser(
+        "report", help="score a built corpus and file the result under decision_lab/reports/"
+    )
+    report_.add_argument("--corpus", required=True, help="corpus id from `corpus build`")
+    report_.add_argument(
+        "--data", type=Path, default=None, help="override the recorded dataset path"
+    )
+    report_.add_argument("--regimes", type=Path, default=None, help="named event windows TOML")
+    report_.add_argument("--scoring-timeframe", default="", help="defaults to the shortest")
+    report_.add_argument(
+        "--band-k", type=_decimal_arg, default=None, help="the ATR multiple, default 1.0"
+    )
+    report_.add_argument("--horizon", type=int, default=None, help="forward bars, default 6")
+    report_.add_argument("--out", type=Path, default=None, help="report path (.md)")
+    report_.add_argument("--verbose", action="store_true")
 
     return parser.parse_args(argv)
 
@@ -299,12 +321,70 @@ def _moment(value: str | None) -> datetime | None:
     return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else ensure_utc(parsed)
 
 
+async def report(args: argparse.Namespace) -> int:
+    """Score the reference pass in a built corpus and write the Markdown report."""
+    meta, cycles = rc.load(args.corpus)
+    data_dir = args.data or Path(meta.dataset_directory)
+    audit = ds.require_verified(data_dir)
+    dataset = ReplayDataset.load(data_dir, SystemClock())
+
+    params = sc.ScoringParams(
+        timeframe=args.scoring_timeframe or dataset.timeframes[0],
+        **({"band_k": args.band_k} if args.band_k is not None else {}),
+        **({"horizon_bars": args.horizon} if args.horizon is not None else {}),
+    )
+    index = await sc.build_price_index(dataset, audit, params)
+    regime_index = (await rg.index_dataset(dataset, params.timeframe)).with_windows(
+        rg.load_windows(args.regimes or rg.DEFAULT_REGIMES_TOML)
+    )
+
+    scored = sc.score_records(cycles, index=index, regimes=regime_index, params=params)
+    panel = meta.reference_basket.panel
+    built = rd.LabReport(
+        generated_at=SystemClock().now(),
+        corpus_id=meta.corpus_id,
+        dataset_directory=str(data_dir),
+        dataset_digest=meta.dataset_digest,
+        dayset_digest=_dayset_digest(data_dir),
+        reference_instrument=dataset.instruments[0].key,
+        reference_panel_id=meta.reference_panel_id,
+        reference_config_digest=meta.reference_config_digest,
+        cadence_seconds=meta.cadence_seconds,
+        scoring=params,
+        vol_window_bars=regime_index.window_bars,
+        shock_percentile=regime_index.shock_percentile,
+        named_windows=tuple(w.name for w in regime_index.windows),
+        start_equity=meta.start_equity,
+        news_blind=meta.news_blind,
+        panel_models=tuple(dict.fromkeys(f"{s.provider_id}:{s.model}" for s in panel.seats)),
+        cycles=len(cycles),
+        regimes=sc.by_regime(scored),
+        seats=st.score_seats(cycles, scored, panel=panel),
+    )
+    out = args.out or reports_dir() / f"decision-lab-{meta.corpus_id}.md"
+    rd.write_report(built, out)
+    logger.info("report written", extra={"path": str(out), "decisions": len(scored)})
+    return EXIT_OK
+
+
+def _dayset_digest(data_dir: Path) -> str:
+    """The pinned day set is not required to score a corpus — it is required to *calibrate* one
+    (slice D). Recorded when present so a report can be tied to the set in force, absent
+    otherwise rather than refusing a scoring run for want of a §10 artifact."""
+    try:
+        return cd.require_pinned(data_dir).dayset_digest
+    except ConfigError:
+        return ""
+
+
 #: Command → coroutine. Dispatch over a table rather than a chain of `if`s, per the repo's own
 #: convention (CLAUDE.md, "prefer dispatch over branching").
 COMMANDS: dict[tuple[str, str], Callable[[argparse.Namespace], Coroutine[Any, Any, int]]] = {
     ("dataset", "verify"): dataset_verify,
     ("dataset", "days"): dataset_days,
     ("corpus", "build"): corpus_build,
+    # `report` has no sub-action, so `getattr(args, "action", "")` yields "".
+    ("report", ""): report,
 }
 
 

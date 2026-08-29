@@ -281,7 +281,12 @@ def _fold(
         grouped.setdefault((row.seat_id, row.regime, row.round_label), []).append(row)
 
     folded = []
-    for (seat_id, regime, label), members in sorted(grouped.items()):
+    # Round 0 before final, per seat and regime. Sorting the label alphabetically puts "final"
+    # first and inverts the story the report tells underneath it: round 0 is the seat's own
+    # opinion, final is that seat after persuasion.
+    for (seat_id, regime, label), members in sorted(
+        grouped.items(), key=lambda item: (item[0][0], item[0][1], item[0][2] != ROUND_ZERO)
+    ):
         turns = sum(m.turns for m in members)
         scored_ = sum(m.scored for m in members)
         correct = sum(m.correct for m in members)
