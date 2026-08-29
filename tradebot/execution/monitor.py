@@ -68,8 +68,20 @@ class _Tracked:
     #: replacements at the same size must not collide.
     revision: int = 0
     legs: dict[str, Order] = field(default_factory=dict)
-    #: The target last reported as unguardable, so that report fires once per target rather than
-    #: once per poll. A de-duplication marker; nothing reasons from it.
+    #: The target the legs now resting for this group were last *requested* for — zero when none
+    #: of ours rest, which is the same fact as "requested for nothing". Deliberately the request
+    #: and not `resting_qty`: `plan_legs` floors its quantity to `lot_size`, so a target that is
+    #: not a lot multiple can never equal the venue's answer, and a trigger comparing the two
+    #: cancels and re-places both legs on every poll for ever (design D2, review C2).
+    #: `binance.parse_account` builds a `Position.qty` straight from `free + locked`, which after
+    #: a base-asset fee is routinely off the `stepSize` grid — so that is a reconciled live
+    #: account, not a hypothetical.
+    requested_qty: Decimal = ZERO
+    #: The target whose *deterministic* refusal — below `min_qty` / `min_notional` — has already
+    #: been reported, so that report fires once per target rather than once per poll. `_maintain`
+    #: does reason from it, and that is sound only because it is set on that one path: the same
+    #: target refuses identically next poll, so a retry buys nothing. A *venue* failure never sets
+    #: it, because that one must be retried (review C1).
     unprotected_at: Decimal | None = None
 
     @property
@@ -198,14 +210,41 @@ class ExecutionMonitor:
             # the legs of every group adopted at startup, because the `orders` projection does not
             # persist `protective` and `_persisted_open_orders` rebuilds the entry without it.
             return
-        if target != group.resting_qty and target != group.unprotected_at:
+        if target == group.unprotected_at:
+            # A deterministic refusal that has already been reported, and already acted on — the
+            # legs were cancelled when it was found. `plan_legs` is a pure function of the target
+            # and the venue's rules, so the same target refuses again: retrying it would file the
+            # same `unprotected_position` every poll. This is the *only* suppression, and it is
+            # sound only because nothing else sets the marker — a venue failure is transient and
+            # must be retried (review C1).
+            return
+        if self._needs_new_legs(group, target):
             await self._replace_legs(group, target)
+
+    def _needs_new_legs(self, group: _Tracked, target: Decimal) -> bool:
+        """Whether the legs must be cancelled and re-placed to guard `target`.
+
+        Two clauses, and each is load-bearing:
+
+        * **The requested target moved.** Compared against what the resting legs were *requested*
+          for, never against `resting_qty`, because those are not the same kind of number:
+          `plan_legs` floors its quantity to `lot_size`, so a target that is not a lot multiple
+          can never equal the venue's answer and would replace the legs on every poll for ever
+          (review C2). Like against like, so a position that is not moving is a group that is not
+          moving.
+        * **The legs vanished while something is still held.** Design D2: legs cancelled at the
+          venue — by the venue itself, or by an operator in its own UI — are re-armed on the next
+          poll. The first clause alone would see an unchanged target, do nothing, and leave the
+          position bare with the monitor believing it guarded.
+        """
+        return target != group.requested_qty or (target > ZERO and group.resting_qty <= ZERO)
 
     async def _replace_legs(self, group: _Tracked, target: Decimal) -> None:
         if target <= ZERO:
             # Nothing is held behind this group any more. Not "unprotected" — that event means
             # money is at risk with no stop, and this guards nothing and risks nothing (§2.3).
             await self._cancel_legs(group, reason="released_to_position")
+            group.requested_qty = ZERO
             group.unprotected_at = None
             return
 
@@ -224,15 +263,29 @@ class ExecutionMonitor:
             # venue would reject it for insufficient balance, so leaving it is a false protection
             # on top of a true report (design §2.3).
             await self._cancel_legs(group, reason="below_venue_minimums")
-            await self._record_unprotected(group, plan.unprotected_reason, target)
+            group.requested_qty = ZERO
+            # Deterministic, so the repeat is worth suppressing: the same target below the same
+            # minimums refuses identically next poll. Set at this call site rather than inside
+            # `_record_unprotected`, which both refusal paths share — the venue-failure path below
+            # must leave no marker behind (review C1).
+            group.unprotected_at = target
+            await self._record_unprotected(group, plan.unprotected_reason)
             return
 
         await self._cancel_legs(group, reason="resized_to_position")
+        # From here until `submit_group` returns, nothing of ours rests. Recorded before the call
+        # because it has to survive the exception below: the retry on the next poll is the only
+        # thing that re-arms a bare position, and it is driven off this field.
+        group.requested_qty = ZERO
         group.revision += 1
         try:
             placed = await self._execution.submit_group(plan.intents, group.instrument)
         except Exception as error:
-            # The legs are already cancelled, so the position is bare until the next poll retries.
+            # The legs are already cancelled, so the position is bare until the next poll retries
+            # — and it does retry, because nothing on this path suppresses it: `requested_qty` is
+            # back to zero against a non-zero target, and `unprotected_at` is deliberately left
+            # alone. A venue error is transient; de-duplicating it the way a below-minimums
+            # refusal is de-duplicated disarms the position permanently on one 5xx (review C1).
             # The venue error still reaches the caller's retry budget — what changes is that the
             # log says what state this left behind instead of showing a cancel and then nothing.
             #
@@ -241,17 +294,24 @@ class ExecutionMonitor:
             # `RetryableError` / `FailClosedError` / `FatalError` reach the caller unchanged.
             # Narrowing this to those three types would silently skip the recording for any
             # *unexpected* exception, which is the precise absence this task exists to close.
-            await self._record_unprotected(group, f"placement failed: {error}", target)
+            await self._record_unprotected(group, f"placement failed: {error}")
             raise
         for leg in placed:
             group.legs[leg.client_order_id] = leg
+        group.requested_qty = target
         group.unprotected_at = None
         events = self._execution.events_for(entry)
         await self._store.append(events.protective_placed(entry, tuple(placed)))
 
-    async def _record_unprotected(self, group: _Tracked, reason: str, target: Decimal) -> None:
+    async def _record_unprotected(self, group: _Tracked, reason: str) -> None:
+        """Say that this position is bare, whichever way it got there.
+
+        Shared by both refusal paths and *reports only*: the operator needs to know the guard is
+        missing whether the plan refused or the venue did. Which of the two it was decides whether
+        the attempt repeats, and that is the caller's to record — a marker set here would be set
+        for both (review C1).
+        """
         entry = group.order
-        group.unprotected_at = target
         events = self._execution.events_for(entry)
         await self._store.append(
             events.protective_placed(entry, (), detail=reason),

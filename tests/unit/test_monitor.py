@@ -16,7 +16,7 @@ from hypothesis import strategies as st
 from tradebot.core.clock import ManualClock
 from tradebot.core.enums import OrderRole, OrderState, OrderType, Side
 from tradebot.core.errors import RetryableError
-from tradebot.core.events import EventType
+from tradebot.core.events import Event, EventType
 from tradebot.core.instrument import Instrument
 from tradebot.core.money import ZERO
 from tradebot.core.orders import Fill, Order, OrderIntent, ProtectivePlan
@@ -831,6 +831,151 @@ class TestLegsTrackThePosition:
             "unprotected_position",
             "unprotected_position",
         ], "the second time it becomes unguardable is a second fact, not a repeat"
+
+
+def _armed(store: EventStore) -> list[Event]:
+    """Every `PROTECTIVE_PLACED` that actually armed legs.
+
+    The same event type carries the *unprotected* report — `protected: False`, no legs — so
+    counting the type alone would conflate arming with failing to arm.
+    """
+    return [
+        event
+        for event in store.read_all()
+        if event.type is EventType.PROTECTIVE_PLACED and event.payload["protected"]
+    ]
+
+
+class TestTheReplaceTriggerRetriesAndSettles:
+    """Final review, C1 and C2 — both about *when* `_maintain` decides to replace the legs.
+
+    Each spans two of the branch's tasks, which is why neither per-task review could see it: one
+    path gave the position up for good on a transient venue error, the other could never stop
+    replacing the legs it had just placed.
+    """
+
+    async def test_a_venue_failure_is_retried_and_a_later_poll_re_arms_the_legs(
+        self,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+    ) -> None:
+        """C1. `_record_unprotected` set `unprotected_at` from both of its call sites, and
+        `_maintain` skipped the replacement while the target still matched it — so one
+        `RetryableError` cancelled the legs and no later poll ever placed another. The reviewer's
+        reproduction, exactly: entry 0.5, an external sell of 0.2, one failure, then three healthy
+        polls, ending with 0.3 BTC held, zero protective legs, and zero further events.
+
+        A venue failure is transient by nature: the same call succeeds seconds later, and the
+        position is bare in the meantime because the cancel deliberately comes first (design D4).
+        """
+
+        class _FailingGroupBroker(SimBroker):
+            fail_group = False
+
+            async def submit_group(self, intents):  # type: ignore[no-untyped-def]
+                if self.fail_group:
+                    self.fail_group = False
+                    raise RetryableError("venue unavailable")
+                return await super().submit_group(intents)
+
+        broker = _FailingGroupBroker(clock, balances={"USDT": Decimal(100_000)})
+        service = ExecutionService(broker, store, ledger, clock)
+        monitor = ExecutionMonitor(broker, service, store, clock)
+        broker.observe(tick(instrument, clock, last="49000"))
+        order = await service.submit(entry_intent(instrument, clock, ttl=None), instrument)
+        monitor.track(order, instrument)
+        await monitor.poll()
+
+        book(ledger, external_sell(instrument, clock, qty="0.2"), instrument)
+        broker.fail_group = True
+        clock.advance(30)
+        broker.observe(tick(instrument, clock, last="49000"))
+        with pytest.raises(RetryableError):
+            await monitor.poll()
+        assert not [
+            leg for leg in monitor.tracked if leg.role.is_protective and leg.state.is_open
+        ], "the cancel comes first, so the position is bare until a poll re-arms it"
+
+        for _ in range(3):
+            clock.advance(30)
+            broker.observe(tick(instrument, clock, last="49000"))
+            await monitor.poll()
+
+        live = [leg for leg in monitor.tracked if leg.role.is_protective and leg.state.is_open]
+        assert {leg.qty for leg in live} == {Decimal("0.3")}, "the next poll armed it again"
+        assert len(_armed(store)) == 2, "armed once, re-armed once, then left alone"
+
+    async def test_a_below_minimums_refusal_is_reported_once_however_many_polls(
+        self,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+    ) -> None:
+        """The other half of C1: a *deterministic* refusal must stay de-duplicated.
+
+        `plan_legs` is a pure function of the target and the venue's rules, so this same target
+        refuses identically on every poll — and a warning repeated every ten seconds is a warning
+        nobody reads. The retry the venue-failure path now gets must not become a report per poll
+        here; that is why the marker moved to the one call site rather than being dropped.
+        """
+        service = ExecutionService(broker, store, ledger, clock)
+        monitor = ExecutionMonitor(broker, service, store, clock)
+        broker.observe(tick(instrument, clock, last="49000"))
+        order = await service.submit(entry_intent(instrument, clock, ttl=None), instrument)
+        monitor.track(order, instrument)
+        await monitor.poll()
+
+        # 0.0001 BTC at 49 000 is 4.90, below the instrument's min_notional of 10.
+        book(ledger, external_sell(instrument, clock, qty="0.4999"), instrument)
+        for _ in range(4):
+            clock.advance(30)
+            broker.observe(tick(instrument, clock, last="49000"))
+            await monitor.poll()
+
+        risk = [e for e in store.read_all() if e.type is EventType.RISK_EVENT]
+        assert [e.payload["rule"] for e in risk] == ["unprotected_position"]
+
+    async def test_a_holding_that_is_not_a_lot_multiple_reaches_a_steady_state(
+        self,
+        monitor: ExecutionMonitor,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+    ) -> None:
+        """C2. The trigger compared a *requested* target with the venue's *reported* quantity,
+        and `plan_legs` floors its quantity to `lot_size` — so a holding off the lot grid could
+        never match and every poll cancelled both legs and placed two more: six
+        `PROTECTIVE_PLACED` in six polls, `revision` reaching 6, the legs never moving off
+        0.30000, and a fresh unprotected window each time.
+
+        Not hypothetical: `binance.parse_account` builds `Position.qty` straight from the raw
+        `free + locked` balance, which after a base-asset fee is routinely not a `stepSize`
+        multiple, and `Reconciler` adopts it. Sim never sees it because sim quantities are always
+        lot-quantized, which is why a soak would not have found this either.
+        """
+        broker.observe(tick(instrument, clock, last="49000"))
+        await submit_entry(monitor, broker, store, ledger, clock, instrument, ttl=None)
+        await monitor.poll()
+
+        # 0.5 - 0.199999 leaves 0.300001 held, one lot-tenth off the 0.00001 grid.
+        book(ledger, external_sell(instrument, clock, qty="0.199999"), instrument)
+        for _ in range(6):
+            clock.advance(30)
+            broker.observe(tick(instrument, clock, last="49000"))
+            await monitor.poll()
+
+        assert len(_armed(store)) == 2, "armed once, resized once, then left alone"
+        assert monitor._tracked["sim-ENTRY"].revision == 2, "no id burned per poll"
+        live = [leg for leg in monitor.tracked if leg.role.is_protective and leg.state.is_open]
+        assert {leg.qty for leg in live} == {Decimal("0.30000")}, "floored, and then left there"
+        risk = [e for e in store.read_all() if e.type is EventType.RISK_EVENT]
+        assert not risk, "an expressible-if-floored target is guarded, not flagged"
 
 
 def _monitor_over(
