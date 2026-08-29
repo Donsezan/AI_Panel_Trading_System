@@ -1,0 +1,19 @@
+# Named event windows (spec §8.2). A window overrides the automatic label for the bars inside it,
+# keeps its own measured direction, and is reported **both** inside its SHOCK_UP or SHOCK_DOWN
+# aggregate and on its own row — so an episode can be read by name without vanishing from the
+# totals.
+#
+# The direction is measured from the window's own bars, never declared here: a window named after
+# a crash that in fact holds a rally is a mislabelled file, and the data wins.
+#
+# These two are the episodes the 2024 dataset the tool is first pointed at contains.
+
+[[window]]
+name = "spot ETF approval"
+from = "2024-01-10T00:00:00Z"
+to   = "2024-01-16T00:00:00Z"
+
+[[window]]
+name = "August carry unwind"
+from = "2024-08-02T00:00:00Z"
+to   = "2024-08-09T00:00:00Z"

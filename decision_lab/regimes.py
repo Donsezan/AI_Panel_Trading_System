@@ -29,15 +29,21 @@ regime.
 from __future__ import annotations
 
 import bisect
+import tomllib
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import Decimal
+from pathlib import Path
+from typing import Final
+
+from pydantic import ConfigDict, Field
 
 from decision_lab.calibration_days import Pool
 from decision_lab.dataset import read_series
 from decision_lab.params import DEFAULT_SHOCK_PERCENTILE, DEFAULT_VOL_WINDOW_BARS
 from decision_lab.volatility import percentile, realised_volatility, window_return
+from tradebot.core.errors import ConfigError
 from tradebot.core.market import Candle
 from tradebot.core.money import ZERO
 from tradebot.core.schema import DomainModel, Money, UtcDatetime
@@ -81,12 +87,23 @@ def label_bars(
     return tuple(
         BarLabel(
             close_time=close_time,
-            label=direction_of(ret) if vol >= threshold else RegimeLabel.NORMAL,
+            label=direction_of(ret) if _is_shock(vol, threshold) else RegimeLabel.NORMAL,
             volatility=vol,
             window_return_=ret,
         )
         for close_time, vol, ret in measured
     )
+
+
+def _is_shock(volatility: Decimal, threshold: Decimal) -> bool:
+    """At or above this instrument's own threshold — and it actually moved.
+
+    The second half is not redundant. `percentile` is nearest-rank, so a series that never moves
+    has a threshold of zero and every one of its bars sits "at or above" it: a motionless market
+    labelled `SHOCK_UP` from end to end. Zero realised volatility is the definition of calm, and
+    it is calm in neither direction rather than in one of them.
+    """
+    return volatility > ZERO and volatility >= threshold
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,14 +115,30 @@ class RegimeIndex:
     shock_percentile: Money
     labels: dict[str, tuple[BarLabel, ...]]
     threshold: dict[str, Money]
+    #: Named episodes that override the automatic label for the bars they cover (§8.2).
+    windows: tuple[EventWindow, ...] = ()
+
+    def with_windows(self, windows: Sequence[EventWindow]) -> RegimeIndex:
+        return replace(self, windows=tuple(windows))
+
+    def window_at(self, as_of: datetime) -> EventWindow | None:
+        """The named episode covering this instant, if any. First match wins."""
+        return next((window for window in self.windows if window.covers(as_of)), None)
 
     def label_at(self, instrument_key: str, as_of: datetime) -> RegimeLabel:
-        """The label of the most recent bar to have *closed* at or before `as_of`.
+        """The bar's label, unless a named window covers the instant and says otherwise.
 
         The same point-in-time rule `CandleSeries.point_in_time` applies to prices: a bar still
         forming at `as_of` is not a fact yet, and a decision taken mid-bar was taken knowing only
         the bars behind it.
+
+        A named window is an operator's assertion that this period is an episode, and the label
+        it carries is measured over the *window's* own bars rather than the trailing 30. That is
+        the point of naming it: an episode is a shape a fixed-width window can straddle.
         """
+        window = self.window_at(as_of)
+        if window is not None:
+            return self._window_label(instrument_key, window)
         bars = self.labels[instrument_key]
         index = bisect.bisect_right([bar.close_time for bar in bars], as_of) - 1
         if index < 0:
@@ -114,6 +147,18 @@ class RegimeIndex:
                 f"its series starts at {bars[0].close_time.isoformat()}"
             )
         return bars[index].label
+
+    def _window_label(self, instrument_key: str, window: EventWindow) -> RegimeLabel:
+        covered = [bar for bar in self.labels[instrument_key] if window.covers(bar.close_time)]
+        if not covered:
+            raise KeyError(f"{instrument_key} has no bars inside window {window.name!r}")
+        # Measured the same way §4.5 measures a day: the window's own realised volatility against
+        # the instrument's own threshold, with the sign from its own return.
+        returns = [bar.window_return_ for bar in covered]
+        volatility = max(bar.volatility for bar in covered)
+        if volatility < self.threshold[instrument_key]:
+            return RegimeLabel.NORMAL
+        return direction_of(sum(returns, start=ZERO))
 
 
 async def index_dataset(
@@ -140,3 +185,41 @@ async def index_dataset(
         labels=labels,
         threshold=threshold,
     )
+
+
+#: The windows the repo ships. Overridable with `--regimes`.
+DEFAULT_REGIMES_TOML: Final = Path(__file__).parent / "config" / "regimes.toml"
+
+
+class EventWindow(DomainModel):
+    """One named episode. Its direction is measured from its bars, never declared (§8.2)."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    name: str
+    from_: UtcDatetime = Field(alias="from")
+    to: UtcDatetime
+
+    def covers(self, moment: datetime) -> bool:
+        return self.from_ <= moment < self.to
+
+
+def load_windows(path: Path) -> tuple[EventWindow, ...]:
+    """Read `regimes.toml`, or nothing at all when there is no such file.
+
+    Absent is not a refusal: named windows are an annotation on top of the automatic labeller,
+    which answers on its own. A *malformed* file is a refusal, because a window silently dropped
+    would move numbers on a report that still claims to cover the episode.
+    """
+    if not path.is_file():
+        return ()
+    with path.open("rb") as handle:
+        document = tomllib.load(handle)
+    windows = tuple(EventWindow.model_validate(row) for row in document.get("window", ()))
+    for window in windows:
+        if window.from_ >= window.to:
+            raise ConfigError(
+                f"named window {window.name!r} ends before it begins "
+                f"({window.from_.isoformat()} → {window.to.isoformat()})"
+            )
+    return windows

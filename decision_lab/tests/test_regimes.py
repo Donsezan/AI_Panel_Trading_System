@@ -80,6 +80,14 @@ def test_a_flat_window_at_or_above_the_threshold_breaks_up() -> None:
     assert rg.direction_of(Decimal("-0.0001")) is Pool.SHOCK_DOWN
 
 
+def test_a_motionless_series_is_never_a_shock() -> None:
+    """A nearest-rank threshold over an all-zero distribution is itself zero, so every bar sits
+    "at or above" it. Calm is the one thing a flat market certainly is, and it is calm in neither
+    direction rather than in whichever one the tie-break points."""
+    labels = rg.label_bars(f.walk(["100"] * 40), window_bars=10, shock_percentile=Decimal("0.90"))
+    assert {bar.label for bar in labels} == {Pool.NORMAL}
+
+
 def test_every_bar_gets_exactly_one_label() -> None:
     candles = rising_then_calm()
     labels = rg.label_bars(candles, window_bars=10, shock_percentile=Decimal("0.90"))
