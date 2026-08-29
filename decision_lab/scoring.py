@@ -26,20 +26,30 @@ missing input is a verdict, not an exception.
 from __future__ import annotations
 
 import bisect
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
 
+from pydantic import Field
+
 from decision_lab.calibration_days import Pool
 from decision_lab.dataset import CoverageAudit, read_series, series_key
 from decision_lab.params import DEFAULT_BAND_K, DEFAULT_HORIZON_BARS
+from decision_lab.records import CycleRecord
+from decision_lab.regimes import RegimeIndex
 from tradebot.core.decision import Decision
 from tradebot.core.enums import Action
 from tradebot.core.market import Candle, timeframe_interval
 from tradebot.core.money import ZERO, divide, multiply
 from tradebot.core.schema import DomainModel, Money, UtcDatetime
 from tradebot.core.snapshot import InstrumentContext
+
+# The flag `reach_consensus` sets on a WAIT from a panel that could not answer, taken from its
+# own module rather than through `records`: a symbol reached through a second module's import
+# list stops resolving the moment that module stops needing it.
+from tradebot.decision.consensus import PANEL_DEGRADED
 from tradebot.indicators.library import REGISTRY
 from tradebot.marketdata.recorder import ReplayDataset
 
@@ -267,3 +277,128 @@ def _regret(action: Action, forward: Forward, band: Decimal, *, holding: bool) -
     """
     exposed = action is Action.BUY or (holding and action is Action.HOLD)
     return divide(max(forward.mfe, ZERO) - (forward.move if exposed else ZERO), band)
+
+
+class RegimeMetrics(DomainModel):
+    """§9.5, for one regime or one named window. Every field is `Decimal` or a count."""
+
+    regime: str
+    decisions: int = 0
+    scored: int = 0
+    correct: int = 0
+    accuracy: Money = ZERO
+    action_rate: Money = ZERO
+    precision_on_action: Money = ZERO
+    mean_conviction_gap: Money = ZERO
+    regret_total: Money = ZERO
+    regret_per_decision: Money = ZERO
+    degradation_rate: Money = ZERO
+    cost_usd: Money = ZERO
+    cost_per_scored: Money = ZERO
+    unscored: dict[str, int] = Field(default_factory=dict)
+
+
+def _ratio(numerator: int | Decimal, denominator: int | Decimal) -> Decimal:
+    """Zero rather than a refusal on an empty denominator: an empty regime is a row of zeroes,
+    and `§8.3` requires the row to exist so 'never happened' does not read as 'not measured'."""
+    return divide(Decimal(numerator), Decimal(denominator)) if denominator else ZERO
+
+
+def _mean(values: Sequence[Decimal]) -> Decimal:
+    return divide(sum(values, start=ZERO), Decimal(len(values))) if values else ZERO
+
+
+def summarise(decisions: Sequence[ScoredDecision], *, regime: str) -> RegimeMetrics:
+    """Fold one regime's decisions into §9.5's metrics."""
+    scored = [d for d in decisions if d.verdict.is_scored]
+    correct = [d for d in scored if d.verdict is Verdict.CORRECT]
+    wrong = [d for d in scored if d.verdict is Verdict.WRONG]
+    acted = [d for d in scored if d.asked_for_an_order]
+    acted_correct = [d for d in acted if d.verdict is Verdict.CORRECT]
+    regrets = [d.regret for d in scored if d.regret is not None]
+    cost = sum((d.cost_usd for d in decisions), start=ZERO)
+    unscored: dict[str, int] = {}
+    for decision in decisions:
+        if not decision.verdict.is_scored:
+            unscored[decision.verdict.value] = unscored.get(decision.verdict.value, 0) + 1
+
+    return RegimeMetrics(
+        regime=regime,
+        decisions=len(decisions),
+        scored=len(scored),
+        correct=len(correct),
+        accuracy=_ratio(len(correct), len(scored)),
+        action_rate=_ratio(len(acted), len(scored)),
+        precision_on_action=_ratio(len(acted_correct), len(acted)),
+        # Zero when either side is empty: a panel with no wrong calls has no *gap*, and reporting
+        # its correct-side mean as one would flatter it.
+        mean_conviction_gap=(
+            _mean([d.conviction for d in correct]) - _mean([d.conviction for d in wrong])
+            if correct and wrong
+            else ZERO
+        ),
+        regret_total=sum(regrets, start=ZERO),
+        regret_per_decision=_mean(regrets),
+        # Over *every* decision, not the scored ones: degradation is the reason a decision is
+        # missing, so measuring it against what survived would hide it.
+        degradation_rate=_ratio(sum(1 for d in decisions if d.degraded), len(decisions)),
+        cost_usd=cost,
+        cost_per_scored=_ratio(cost, len(scored)),
+        unscored=unscored,
+    )
+
+
+def by_regime(decisions: Sequence[ScoredDecision]) -> tuple[RegimeMetrics, ...]:
+    """The three regimes, always all three, then one row per named window (§8.3, §8.2).
+
+    `SHOCK_UP` and `SHOCK_DOWN` are never pooled: they ask opposite questions of a long-only
+    system, and a blended figure averages "did the seats catch the move" with "did the seats
+    protect capital" and hides both.
+    """
+    rows = [
+        summarise([d for d in decisions if d.regime is pool], regime=pool.value) for pool in Pool
+    ]
+    windows = sorted({d.window_name for d in decisions if d.window_name})
+    rows += [
+        summarise([d for d in decisions if d.window_name == name], regime=name) for name in windows
+    ]
+    return tuple(rows)
+
+
+def score_records(
+    records: Sequence[CycleRecord],
+    *,
+    index: PriceIndex,
+    regimes: RegimeIndex,
+    params: ScoringParams,
+) -> tuple[ScoredDecision, ...]:
+    """Score every (cycle, instrument) of the reference pass."""
+    results: list[ScoredDecision] = []
+    for record in records:
+        # `basket` mode answers for N instruments in one provider call, so the cycle's cost is
+        # already de-duplicated by `total_cost` and is split evenly across the instruments it
+        # answered for rather than counted once per instrument.
+        per_instrument = _ratio(record.cost_usd, len(record.snapshot.instruments))
+        for context in record.snapshot.instruments:
+            decision = record.decision_for(context.instrument.key)
+            if decision is None:
+                continue
+            window = regimes.window_at(record.as_of)
+            results.append(
+                score_decision(
+                    cycle_id=record.cycle_id,
+                    as_of=record.as_of,
+                    context=context,
+                    decision=decision,
+                    forward=index.forward(
+                        context.instrument.key, record.as_of, horizon=params.horizon_bars
+                    ),
+                    band=band_for(context, params),
+                    regime=regimes.label_at(context.instrument.key, record.as_of),
+                    window_name=window.name if window else "",
+                    degraded=PANEL_DEGRADED in decision.flags,
+                    cost_usd=per_instrument,
+                    crossed_hole=index.crosses_hole(context.instrument.key, record.as_of, params),
+                )
+            )
+    return tuple(results)
