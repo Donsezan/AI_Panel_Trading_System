@@ -8,9 +8,9 @@ them is the binary rounding error `tradebot.core.money` exists to keep out.
 Annotations are checked wherever they appear — a field, an argument, a return — rather than only
 on `x: float`, because `def band(k: float) -> float` is the same defect one syntax node over.
 
-The exemption set is empty on purpose. Slice C's `candidates.py` will need one entry —
-`SeatConfig.temperature`, which `tomllib` parses as a `float` and which is a model
-hyper-parameter, not money. Add it there, with that reason, and nowhere else.
+The exemption set holds exactly one entry: `candidates.py`, for `SeatConfig.temperature`, which
+`tomllib` parses as a `float` and which is a model hyper-parameter rather than money. Nothing else
+belongs there.
 """
 
 from __future__ import annotations
@@ -24,8 +24,10 @@ import pytest
 import decision_lab
 
 TOOL_ROOT = Path(decision_lab.__file__).parent
-#: Modules permitted to name `float`. Empty in slice A — see the module docstring.
-FLOAT_EXEMPT: frozenset[str] = frozenset()
+#: Modules permitted to name `float`. `candidates.py` is the only one, and only for
+#: `SeatConfig.temperature`: `tomllib` parses a TOML float as a `float`, and a sampling temperature
+#: is a model hyper-parameter, not money. Nothing else may be added here.
+FLOAT_EXEMPT: frozenset[str] = frozenset({"candidates.py"})
 
 
 def tool_sources() -> list[tuple[Path, ast.Module]]:
