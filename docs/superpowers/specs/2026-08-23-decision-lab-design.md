@@ -714,6 +714,14 @@ tuning constant: 100% of named windows and pinned days, then 60 `NORMAL`, 30 `SH
 Key: `blake2s(snapshot.digest + candidate_panel_digest)`. A hit returns the stored `PanelOutcome`
 without a provider call.
 
+**The cache is not the result file, and it is deliberately not scoped by matrix.** It lives at
+`workspace/<corpus_id>/cache/`, content-addressed by that key alone, because the key already names
+everything that determines the answer: this evidence, this panel. §7.6's result files are the
+*experiment's* record and are scoped by `matrix_digest`; the cache is shared across every matrix
+over one corpus. Scoping the cache the same way would have defeated the property this section
+exists for — adding one candidate changes the digest, and every previously-answered candidate would
+be paid for again.
+
 What this actually buys, stated honestly: **adding a new candidate to an existing sweep re-runs only
 the new one.** Changing one seat's prompt changes the panel digest and re-runs that whole candidate —
 because in `blind_then_debate` the other seats see the changed seat's arguments, so their answers are
