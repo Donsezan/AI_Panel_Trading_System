@@ -126,3 +126,18 @@ def test_entries_come_back_in_corpus_order() -> None:
 
     order = [entry.cycle_id for entry in corpus.entries if entry.cycle_id in set(sample.cycle_ids)]
     assert list(sample.cycle_ids) == order, "a sweep walks history forwards, whatever it drew in"
+
+
+def test_the_atr_reading_is_tagged_with_the_corpus_timeframe() -> None:
+    """§9.2's `scoring.band_for` reads `context.indicator("ATR", params.timeframe)` — a lookup by
+    name *and* timeframe. A snapshot built at a non-default cadence whose ATR still says "1h"
+    would not raise or read wrong; the lookup would just return `None`, and the decision would
+    score as unscorable rather than as an error. `corpus_with_entries` must thread its own
+    `timeframe` through to every snapshot's indicator so the two never silently disagree.
+    """
+    corpus = corpus_with_entries(count=1, as_of=EPOCH, timeframe="4h")
+
+    reading = corpus.entries[0].snapshot.instruments[0].indicator("ATR", "4h")
+
+    assert reading is not None, "the ATR reading must be tagged with the corpus's own timeframe"
+    assert reading.timeframe == "4h"

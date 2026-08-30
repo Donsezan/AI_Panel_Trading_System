@@ -128,11 +128,19 @@ def write_dataset(
     return directory
 
 
-def snapshot_at(as_of: datetime, *, price: str = "100", atr: str = "1.0") -> ContextSnapshot:
+def snapshot_at(
+    as_of: datetime, *, timeframe: str = "1h", price: str = "100", atr: str = "1.0"
+) -> ContextSnapshot:
     """A minimal but real snapshot: one instrument, one quote, one ATR reading.
 
     Real rather than a stub because scoring reads `context.indicator("ATR", …)` off it, and the
     band is derived from exactly the evidence the panel had (§9.2).
+
+    `timeframe` must match the corpus's own bar grid: `scoring.band_for` looks the ATR reading up
+    *by timeframe*, so a snapshot tagged with the wrong one is not a wrong number but an absent
+    one — `context.indicator("ATR", …)` returns `None` and the decision reads as unscorable
+    rather than as an error. `corpus_with_entries` passes its own `timeframe` through here so the
+    two agree by construction rather than by coincidence.
 
     The field names are verified against `tradebot/core/snapshot.py` and `core/market.py`, not
     guessed: `Quote` carries `bid`/`ask`/`last` and no `price`, `IndicatorReading` carries `text`
@@ -155,7 +163,7 @@ def snapshot_at(as_of: datetime, *, price: str = "100", atr: str = "1.0") -> Con
                 ),
                 indicators=(
                     IndicatorReading(
-                        name="ATR", timeframe="1h", value=Decimal(atr), text=f"ATR is {atr}"
+                        name="ATR", timeframe=timeframe, value=Decimal(atr), text=f"ATR is {atr}"
                     ),
                 ),
             ),
@@ -174,7 +182,7 @@ def corpus_with_entries(
             cycle_id=f"c{index}",
             basket_id="reference",
             as_of=as_of + interval * index,
-            snapshot=snapshot_at(as_of + interval * index),
+            snapshot=snapshot_at(as_of + interval * index, timeframe=timeframe),
         )
         for index in range(count)
     )
