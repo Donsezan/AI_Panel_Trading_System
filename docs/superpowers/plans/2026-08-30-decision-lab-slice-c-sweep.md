@@ -208,16 +208,11 @@ import hashlib
 import itertools
 import tomllib
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Final
 
-from tradebot.core.config import Basket, PanelConfig
-from tradebot.core.enums import ProviderKind
 from tradebot.core.errors import ConfigError
-from tradebot.core.schema import canonical_json
-from tradebot.decision.providers.registry import preset, reach_of
 
 #: Expanded candidates a matrix may hold unless it says otherwise. In the spirit of
 #: `DEFAULT_MAX_CYCLES`: a 400-candidate cross product is not a sweep anybody meant to start.
@@ -533,7 +528,19 @@ Expected: FAIL — `AttributeError: module 'decision_lab.candidates' has no attr
 
 - [ ] **Step 3: Write minimal implementation**
 
-Append to `decision_lab/candidates.py`:
+Add these imports to `decision_lab/candidates.py` — Task 1 deliberately left them out, because an
+import with no use yet is an `F401` on Task 1's own commit:
+
+```python
+from dataclasses import dataclass
+
+from tradebot.core.config import Basket, PanelConfig
+from tradebot.core.enums import ProviderKind
+from tradebot.core.schema import canonical_json
+from tradebot.decision.providers.registry import preset, reach_of
+```
+
+Then append to `decision_lab/candidates.py`:
 
 ```python
 @dataclass(frozen=True, slots=True)
@@ -1120,27 +1127,34 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'decision_lab.sampling'
 Append to `decision_lab/tests/factories.py`:
 
 ```python
-def snapshot_at(as_of: datetime, *, price: str = "100") -> ContextSnapshot:
+def snapshot_at(as_of: datetime, *, price: str = "100", atr: str = "1.0") -> ContextSnapshot:
     """A minimal but real snapshot: one instrument, one quote, one ATR reading.
 
     Real rather than a stub because scoring reads `context.indicator("ATR", …)` off it, and the
     band is derived from exactly the evidence the panel had (§9.2).
+
+    The field names are verified against `tradebot/core/snapshot.py` and `core/market.py`, not
+    guessed: `Quote` carries `bid`/`ask`/`last` and no `price`, `IndicatorReading` carries `text`
+    and no `computed_at`, and `ContextSnapshot` requires `snapshot_id` and `basket_id`.
     """
     inst = instrument()
     return ContextSnapshot(
+        snapshot_id=f"snap-{as_of.isoformat()}",
+        basket_id="reference",
         as_of=as_of,
         instruments=(
             InstrumentContext(
                 instrument=inst,
                 quote=Quote(
                     instrument_key=inst.key,
-                    price=Decimal(price),
+                    bid=Decimal(price),
+                    ask=Decimal(price),
+                    last=Decimal(price),
                     observed_at=as_of,
-                    venue=inst.venue,
                 ),
                 indicators=(
                     IndicatorReading(
-                        name="ATR", timeframe="1h", value=Decimal("1.0"), computed_at=as_of
+                        name="ATR", timeframe="1h", value=Decimal(atr), text=f"ATR is {atr}"
                     ),
                 ),
             ),
@@ -1205,7 +1219,7 @@ from tradebot.core.market import Quote
 from tradebot.core.snapshot import ContextSnapshot, InstrumentContext
 ```
 
-> **Note for the implementer:** verify `IndicatorReading`, `Quote` and `InstrumentContext` field names against `tradebot/core/` before writing — construct them the way `tests/unit` already does rather than guessing. If a required field is missing the models will say so, and the fix belongs here, not in a looser assertion.
+> **Note for the implementer:** these constructor arguments were checked against `tradebot/core/snapshot.py` and `tradebot/core/market.py` while the plan was written. Write them as given. If a model still refuses, read the model and fix the factory — never loosen an assertion to make a fixture validate.
 
 - [ ] **Step 4: Add the sizes to `params.py`**
 
@@ -1395,7 +1409,7 @@ from decision_lab import sweep
 from decision_lab.tests.factories import corpus_with_entries
 from tradebot.core.config import PanelConfig, ProviderBinding, SeatConfig
 from tradebot.core.decision import Decision, SeatResponse, SeatVote
-from tradebot.core.enums import Action
+from tradebot.core.enums import Action, SizeHint
 
 AS_OF = datetime(2024, 3, 1, tzinfo=UTC)
 
@@ -1423,7 +1437,9 @@ def response(provider_id: str, model: str, *, seat_id: str = "technical") -> Sea
         model=model,
         round_index=0,
         instrument_key="binance:BTC/USDT",
-        vote=SeatVote(action=Action.BUY, conviction=3, thesis="t"),
+        vote=SeatVote(
+            action=Action.BUY, conviction=3, size_hint=SizeHint.HALF, thesis="t"
+        ),
         responded_at=AS_OF,
         cost_usd=Decimal("0.01"),
     )
@@ -2519,13 +2535,25 @@ def test_two_identical_candidates_agree_completely() -> None:
 
 
 def test_a_disagreement_that_moves_money_is_counted_apart() -> None:
+    """Not every disagreement is one. `_TRADABLE_ACTIONS` holds BUY and SELL; HOLD and WAIT are
+    two different ways of not acting, and a pair that differs only between those moves no money."""
     left = [decision("c1", Action.BUY), decision("c2", Action.HOLD)]
-    right = [decision("c1", Action.WAIT), decision("c2", Action.SELL)]
+    right = [decision("c1", Action.WAIT), decision("c2", Action.WAIT)]
+
+    normal = [r for r in compare.agreement({"a": left, "b": right}) if r.regime == "NORMAL"][0]
+
+    assert normal.agreed == 0, "both cycles disagree on the action"
+    assert normal.tradable_divergences == 1, "but only c1 has one side asking for an order"
+
+
+def test_two_ways_of_not_acting_are_not_a_tradable_divergence() -> None:
+    left = [decision("c1", Action.HOLD)]
+    right = [decision("c1", Action.WAIT)]
 
     normal = [r for r in compare.agreement({"a": left, "b": right}) if r.regime == "NORMAL"][0]
 
     assert normal.agreed == 0
-    assert normal.tradable_divergences == 1, "c1 only: BUY vs WAIT. c2 is SELL vs HOLD — both act"
+    assert normal.tradable_divergences == 0
 
 
 def test_agreement_is_reported_per_regime_and_never_pooled() -> None:
@@ -2737,7 +2765,7 @@ def _in_regime(row: ScoredDecision, regime: str) -> bool:
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `.venv\Scripts\python.exe -m pytest decision_lab/tests/test_compare.py -q`
-Expected: PASS, 7 tests
+Expected: PASS, 8 tests
 
 - [ ] **Step 5: Commit**
 
@@ -3328,7 +3356,9 @@ async def sweep_command(args: argparse.Namespace) -> int:
     clock = SystemClock()
     corpus = cp.load(args.corpus)
     data_dir = args.data or Path(corpus.meta.dataset_directory)
-    audit = ds.require_verified(data_dir)
+    # Called for its refusal, not its value: §15 says an unverified dataset refuses everything
+    # downstream of it, and a sweep is the most expensive thing downstream.
+    ds.require_verified(data_dir)
     dataset = ReplayDataset.load(data_dir, clock)
 
     matrix = cd.load_matrix(args.configs, reference=corpus.meta.reference_basket)
@@ -3392,7 +3422,6 @@ async def sweep_command(args: argparse.Namespace) -> int:
     # fix the cause, run again, and the cache makes the repeat free.
     if result.status in (sw.SweepStatus.HALTED_BUDGET, sw.SweepStatus.HALTED_FALLBACK):
         return EXIT_BUDGET
-    _ = audit
     return EXIT_OK
 
 
