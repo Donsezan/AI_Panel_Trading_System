@@ -259,13 +259,33 @@ async def run(
         )
         done = read_rows(path)
         for entry in wanted:
-            if entry.cycle_id in done:
+            # A clean row already bought needs nothing further. A contaminated or errored one
+            # holds no answer, so resuming past it would lock in a permanent hole and leave this
+            # candidate scored over a different set of entries than its rivals (§3) — it is
+            # re-attempted below exactly as if nothing had been recorded for it yet. Appending its
+            # new outcome, dirty or clean, is still right: the record that it happened is the
+            # point (§7.6), it is just not, by itself, a result.
+            prior = done.get(entry.cycle_id)
+            if prior is not None and not prior.contaminated and not prior.error:
                 continue
 
             key = cache_key(entry.snapshot.digest, candidate.panel_digest)
             hit = cache_read(corpus.meta.corpus_id, key, workspace=workspace)
             if hit is not None:
-                append_row(path, hit.model_copy(update={"cycle_id": entry.cycle_id}))
+                row = hit.model_copy(update={"cycle_id": entry.cycle_id})
+                append_row(path, row)
+                if row.contaminated or row.error:
+                    # Fail closed even for a stale cache entry (one written before the cache
+                    # stopped accepting dirty rows, below): a failure reused from the cache is
+                    # still not an answer, so it must never be counted as a free clean reuse or
+                    # let the substitute policy go unconsulted (§7.7). Unreachable once every row
+                    # in the cache is clean by construction, but that is not a reason to leave a
+                    # path that would otherwise report a failure as a successful hit.
+                    result = _account_for(result, row)
+                    halted = _halt_if_contaminated(result, row, candidate, entry, matrix)
+                    if halted is not None:
+                        return halted
+                    continue
                 result = result.model_copy(update={"cached": result.cached + 1})
                 continue
 
@@ -279,23 +299,47 @@ async def run(
 
             row = await _evaluate(engine, candidate, entry)
             append_row(path, row)
-            cache_write(corpus.meta.corpus_id, key, row, workspace=workspace)
+            # §7.4: the cache stores answers, shared across every matrix that lands on the same
+            # (snapshot, panel) pair, and a failure is not an answer — caching a transient 429 or
+            # a one-off fallback would make the cheapest possible failure the most durable thing
+            # in the workspace, served to every future candidate that happens to match this key.
+            if not row.contaminated and not row.error:
+                cache_write(corpus.meta.corpus_id, key, row, workspace=workspace)
             result = result.model_copy(
                 update={
                     "evaluated": result.evaluated + 1,
                     "spent_usd": result.spent_usd + row.cost_usd,
-                    "failed": result.failed + int(bool(row.error)),
-                    "contaminated": result.contaminated + int(row.contaminated),
                 }
             )
-            if row.contaminated and matrix.on_fallback is SweepPolicy.HALT:
-                return _halt(
-                    result,
-                    SweepStatus.HALTED_FALLBACK,
-                    f"{candidate.candidate_id} at {entry.as_of.isoformat()}: "
-                    + "; ".join(row.substitutes),
-                )
+            result = _account_for(result, row)  # failed / contaminated, wherever the row came from
+            halted = _halt_if_contaminated(result, row, candidate, entry, matrix)
+            if halted is not None:
+                return halted
     return result
+
+
+def _account_for(result: SweepResult, row: SweepRow) -> SweepResult:
+    """Count a dirty row's failure and/or contamination, wherever it was produced."""
+    return result.model_copy(
+        update={
+            "failed": result.failed + int(bool(row.error)),
+            "contaminated": result.contaminated + int(row.contaminated),
+        }
+    )
+
+
+def _halt_if_contaminated(
+    result: SweepResult, row: SweepRow, candidate: Candidate, entry: CorpusEntry, matrix: Matrix
+) -> SweepResult | None:
+    """§7.7: a substitute answered, and under the default policy that stops the sweep — the row
+    is already appended by the caller, so nothing already bought is lost by halting here."""
+    if row.contaminated and matrix.on_fallback is SweepPolicy.HALT:
+        return _halt(
+            result,
+            SweepStatus.HALTED_FALLBACK,
+            f"{candidate.candidate_id} at {entry.as_of.isoformat()}: " + "; ".join(row.substitutes),
+        )
+    return None
 
 
 def _halt(result: SweepResult, status: SweepStatus, reason: str) -> SweepResult:

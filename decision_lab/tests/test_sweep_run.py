@@ -205,3 +205,58 @@ async def test_the_meta_round_trips_and_records_the_run_kind(tmp_path: Path) -> 
     assert reread is not None
     assert reread.matrix_digest == result.matrix_digest
     assert reread.evaluation is False, "a stub matrix is a plumbing check (§7.2)"
+
+
+async def test_a_contaminated_row_is_never_written_to_the_shared_cache(tmp_path: Path) -> None:
+    """§7.4: the cache stores answers, and a failure is not one — a contaminated row cached would
+    be served to every future matrix sharing this (snapshot, panel) key."""
+    corpus, matrix = corpus_with_entries(count=2, as_of=AS_OF), matrix_of(tmp_path)
+    engine = ScriptedEngine([_plain(), _plain("stub", "varied-news")])
+
+    await _run(corpus, matrix, tmp_path, engine)
+
+    candidate = matrix.candidates[0]
+    key = sweep.cache_key(corpus.entries[1].snapshot.digest, candidate.panel_digest)
+    assert sweep.cache_read(corpus.meta.corpus_id, key, workspace=tmp_path) is None
+
+
+async def test_an_errored_row_is_never_cached_and_is_re_attempted(tmp_path: Path) -> None:
+    """§7.4/§7.6: an errored row is likewise not an answer, and resuming past it would leave a
+    permanent hole rather than giving a since-fixed provider a chance to answer for real."""
+    corpus, matrix = corpus_with_entries(count=2, as_of=AS_OF), matrix_of(tmp_path)
+    engine = ScriptedEngine([_plain(), RuntimeError("boom")])
+
+    first = await _run(corpus, matrix, tmp_path, engine)
+    candidate = matrix.candidates[0]
+    key = sweep.cache_key(corpus.entries[1].snapshot.digest, candidate.panel_digest)
+
+    assert first.failed == 1
+    assert sweep.cache_read(corpus.meta.corpus_id, key, workspace=tmp_path) is None
+
+    second = await _run(corpus, matrix, tmp_path, engine)
+    kept = _rows(corpus, matrix, tmp_path)
+
+    assert engine.calls == 3, "the errored entry was retried, not skipped as already-done"
+    assert second.failed == 0
+    assert kept["c1"].error == "", "the retry succeeded and its answer is what is kept"
+
+
+async def test_a_second_run_after_a_fallback_halt_re_evaluates_the_dirty_entry(
+    tmp_path: Path,
+) -> None:
+    """§7.6/§7.7: a halted entry's contaminated row must not make a resume skip it — that would
+    complete the sweep while permanently missing that entry's real answer (§3's even comparison)."""
+    corpus = corpus_with_entries(count=3, as_of=AS_OF)
+    matrix = matrix_of(tmp_path)
+    engine = ScriptedEngine([_plain(), _plain("stub", "varied-news")])
+
+    first = await _run(corpus, matrix, tmp_path, engine)
+    assert first.status is sweep.SweepStatus.HALTED_FALLBACK
+    assert engine.calls == 2, "halted after the second entry, the third never attempted"
+
+    second = await _run(corpus, matrix, tmp_path, engine)
+    kept = _rows(corpus, matrix, tmp_path)
+
+    assert engine.calls == 4, "the dirty entry was retried and the third entry was reached too"
+    assert second.status is sweep.SweepStatus.OK, "the panel now answers cleanly and it proceeds"
+    assert kept["c1"].contaminated is False, "the retry's clean answer is what is kept"
