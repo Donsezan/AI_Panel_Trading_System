@@ -671,6 +671,23 @@ unresolvable bindings, repeated fallbacks, a majority above 1, an over-long inst
 The expansion cap refuses an oversized matrix in the spirit of `DEFAULT_MAX_CYCLES` — a 400-candidate
 cross product is not a sweep anybody meant to start.
 
+**Two kinds of run, decided by the binding and never by a flag.** A candidate bound to the offline
+stub measures canned JSON, so a matrix containing one is a *plumbing check*: it runs, and its
+report and its §11 row are stamped `PLUMBING CHECK — NOT AN EVALUATION`, unconditionally, the way
+the contamination banner is. A matrix binding only real providers is an *evaluation*. The switch is
+the configuration rather than a command-line flag for the reason `varied-*` is panel data: a flag
+would leave a registry of rows that behaved differently under identical recorded configuration, and
+"was this a real measurement" must be answerable from the artifact alone.
+
+**An evaluation refuses before spend if any declared provider is unreachable.** `reach_of` reporting
+*any* missing key refuses — not merely a fully silenced seat — because a partly-reachable seat is
+one that will answer on its backup, and §7.7 says that is not a measurement. The refusal is exit 4,
+names the seat, the binding and the environment variable, **and writes a §11 row with
+`status = "provider_unavailable"`**: "we tried to evaluate on the 30th and could not, because of
+providers" is a fact about the experiment and belongs in the registry, not in a terminal that
+scrolled away. This is deliberately stricter than ADR 0023, which is right for a *trading* system —
+degrade, say so, keep running — and wrong for a measuring one.
+
 ### 7.3 Sampling
 
 Evaluating every candidate on every corpus entry is affordable only at coarse cadence. The default
@@ -684,6 +701,13 @@ is a **stratified, seeded** sample:
 
 The seed is recorded in the report, so a re-run draws the same sample and two sweeps are comparable.
 `--full` disables sampling.
+
+A corpus *cycle* covers every instrument in the reference basket, and two of them can sit in two
+different regimes at the same instant. The stratum is therefore the regime of the **reference
+instrument** — the one §4.5 already draws the day set from and every report already names — rather
+than a per-instrument label a cycle cannot have one of. Defaults, in `params.py` beside every other
+tuning constant: 100% of named windows and pinned days, then 60 `NORMAL`, 30 `SHOCK_UP` and 30
+`SHOCK_DOWN`, drawn with `DEFAULT_SEED`.
 
 ### 7.4 Cache
 
@@ -708,10 +732,56 @@ the ceiling is a projection rather than a guess.
 
 ### 7.6 Resume
 
-Results append to `workspace/<corpus_id>/<candidate_id>.jsonl` as they are produced. An interrupted
-sweep re-run picks up where it stopped. This matters at 40,000 calls: a sweep that loses everything
-to a dropped connection is a sweep nobody runs twice. It is also what lets §12's dashboard tail a
-running sweep rather than waiting for it to finish.
+Results append to `workspace/<corpus_id>/sweep-<matrix_digest>/<candidate_id>.jsonl` as they are
+produced. An interrupted sweep re-run picks up where it stopped. This matters at 40,000 calls: a
+sweep that loses everything to a dropped connection is a sweep nobody runs twice. It is also what
+lets §12's dashboard tail a running sweep rather than waiting for it to finish.
+
+The directory is scoped by `matrix_digest`, not flat under the corpus: two matrices over one corpus
+will both contain a candidate called `baseline`, and a flat layout would resume one experiment into
+the other's file. Same reasoning as `corpus._existing` keying reuse on identity.
+
+### 7.7 A substitute model is not the panel under test
+
+The thing being measured is *this snapshot, through this seat, producing this answer*. A seat whose
+primary binding fails and answers on its fallback has produced a different panel's answer in a row
+labelled with the configured seat's name. It cannot be scored, because the configuration it claims
+to measure never ran.
+
+**Contamination is per cycle, not per seat.** One substitute answer poisons the whole decision, not
+just that seat's row: under `blind_then_debate` the other seats read the substitute's arguments in
+later rounds — the same argument §7.4 makes for the cache — and under either protocol the
+substitute's vote enters `reach_consensus` and helps set the panel's action. So the cycle drops out
+whole: the panel row and every seat row for it.
+
+Detection is free and already written: `SeatResponse.fingerprint` is the binding that actually
+answered, and §9.7's fallback rate already compares it against the seat's primary.
+
+What happens next is declared in the matrix, because it is a property of the experiment and belongs
+on the report:
+
+```toml
+[sweep]
+on_fallback = "halt"      # default
+# on_fallback = "exclude"
+```
+
+- **`halt`** — the first substitute answer stops the sweep. Exit 5, completed rows kept (§7.6
+  appends as it goes), and the report names the candidate, the entry, the seat and both bindings.
+  Recoverable rather than restarted: §7.4's cache means a re-run repeats no completed work, so the
+  rhythm is halt, fix the provider, resume.
+- **`exclude`** — the run continues, and every decision from a cycle in which any seat fell back is
+  `UNSCORED (fallback)` and excluded from every metric. For a long run on free slots where losing
+  some cycles beats losing the night.
+
+Both settings share the invariant, and it is the point of the section: **a contaminated decision is
+never scored.** The setting decides only whether the run stops. It therefore does *not* feed
+`matrix_digest` and does not affect the §7.4 cache — it changes when you stop, not what is produced
+— and it is recorded on the §11 row and printed on the report.
+
+An **abstention is not a fallback**. A seat whose whole chain fails abstains, the panel resolves
+`WAIT (PANEL_DEGRADED)`, and that is a real outcome of the real panel — §9.5 already reports the
+degradation rate. Only "a different model answered" halts or excludes.
 
 ---
 
@@ -1018,6 +1088,15 @@ Identical parameters **update** the row; any changed parameter creates a new one
 duplicates, a changed prompt never silently overwrites the result it should be compared against,
 and two rows on screen are always two genuinely different experiments.
 
+Every row carries a `status`, because a run that never produced a number is still a fact about the
+experiment: `ok`, `provider_unavailable` (§7.2's pre-spend refusal), `halted_fallback` (§7.7),
+`halted_budget` (§7.5). It also records `on_fallback` and whether the run was an evaluation or a
+plumbing check — neither feeds `run_id`, both are needed to read the row.
+
+`run_id` is computed over the **full** field set from the start, with §10's `scenario`,
+`start_equity` and `window` empty for a sweep, so slice D lands without renumbering rows already
+written.
+
 The registry is the answer to "compare and find the most efficient setup": it is append-only, it is
 a flat file that a notebook can read, and §12 renders it. Rows are never deleted by the tool —
 `--prune` is an operator act naming what it removes, in the spirit of the bot's own retention rule
@@ -1098,9 +1177,14 @@ Markdown, to `decision_lab/reports/`. Never printed — a tuning result is filed
 it justified, exactly as `report promotion` and `report shadow` are.
 
 Every report opens with its banners: the `BacktestHarness` contamination banner verbatim,
-`NEWS-BLIND RUN` / `RECONSTRUCTED NEWS` / `SUMMARIZED NEWS` where they apply, `GATE SKIPPED` where
-`--skip-gate` was used, and the tool's own line stating it is a comparison instrument and not
-evidence of alpha.
+`NEWS-BLIND RUN` / `RECONSTRUCTED NEWS` / `SUMMARIZED NEWS` where they apply, `PLUMBING CHECK — NOT
+AN EVALUATION` where any candidate binds the stub (§7.2), `GATE SKIPPED` where `--skip-gate` was
+used, and the tool's own line stating it is a comparison instrument and not evidence of alpha.
+
+There is one `report` command, not two. It renders the reference pass as it always has and *grows*
+the cross-candidate sections when sweep results exist under that corpus; `--matrix <digest>` picks
+between them only when more than one sweep has run. A second command would be a second rendering
+path over the same tables.
 
 Then the experiment's identity, in full, because a result whose provenance is not on the page is not
 reproducible: dataset and its coverage audit, the pinned day set and its digest, the reference
