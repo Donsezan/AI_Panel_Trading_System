@@ -123,6 +123,19 @@ tables. A file the same call created has nothing to lose; a file with tables but
 `alembic_version` is copied, because it cannot be told apart from a real ledger whose version table
 was lost.
 
+`decision_lab` is a separate tool with its own entry point and its own gate — never a
+`tradebot` subcommand ([docs/superpowers/specs/2026-08-23-decision-lab-design.md](docs/superpowers/specs/2026-08-23-decision-lab-design.md) §2.1):
+
+```powershell
+.venv\Scripts\python.exe -m decision_lab dataset verify --data data\history   # --repair re-asks the venue
+.venv\Scripts\python.exe -m decision_lab dataset days   --data data\history   # pin the nine calibration days
+.venv\Scripts\python.exe -m decision_lab corpus build --data data\history --every 8h --reference-panel sim
+.venv\Scripts\python.exe -m decision_lab report --corpus <corpus_id>          # writes decision_lab\reports\*.md
+.\decision_lab\check.ps1                                                      # its own format/lint/mypy/tests
+```
+
+Both gates must pass: `.\decision_lab\check.ps1` **and** the root `.\check.ps1`.
+
 Dependencies are hash-pinned. After editing `pyproject.toml`:
 
 ```powershell
@@ -203,6 +216,71 @@ thread's open transaction: `await store.append(...)` returns having written noth
 file database gives each checkout its own connection and is unaffected, so this is a harness trap,
 not a production one — but a test that races it is testing the harness. Drive the reader
 explicitly (`hub.drain()`, `hub.broadcast()`) instead of waiting for its loop to notice.
+
+## decision_lab — grading the panel's judgement
+
+A separate top-level package, not a bot phase. The bot can say what happened to the money; it
+could never say whether a decision was *right*, which mixes good judgement with good luck. This
+scores decisions against what the market did next, over recorded history, per regime and per seat.
+Specced in [docs/superpowers/specs/2026-08-23-decision-lab-design.md](docs/superpowers/specs/2026-08-23-decision-lab-design.md);
+five slices, of which **A (integrity, day set, corpus) and B (regimes, scoring, per-seat, report)
+have shipped**. C (the sweep), D (calibration) and E (news) are not built, and only E touches
+`tradebot` at all.
+
+```
+dataset.py             audit recorded history, repair holes, refuse an unverified dataset
+  calibration_days.py  the nine pinned days, drawn per pool from the reference instrument
+  corpus.py            one reference pass through the unmodified BacktestHarness -> corpus.db
+    records.py         fold each cycle out of that log: snapshot, decisions, votes, outcome
+    regimes.py         label every bar NORMAL | SHOCK_UP | SHOCK_DOWN, named windows overriding
+      scoring.py       the long-only truth table, the ATR band, five verdicts, per-regime metrics
+        seats.py       each seat against the same truth; round 0 vs final; swing; contribution
+          render.py    Markdown to decision_lab/reports/, never printed
+```
+
+Rules that are easy to get backwards:
+
+- **Nothing under `tradebot/` may name `decision_lab`**, and the bot's CLI is untouched — a tuning
+  tool reachable from a live process by accident is one an operator reaches by accident.
+  `test_separation.py` enforces it, and `git diff --stat main -- tradebot/` staying empty is a
+  slice exit criterion. Slice E is the one sanctioned exception, and its seam and its guard tests
+  are **one change, never two**.
+- **No `float`, anywhere**, enforced by `test_discipline.py` — the same rule
+  `test_money_discipline.py` gives the bot, applied to a package that is entirely arithmetic.
+- **The truth label is long-only aware, and it is the thing easiest to get backwards.** Tier-1
+  refuses a short, so standing aside from a fall *while flat* is **correct**, not a missed
+  opportunity. Scored the other way the tool systematically punishes the conservative behaviour
+  the bot exists to have, and `SHOCK_DOWN` becomes a period it is doomed to fail rather than a
+  test it can pass. While *holding*, the same fall demanded an exit.
+- **`SHOCK_UP` and `SHOCK_DOWN` are never pooled, and every regime row is always rendered.** They
+  ask opposite questions of a long-only system — did the seats catch the move, did they protect
+  capital — and a blended figure hides both. An absent `SHOCK_DOWN` row reads as *not measured*,
+  which is the opposite of *never happened*.
+- **The band is `k × ATR` read off the frozen snapshot, never recomputed**, so a verdict is
+  derived from exactly the evidence the panel had rather than from a better view of the same
+  market. Unscorable is a **verdict with a reason** — gap, horizon, or no ATR — never a drop: a
+  run that dropped them reports accuracy over a subset it chose after the fact.
+- **Round 0 is reported beside the final vote.** Under `blind_then_debate` a seat's later votes
+  are contaminated by its peers *by design*; "which seat reasons well" and "which seat is easily
+  talked round" are different questions and one column answers neither.
+  `reach_consensus` is **imported** for the swing rate, never reimplemented — a second consensus
+  rule would make the measurement a measurement of the copy — and the counterfactual drops the
+  seat from the `PanelConfig` too, because `required_votes` is `ceil(majority × seat_count)` and
+  leaving it alone asks "what if this seat had abstained", a different question.
+- **A corpus is reused at its identity, never rebuilt** (`corpus._existing`), so re-running
+  `corpus build` with the same arguments returns the existing pass and exits 0 — including a
+  short one that auto-paused. Delete the directory to retry. `decision_lab/workspace/` and
+  `decision_lab/reports/` are gitignored, so none of this is visible from the repo.
+- **A reference pass is not reproducible and can die on an open bot defect.** `SIM_PANEL`'s
+  `varied-*` seats draw from an unseeded `random.Random` and `corpus build` has no `--seed`; worse,
+  a pass can reach [KNOWN_GAPS](docs/KNOWN_GAPS.md) §5 — the monitor polls only *after* a cycle's
+  order, so a stop that matched during the gap leaves the ledger holding a position the panel then
+  sizes a SELL against, and the build dies on `sell of … exceeds holding …`. Measured over seven
+  seeds, three did. `test_slice_b_end_to_end.py` therefore pins `STUB_SEED = 2024` through the
+  `rng` seam `StubLLMProvider` documents; **delete that pin when §5 closes.**
+- **A pass also ends when the basket auto-pauses.** `max_consecutive_losses` is a legitimate
+  Tier-1 rule and a replay has no human to clear it, so the harness stops and the report shows how
+  much of the window went unused. `ran_cycles` well below `planned_cycles` is that, not a crash.
 
 ### Phase 11 — the instrument master
 
