@@ -122,11 +122,17 @@ def substitutes_in(responses: Sequence[SeatResponse], panel: PanelConfig) -> tup
     fallback — the same field §9.7's fallback rate is computed from.
     """
     primary = {seat.seat_id: seat.primary.fingerprint for seat in panel.seats}
-    found = {
-        f"{r.seat_id}: {primary[r.seat_id]} -> {r.fingerprint}"
-        for r in responses
-        if r.seat_id in primary and r.fingerprint != primary[r.seat_id]
-    }
+    found = set()
+    for r in responses:
+        if r.seat_id not in primary:
+            # §7.7: a response naming a seat the configured panel does not declare cannot be
+            # attributed to that panel at all — "I cannot match this to a seat" must resolve to
+            # contaminated, not to clean, the same fail-closed rule the bot applies to every
+            # other uncertainty. Worded distinctly from the ordinary fallback case below so an
+            # operator can tell "wrong model" apart from "no such seat" at a glance.
+            found.add(f"{r.seat_id}: not a seat this panel declares")
+        elif r.fingerprint != primary[r.seat_id]:
+            found.add(f"{r.seat_id}: {primary[r.seat_id]} -> {r.fingerprint}")
     return tuple(sorted(found))
 
 

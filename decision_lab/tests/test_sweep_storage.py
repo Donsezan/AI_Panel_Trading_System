@@ -125,6 +125,26 @@ def test_a_fallback_binding_is_a_substitute_and_names_both_ends() -> None:
     assert found == ("technical: openrouter:primary-model -> gemini:backup-model",)
 
 
+def test_a_response_from_an_undeclared_seat_is_a_substitute_and_names_the_fault() -> None:
+    """§7.7: unmatched to any configured seat, so it cannot be attributed to this panel."""
+    found = sweep.substitutes_in(
+        (response("openrouter", "primary-model", seat_id="ghost"),), panel()
+    )
+
+    assert found == ("ghost: not a seat this panel declares",)
+
+
+def test_an_undeclared_seat_contaminates_the_row_and_drops_the_record() -> None:
+    corpus = corpus_with_entries(count=1, as_of=AS_OF)
+    substitutes = sweep.substitutes_in(
+        (response("openrouter", "primary-model", seat_id="ghost"),), panel()
+    )
+    bad_row = row(substitutes=substitutes)
+
+    assert bad_row.contaminated is True
+    assert sweep.records_from_rows(corpus, {"c0": bad_row}) == ()
+
+
 def test_a_row_with_any_substitute_is_contaminated() -> None:
     assert row().contaminated is False
     assert row(substitutes=("technical: a -> b",)).contaminated is True
