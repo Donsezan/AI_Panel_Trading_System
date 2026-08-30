@@ -8,9 +8,12 @@ them is the binary rounding error `tradebot.core.money` exists to keep out.
 Annotations are checked wherever they appear — a field, an argument, a return — rather than only
 on `x: float`, because `def band(k: float) -> float` is the same defect one syntax node over.
 
-The exemption set holds exactly one entry: `candidates.py`, for `SeatConfig.temperature`, which
-`tomllib` parses as a `float` and which is a model hyper-parameter rather than money. Nothing else
-belongs there.
+Slice A predicted `candidates.py` would need an exemption for `SeatConfig.temperature`, since
+`tomllib` parses a TOML float as a Python `float`. It does not: `_panel_for` passes each seat
+through as an opaque `dict(seat)`, handed to `Basket.model_validate` for pydantic to coerce, so no
+`float` is ever named — as a call or an annotation — anywhere in that module. The exemption set is
+empty, and a future entry needs the same standard of justification a real one would have met: a
+`float` the package genuinely cannot avoid, never one it merely passes through unread.
 """
 
 from __future__ import annotations
@@ -24,10 +27,10 @@ import pytest
 import decision_lab
 
 TOOL_ROOT = Path(decision_lab.__file__).parent
-#: Modules permitted to name `float`. `candidates.py` is the only one, and only for
-#: `SeatConfig.temperature`: `tomllib` parses a TOML float as a `float`, and a sampling temperature
-#: is a model hyper-parameter, not money. Nothing else may be added here.
-FLOAT_EXEMPT: frozenset[str] = frozenset({"candidates.py"})
+#: Modules permitted to name `float`. Empty: `candidates.py` was predicted to need an entry for
+#: `SeatConfig.temperature`, but seat documents pass through it as opaque dicts and pydantic does
+#: the coercion, so no `float` is ever named there. See the module docstring.
+FLOAT_EXEMPT: frozenset[str] = frozenset()
 
 
 def tool_sources() -> list[tuple[Path, ast.Module]]:
