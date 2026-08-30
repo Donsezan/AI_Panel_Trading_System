@@ -293,11 +293,44 @@ def unreachable(matrix: Matrix, environ: Mapping[str, str] | None = None) -> tup
     (§2.4). What differs here is the *threshold*: any missing key at all, not merely a silenced
     seat, because a partly-reachable seat is one that will answer on its backup — and §7.7 says
     that is not a measurement.
+
+    §7.2 requires a refusal to name "the seat, the binding and the environment variable" — a
+    provider id alone does not say *which* seat's vote would be affected, and that is exactly the
+    fact an operator needs when only one seat's fallback touches the absent key. `reach_of`
+    already separates *degraded* seats (a working binding remains — the substitution §7.2 refuses)
+    from *silenced* ones (no binding left — the seat abstains instead); the wording keeps that
+    distinction rather than flattening both into one sentence.
     """
     findings: list[str] = []
     for candidate in matrix.candidates:
         reach = reach_of(candidate.panel, environ)
-        findings += [f"{candidate.candidate_id}: {missing}" for missing in reach.missing]
+        if not reach.missing:
+            continue
+        secret_of = {entry.provider_id: entry.secret_ref for entry in reach.missing}
+        degraded, silenced = set(reach.degraded), set(reach.silenced)
+        named: set[str] = set()
+        for seat in candidate.panel.seats:
+            if seat.seat_id not in degraded and seat.seat_id not in silenced:
+                continue
+            consequence = (
+                "would answer on its backup" if seat.seat_id in degraded else "would abstain"
+            )
+            for binding in seat.bindings:
+                secret_ref = secret_of.get(binding.provider_id)
+                if secret_ref is None:
+                    continue
+                named.add(binding.provider_id)
+                findings.append(
+                    f"{candidate.candidate_id}: seat {seat.seat_id!r} binds {binding.fingerprint}, "
+                    f"which has no {secret_ref} in the environment — the seat {consequence}"
+                )
+        # A declared provider no seat binds cannot be attributed to a seat; still block, because
+        # nothing would ever exercise it and the fail-closed default is "not a measurement".
+        findings += [
+            f"{candidate.candidate_id}: {entry}"
+            for entry in reach.missing
+            if entry.provider_id not in named
+        ]
     return tuple(findings)
 
 
@@ -312,6 +345,6 @@ def require_reachable(matrix: Matrix, environ: Mapping[str, str] | None = None) 
     if missing:
         raise ConfigError(
             "this matrix cannot be evaluated — an endpoint it declares has no key, so a seat "
-            "would answer on its backup and measure a panel that was never configured: "
-            + "; ".join(missing)
+            "would substitute a binding or abstain, measuring a panel that was never "
+            "configured: " + "; ".join(missing)
         )

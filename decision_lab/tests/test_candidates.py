@@ -44,6 +44,30 @@ providers = ["openrouter"]
   model = "deepseek/deepseek-chat-v3-0324:free"
 """
 
+# Two seats on the same reachable primary; only "news" touches gemini, and only as a fallback.
+# Discriminates a per-seat message from a per-provider one: "trend" must never be named.
+FALLBACK_MATRIX = """
+[[candidates]]
+id = "baseline"
+providers = ["openrouter", "gemini"]
+
+  [[candidates.seats]]
+  seat_id = "trend"
+  role = "trend analyst"
+  provider_id = "openrouter"
+  model = "deepseek/deepseek-chat-v3-0324:free"
+
+  [[candidates.seats]]
+  seat_id = "news"
+  role = "news analyst"
+  provider_id = "openrouter"
+  model = "deepseek/deepseek-chat-v3-0324:free"
+
+    [[candidates.seats.fallbacks]]
+    provider_id = "gemini"
+    model = "gemini-2.0-flash"
+"""
+
 
 def reference() -> Basket:
     return Basket(
@@ -113,6 +137,23 @@ def test_a_missing_key_refuses_an_evaluation_and_names_the_variable(tmp_path: Pa
 
     with pytest.raises(ConfigError, match="OPENROUTER_API_KEY"):
         cd.require_reachable(matrix, environ={})
+
+
+def test_a_missing_fallback_key_names_the_seat_that_would_substitute(tmp_path: Path) -> None:
+    """§7.2: only "news" falls back to gemini — the message must name it, not "trend"."""
+    matrix = cd.load_matrix(write(tmp_path, FALLBACK_MATRIX), reference=reference())
+    environ = {"OPENROUTER_API_KEY": "sk-test"}
+
+    (finding,) = cd.unreachable(matrix, environ=environ)
+    assert "news" in finding
+    assert "trend" not in finding
+    assert "gemini" in finding
+    assert "GEMINI_API_KEY" in finding
+    assert "backup" in finding, "a degraded seat substitutes; it does not abstain"
+
+    with pytest.raises(ConfigError, match="news") as excinfo:
+        cd.require_reachable(matrix, environ=environ)
+    assert "GEMINI_API_KEY" in str(excinfo.value)
 
 
 def test_a_present_key_passes(tmp_path: Path) -> None:

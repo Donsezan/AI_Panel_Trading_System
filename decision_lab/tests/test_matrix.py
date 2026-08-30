@@ -81,6 +81,23 @@ def test_a_prompt_axis_varies_one_seat_and_names_it(tmp_path: Path) -> None:
     assert expanded[1]["seats"][1]["instruction"] == "Weight recent trend continuation."
 
 
+def test_a_prompt_axis_and_a_field_axis_expand_together(tmp_path: Path) -> None:
+    """The id lists every axis; the order is `_axes`'s (prompt axes, sorted, then field axes,
+    sorted) crossed by `itertools.product` (rightmost axis fastest) — pinned here, not derived,
+    because §11's `run_id` and a later results-registry row are keyed on this id."""
+    text = MATRIX.replace(
+        "max_rounds = [1, 3]", 'max_rounds = [1, 3]\nprompts.risk = ["cautious", "momentum"]'
+    )
+    expanded = cd.expand(cd.read_document(write(tmp_path, text)))
+
+    assert [c["id"] for c in expanded] == [
+        "baseline~risk=cautious~max_rounds=1",
+        "baseline~risk=cautious~max_rounds=3",
+        "baseline~risk=momentum~max_rounds=1",
+        "baseline~risk=momentum~max_rounds=3",
+    ]
+
+
 def test_a_document_with_no_expand_block_is_its_own_candidates(tmp_path: Path) -> None:
     text = MATRIX.split("[expand]")[0]
     expanded = cd.expand(cd.read_document(write(tmp_path, text)))
