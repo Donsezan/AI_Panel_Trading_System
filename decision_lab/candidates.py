@@ -16,14 +16,20 @@ here performs I/O beyond reading the matrix file, and nothing writes.
 
 from __future__ import annotations
 
+import hashlib
 import itertools
 import tomllib
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Final
 
+from tradebot.core.config import Basket, PanelConfig
+from tradebot.core.enums import ProviderKind
 from tradebot.core.errors import ConfigError
+from tradebot.core.schema import canonical_json
+from tradebot.decision.providers.registry import preset, reach_of
 
 #: Expanded candidates a matrix may hold unless it says otherwise. In the spirit of
 #: `DEFAULT_MAX_CYCLES`: a 400-candidate cross product is not a sweep anybody meant to start.
@@ -158,3 +164,154 @@ def _apply(
 
     candidate["id"] = "~".join((str(base.get("id", "candidate")), *suffix))
     return candidate
+
+
+@dataclass(frozen=True, slots=True)
+class Candidate:
+    """One configuration under test: the reference basket, with this panel."""
+
+    candidate_id: str
+    basket: Basket
+
+    @property
+    def panel(self) -> PanelConfig:
+        return self.basket.panel
+
+    @property
+    def panel_digest(self) -> str:
+        """Identity of what is being measured. The §7.4 cache key's second half."""
+        return hashlib.blake2s(
+            canonical_json(self.panel).encode("utf-8"), digest_size=16
+        ).hexdigest()
+
+    @property
+    def stub_bindings(self) -> tuple[str, ...]:
+        """Bindings served by the offline stub, anywhere in any seat's chain.
+
+        States the rule `control.readiness._scripted_bindings` states for live, one level over.
+        That function is private, and the separation contract (§2.1) forbids this package editing
+        `tradebot` to make it public — so the *rule* is repeated here rather than the code, and it
+        is the rule that matters: a fallback to a stub is as disqualifying as a primary one,
+        because a run is then one outage away from measuring canned JSON.
+        """
+        kinds = {provider.provider_id: provider.kind for provider in self.panel.providers}
+        return tuple(
+            f"{self.candidate_id}: {seat.seat_id}->{binding.fingerprint}"
+            for seat in self.panel.seats
+            for binding in seat.bindings
+            if kinds.get(binding.provider_id) is ProviderKind.STUB
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class Matrix:
+    """An expanded, validated candidate set, and what kind of run it is."""
+
+    candidates: tuple[Candidate, ...]
+    on_fallback: SweepPolicy
+    source: Path
+
+    @property
+    def matrix_digest(self) -> str:
+        """§7.1: identity of the fully expanded set, so changing one prompt is a new matrix.
+
+        `on_fallback` is deliberately not in it — it changes when a run stops, never what a run
+        produces (§7.7), and a digest that split on it would show one experiment as two.
+        """
+        payload = "|".join(f"{c.candidate_id}:{c.panel_digest}" for c in self.candidates)
+        return hashlib.blake2s(payload.encode("utf-8"), digest_size=16).hexdigest()
+
+    @property
+    def stub_bindings(self) -> tuple[str, ...]:
+        return tuple(b for candidate in self.candidates for b in candidate.stub_bindings)
+
+    @property
+    def is_evaluation(self) -> bool:
+        """False when anything binds the stub: that run measures canned JSON (§7.2)."""
+        return not self.stub_bindings
+
+
+def load_matrix(path: Path, *, reference: Basket) -> Matrix:
+    """Read, expand and validate a matrix. Every refusal here happens before any spend."""
+    document = read_document(path)
+    built = tuple(
+        Candidate(candidate_id=str(entry["id"]), basket=_basket_for(entry, reference))
+        for entry in expand(document)
+    )
+    seen = [candidate.candidate_id for candidate in built]
+    if len(set(seen)) != len(seen):
+        raise ConfigError(f"{path} expands to duplicate candidate ids: {sorted(set(seen))}")
+    return Matrix(candidates=built, on_fallback=policy_of(document), source=path)
+
+
+def _basket_for(entry: Mapping[str, Any], reference: Basket) -> Basket:
+    """The reference basket with this candidate's panel, through the bot's own validation.
+
+    `model_validate` rather than a constructor, so a candidate is refused by exactly the rules the
+    bot would refuse it by: unresolvable bindings, a repeated fallback, a majority above 1, an
+    over-long instruction (§7.2).
+    """
+    document = reference.model_dump(mode="json")
+    document["panel"] = _panel_for(entry)
+    if "decision_mode" in entry:
+        document["decision_mode"] = entry["decision_mode"]
+    # A challenger belongs to the bot's shadow comparison (ADR 0018), not to a sweep: every
+    # candidate here is judged in its own right, so a challenger inherited from the reference
+    # basket would deliberate a second panel nothing reads and bill it to this run.
+    document.pop("shadow_panel", None)
+    try:
+        return Basket.model_validate(document)
+    except ValueError as error:
+        raise ConfigError(
+            f"candidate {entry.get('id')!r} is not a valid basket: {error}"
+        ) from error
+
+
+def _panel_for(entry: Mapping[str, Any]) -> dict[str, Any]:
+    declared = entry.get("providers", ["stub"])
+    panel: dict[str, Any] = {
+        "panel_id": str(entry["id"]),
+        "providers": [preset(provider_id).model_dump(mode="json") for provider_id in declared],
+        "seats": [dict(seat) for seat in entry.get("seats", ())],
+    }
+    for field in (
+        "protocol",
+        "max_rounds",
+        "qualified_majority",
+        "max_abstain_fraction",
+        "max_cost_usd_per_cycle",
+    ):
+        if field in entry:
+            panel[field] = entry[field]
+    return panel
+
+
+def unreachable(matrix: Matrix, environ: Mapping[str, str] | None = None) -> tuple[str, ...]:
+    """Endpoints a candidate declares whose key is absent, as printable findings.
+
+    `reach_of` is the bot's single rule for the question and is imported rather than restated
+    (§2.4). What differs here is the *threshold*: any missing key at all, not merely a silenced
+    seat, because a partly-reachable seat is one that will answer on its backup — and §7.7 says
+    that is not a measurement.
+    """
+    findings: list[str] = []
+    for candidate in matrix.candidates:
+        reach = reach_of(candidate.panel, environ)
+        findings += [f"{candidate.candidate_id}: {missing}" for missing in reach.missing]
+    return tuple(findings)
+
+
+def require_reachable(matrix: Matrix, environ: Mapping[str, str] | None = None) -> None:
+    """Refuse an evaluation whose providers cannot be reached (§7.2).
+
+    A plumbing check is exempt: the stub has no endpoint and no key, so there is nothing to miss.
+    """
+    if not matrix.is_evaluation:
+        return
+    missing = unreachable(matrix, environ)
+    if missing:
+        raise ConfigError(
+            "this matrix cannot be evaluated — an endpoint it declares has no key, so a seat "
+            "would answer on its backup and measure a panel that was never configured: "
+            + "; ".join(missing)
+        )
