@@ -25,9 +25,13 @@ from collections.abc import Iterable, Sequence
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
+from typing import Final
 
+from decision_lab.compare import Agreement, Ranked
+from decision_lab.sampling import Sample
 from decision_lab.scoring import RegimeMetrics, ScoringParams
 from decision_lab.seats import FINAL, ROUND_ZERO, SeatMetrics, rounds_are_identical
+from tradebot.core.money import ZERO
 from tradebot.core.schema import DomainModel, Money, UtcDatetime
 from tradebot.validation.backtest import BANNER
 
@@ -45,6 +49,23 @@ NEWS_BLIND = (
     '"no sources configured". A shock block therefore measures the panel\'s reaction to a violent '
     "price move rather than to the reporting of an event."
 )
+
+#: §7.2. A run in which any candidate bound the offline stub measured canned JSON. Rendered
+#: unconditionally and above the identity block, exactly as the contamination banner is — a
+#: reader must meet it before they meet a number.
+PLUMBING_CHECK: Final = (
+    "**PLUMBING CHECK — NOT AN EVALUATION.** At least one candidate in this run binds the "
+    "offline stub, whose votes are drawn from a fixed catalogue. Every table below exercises the "
+    "sweep, the scoring and this page; none of it measures any model's judgement. Re-run with a "
+    "matrix bound to real providers to learn something."
+)
+
+
+class CandidateSeats(DomainModel):
+    """§9.7's tables, one set per candidate — a seat is only comparable within its own panel."""
+
+    candidate_id: str
+    seats: tuple[SeatMetrics, ...] = ()
 
 
 class LabReport(DomainModel):
@@ -70,6 +91,24 @@ class LabReport(DomainModel):
     regimes: tuple[RegimeMetrics, ...] = ()
     seats: tuple[SeatMetrics, ...] = ()
 
+    # --- The sweep (§7, §9.6). All empty on a reference-pass report, which then renders exactly
+    # as it did in slice B: one command, one rendering path (§14).
+    plumbing_check: bool = False
+    matrix_digest: str = ""
+    matrix_source: str = ""
+    on_fallback: str = ""
+    sweep_status: str = ""
+    halted_on: str = ""
+    sample: Sample | None = None
+    budget_usd: Money = ZERO
+    spent_usd: Money = ZERO
+    #: Cycles dropped because a substitute model answered (§7.7). Reported beside the scored
+    #: count, never instead of it.
+    contaminated: int = 0
+    ranking: tuple[Ranked, ...] = ()
+    agreement: tuple[Agreement, ...] = ()
+    candidate_seats: tuple[CandidateSeats, ...] = ()
+
 
 def report_markdown(report: LabReport) -> str:
     sections = [
@@ -79,11 +118,23 @@ def report_markdown(report: LabReport) -> str:
         "",
         DISCLAIMER,
     ]
+    if report.plumbing_check:
+        sections += ["", PLUMBING_CHECK]
     if report.news_blind:
         sections += ["", NEWS_BLIND]
+    sections += ["", _identity(report)]
+    if report.ranking:
+        sections += [
+            "",
+            "## Candidates, by regime",
+            "",
+            _ranking_table(report.ranking),
+            "",
+            _agreement_table(report.agreement),
+            "",
+            _candidate_seat_tables(report.candidate_seats),
+        ]
     sections += [
-        "",
-        _identity(report),
         "",
         "## Panel, by regime",
         "",
@@ -99,7 +150,7 @@ def report_markdown(report: LabReport) -> str:
 
 
 def _identity(report: LabReport) -> str:
-    rows = [
+    rows: list[tuple[str, str]] = [
         ("generated", _stamp(report.generated_at)),
         ("corpus", report.corpus_id),
         ("dataset", f"{report.dataset_directory} (`{report.dataset_digest}`)"),
@@ -118,6 +169,40 @@ def _identity(report: LabReport) -> str:
         ("named windows", ", ".join(report.named_windows) or "none"),
         ("starting equity", str(report.start_equity)),
     ]
+    # §7, §9.6: a sweep's own provenance, appended rather than interleaved — a reference-pass
+    # report (matrix_digest unset) keeps the rows above exactly as slice B rendered them.
+    if report.matrix_digest:
+        rows += [
+            ("matrix", report.matrix_digest),
+            ("matrix source", report.matrix_source),
+            ("on_fallback", report.on_fallback),
+            ("sweep status", report.sweep_status or "ok"),
+            ("budget", str(report.budget_usd)),
+            ("spent", str(report.spent_usd)),
+        ]
+        if report.sample is not None:
+            rows.append(("sample seed", str(report.sample.seed)))
+            rows.append(
+                (
+                    "sample",
+                    "every entry"
+                    if report.sample.full
+                    else ", ".join(
+                        f"{name} {count}/{report.sample.available.get(name, count)}"
+                        for name, count in sorted(report.sample.selected.items())
+                    ),
+                )
+            )
+        if report.contaminated:
+            rows.append(
+                (
+                    "dropped",
+                    f"{report.contaminated} cycle(s) — a substitute model answered, so they "
+                    "measure a panel that was never configured (§7.7)",
+                )
+            )
+        if report.halted_on:
+            rows.append(("halted on", report.halted_on))
     return "## Experiment\n\n" + _table(("", ""), [[label, value] for label, value in rows])
 
 
@@ -224,6 +309,72 @@ def _seat_tables(seats: Sequence[SeatMetrics]) -> str:
             "shown rather than the same numbers twice." + note
         )
     return _table(headers, rows) + note
+
+
+def _ranking_table(rows: Sequence[Ranked]) -> str:
+    headers = (
+        "regime",
+        "candidate",
+        "scored",
+        "accuracy",
+        "action rate",
+        "precision on action",
+        "conviction gap",
+        "regret/decision",
+        "degraded",
+        "$/scored",
+    )
+    body = [
+        [
+            row.regime,
+            row.candidate_id,
+            str(row.scored),
+            _pct(row.accuracy),
+            _pct(row.action_rate),
+            _pct(row.precision_on_action),
+            _num(row.mean_conviction_gap),
+            _num(row.regret_per_decision),
+            _pct(row.degradation_rate),
+            _num(row.cost_per_scored),
+        ]
+        for row in rows
+    ]
+    return _table(headers, body) + (
+        "\n\nOrdered by accuracy within each regime. **Read `SHOCK_DOWN` first**: a long-only "
+        "system's worst outcome is not a missed rally, and a candidate that ranks first in "
+        "`NORMAL` and last in `SHOCK_DOWN` is not the safer panel."
+    )
+
+
+def _agreement_table(rows: Sequence[Agreement]) -> str:
+    if not rows:
+        return "Only one candidate ran, so there is nothing to compare it against."
+    body = [
+        [
+            row.regime,
+            row.left,
+            row.right,
+            str(row.compared),
+            _pct(row.rate),
+            str(row.tradable_divergences),
+        ]
+        for row in rows
+    ]
+    return (
+        "### Agreement\n\nPairwise, per regime. **Two candidates agreeing 98% of the time are "
+        "one experiment run twice** — and paying for both buys one answer. `tradable divergence` "
+        "is the disagreement that moves money: the cycles where exactly one of them asked for an "
+        "order.\n\n"
+        + _table(("regime", "left", "right", "compared", "agreement", "tradable divergence"), body)
+    )
+
+
+def _candidate_seat_tables(blocks: Sequence[CandidateSeats]) -> str:
+    if not blocks:
+        return ""
+    return "\n\n".join(
+        f"### Seats — {block.candidate_id}\n\n{_seat_tables(block.seats)}" for block in blocks
+    )
 
 
 def _table(headers: Sequence[str], rows: Iterable[Sequence[str]]) -> str:
