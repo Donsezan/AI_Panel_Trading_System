@@ -179,10 +179,26 @@ class Candidate:
 
     @property
     def panel_digest(self) -> str:
-        """Identity of what is being measured. The §7.4 cache key's second half."""
-        return hashlib.blake2s(
-            canonical_json(self.panel).encode("utf-8"), digest_size=16
-        ).hexdigest()
+        """Identity of what determines this candidate's *answer*. The §7.4 cache key's second
+        half, so it must cover everything that can change what a deliberation produces.
+
+        That is `panel` **and** `basket.decision_mode` — not `panel` alone. §7.1 lists
+        `decision_mode` as one of the four axes a matrix may vary, but it is a field of `Basket`
+        (`tradebot/core/config.py`), not of `PanelConfig`, and `DecisionEngine.deliberate` reads
+        `basket.decision_mode` to choose between `_per_asset` and `_basket` — two different code
+        paths that run the debate protocol differently and can answer differently for the same
+        panel. Leaving it out of the digest let two candidates that varied only on
+        `decision_mode` collide on one §7.4 cache key: the second was served the first's rows
+        verbatim, cost nothing, and the agreement matrix reported "100% agreement" for what was
+        actually a candidate that was never evaluated.
+
+        Everything else about `self.basket` — instruments, risk_policy, schedule, and so on — is
+        deliberately excluded: `_basket_for` copies those verbatim from the reference basket for
+        every candidate in a matrix, so they never differ and hashing them would buy nothing but
+        an unearned cache miss whenever the reference basket itself changes.
+        """
+        payload = f"{canonical_json(self.panel)}|{self.basket.decision_mode.value}"
+        return hashlib.blake2s(payload.encode("utf-8"), digest_size=16).hexdigest()
 
     @property
     def stub_bindings(self) -> tuple[str, ...]:
@@ -213,13 +229,16 @@ class Matrix:
 
     @property
     def matrix_digest(self) -> str:
-        """§7.1: identity of the fully expanded set, so changing one prompt is a new matrix.
+        """§7.1: identity of the fully expanded candidate *set*, so changing one prompt is a new
+        matrix — and a hand-reordered TOML declaring the same candidates is not: the pairs are
+        sorted before hashing, so declaration order cannot mint a second digest for one set (and,
+        through `sweep.latest_meta`'s ambiguity refusal, silently hide a report's own sweep).
 
         `on_fallback` is deliberately not in it — it changes when a run stops, never what a run
         produces (§7.7), and a digest that split on it would show one experiment as two.
         """
-        payload = "|".join(f"{c.candidate_id}:{c.panel_digest}" for c in self.candidates)
-        return hashlib.blake2s(payload.encode("utf-8"), digest_size=16).hexdigest()
+        pairs = sorted(f"{c.candidate_id}:{c.panel_digest}" for c in self.candidates)
+        return hashlib.blake2s("|".join(pairs).encode("utf-8"), digest_size=16).hexdigest()
 
     @property
     def stub_bindings(self) -> tuple[str, ...]:

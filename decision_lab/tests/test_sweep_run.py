@@ -56,6 +56,19 @@ class ScriptedEngine:
         return answer
 
 
+class TrackingEngine(ScriptedEngine):
+    """A `ScriptedEngine` that also implements `sweep._ClosesResources`, so `run` closes it —
+    the real `_PooledEngine` `engine_from_pool` builds does too; this stand-in isolates whether
+    `run` actually calls `aclose` from whether `ProviderPool.close` itself works (finding 5)."""
+
+    def __init__(self, outcomes: list[PanelOutcome | Exception]) -> None:
+        super().__init__(outcomes)
+        self.closed = False
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
 def _plain(provider_id: str = "stub", model: str = "varied-technical") -> PanelOutcome:
     seat = response(provider_id, model, seat_id="technical")
     return PanelOutcome(
@@ -195,6 +208,29 @@ async def test_only_the_sampled_entries_are_paid_for(tmp_path: Path) -> None:
     assert engine.calls == 2
 
 
+def test_sweep_digests_and_latest_meta_are_empty_when_nothing_ran(tmp_path: Path) -> None:
+    assert sweep.sweep_digests("corpus-x", workspace=tmp_path) == ()
+    assert sweep.latest_meta("corpus-x", workspace=tmp_path) is None
+
+
+async def test_latest_meta_refuses_to_guess_between_two_sweeps(tmp_path: Path) -> None:
+    """finding 4: `None` here used to be indistinguishable from "nothing ran" — `sweep_digests`
+    is what lets `report` say which two it found rather than silently rendering nothing."""
+    corpus = corpus_with_entries(count=1, as_of=AS_OF)
+    matrix_a = matrix_of(tmp_path / "a")
+    matrix_b = matrix_of(tmp_path / "b", MATRIX.replace('id = "baseline"', 'id = "other"'))
+
+    result_a = await _run(corpus, matrix_a, tmp_path, ScriptedEngine([]))
+    sweep.write_meta(result_a, workspace=tmp_path)
+    result_b = await _run(corpus, matrix_b, tmp_path, ScriptedEngine([]))
+    sweep.write_meta(result_b, workspace=tmp_path)
+
+    assert sweep.latest_meta(corpus.meta.corpus_id, workspace=tmp_path) is None
+    assert sweep.sweep_digests(corpus.meta.corpus_id, workspace=tmp_path) == tuple(
+        sorted((result_a.matrix_digest, result_b.matrix_digest))
+    )
+
+
 async def test_the_meta_round_trips_and_records_the_run_kind(tmp_path: Path) -> None:
     corpus, matrix = corpus_with_entries(count=2, as_of=AS_OF), matrix_of(tmp_path)
 
@@ -239,6 +275,56 @@ async def test_an_errored_row_is_never_cached_and_is_re_attempted(tmp_path: Path
     assert engine.calls == 3, "the errored entry was retried, not skipped as already-done"
     assert second.failed == 0
     assert kept["c1"].error == "", "the retry succeeded and its answer is what is kept"
+
+
+async def test_every_candidates_engine_is_closed_once_it_is_done(tmp_path: Path) -> None:
+    """finding 5: `engine_from_pool` used to build one `ProviderPool` — one HTTP client — per
+    candidate and never release it. `run` must close whatever it built for a candidate once that
+    candidate's entries are done, before moving to the next one."""
+    corpus = corpus_with_entries(count=1, as_of=AS_OF)
+    matrix = matrix_of(tmp_path, MATRIX + '\n[expand]\ndecision_mode = ["per_asset", "basket"]\n')
+    engines = [TrackingEngine([]), TrackingEngine([])]
+    remaining = iter(engines)
+
+    result = await sweep.run(
+        corpus,
+        matrix,
+        sample=sample_of(corpus),
+        clock=ManualClock(AS_OF),
+        budget_usd=Decimal(1),
+        workspace=tmp_path,
+        engine_for=lambda _: next(remaining),
+    )
+
+    assert result.status is sweep.SweepStatus.OK
+    assert all(engine.closed for engine in engines), "every candidate's engine must be closed"
+
+
+async def test_the_engine_is_closed_even_when_the_sweep_halts(tmp_path: Path) -> None:
+    """finding 5: a halt must not skip cleanup — the `finally` around the candidate loop runs
+    whether the candidate finished normally or the sweep stopped partway through it."""
+    corpus, matrix = corpus_with_entries(count=4, as_of=AS_OF), matrix_of(tmp_path)
+    engine = TrackingEngine([_plain(), _plain("stub", "varied-news")])
+
+    result = await _run(corpus, matrix, tmp_path, engine)
+
+    assert result.status is sweep.SweepStatus.HALTED_FALLBACK
+    assert engine.closed is True
+
+
+async def test_a_pooled_engine_for_an_all_stub_panel_closes_without_a_client(
+    tmp_path: Path,
+) -> None:
+    """finding 5's own caveat: `ProviderPool.owns_client` is False for an all-stub panel (no
+    socket was ever opened), so closing it must be free, must not raise, and must not need a
+    network — offline tests that hit the real `engine_from_pool` must keep working unmodified."""
+    matrix = matrix_of(tmp_path)
+    build = sweep.engine_from_pool(ManualClock(AS_OF))
+    engine = build(matrix.candidates[0])
+
+    assert isinstance(engine, sweep._ClosesResources)
+    await engine.aclose()
+    await engine.aclose()  # idempotent: a second close must not raise either
 
 
 async def test_a_second_run_after_a_fallback_halt_re_evaluates_the_dirty_entry(

@@ -14,12 +14,19 @@ Rows are never deleted by the tool. `--prune` is an operator act naming what it 
 spirit of the bot's own rule that deletion is the one irreversible step (ADR 0028).
 
 Failure semantics: an absent registry reads as no runs, never as an error. Recording rewrites the
-whole file, which is safe because a sweep is a single process and nothing else holds it open.
+whole file — safe against a concurrent reader or writer because a sweep is a single process and
+nothing else holds it open, and safe against a **crash mid-write** because the rewrite lands in a
+temporary file in the same directory first and is swapped into place with `os.replace`, atomic on
+both Windows and POSIX. Without that, a process killed between the write and the close leaves a
+truncated final line, and `read_all`'s `model_validate_json` then raises on every future `sweep`
+and `report` until someone hand-edits the file back to valid JSON.
 """
 
 from __future__ import annotations
 
 import hashlib
+import os
+import tempfile
 from pathlib import Path
 from typing import Final
 
@@ -102,7 +109,14 @@ def read_all(*, workspace: Path | None = None) -> tuple[RunRow, ...]:
 
 
 def record(row: RunRow, *, workspace: Path | None = None) -> None:
-    """Append, or replace the row with this identity in place (§11)."""
+    """Append, or replace the row with this identity in place (§11).
+
+    Written to a temporary file in the registry's own directory, then swapped in with
+    `os.replace` — atomic on both Windows and POSIX, so a process dying mid-write leaves the file
+    `read_all` already trusts untouched rather than truncated on its final line (see the module
+    docstring). The temp file is on the same filesystem by construction (`dir=path.parent`),
+    which is what makes the replace atomic rather than a copy that could itself be interrupted.
+    """
     stamped = row.model_copy(update={"run_id": row.identity})
     existing = list(read_all(workspace=workspace))
     for index, present in enumerate(existing):
@@ -114,6 +128,15 @@ def record(row: RunRow, *, workspace: Path | None = None) -> None:
 
     path = registry_path(workspace=workspace)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        "\n".join(entry.model_dump_json() for entry in existing) + "\n", encoding="utf-8"
+    payload = "\n".join(entry.model_dump_json() for entry in existing) + "\n"
+    descriptor, tmp_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{REGISTRY_FILE}.", suffix=".tmp"
     )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+        tmp_path.replace(path)  # `Path.replace` is `os.replace`: atomic on Windows and POSIX
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise

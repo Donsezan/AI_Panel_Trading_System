@@ -108,6 +108,10 @@ class LabReport(DomainModel):
     ranking: tuple[Ranked, ...] = ()
     agreement: tuple[Agreement, ...] = ()
     candidate_seats: tuple[CandidateSeats, ...] = ()
+    #: Candidates the sweep never reached at all — a halt stopped it first (finding 3). Kept out
+    #: of `ranking`/`agreement` rather than folded in at 0.0% accuracy, which would read as
+    #: measured and worst rather than not measured.
+    not_measured_candidates: tuple[str, ...] = ()
 
 
 def report_markdown(report: LabReport) -> str:
@@ -123,12 +127,12 @@ def report_markdown(report: LabReport) -> str:
     if report.news_blind:
         sections += ["", NEWS_BLIND]
     sections += ["", _identity(report)]
-    if report.ranking:
+    if report.ranking or report.not_measured_candidates:
         sections += [
             "",
             "## Candidates, by regime",
             "",
-            _ranking_table(report.ranking),
+            _ranking_table(report.ranking) + _not_measured_note(report.not_measured_candidates),
             "",
             _agreement_table(report.agreement),
             "",
@@ -343,6 +347,18 @@ def _ranking_table(rows: Sequence[Ranked]) -> str:
         "\n\nOrdered by accuracy within each regime. **Read `SHOCK_DOWN` first**: a long-only "
         "system's worst outcome is not a missed rally, and a candidate that ranks first in "
         "`NORMAL` and last in `SHOCK_DOWN` is not the safer panel."
+    )
+
+
+def _not_measured_note(candidate_ids: Sequence[str]) -> str:
+    """A candidate a halt never reached (finding 3) is absent from the table above rather than
+    shown at 0.0% accuracy, which would read as measured and worst — not measured at all."""
+    if not candidate_ids:
+        return ""
+    return (
+        "\n\n**Not measured:** " + ", ".join(candidate_ids) + " — the sweep halted before "
+        "reaching " + ("this candidate" if len(candidate_ids) == 1 else "these candidates") + ". "
+        "Left out of the table and the agreement matrix above rather than scored as 0%."
     )
 
 

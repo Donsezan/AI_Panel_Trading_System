@@ -374,11 +374,18 @@ async def sweep_command(args: argparse.Namespace) -> int:
     regime_index = (await rg.index_dataset(dataset, timeframe)).with_windows(
         rg.load_windows(args.regimes or rg.DEFAULT_REGIMES_TOML)
     )
+    pinned = _pinned_calibration(data_dir)
     sample = sampling.stratified(
         corpus,
         regimes=regime_index,
-        reference_instrument=dataset.instruments[0].key,
-        pinned=_pinned_days(data_dir),
+        # §7.3: the stratum is the regime of the instrument §4.5 already drew the day set from —
+        # the same one `dataset days --reference-instrument` recorded on the pinned set — not
+        # necessarily `dataset.instruments[0]`. Falling back to the dataset's first instrument
+        # only when nothing is pinned yet, since a sweep does not itself require a day set (§15).
+        reference_instrument=(
+            pinned.reference_instrument if pinned is not None else dataset.instruments[0].key
+        ),
+        pinned=pinned.all_days if pinned is not None else (),
         seed=args.seed,
         full=args.full,
     )
@@ -434,13 +441,17 @@ def _registry_row(
     )
 
 
-def _pinned_days(data_dir: Path) -> tuple[date, ...]:
-    """The pinned set if there is one. A sweep does not require it — §15 requires it of a
-    *calibration* — but when it exists those days are taken whole (§7.3)."""
+def _pinned_calibration(data_dir: Path) -> cday.CalibrationDays | None:
+    """The pinned day set if there is one. A sweep does not require it — §15 requires it of a
+    *calibration* — but when it exists those days are taken whole (§7.3), and its own
+    `reference_instrument` is the sample's stratum, not necessarily the dataset's first (finding
+    6): §4.5 already drew the day set from one instrument, and the sample must agree with it on
+    which instrument decides "shock", or the two artifacts would be answering for two different
+    definitions of the same word."""
     try:
-        return cday.require_pinned(data_dir).all_days
+        return cday.require_pinned(data_dir)
     except ConfigError:
-        return ()
+        return None
 
 
 def _moment(value: str | None) -> datetime | None:
@@ -480,13 +491,55 @@ async def report(args: argparse.Namespace) -> int:
     result = (
         sw.read_meta(meta.corpus_id, args.matrix) if args.matrix else sw.latest_meta(meta.corpus_id)
     )
+    if result is None and not args.matrix:
+        # finding 4: `latest_meta` returns `None` both when nothing ran and when two sweeps did
+        # and neither was named — indistinguishable to the reader unless `report` says which. Not
+        # a refusal: the reference pass below still renders, exactly as it would with no sweep.
+        digests = sw.sweep_digests(meta.corpus_id)
+        if len(digests) > 1:
+            logger.warning(
+                "more than one sweep has run under this corpus; pass --matrix to pick one — "
+                "rendering the reference pass only until then",
+                extra={"matrix_digests": list(digests)},
+            )
     ranking: tuple[cmp.Ranked, ...] = ()
     agreement: tuple[cmp.Agreement, ...] = ()
     candidate_seats: tuple[rd.CandidateSeats, ...] = ()
     by_candidate: dict[str, tuple[sc.ScoredDecision, ...]] = {}
+    not_measured: list[str] = []
     matrix: cd.Matrix | None = None
     if result is not None:
-        matrix = cd.load_matrix(Path(result.matrix_source), reference=meta.reference_basket)
+        # finding 2: the matrix is reloaded from the path the sweep recorded, and that file can
+        # have moved, gone missing, or simply changed since — one edited prompt is enough to mint
+        # a new `matrix_digest` (§7.1). Trusting the reload blindly would stamp the registry row
+        # below with the NEW digest while the rows read out from disk (keyed by the OLD digest,
+        # a few lines down) are the OLD experiment's, and any candidate the edit renamed would
+        # silently read zero rows instead of refusing. Both the missing-file and the
+        # changed-content cases are the same refusal: the recorded matrix can no longer be
+        # trusted to describe what actually ran.
+        try:
+            matrix = cd.load_matrix(Path(result.matrix_source), reference=meta.reference_basket)
+        except ConfigError as error:
+            logger.error(
+                "report refused; the sweep's matrix could not be reloaded",
+                extra={
+                    "matrix_source": result.matrix_source,
+                    "recorded_digest": result.matrix_digest,
+                    "reason": str(error),
+                },
+            )
+            return EXIT_CANDIDATE
+        if matrix.matrix_digest != result.matrix_digest:
+            logger.error(
+                "report refused; the matrix on disk no longer matches the one this sweep ran",
+                extra={
+                    "matrix_source": result.matrix_source,
+                    "recorded_digest": result.matrix_digest,
+                    "reloaded_digest": matrix.matrix_digest,
+                },
+            )
+            return EXIT_CANDIDATE
+
         blocks = []
         for candidate in matrix.candidates:
             rows = sw.read_rows(
@@ -496,13 +549,21 @@ async def report(args: argparse.Namespace) -> int:
             candidate_scored = sc.score_records(
                 records, index=index, regimes=regime_index, params=params
             )
-            by_candidate[candidate.candidate_id] = candidate_scored
             blocks.append(
                 rd.CandidateSeats(
                     candidate_id=candidate.candidate_id,
                     seats=st.score_seats(records, candidate_scored, panel=candidate.panel),
                 )
             )
+            if not rows:
+                # finding 3: no row was ever recorded for this candidate — a halt never reached
+                # it, not "it scored zero". `by_regime(())` would give three legitimate-looking
+                # zero rows and `_ranking_table` would sort it in as a peer at 0.0% accuracy,
+                # last: measured and worst, when it was never measured at all. Kept out of the
+                # cross-candidate tables entirely and named on the page instead.
+                not_measured.append(candidate.candidate_id)
+                continue
+            by_candidate[candidate.candidate_id] = candidate_scored
         ranking = cmp.ranking(by_candidate)
         agreement = cmp.agreement(by_candidate)
         candidate_seats = tuple(blocks)
@@ -540,6 +601,7 @@ async def report(args: argparse.Namespace) -> int:
         ranking=ranking,
         agreement=agreement,
         candidate_seats=candidate_seats,
+        not_measured_candidates=tuple(not_measured),
     )
     out = args.out or reports_dir() / f"decision-lab-{meta.corpus_id}.md"
     rd.write_report(built, out)

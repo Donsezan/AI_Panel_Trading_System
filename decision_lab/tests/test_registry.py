@@ -11,6 +11,8 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
+import pytest
+
 from decision_lab import registry
 
 AT = datetime(2026, 8, 30, tzinfo=UTC)
@@ -95,3 +97,26 @@ def test_rows_keep_the_order_they_were_first_written_in(tmp_path: Path) -> None:
     registry.record(row(candidate_id="a", scored=9), workspace=tmp_path)
 
     assert [r.candidate_id for r in registry.read_all(workspace=tmp_path)] == ["a", "b"]
+
+
+def test_a_failed_write_never_corrupts_the_registry_already_on_disk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """finding 8: `record` used to rewrite `registry.jsonl` in place with `write_text` — a process
+    dying mid-write left a truncated final line that `read_all` would then raise on forever.
+    Writing to a temp file and swapping it in with `Path.replace` (which is `os.replace`) means a
+    failure before the swap must leave the file `read_all` already trusts completely untouched,
+    and must not leave a stray temp file behind either."""
+    registry.record(row(candidate_id="a"), workspace=tmp_path)
+
+    def boom(self: Path, target: object) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(Path, "replace", boom)
+
+    with pytest.raises(OSError):
+        registry.record(row(candidate_id="b"), workspace=tmp_path)
+
+    rows = registry.read_all(workspace=tmp_path)
+    assert [r.candidate_id for r in rows] == ["a"], "the original file must survive a failed swap"
+    assert list(tmp_path.glob("*.tmp")) == [], "a failed write must not leave a temp file behind"

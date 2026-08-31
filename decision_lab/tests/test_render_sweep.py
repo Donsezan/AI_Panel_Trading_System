@@ -140,3 +140,23 @@ def test_one_candidate_says_so_rather_than_printing_an_empty_matrix() -> None:
     text = rd.report_markdown(report(ranking=(ranked("a"),), agreement=()))
 
     assert "nothing to compare it against" in text
+
+
+def test_a_candidate_a_halt_never_reached_is_not_ranked_as_a_scored_zero() -> None:
+    """finding 3: `by_regime(())`'s legitimate zero row must never stand in for "not measured" —
+    that reads as measured and worst rather than not measured at all."""
+    text = rd.report_markdown(
+        report(ranking=(ranked("a", accuracy="0.6"),), not_measured_candidates=("b",))
+    )
+
+    assert "| NORMAL | b |" not in text, "an unreached candidate must never appear as a ranked row"
+    assert "**Not measured:** b" in text
+
+
+def test_the_candidates_section_appears_even_with_nothing_ranked() -> None:
+    """Every candidate in the matrix halted before it ran: `ranking` is empty, but the reader
+    still needs to be told the sweep produced nothing rather than the section vanishing."""
+    text = rd.report_markdown(report(not_measured_candidates=("a", "b")))
+
+    assert "## Candidates, by regime" in text
+    assert "**Not measured:** a, b" in text

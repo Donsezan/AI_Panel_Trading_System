@@ -29,7 +29,7 @@ from collections.abc import Callable, Mapping, Sequence
 from decimal import Decimal
 from enum import StrEnum
 from pathlib import Path
-from typing import Final, Protocol
+from typing import Final, Protocol, runtime_checkable
 
 from decision_lab.candidates import Candidate, Matrix, SweepPolicy
 from decision_lab.corpus import Corpus, CorpusEntry, corpus_dir
@@ -43,7 +43,7 @@ from tradebot.core.money import ZERO
 from tradebot.core.schema import DomainModel, Money, UtcDatetime
 from tradebot.core.snapshot import ContextSnapshot
 from tradebot.decision.engine import DecisionEngine
-from tradebot.decision.providers.registry import build_providers
+from tradebot.decision.providers.registry import ProviderPool, build_providers
 from tradebot.decision.seat import SeatRunner
 
 logger = get_logger("decision_lab.sweep")
@@ -211,16 +211,51 @@ class DeliberatingEngine(Protocol):
     async def deliberate(self, snapshot: ContextSnapshot, basket: Basket) -> PanelOutcome: ...
 
 
+@runtime_checkable
+class _ClosesResources(Protocol):
+    """An engine that opened something needing release. Not every `DeliberatingEngine` holds one
+    — the scripted stand-ins the tests inject do not — so `run` closes only what implements this,
+    checked with `isinstance` at runtime rather than assumed of every engine."""
+
+    async def aclose(self) -> None: ...
+
+
+class _PooledEngine:
+    """A `DecisionEngine` bound to the `ProviderPool` that feeds it.
+
+    `ProviderPool.close`'s own docstring warns that a leaked client keeps the process alive after
+    a cycle — `engine_from_pool` used to build a fresh pool per candidate and never release it,
+    which meant every real sweep leaked one HTTP client per candidate. Wrapping the two together
+    is what lets `run` release the pool exactly when it is done with the candidate that opened it.
+    """
+
+    def __init__(self, engine: DecisionEngine, pool: ProviderPool) -> None:
+        self._engine = engine
+        self._pool = pool
+
+    async def deliberate(self, snapshot: ContextSnapshot, basket: Basket) -> PanelOutcome:
+        return await self._engine.deliberate(snapshot, basket)
+
+    async def aclose(self) -> None:
+        # A no-op for an all-stub panel: `owns_client` is False and `close` already checks
+        # `_client is not None`, so this costs nothing on the offline path the tests exercise.
+        await self._pool.close()
+
+
 #: How the loop obtains an engine for one candidate.
 EngineFor = Callable[[Candidate], DeliberatingEngine]
 
 
 def engine_from_pool(clock: Clock) -> EngineFor:
-    """The real engine: one provider pool per candidate, since panels declare their own."""
+    """The real engine: one provider pool per candidate, since panels declare their own.
+
+    Wrapped in `_PooledEngine` so `run` can close the pool once it is done with this candidate —
+    see that class's docstring for the leak this closes.
+    """
 
     def build(candidate: Candidate) -> DeliberatingEngine:
         pool = build_providers(candidate.panel.providers, clock)
-        return DecisionEngine(SeatRunner(pool.providers, clock))
+        return _PooledEngine(DecisionEngine(SeatRunner(pool.providers, clock)), pool)
 
     return build
 
@@ -258,63 +293,76 @@ async def run(
             workspace=workspace,
         )
         done = read_rows(path)
-        for entry in wanted:
-            # A clean row already bought needs nothing further. A contaminated or errored one
-            # holds no answer, so resuming past it would lock in a permanent hole and leave this
-            # candidate scored over a different set of entries than its rivals (§3) — it is
-            # re-attempted below exactly as if nothing had been recorded for it yet. Appending its
-            # new outcome, dirty or clean, is still right: the record that it happened is the
-            # point (§7.6), it is just not, by itself, a result.
-            prior = done.get(entry.cycle_id)
-            if prior is not None and not prior.contaminated and not prior.error:
-                continue
-
-            key = cache_key(entry.snapshot.digest, candidate.panel_digest)
-            hit = cache_read(corpus.meta.corpus_id, key, workspace=workspace)
-            if hit is not None:
-                row = hit.model_copy(update={"cycle_id": entry.cycle_id})
-                append_row(path, row)
-                if row.contaminated or row.error:
-                    # Fail closed even for a stale cache entry (one written before the cache
-                    # stopped accepting dirty rows, below): a failure reused from the cache is
-                    # still not an answer, so it must never be counted as a free clean reuse or
-                    # let the substitute policy go unconsulted (§7.7). Unreachable once every row
-                    # in the cache is clean by construction, but that is not a reason to leave a
-                    # path that would otherwise report a failure as a successful hit.
-                    result = _account_for(result, row)
-                    halted = _halt_if_contaminated(result, row, candidate, entry, matrix)
-                    if halted is not None:
-                        return halted
+        # `engine_from_pool` opens one `ProviderPool` — one HTTP client — per candidate. Wrapping
+        # the whole candidate in `try/finally` closes it once this candidate is done, on the halt
+        # and exception paths too (`return` inside a `try` still runs `finally` first) — not only
+        # on the happy path, which is what used to leak one client per candidate on every real
+        # sweep (`ProviderPool.close`'s own docstring: a leaked client keeps the process alive
+        # after a cycle). A no-op for the scripted engines the tests inject, which are not
+        # `_ClosesResources`, and for an all-stub panel, whose pool never opened a client at all.
+        try:
+            for entry in wanted:
+                # A clean row already bought needs nothing further. A contaminated or errored one
+                # holds no answer, so resuming past it would lock in a permanent hole and leave
+                # this candidate scored over a different set of entries than its rivals (§3) — it
+                # is re-attempted below exactly as if nothing had been recorded for it yet.
+                # Appending its new outcome, dirty or clean, is still right: the record that it
+                # happened is the point (§7.6), it is just not, by itself, a result.
+                prior = done.get(entry.cycle_id)
+                if prior is not None and not prior.contaminated and not prior.error:
                     continue
-                result = result.model_copy(update={"cached": result.cached + 1})
-                continue
 
-            if result.spent_usd >= budget_usd:
-                return _halt(
-                    result,
-                    SweepStatus.HALTED_BUDGET,
-                    f"the ${budget_usd} ceiling was reached at {candidate.candidate_id} "
-                    f"/ {entry.as_of.isoformat()}",
+                key = cache_key(entry.snapshot.digest, candidate.panel_digest)
+                hit = cache_read(corpus.meta.corpus_id, key, workspace=workspace)
+                if hit is not None:
+                    row = hit.model_copy(update={"cycle_id": entry.cycle_id})
+                    append_row(path, row)
+                    if row.contaminated or row.error:
+                        # Fail closed even for a stale cache entry (one written before the cache
+                        # stopped accepting dirty rows, below): a failure reused from the cache is
+                        # still not an answer, so it must never be counted as a free clean reuse or
+                        # let the substitute policy go unconsulted (§7.7). Unreachable once every
+                        # row in the cache is clean by construction, but that is not a reason to
+                        # leave a path that would otherwise report a failure as a successful hit.
+                        result = _account_for(result, row)
+                        halted = _halt_if_contaminated(result, row, candidate, entry, matrix)
+                        if halted is not None:
+                            return halted
+                        continue
+                    result = result.model_copy(update={"cached": result.cached + 1})
+                    continue
+
+                if result.spent_usd >= budget_usd:
+                    return _halt(
+                        result,
+                        SweepStatus.HALTED_BUDGET,
+                        f"the ${budget_usd} ceiling was reached at {candidate.candidate_id} "
+                        f"/ {entry.as_of.isoformat()}",
+                    )
+
+                row = await _evaluate(engine, candidate, entry)
+                append_row(path, row)
+                # §7.4: the cache stores answers, shared across every matrix that lands on the
+                # same (snapshot, panel) pair, and a failure is not an answer — caching a
+                # transient 429 or a one-off fallback would make the cheapest possible failure the
+                # most durable thing in the workspace, served to every future candidate that
+                # happens to match this key.
+                if not row.contaminated and not row.error:
+                    cache_write(corpus.meta.corpus_id, key, row, workspace=workspace)
+                result = result.model_copy(
+                    update={
+                        "evaluated": result.evaluated + 1,
+                        "spent_usd": result.spent_usd + row.cost_usd,
+                    }
                 )
-
-            row = await _evaluate(engine, candidate, entry)
-            append_row(path, row)
-            # §7.4: the cache stores answers, shared across every matrix that lands on the same
-            # (snapshot, panel) pair, and a failure is not an answer — caching a transient 429 or
-            # a one-off fallback would make the cheapest possible failure the most durable thing
-            # in the workspace, served to every future candidate that happens to match this key.
-            if not row.contaminated and not row.error:
-                cache_write(corpus.meta.corpus_id, key, row, workspace=workspace)
-            result = result.model_copy(
-                update={
-                    "evaluated": result.evaluated + 1,
-                    "spent_usd": result.spent_usd + row.cost_usd,
-                }
-            )
-            result = _account_for(result, row)  # failed / contaminated, wherever the row came from
-            halted = _halt_if_contaminated(result, row, candidate, entry, matrix)
-            if halted is not None:
-                return halted
+                # failed / contaminated, wherever the row came from
+                result = _account_for(result, row)
+                halted = _halt_if_contaminated(result, row, candidate, entry, matrix)
+                if halted is not None:
+                    return halted
+        finally:
+            if isinstance(engine, _ClosesResources):
+                await engine.aclose()
     return result
 
 
@@ -392,14 +440,33 @@ def read_meta(
     return SweepResult.model_validate_json(path.read_text(encoding="utf-8"))
 
 
+def sweep_digests(corpus_id: str, *, workspace: Path | None = None) -> tuple[str, ...]:
+    """Every `matrix_digest` with a sweep directory under this corpus, sorted for a stable list.
+
+    `latest_meta` needs the count to decide whether "the" sweep is unambiguous; `report` needs the
+    digests themselves when it is not, so an operator can be told what `--matrix` to pass instead
+    of being handed a page that silently rendered nothing (finding 4).
+    """
+    directory = corpus_dir(corpus_id, workspace=workspace)
+    if not directory.is_dir():
+        return ()
+    return tuple(
+        sorted(
+            found.parent.name.removeprefix("sweep-")
+            for found in directory.glob(f"sweep-*/{SWEEP_META}")
+        )
+    )
+
+
 def latest_meta(corpus_id: str, *, workspace: Path | None = None) -> SweepResult | None:
     """The one sweep under this corpus, or `None`. Refuses to guess between two (§14).
 
-    `report --matrix` is how a reader picks when more than one has run; choosing for them would
-    silently rank one experiment's candidates on another's page.
+    `None` alone is silent — it reads identically whether no sweep ever ran here or two did and
+    neither was named — so `report --matrix` is how a reader picks when more than one has run, and
+    `report` itself calls `sweep_digests` separately to say which digests it found rather than
+    letting the ambiguity render as an empty page (finding 4).
     """
-    directory = corpus_dir(corpus_id, workspace=workspace)
-    found = sorted(directory.glob(f"sweep-*/{SWEEP_META}")) if directory.is_dir() else []
-    if len(found) != 1:
+    digests = sweep_digests(corpus_id, workspace=workspace)
+    if len(digests) != 1:
         return None
-    return SweepResult.model_validate_json(found[0].read_text(encoding="utf-8"))
+    return read_meta(corpus_id, digests[0], workspace=workspace)

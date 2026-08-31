@@ -14,8 +14,10 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
+from decision_lab import candidates as cd
 from decision_lab import sweep
 from decision_lab.tests.factories import corpus_with_entries
+from decision_lab.tests.test_candidates import STUB_MATRIX, reference, write
 from tradebot.core.config import PanelConfig, ProviderBinding, SeatConfig
 from tradebot.core.decision import Decision, SeatResponse, SeatVote
 from tradebot.core.enums import Action, SizeHint
@@ -64,12 +66,34 @@ def row(**overrides: object) -> sweep.SweepRow:
     return sweep.SweepRow(**base)
 
 
-def test_the_cache_key_names_the_evidence_and_the_panel_only() -> None:
+def test_the_cache_key_is_a_deterministic_hash_of_its_two_arguments() -> None:
+    """This is all `cache_key` itself can be shown to do: it takes two already-computed digest
+    strings and combines them deterministically. It does **not** prove the key "names the
+    evidence and the panel only" — that property lives one layer up, in what feeds it
+    `panel_digest` (see `test_two_candidates_differing_only_in_decision_mode_get_different_
+    cache_keys` below, which is the test that used to carry this name and did not assert it)."""
     key = sweep.cache_key("snap-digest", "panel-digest")
 
     assert key == sweep.cache_key("snap-digest", "panel-digest")
     assert key != sweep.cache_key("snap-digest", "other-panel")
     assert key != sweep.cache_key("other-snap", "panel-digest")
+
+
+def test_two_candidates_differing_only_in_decision_mode_get_different_cache_keys(
+    tmp_path: Path,
+) -> None:
+    """CRITICAL finding: `decision_mode` is a `Basket` field (tradebot/core/config.py:604), not a
+    `PanelConfig` one, but §7.1 lists it as a matrix axis. A cache key built from `panel_digest`
+    alone would collide `X~decision_mode=per_asset` and `X~decision_mode=basket` on the same §7.4
+    key, so the second candidate is served the first's rows verbatim and never actually runs."""
+    text = STUB_MATRIX + '\n[expand]\ndecision_mode = ["per_asset", "basket"]\n'
+    matrix = cd.load_matrix(write(tmp_path, text), reference=reference())
+    per_asset, basket = matrix.candidates
+
+    key_a = sweep.cache_key("snap-digest", per_asset.panel_digest)
+    key_b = sweep.cache_key("snap-digest", basket.panel_digest)
+
+    assert key_a != key_b
 
 
 def test_a_cached_row_is_returned_without_a_second_call(tmp_path: Path) -> None:

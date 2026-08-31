@@ -195,3 +195,70 @@ def test_a_reworded_prompt_is_a_different_matrix(tmp_path: Path) -> None:
     )
 
     assert reworded.matrix_digest != base.matrix_digest
+
+
+def test_candidates_differing_only_in_decision_mode_get_different_panel_digests(
+    tmp_path: Path,
+) -> None:
+    """CRITICAL finding: `decision_mode` lives on `Basket`, not `PanelConfig`
+    (tradebot/core/config.py:604), but §7.1 lists it as a matrix axis and
+    `DecisionEngine.deliberate` reads `basket.decision_mode` to pick `_per_asset` vs `_basket` —
+    two paths that can answer differently for the same panel. A digest over `panel` alone would
+    collide the two candidates on one §7.4 cache key, so the second is served the first's rows
+    verbatim and is never actually evaluated."""
+    text = STUB_MATRIX + '\n[expand]\ndecision_mode = ["per_asset", "basket"]\n'
+    matrix = cd.load_matrix(write(tmp_path, text), reference=reference())
+
+    per_asset, basket = matrix.candidates
+    assert per_asset.basket.decision_mode.value == "per_asset"
+    assert basket.basket.decision_mode.value == "basket"
+    assert per_asset.panel_digest != basket.panel_digest
+
+
+def test_the_matrix_digest_does_not_depend_on_declaration_order(tmp_path: Path) -> None:
+    """§7.1: the digest is over the fully expanded candidate *set* — a hand-reordered TOML
+    declaring the same candidates must mint the same digest, or a report silently loses its own
+    sweep to `sweep.latest_meta`'s ambiguity refusal (finding 7)."""
+    forward = """
+[[candidates]]
+id = "a"
+
+  [[candidates.seats]]
+  seat_id = "trend"
+  role = "trend analyst"
+  provider_id = "stub"
+  model = "varied-technical"
+
+[[candidates]]
+id = "b"
+
+  [[candidates.seats]]
+  seat_id = "trend"
+  role = "trend analyst"
+  provider_id = "stub"
+  model = "varied-news"
+"""
+    reversed_ = """
+[[candidates]]
+id = "b"
+
+  [[candidates.seats]]
+  seat_id = "trend"
+  role = "trend analyst"
+  provider_id = "stub"
+  model = "varied-news"
+
+[[candidates]]
+id = "a"
+
+  [[candidates.seats]]
+  seat_id = "trend"
+  role = "trend analyst"
+  provider_id = "stub"
+  model = "varied-technical"
+"""
+    left = cd.load_matrix(write(tmp_path / "a", forward), reference=reference())
+    right = cd.load_matrix(write(tmp_path / "b", reversed_), reference=reference())
+
+    assert {c.candidate_id for c in left.candidates} == {c.candidate_id for c in right.candidates}
+    assert left.matrix_digest == right.matrix_digest
