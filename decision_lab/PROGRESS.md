@@ -15,12 +15,13 @@ Slice order and rationale: §18.
 |---|---|---|
 | **A** — integrity, day set, corpus | verified history + a frozen set of decision contexts | ✅ shipped |
 | **B** — regimes, scoring, per-seat, report | *how did this panel do, and which seat carried it* | ✅ shipped |
-| **C** — the sweep | *is a **different** panel right more often* — the stated goal | ⬜ not started |
+| **C** — the sweep | *is a **different** panel right more often* — the stated goal | ✅ shipped |
 | **D** — calibration + dashboard | normal day / shock day / six-month profit run | ⬜ not started |
 | **E** — news archive | shock days measure the *news*, not just the price move | ⬜ not started |
 
-**Two slices of five.** Everything that exists answers the one-configuration question. Comparing
-configurations — the thing the tool was built for — is slice C and is not built.
+**Three slices of five.** Comparing configurations — the thing the tool was built for — now runs:
+N candidates over one frozen corpus, ranked, with a pairwise agreement matrix and a per-candidate
+seat breakdown. D (calibration + dashboard) and E (news) are not built.
 
 ---
 
@@ -44,13 +45,13 @@ Result today: both 1h series 4368/4368 bars, zero holes. Corpus `8ac130d8…`, 5
 
 Result today: [reports/decision-lab-8ac130d8f2ed5650dff0dcb9f969d07e.md](reports/).
 
-## Slice C — the sweep ⬜
+## Slice C — the sweep ✅
 
-- [ ] `config/sweep.toml` — the candidate matrix, and its expansion cap
-- [ ] `candidates.py` — matrix → `PanelConfig` → `Basket`, validated *before* spend
-- [ ] `sweep.py` — N candidates over one corpus: cache, budget ceiling, resume
-- [ ] Cross-candidate tables (§9.6): ranking, agreement matrix
-- [ ] `registry.py` — keep every result, so two setups are compared rather than remembered
+- [x] `config/sweep.toml` — the candidate matrix, and its expansion cap
+- [x] `candidates.py` — matrix → `PanelConfig` → `Basket`, validated *before* spend
+- [x] `sweep.py` — N candidates over one corpus: cache, budget ceiling, resume
+- [x] Cross-candidate tables (§9.6): ranking, agreement matrix
+- [x] `registry.py` — keep every result, so two setups are compared rather than remembered
 
 ## Slice D — calibration and the dashboard ⬜
 
@@ -76,14 +77,18 @@ Result today: [reports/decision-lab-8ac130d8f2ed5650dff0dcb9f969d07e.md](reports
 .venv\Scripts\python.exe -m decision_lab dataset days   --data data\history
 .venv\Scripts\python.exe -m decision_lab corpus build --data data\history --every 8h --reference-panel sim
 .venv\Scripts\python.exe -m decision_lab report --corpus 8ac130d8f2ed5650dff0dcb9f969d07e
+.venv\Scripts\python.exe -m decision_lab sweep --corpus <id> --configs decision_lab\config\sweep-stub.toml --budget 1
+.venv\Scripts\python.exe -m decision_lab sweep --corpus <id> --budget 40   # needs OPENROUTER_API_KEY
 .\decision_lab\check.ps1
 ```
 
 ## Open items inside what already shipped
 
-- **No real panel has ever been scored.** Every pass so far ran on stub seats (`stub:varied-*`),
-  drawn from a JSON catalogue at `$0.0000`. The plumbing is proven end to end; the accuracy numbers
-  on the report measure a random draw, not judgement.
+- **No real panel has ever been scored, but it is now one command away.** `sweep --configs
+  decision_lab\config\sweep.toml` is a real measurement and needs `OPENROUTER_API_KEY`.
+  `sweep-stub.toml` remains a plumbing check — every report and registry row it produces is
+  stamped `PLUMBING CHECK — NOT AN EVALUATION`, so a stub run can never be mistaken for one that
+  measured judgement.
 - **Every report is `NEWS-BLIND`** until slice E. Shock blocks measure the reaction to a violent
   price move, not to the reporting of an event.
 - **Corpus `61721dba…` (4h) is a stale 67/1080-cycle pass** and is reused at its identity, never
@@ -93,5 +98,6 @@ Result today: [reports/decision-lab-8ac130d8f2ed5650dff0dcb9f969d07e.md](reports
 
 ## Next step when you pick this up
 
-Slice C. It is the stated goal, it needs no `tradebot` change, and it runs on the corpus that
-already exists.
+Slice D — calibration and the dashboard. The sweep the tool was built for now runs; what is
+missing is the three fixed scenarios that make a run *repeatable and comparable to a gate*, and
+somewhere to watch a long one land beside itself as it goes.
