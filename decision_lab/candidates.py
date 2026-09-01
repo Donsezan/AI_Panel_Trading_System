@@ -92,6 +92,7 @@ def expand(document: Mapping[str, Any]) -> tuple[dict[str, Any], ...]:
     axes = _axes(document)
     expanded: list[dict[str, Any]] = []
     for base in declared:
+        _require_prompt_axes_name_seats(base, axes)
         for combination in itertools.product(*(values for _, values in axes)):
             expanded.append(_apply(base, tuple(zip(axes, combination, strict=True)), library))
 
@@ -102,6 +103,29 @@ def expand(document: Mapping[str, Any]) -> tuple[dict[str, Any], ...]:
             "Raise `limit` in [expand] deliberately, or narrow an axis"
         )
     return tuple(expanded)
+
+
+def _require_prompt_axes_name_seats(
+    base: Mapping[str, Any],
+    axes: Sequence[tuple[tuple[str, str], Sequence[Any]]],
+) -> None:
+    """A `[expand] prompts.<seat_id>` axis that names no seat of this candidate is refused.
+
+    `_apply` varies the id suffix whether or not a seat matched, so a typo'd seat mints one
+    candidate per value whose seats are *byte-identical*. They then share a `panel_digest`, so the
+    §7.4 cache answers every one of them out of the first, the sweep spends nothing further, and
+    the §9.6 agreement matrix reports them at 100% — a misspelled seat reading as the finding
+    "this prompt makes no difference". Every other naming mistake in this file refuses before
+    spend; so does this one.
+    """
+    seats = {str(seat.get("seat_id")) for seat in base.get("seats", ())}
+    for (kind, name), _ in axes:
+        if kind == "prompt" and name not in seats:
+            known = ", ".join(sorted(seats)) or "none declared"
+            raise ConfigError(
+                f"[expand] prompts.{name} names no seat of candidate "
+                f"{str(base.get('id', 'candidate'))!r}; its seats are: {known}"
+            )
 
 
 def _axes(document: Mapping[str, Any]) -> tuple[tuple[tuple[str, str], Sequence[Any]], ...]:
@@ -260,7 +284,28 @@ def load_matrix(path: Path, *, reference: Basket) -> Matrix:
     seen = [candidate.candidate_id for candidate in built]
     if len(set(seen)) != len(seen):
         raise ConfigError(f"{path} expands to duplicate candidate ids: {sorted(set(seen))}")
+    _require_one_kind_of_run(path, built)
     return Matrix(candidates=built, on_fallback=policy_of(document), source=path)
+
+
+def _require_one_kind_of_run(path: Path, built: Sequence[Candidate]) -> None:
+    """A matrix is a plumbing check or an evaluation, never half of each (§7.2).
+
+    `is_evaluation` is False when *anything* binds the stub, and it is a whole-run label: it
+    waives §7.2's missing-key refusal for every candidate in the matrix, and it stamps the report
+    `PLUMBING_CHECK`. Mixing the two kinds is therefore wrong in both directions at once — the
+    real candidates spend real money against seats that may have fallen back or been silenced,
+    and the page carrying their ranking says it measured canned JSON. There is no single honest
+    label for such a run, so it is refused where every other matrix fault is: before any spend.
+    """
+    stubbed = [c.candidate_id for c in built if c.stub_bindings]
+    if stubbed and len(stubbed) != len(built):
+        real = [c.candidate_id for c in built if not c.stub_bindings]
+        raise ConfigError(
+            f"{path} mixes a plumbing check with an evaluation: {sorted(stubbed)} bind the "
+            f"offline stub while {sorted(real)} bind real endpoints. A matrix is one kind of run "
+            "or the other — split them into two files"
+        )
 
 
 def _basket_for(entry: Mapping[str, Any], reference: Basket) -> Basket:
@@ -357,6 +402,9 @@ def require_reachable(matrix: Matrix, environ: Mapping[str, str] | None = None) 
     """Refuse an evaluation whose providers cannot be reached (§7.2).
 
     A plumbing check is exempt: the stub has no endpoint and no key, so there is nothing to miss.
+    The exemption is safe only because `load_matrix` refuses a matrix that mixes the two kinds —
+    otherwise one stub "control" candidate would waive this refusal for every real candidate
+    beside it.
     """
     if not matrix.is_evaluation:
         return

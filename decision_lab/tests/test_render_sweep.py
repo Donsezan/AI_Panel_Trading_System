@@ -142,21 +142,67 @@ def test_one_candidate_says_so_rather_than_printing_an_empty_matrix() -> None:
     assert "nothing to compare it against" in text
 
 
-def test_a_candidate_a_halt_never_reached_is_not_ranked_as_a_scored_zero() -> None:
+def test_a_candidate_that_produced_nothing_is_not_ranked_as_a_scored_zero() -> None:
     """finding 3: `by_regime(())`'s legitimate zero row must never stand in for "not measured" —
     that reads as measured and worst rather than not measured at all."""
     text = rd.report_markdown(
-        report(ranking=(ranked("a", accuracy="0.6"),), not_measured_candidates=("b",))
+        report(
+            ranking=(ranked("a", accuracy="0.6"),),
+            not_measured_candidates=(rd.NotMeasured(candidate_id="b", reason="a halt"),),
+        )
     )
 
-    assert "| NORMAL | b |" not in text, "an unreached candidate must never appear as a ranked row"
-    assert "**Not measured:** b" in text
+    assert "| NORMAL | b |" not in text, "an unmeasured candidate must never appear as a row"
+    assert "**Not measured.**" in text
+    assert "`b` — a halt" in text
+
+
+def test_each_unmeasured_candidate_carries_its_own_reason() -> None:
+    """The three causes need different fixes — re-run the sweep, fix the candidate, or look at
+    why its cycles carried no decision — so one blanket "the sweep halted" would misdirect two
+    of them."""
+    text = rd.report_markdown(
+        report(
+            not_measured_candidates=(
+                rd.NotMeasured(candidate_id="b", reason="the sweep halted before reaching it"),
+                rd.NotMeasured(candidate_id="a", reason="all 9 of its rows were unusable"),
+            )
+        )
+    )
+
+    assert "`a` — all 9 of its rows were unusable" in text
+    assert "`b` — the sweep halted before reaching it" in text
 
 
 def test_the_candidates_section_appears_even_with_nothing_ranked() -> None:
     """Every candidate in the matrix halted before it ran: `ranking` is empty, but the reader
     still needs to be told the sweep produced nothing rather than the section vanishing."""
-    text = rd.report_markdown(report(not_measured_candidates=("a", "b")))
+    text = rd.report_markdown(
+        report(
+            not_measured_candidates=(
+                rd.NotMeasured(candidate_id="a", reason="a halt"),
+                rd.NotMeasured(candidate_id="b", reason="a halt"),
+            )
+        )
+    )
 
     assert "## Candidates, by regime" in text
-    assert "**Not measured:** a, b" in text
+    assert "**Not measured.**" in text
+    assert "`a` — a halt" in text and "`b` — a halt" in text
+
+
+def test_no_candidate_measured_never_claims_that_one_candidate_ran() -> None:
+    """finding 6: `compare.agreement` returns `()` both when one candidate ran and when none was
+    measured. Printing "only one candidate ran" over a ranking table listing none of them states
+    a fact about the experiment that is simply untrue."""
+    text = rd.report_markdown(
+        report(
+            not_measured_candidates=(
+                rd.NotMeasured(candidate_id="a", reason="a halt"),
+                rd.NotMeasured(candidate_id="b", reason="a halt"),
+            )
+        )
+    )
+
+    assert "nothing to compare it against" not in text, "no candidate ran, let alone one"
+    assert "No candidate produced a scored decision" in text

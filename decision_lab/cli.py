@@ -18,7 +18,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Mapping, Sequence
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -467,6 +467,30 @@ def _moment(value: str | None) -> datetime | None:
     return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else ensure_utc(parsed)
 
 
+def _not_measured_reason(rows: Mapping[str, sw.SweepRow], records: Sequence[rc.CycleRecord]) -> str:
+    """Why a candidate contributed no measurement — never merely *that* it did not.
+
+    "Not measured" has three causes that an operator must act on differently: a halt that stopped
+    the sweep before this candidate (re-run and it fills in), rows that all failed or were all
+    contaminated (the candidate itself is broken, or its seats are substituting), and a candidate
+    that replayed cleanly but whose cycles yielded no decision at all. A note that flattened them
+    into "the sweep halted" would send the second and third to the wrong fix.
+    """
+    if not rows:
+        return "the sweep halted before reaching it — no row was recorded"
+    if not records:
+        failed = sum(1 for row in rows.values() if row.error)
+        contaminated = sum(1 for row in rows.values() if row.contaminated)
+        parts = [f"{failed} failed"] if failed else []
+        parts += [f"{contaminated} contaminated by a substitute model"] if contaminated else []
+        why = ", ".join(parts) or "none of them matched a corpus entry"
+        return (
+            f"all {len(rows)} of its rows were unusable ({why}) — nothing it produced measures "
+            "the panel it declares"
+        )
+    return f"{len(records)} cycles replayed cleanly, but none of them carried a decision to score"
+
+
 async def report(args: argparse.Namespace) -> int:
     """Score the reference pass in a built corpus and write the Markdown report."""
     meta, cycles = rc.load(args.corpus)
@@ -491,7 +515,22 @@ async def report(args: argparse.Namespace) -> int:
     result = (
         sw.read_meta(meta.corpus_id, args.matrix) if args.matrix else sw.latest_meta(meta.corpus_id)
     )
-    if result is None and not args.matrix:
+    if result is None and args.matrix:
+        # finding 4 (second half): the operator named a sweep, and no sweep by that digest ran
+        # under this corpus. Falling through would write a reference-pass-only page at exit 0 —
+        # the same silent-empty-report the ambiguity warning below exists to prevent, reached
+        # through the other branch, and worse for being asked a precise question. A mistyped or
+        # stale digest is refused, and the digests that *did* run are named so it can be fixed.
+        logger.error(
+            "report refused; no sweep with this matrix digest has run under this corpus",
+            extra={
+                "corpus_id": meta.corpus_id,
+                "requested_digest": args.matrix,
+                "available_digests": list(sw.sweep_digests(meta.corpus_id)),
+            },
+        )
+        return EXIT_CANDIDATE
+    if result is None:
         # finding 4: `latest_meta` returns `None` both when nothing ran and when two sweeps did
         # and neither was named — indistinguishable to the reader unless `report` says which. Not
         # a refusal: the reference pass below still renders, exactly as it would with no sweep.
@@ -506,7 +545,7 @@ async def report(args: argparse.Namespace) -> int:
     agreement: tuple[cmp.Agreement, ...] = ()
     candidate_seats: tuple[rd.CandidateSeats, ...] = ()
     by_candidate: dict[str, tuple[sc.ScoredDecision, ...]] = {}
-    not_measured: list[str] = []
+    not_measured: list[rd.NotMeasured] = []
     matrix: cd.Matrix | None = None
     if result is not None:
         # finding 2: the matrix is reloaded from the path the sweep recorded, and that file can
@@ -549,20 +588,29 @@ async def report(args: argparse.Namespace) -> int:
             candidate_scored = sc.score_records(
                 records, index=index, regimes=regime_index, params=params
             )
+            if not candidate_scored:
+                # finding 3: nothing this candidate produced reached scoring. `by_regime(())`
+                # would give three legitimate-looking zero rows and `_ranking_table` would sort
+                # it in as a peer at 0.0% accuracy, last: measured and worst, when it was never
+                # measured at all. Kept out of the ranking, the agreement matrix *and* the
+                # per-candidate seat tables, and named on the page with the reason instead.
+                #
+                # The test is the scored decisions, not `rows`: a candidate whose every row
+                # errored or was contaminated has a non-empty `.jsonl` and no measurement
+                # whatever, and `records_from_rows` has already dropped both (§7.7).
+                not_measured.append(
+                    rd.NotMeasured(
+                        candidate_id=candidate.candidate_id,
+                        reason=_not_measured_reason(rows, records),
+                    )
+                )
+                continue
             blocks.append(
                 rd.CandidateSeats(
                     candidate_id=candidate.candidate_id,
                     seats=st.score_seats(records, candidate_scored, panel=candidate.panel),
                 )
             )
-            if not rows:
-                # finding 3: no row was ever recorded for this candidate — a halt never reached
-                # it, not "it scored zero". `by_regime(())` would give three legitimate-looking
-                # zero rows and `_ranking_table` would sort it in as a peer at 0.0% accuracy,
-                # last: measured and worst, when it was never measured at all. Kept out of the
-                # cross-candidate tables entirely and named on the page instead.
-                not_measured.append(candidate.candidate_id)
-                continue
             by_candidate[candidate.candidate_id] = candidate_scored
         ranking = cmp.ranking(by_candidate)
         agreement = cmp.agreement(by_candidate)

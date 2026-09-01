@@ -262,3 +262,28 @@ id = "a"
 
     assert {c.candidate_id for c in left.candidates} == {c.candidate_id for c in right.candidates}
     assert left.matrix_digest == right.matrix_digest
+
+
+def test_a_matrix_mixing_a_stub_control_with_real_candidates_refuses(tmp_path: Path) -> None:
+    """finding 5: `is_evaluation` is False when *anything* binds the stub, and it is a whole-run
+    label — it waives §7.2's missing-key refusal for every candidate in the matrix and stamps the
+    report `PLUMBING_CHECK`. One stub "control" beside real candidates is therefore wrong in both
+    directions at once: the real ones spend against seats that may have silently fallen back, and
+    the page carrying their ranking says it measured canned JSON. No single label is honest, so
+    the matrix is refused before any spend."""
+    text = REAL_MATRIX + STUB_MATRIX.replace('id = "baseline"', 'id = "control"')
+
+    with pytest.raises(ConfigError, match="mixes a plumbing check with an evaluation") as raised:
+        cd.load_matrix(write(tmp_path, text), reference=reference())
+
+    assert "'control'" in str(raised.value) and "'baseline'" in str(raised.value)
+
+
+def test_an_all_stub_matrix_and_an_all_real_one_are_both_accepted(tmp_path: Path) -> None:
+    """The refusal is on *mixing*, not on the stub. Both pure kinds keep working exactly as
+    before, which is what the two shipped matrices rely on."""
+    stub = cd.load_matrix(write(tmp_path / "a", STUB_MATRIX), reference=reference())
+    real = cd.load_matrix(write(tmp_path / "b", REAL_MATRIX), reference=reference())
+
+    assert stub.is_evaluation is False
+    assert real.is_evaluation is True

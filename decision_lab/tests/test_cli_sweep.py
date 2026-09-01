@@ -164,7 +164,69 @@ def test_report_marks_a_candidate_the_sweep_never_reached_as_not_measured(
 
     text = out.read_text(encoding="utf-8")
     assert f"| NORMAL | {second_id} |" not in text, "unreached must never be a scored row"
-    assert f"**Not measured:** {second_id}" in text
+    assert f"### Seats — {second_id}" not in text, "nor does it get a seat table (finding 3)"
+    assert f"`{second_id}` — the sweep halted before reaching it" in text
+
+
+def test_report_refuses_a_matrix_digest_that_never_ran(
+    tmp_path: Path, built_corpus_id: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """finding 4: the ambiguity warning is reached only when no `--matrix` was passed, so a
+    mistyped or stale digest fell straight through and wrote a reference-pass-only page at exit
+    0 — the same silent empty report, through the other branch, in answer to a precise question.
+    """
+    out = tmp_path / "report.md"
+    args = cli.parse_args(
+        ["report", "--corpus", built_corpus_id, "--matrix", "0" * 32, "--out", str(out)]
+    )
+    with caplog.at_level(logging.ERROR, logger="decision_lab.cli"):
+        assert asyncio.run(cli.report(args)) == cli.EXIT_CANDIDATE
+
+    assert not out.exists(), "a refusal writes no page"
+    assert any("no sweep with this matrix digest" in r.message for r in caplog.records)
+
+
+def test_report_does_not_rank_a_candidate_whose_every_row_failed(
+    tmp_path: Path, built_corpus_id: str
+) -> None:
+    """finding 1: a candidate whose rows all errored has a *non-empty* `.jsonl`, so a guard on
+    `rows` admits it with an empty score tuple. `by_regime(())` then emits three
+    legitimate-looking zero rows and it ranks last at 0.0% accuracy — measured and worst, when
+    nothing it produced measures anything at all. Rewriting the rows with an error on each
+    reproduces exactly what a deliberation that raised leaves on disk (§7.7).
+    """
+    configs = tmp_path / "m.toml"
+    configs.write_text(
+        STUB_MATRIX + '\n[expand]\ndecision_mode = ["per_asset", "basket"]\n', encoding="utf-8"
+    )
+    assert (
+        cli.main(["sweep", "--corpus", built_corpus_id, "--configs", str(configs), "--budget", "1"])
+        == cli.EXIT_OK
+    )
+
+    result = sw.latest_meta(built_corpus_id)
+    assert result is not None
+    second_id = result.candidate_ids[1]
+    path = sw.rows_path(built_corpus_id, result.matrix_digest, second_id)
+    rows = sw.read_rows(path)
+    assert rows, "the sweep must have written rows, or this is the already-covered empty case"
+    path.write_text(
+        "\n".join(
+            row.model_copy(
+                update={"decisions": (), "responses": (), "error": "TimeoutError: boom"}
+            ).model_dump_json()
+            for row in rows.values()
+        ),
+        encoding="utf-8",
+    )
+
+    out = tmp_path / "report.md"
+    assert cli.main(["report", "--corpus", built_corpus_id, "--out", str(out)]) == cli.EXIT_OK
+
+    text = out.read_text(encoding="utf-8")
+    assert f"| NORMAL | {second_id} |" not in text, "a failed candidate is not a 0% candidate"
+    assert f"### Seats — {second_id}" not in text, "nor does it get a seat table (finding 3)"
+    assert f"`{second_id}` — all " in text and "failed" in text
 
 
 def test_report_warns_when_two_sweeps_are_ambiguous_and_names_the_digests(

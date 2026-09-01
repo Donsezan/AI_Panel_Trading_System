@@ -135,3 +135,39 @@ def test_an_unknown_policy_refuses_rather_than_defaulting(tmp_path: Path) -> Non
 def test_a_missing_matrix_file_refuses_by_path(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match=r"sweep\.toml"):
         cd.read_document(tmp_path / "sweep.toml")
+
+
+def test_a_prompt_axis_naming_no_seat_refuses(tmp_path: Path) -> None:
+    """finding 2: `_apply` varies the id suffix whether or not a seat matched, so a misspelled
+    seat mints one candidate per value whose seats are *byte-identical*. They share a
+    `panel_digest`, so the §7.4 cache answers every one out of the first and the §9.6 agreement
+    matrix reports them at 100% — a typo reading as the finding "this prompt makes no difference
+    to this seat". Every other naming mistake in the file refuses; so must this one."""
+    text = MATRIX.replace("max_rounds = [1, 3]", 'prompts.risk_officer = ["cautious", "momentum"]')
+
+    with pytest.raises(ConfigError, match="names no seat") as raised:
+        cd.expand(cd.read_document(write(tmp_path, text)))
+
+    assert "risk, trend" in str(raised.value), "the seats it could have meant are named"
+
+
+def test_a_prompt_axis_is_checked_against_every_declared_candidate(tmp_path: Path) -> None:
+    """The axis is crossed with *each* candidate, so a seat only the first one declares is still
+    a silent no-op for the second — and the second's ids would vary on nothing."""
+    text = (
+        MATRIX
+        + """
+[[candidates]]
+id = "lean"
+
+  [[candidates.seats]]
+  seat_id = "trend"
+  role = "trend analyst"
+  provider_id = "stub"
+  model = "varied-technical"
+"""
+    )
+    text = text.replace("max_rounds = [1, 3]", 'prompts.risk = ["cautious", "momentum"]')
+
+    with pytest.raises(ConfigError, match="candidate 'lean'"):
+        cd.expand(cd.read_document(write(tmp_path, text)))

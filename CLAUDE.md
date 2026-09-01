@@ -292,7 +292,29 @@ Rules that are easy to get backwards:
   also refuses before spend when any declared key is missing — not merely when a seat is fully
   silenced, because a partly-reachable seat is one that answers on its backup. Deliberately
   stricter than ADR 0023: degrade-and-continue is right for a trading system and wrong for a
-  measuring one.
+  measuring one. **A matrix is one kind of run or the other, never half of each**, refused by
+  `load_matrix`: the label is whole-run, so one stub "control" candidate beside real ones both
+  waives that missing-key refusal for all of them and stamps the report `PLUMBING CHECK` — the
+  real candidates spend, and the page carrying their ranking says it measured canned JSON.
+- **A candidate is *measured* only if a scored decision survived, and the test is the scored
+  decisions — never the row file.** A candidate whose rows all errored or were all contaminated
+  has a non-empty `.jsonl` and no measurement whatever; admitted, `by_regime(())` gives it three
+  legitimate-looking zero rows and it ranks last at 0.0% accuracy — *measured and worst* rather
+  than never measured. It is kept out of the ranking, the agreement matrix **and** its own seat
+  table (whose `rounds_are_identical(())` is vacuously true, so an empty block claims a
+  `blind_then_debate` candidate ran `single_round`), and named on the page **with its reason**:
+  a halt that never reached it, rows that all failed, and a clean replay carrying no decision
+  need three different fixes. For the same reason an empty agreement matrix distinguishes *one*
+  candidate from *none* — `compare.agreement` returns `()` for both, and "only one candidate ran"
+  over a ranking listing none of them is simply untrue.
+- **A `report --matrix` naming a sweep that never ran is a refusal, not a quieter page.** The
+  ambiguity warning fires only when no `--matrix` was passed, so a mistyped or stale digest fell
+  through to a reference-pass-only report at exit 0 — the same silent empty page, in answer to a
+  precise question.
+- **`[expand] prompts.<seat_id>` naming no seat refuses.** The id suffix varies whether or not a
+  seat matched, so a typo mints candidates whose seats are byte-identical: they share a
+  `panel_digest`, the §7.4 cache answers them all out of the first, and the agreement matrix
+  reports 100% — a misspelling reading as "this prompt makes no difference".
 - **A substitute model is not the panel under test, and it contaminates the whole cycle** — under
   `blind_then_debate` the peers read its arguments, and under either protocol its vote reaches
   `reach_consensus`. `on_fallback` (`halt` by default, or `exclude`) decides only whether the run

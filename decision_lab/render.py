@@ -68,6 +68,18 @@ class CandidateSeats(DomainModel):
     seats: tuple[SeatMetrics, ...] = ()
 
 
+class NotMeasured(DomainModel):
+    """A candidate that produced no measurement, and why (§9.6).
+
+    The reason is carried rather than re-derived at render time because the three causes are not
+    distinguishable from the report alone: a halt that never reached this candidate, rows that all
+    failed or were all contaminated, and a clean replay that carried no decision to score.
+    """
+
+    candidate_id: str
+    reason: str
+
+
 class LabReport(DomainModel):
     """Everything one report says. One object, so the notebook and the renderer agree."""
 
@@ -108,10 +120,11 @@ class LabReport(DomainModel):
     ranking: tuple[Ranked, ...] = ()
     agreement: tuple[Agreement, ...] = ()
     candidate_seats: tuple[CandidateSeats, ...] = ()
-    #: Candidates the sweep never reached at all — a halt stopped it first (finding 3). Kept out
-    #: of `ranking`/`agreement` rather than folded in at 0.0% accuracy, which would read as
-    #: measured and worst rather than not measured.
-    not_measured_candidates: tuple[str, ...] = ()
+    #: Candidates that produced no scored decision — a halt never reached them, every row
+    #: failed or was contaminated, or nothing they replayed carried a decision (finding 3).
+    #: Kept out of `ranking`, `agreement` *and* `candidate_seats` rather than folded in at
+    #: 0.0% accuracy, which would read as measured and worst rather than not measured at all.
+    not_measured_candidates: tuple[NotMeasured, ...] = ()
 
 
 def report_markdown(report: LabReport) -> str:
@@ -134,7 +147,7 @@ def report_markdown(report: LabReport) -> str:
             "",
             _ranking_table(report.ranking) + _not_measured_note(report.not_measured_candidates),
             "",
-            _agreement_table(report.agreement),
+            _agreement_table(report.agreement, report.ranking),
             "",
             _candidate_seat_tables(report.candidate_seats),
         ]
@@ -350,21 +363,42 @@ def _ranking_table(rows: Sequence[Ranked]) -> str:
     )
 
 
-def _not_measured_note(candidate_ids: Sequence[str]) -> str:
-    """A candidate a halt never reached (finding 3) is absent from the table above rather than
-    shown at 0.0% accuracy, which would read as measured and worst — not measured at all."""
-    if not candidate_ids:
+def _not_measured_note(rows: Sequence[NotMeasured]) -> str:
+    """A candidate that produced no scored decision (finding 3) is absent from the tables above
+    rather than shown at 0.0% accuracy, which would read as measured and worst — not measured at
+    all. Each is named with its own reason, because the three causes need different fixes."""
+    if not rows:
         return ""
+    listed = "".join(
+        f"\n* `{row.candidate_id}` — {row.reason}"
+        for row in sorted(rows, key=lambda row: row.candidate_id)
+    )
+    one = len(rows) == 1
     return (
-        "\n\n**Not measured:** " + ", ".join(candidate_ids) + " — the sweep halted before "
-        "reaching " + ("this candidate" if len(candidate_ids) == 1 else "these candidates") + ". "
-        "Left out of the table and the agreement matrix above rather than scored as 0%."
+        "\n\n**Not measured.** "
+        + ("This candidate" if one else "These candidates")
+        + " produced no scored decision, so "
+        + ("it is" if one else "they are")
+        + " left out of the ranking, the agreement matrix and the seat tables rather than "
+        "reported at 0%.\n" + listed
     )
 
 
-def _agreement_table(rows: Sequence[Agreement]) -> str:
+def _agreement_table(rows: Sequence[Agreement], ranking: Sequence[Ranked]) -> str:
+    """Finding 6: an empty matrix has two causes, and they are opposite facts about the run.
+
+    `compare.agreement` returns `()` both when one candidate ran and when *none* was measured, so
+    the number of candidates that actually reached the ranking is what tells them apart. Asserting
+    "only one candidate ran" over a ranking table listing none of them states a fact about the
+    experiment that is simply untrue.
+    """
     if not rows:
-        return "Only one candidate ran, so there is nothing to compare it against."
+        if len({row.candidate_id for row in ranking}) == 1:
+            return "Only one candidate ran, so there is nothing to compare it against."
+        return (
+            "No candidate produced a scored decision, so there is nothing to compare. See "
+            "**Not measured** above for why."
+        )
     body = [
         [
             row.regime,
