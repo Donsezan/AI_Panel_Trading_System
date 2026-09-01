@@ -61,6 +61,12 @@ DAYSET_FILE: Final = "decision_lab-calibration-days.json"
 CORPUS_META: Final = "corpus.json"
 
 
+#: Corpus entries drawn per stratum by `sweep` when nobody said otherwise (§7.3). Named windows
+#: and the pinned days are taken *whole* and are deliberately not in this table: they are rare and
+#: they are the point of the exercise, so a quota over them would defeat it.
+SAMPLE_SIZES: Final = {"NORMAL": 60, "SHOCK_UP": 30, "SHOCK_DOWN": 30}
+
+
 def workspace_root() -> Path:
     """Scratch databases, caches and results. Gitignored, and never `data/` (§2.1)."""
     return Path(__file__).parent / "workspace"

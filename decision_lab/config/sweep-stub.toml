@@ -1,0 +1,54 @@
+# The plumbing check (spec §7.2).
+#
+# Every binding is the offline stub, so this matrix costs nothing, needs no key and reaches no
+# network — and every report and registry row it produces is stamped
+# PLUMBING CHECK — NOT AN EVALUATION. The stub draws from a fifteen-entry catalogue: it exercises
+# the sweep, the cache, the budget, the tables and the report, and it measures nothing about any
+# model's judgement.
+#
+# Use it to prove a change works. Use sweep.toml to learn something.
+
+[sweep]
+on_fallback = "halt"
+
+[prompts.cautious]
+text = "Favour standing aside. State the single strongest argument against your own vote."
+
+[prompts.momentum]
+text = "Weight recent trend continuation over mean reversion. Name the invalidation level."
+
+[[candidates]]
+id = "varied-three"
+protocol = "blind_then_debate"
+max_rounds = 3
+max_cost_usd_per_cycle = "0"
+providers = ["stub"]
+
+  [[candidates.seats]]
+  seat_id = "technical"
+  role = "Technical Analyst"
+  provider_id = "stub"
+  model = "varied-technical"
+  evidence = ["indicators", "position"]
+  prompt = "momentum"
+
+  [[candidates.seats]]
+  seat_id = "news"
+  role = "News/Sentiment Analyst"
+  provider_id = "stub"
+  model = "varied-news"
+  evidence = ["news", "position"]
+  prompt = "cautious"
+
+  [[candidates.seats]]
+  seat_id = "skeptic"
+  role = "Macro/Risk Skeptic"
+  provider_id = "stub"
+  model = "varied-skeptic"
+  evidence = ["indicators", "news", "position"]
+  devils_advocate = true
+  prompt = "cautious"
+
+[expand]
+max_rounds = [1, 3]
+limit = 4

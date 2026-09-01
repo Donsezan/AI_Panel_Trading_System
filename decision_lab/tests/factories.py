@@ -16,10 +16,13 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
+from decision_lab.corpus import Corpus, CorpusEntry, CorpusMeta
 from decision_lab.dataset import csv_path, write_series
+from tradebot.core.config import Basket, PanelConfig, SeatConfig
 from tradebot.core.enums import AssetClass, MarketSession
 from tradebot.core.instrument import Instrument
-from tradebot.core.market import Candle, timeframe_interval
+from tradebot.core.market import Candle, Quote, timeframe_interval
+from tradebot.core.snapshot import ContextSnapshot, IndicatorReading, InstrumentContext
 from tradebot.marketdata.recorder import MANIFEST, DatasetManifest
 
 EPOCH = datetime(2024, 1, 1, tzinfo=UTC)
@@ -123,3 +126,93 @@ def write_dataset(
     )
     (directory / MANIFEST).write_text(manifest.model_dump_json(indent=2), encoding="utf-8")
     return directory
+
+
+def snapshot_at(
+    as_of: datetime, *, timeframe: str = "1h", price: str = "100", atr: str = "1.0"
+) -> ContextSnapshot:
+    """A minimal but real snapshot: one instrument, one quote, one ATR reading.
+
+    Real rather than a stub because scoring reads `context.indicator("ATR", …)` off it, and the
+    band is derived from exactly the evidence the panel had (§9.2).
+
+    `timeframe` must match the corpus's own bar grid: `scoring.band_for` looks the ATR reading up
+    *by timeframe*, so a snapshot tagged with the wrong one is not a wrong number but an absent
+    one — `context.indicator("ATR", …)` returns `None` and the decision reads as unscorable
+    rather than as an error. `corpus_with_entries` passes its own `timeframe` through here so the
+    two agree by construction rather than by coincidence.
+
+    The field names are verified against `tradebot/core/snapshot.py` and `core/market.py`, not
+    guessed: `Quote` carries `bid`/`ask`/`last` and no `price`, `IndicatorReading` carries `text`
+    and no `computed_at`, and `ContextSnapshot` requires `snapshot_id` and `basket_id`.
+    """
+    inst = instrument()
+    return ContextSnapshot(
+        snapshot_id=f"snap-{as_of.isoformat()}",
+        basket_id="reference",
+        as_of=as_of,
+        instruments=(
+            InstrumentContext(
+                instrument=inst,
+                quote=Quote(
+                    instrument_key=inst.key,
+                    bid=Decimal(price),
+                    ask=Decimal(price),
+                    last=Decimal(price),
+                    observed_at=as_of,
+                ),
+                indicators=(
+                    IndicatorReading(
+                        name="ATR", timeframe=timeframe, value=Decimal(atr), text=f"ATR is {atr}"
+                    ),
+                ),
+            ),
+        ),
+    )
+
+
+def corpus_with_entries(
+    *, count: int, as_of: datetime, corpus_id: str = "corpus-test", timeframe: str = "1h"
+) -> Corpus:
+    """A `Corpus` of `count` entries on the venue's bar grid, with a real snapshot on each."""
+    interval = timeframe_interval(timeframe)
+    entries = tuple(
+        CorpusEntry(
+            seq=index,
+            cycle_id=f"c{index}",
+            basket_id="reference",
+            as_of=as_of + interval * index,
+            snapshot=snapshot_at(as_of + interval * index, timeframe=timeframe),
+        )
+        for index in range(count)
+    )
+    meta = CorpusMeta(
+        corpus_id=corpus_id,
+        built_at=as_of,
+        dataset_directory="data/history",
+        dataset_digest="d1",
+        reference_panel_id="stub",
+        reference_basket=_reference_basket(),
+        reference_config_digest="r1",
+        cadence_seconds=int(interval.total_seconds()),
+        start_equity=Decimal(10_000),
+        requested_start=as_of,
+        window_start=as_of,
+        window_end=as_of + interval * count,
+        warmup_seconds=0,
+        planned_cycles=count,
+        ran_cycles=count,
+    )
+    return Corpus(meta=meta, entries=entries)
+
+
+def _reference_basket() -> Basket:
+    return Basket(
+        basket_id="reference",
+        name="reference",
+        instruments=(instrument(),),
+        panel=PanelConfig(
+            panel_id="reference",
+            seats=(SeatConfig(seat_id="a", role="a", provider_id="stub", model="stub-technical"),),
+        ),
+    )

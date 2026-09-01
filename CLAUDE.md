@@ -223,8 +223,8 @@ A separate top-level package, not a bot phase. The bot can say what happened to 
 could never say whether a decision was *right*, which mixes good judgement with good luck. This
 scores decisions against what the market did next, over recorded history, per regime and per seat.
 Specced in [docs/superpowers/specs/2026-08-23-decision-lab-design.md](docs/superpowers/specs/2026-08-23-decision-lab-design.md);
-five slices, of which **A (integrity, day set, corpus) and B (regimes, scoring, per-seat, report)
-have shipped**. C (the sweep), D (calibration) and E (news) are not built, and only E touches
+five slices, of which **A (integrity, day set, corpus), B (regimes, scoring, per-seat, report) and
+C (the sweep) have shipped**. D (calibration) and E (news) are not built, and only E touches
 `tradebot` at all.
 
 ```
@@ -233,8 +233,13 @@ dataset.py             audit recorded history, repair holes, refuse an unverifie
   corpus.py            one reference pass through the unmodified BacktestHarness -> corpus.db
     records.py         fold each cycle out of that log: snapshot, decisions, votes, outcome
     regimes.py         label every bar NORMAL | SHOCK_UP | SHOCK_DOWN, named windows overriding
+    candidates.py      TOML matrix -> validated PanelConfig -> Basket, refused before any spend
       scoring.py       the long-only truth table, the ATR band, five verdicts, per-regime metrics
         seats.py       each seat against the same truth; round 0 vs final; swing; contribution
+      sampling.py      the stratified sample a sweep draws its corpus entries from
+        sweep.py       N candidates over one corpus: cache, budget ceiling, resume
+        compare.py     the cross-candidate ranking and the pairwise agreement matrix
+          registry.py  every run kept, so two setups are compared rather than remembered
           render.py    Markdown to decision_lab/reports/, never printed
 ```
 
@@ -281,6 +286,46 @@ Rules that are easy to get backwards:
 - **A pass also ends when the basket auto-pauses.** `max_consecutive_losses` is a legitimate
   Tier-1 rule and a replay has no human to clear it, so the harness stops and the report shows how
   much of the window went unused. `ran_cycles` well below `planned_cycles` is that, not a crash.
+- **A stub binding makes the run a plumbing check, and the *binding* decides — never a flag.** A
+  flag would leave a registry of rows that behaved differently under identical recorded
+  configuration, which is the same argument that keeps `varied-*` in panel data. An evaluation
+  also refuses before spend when any declared key is missing — not merely when a seat is fully
+  silenced, because a partly-reachable seat is one that answers on its backup. Deliberately
+  stricter than ADR 0023: degrade-and-continue is right for a trading system and wrong for a
+  measuring one. **A matrix is one kind of run or the other, never half of each**, refused by
+  `load_matrix`: the label is whole-run, so one stub "control" candidate beside real ones both
+  waives that missing-key refusal for all of them and stamps the report `PLUMBING CHECK` — the
+  real candidates spend, and the page carrying their ranking says it measured canned JSON.
+- **A candidate is *measured* only if a scored decision survived, and the test is the scored
+  decisions — never the row file.** A candidate whose rows all errored or were all contaminated
+  has a non-empty `.jsonl` and no measurement whatever; admitted, `by_regime(())` gives it three
+  legitimate-looking zero rows and it ranks last at 0.0% accuracy — *measured and worst* rather
+  than never measured. It is kept out of the ranking, the agreement matrix **and** its own seat
+  table (whose `rounds_are_identical(())` is vacuously true, so an empty block claims a
+  `blind_then_debate` candidate ran `single_round`), and named on the page **with its reason**:
+  a halt that never reached it, rows that all failed, and a clean replay carrying no decision
+  need three different fixes. For the same reason an empty agreement matrix distinguishes *one*
+  candidate from *none* — `compare.agreement` returns `()` for both, and "only one candidate ran"
+  over a ranking listing none of them is simply untrue.
+- **A `report --matrix` naming a sweep that never ran is a refusal, not a quieter page.** The
+  ambiguity warning fires only when no `--matrix` was passed, so a mistyped or stale digest fell
+  through to a reference-pass-only report at exit 0 — the same silent empty page, in answer to a
+  precise question.
+- **`[expand] prompts.<seat_id>` naming no seat refuses.** The id suffix varies whether or not a
+  seat matched, so a typo mints candidates whose seats are byte-identical: they share a
+  `panel_digest`, the §7.4 cache answers them all out of the first, and the agreement matrix
+  reports 100% — a misspelling reading as "this prompt makes no difference".
+- **A substitute model is not the panel under test, and it contaminates the whole cycle** — under
+  `blind_then_debate` the peers read its arguments, and under either protocol its vote reaches
+  `reach_consensus`. `on_fallback` (`halt` by default, or `exclude`) decides only whether the run
+  stops; a contaminated decision is never scored either way. An **abstention is not a fallback**:
+  the configured seat answered nothing, `WAIT (PANEL_DEGRADED)` is a real outcome of the real
+  panel, and §9.5 already reports the degradation rate.
+- **The cache is shared across matrices; the result files are not.** The key is
+  `blake2s(snapshot.digest + panel_digest)` — everything that determines the answer and nothing
+  else — so adding one candidate re-pays for none of the others. The `sweep-<matrix_digest>/`
+  directories are scoped, because two matrices both hold a `baseline` and a flat layout would
+  resume one experiment into the other's file.
 
 ### Phase 11 — the instrument master
 

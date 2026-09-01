@@ -18,20 +18,24 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Mapping, Sequence
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from decision_lab import calibration_days as cd
+from decision_lab import calibration_days as cday
+from decision_lab import candidates as cd
+from decision_lab import compare as cmp
 from decision_lab import corpus as cp
 from decision_lab import dataset as ds
 from decision_lab import records as rc
 from decision_lab import regimes as rg
+from decision_lab import registry, sampling
 from decision_lab import render as rd
 from decision_lab import scoring as sc
 from decision_lab import seats as st
+from decision_lab import sweep as sw
 from decision_lab.params import (
     CADENCE_SECONDS,
     DAYSET_FILE,
@@ -42,7 +46,7 @@ from decision_lab.params import (
 from tradebot.core.clock import SystemClock, ensure_utc
 from tradebot.core.errors import ConfigError, MoneyError, TradebotError
 from tradebot.core.logging import configure_logging, get_logger
-from tradebot.core.money import to_decimal
+from tradebot.core.money import ZERO, to_decimal
 from tradebot.interfaces.exchange import VenueTransport
 from tradebot.marketdata.recorder import MANIFEST, ReplayDataset
 
@@ -151,6 +155,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     corpus_build_parser.add_argument("--verbose", action="store_true")
 
+    sweep_ = commands.add_parser(
+        "sweep", help="run every candidate in a matrix over one corpus and record the result"
+    )
+    sweep_.add_argument("--corpus", required=True, help="corpus id from `corpus build`")
+    sweep_.add_argument(
+        "--configs",
+        type=Path,
+        default=cd.DEFAULT_MATRIX,
+        help="candidate matrix TOML; defaults to config/sweep.toml, which is an evaluation",
+    )
+    sweep_.add_argument(
+        "--budget", type=_decimal_arg, default=Decimal(0), help="hard USD ceiling for this run"
+    )
+    sweep_.add_argument("--full", action="store_true", help="every entry, not a sample")
+    sweep_.add_argument("--seed", type=int, default=DEFAULT_SEED)
+    sweep_.add_argument("--data", type=Path, default=None)
+    sweep_.add_argument("--regimes", type=Path, default=None)
+    sweep_.add_argument("--scoring-timeframe", default="")
+    sweep_.add_argument("--verbose", action="store_true")
+
     report_ = commands.add_parser(
         "report", help="score a built corpus and file the result under decision_lab/reports/"
     )
@@ -165,6 +189,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     report_.add_argument("--horizon", type=int, default=None, help="forward bars, default 6")
     report_.add_argument("--out", type=Path, default=None, help="report path (.md)")
+    report_.add_argument(
+        "--matrix", default="", help="matrix digest, when more than one sweep ran on this corpus"
+    )
     report_.add_argument("--verbose", action="store_true")
 
     return parser.parse_args(argv)
@@ -254,27 +281,27 @@ async def dataset_days(args: argparse.Namespace) -> int:
                 "--reselect as well to say so: the new set has a different dayset_digest, and "
                 "every run recorded under the old one stops being comparable"
             )
-        pinned = cd.require_pinned(args.data)
+        pinned = cday.require_pinned(args.data)
         logger.info("calibration days already pinned", extra=_days_fields(pinned))
         return EXIT_OK
 
     dataset = _load(args.data, clock)
-    days = await cd.select(
+    days = await cday.select(
         dataset,
         audit,
         clock,
         seed=args.seed,
         reference_instrument=args.reference_instrument or dataset.instruments[0].key,
         scoring_timeframe=args.scoring_timeframe or dataset.timeframes[0],
-        thresholds=cd.Thresholds(shock_percentile=args.shock_percentile),
+        thresholds=cday.Thresholds(shock_percentile=args.shock_percentile),
         pinned=tuple(args.pin),
     )
-    cd.write(args.data, days)
+    cday.write(args.data, days)
     logger.info("calibration days pinned", extra=_days_fields(days))
     return EXIT_OK
 
 
-def _days_fields(days: cd.CalibrationDays) -> dict[str, Any]:
+def _days_fields(days: cday.CalibrationDays) -> dict[str, Any]:
     return {
         "digest": days.dayset_digest,
         "reference": days.reference_instrument,
@@ -308,6 +335,125 @@ async def corpus_build(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+async def sweep_command(args: argparse.Namespace) -> int:
+    """Run a matrix over a corpus. Every refusal happens before spend (§7.2)."""
+    clock = SystemClock()
+    corpus = cp.load(args.corpus)
+    data_dir = args.data or Path(corpus.meta.dataset_directory)
+    # Called for its refusal, not its value: §15 says an unverified dataset refuses everything
+    # downstream of it, and a sweep is the most expensive thing downstream.
+    ds.require_verified(data_dir)
+    dataset = ReplayDataset.load(data_dir, clock)
+
+    # A matrix that fails `Basket` validation has no digest to record a row under (§7.2) — unlike
+    # the reachability refusal below, there is nothing valid to identify the attempted run by.
+    try:
+        matrix = cd.load_matrix(args.configs, reference=corpus.meta.reference_basket)
+    except ConfigError as error:
+        logger.error("sweep refused; nothing was spent", extra={"reason": str(error)})
+        return EXIT_CANDIDATE
+
+    row = _registry_row(corpus, matrix, clock, seed=args.seed)
+    try:
+        cd.require_reachable(matrix)
+    except ConfigError as error:
+        registry.record(
+            row.model_copy(update={"status": "provider_unavailable", "note": str(error)})
+        )
+        logger.error("sweep refused; nothing was spent", extra={"reason": str(error)})
+        return EXIT_CANDIDATE
+
+    if not matrix.is_evaluation:
+        logger.warning(
+            "this matrix binds the offline stub, so the run is a plumbing check and measures "
+            "no model's judgement",
+            extra={"bindings": list(matrix.stub_bindings)},
+        )
+
+    timeframe = args.scoring_timeframe or dataset.timeframes[0]
+    regime_index = (await rg.index_dataset(dataset, timeframe)).with_windows(
+        rg.load_windows(args.regimes or rg.DEFAULT_REGIMES_TOML)
+    )
+    pinned = _pinned_calibration(data_dir)
+    sample = sampling.stratified(
+        corpus,
+        regimes=regime_index,
+        # §7.3: the stratum is the regime of the instrument §4.5 already drew the day set from —
+        # the same one `dataset days --reference-instrument` recorded on the pinned set — not
+        # necessarily `dataset.instruments[0]`. Falling back to the dataset's first instrument
+        # only when nothing is pinned yet, since a sweep does not itself require a day set (§15).
+        reference_instrument=(
+            pinned.reference_instrument if pinned is not None else dataset.instruments[0].key
+        ),
+        pinned=pinned.all_days if pinned is not None else (),
+        seed=args.seed,
+        full=args.full,
+    )
+
+    result = await sw.run(corpus, matrix, sample=sample, clock=clock, budget_usd=args.budget)
+    sw.write_meta(result)
+    registry.record(
+        row.model_copy(
+            update={
+                "status": result.status.value,
+                "evaluation": result.evaluation,
+                "on_fallback": result.on_fallback,
+                "contaminated": result.contaminated,
+                "cost_usd": result.spent_usd,
+                "note": result.halted_on,
+            }
+        )
+    )
+    logger.info(
+        "sweep complete",
+        extra={
+            "status": result.status.value,
+            "candidates": len(matrix.candidates),
+            "evaluated": result.evaluated,
+            "cached": result.cached,
+            "contaminated": result.contaminated,
+            "spent": str(result.spent_usd),
+        },
+    )
+    # Both halts keep everything they bought and both are re-runnable; one distinguishes them on
+    # the row and in the log, not by the exit code, because to a script the action is the same:
+    # fix the cause, run again, and the cache makes the repeat free.
+    if result.status in (sw.SweepStatus.HALTED_BUDGET, sw.SweepStatus.HALTED_FALLBACK):
+        return EXIT_BUDGET
+    return EXIT_OK
+
+
+def _registry_row(
+    corpus: cp.Corpus, matrix: cd.Matrix, clock: SystemClock, *, seed: int
+) -> registry.RunRow:
+    """One row per sweep, identified *before* the run so a refusal is recorded too (§11)."""
+    return registry.RunRow(
+        recorded_at=clock.now(),
+        scenario="sweep",
+        dataset_digest=corpus.meta.dataset_digest,
+        corpus_id=corpus.meta.corpus_id,
+        matrix_digest=matrix.matrix_digest,
+        dayset_digest=_dayset_digest(Path(corpus.meta.dataset_directory)),
+        cadence_seconds=corpus.meta.cadence_seconds,
+        sample_seed=seed,
+        evaluation=matrix.is_evaluation,
+        on_fallback=matrix.on_fallback.value,
+    )
+
+
+def _pinned_calibration(data_dir: Path) -> cday.CalibrationDays | None:
+    """The pinned day set if there is one. A sweep does not require it — §15 requires it of a
+    *calibration* — but when it exists those days are taken whole (§7.3), and its own
+    `reference_instrument` is the sample's stratum, not necessarily the dataset's first (finding
+    6): §4.5 already drew the day set from one instrument, and the sample must agree with it on
+    which instrument decides "shock", or the two artifacts would be answering for two different
+    definitions of the same word."""
+    try:
+        return cday.require_pinned(data_dir)
+    except ConfigError:
+        return None
+
+
 def _moment(value: str | None) -> datetime | None:
     """An optional ISO window edge, UTC-aware. A bare date is midnight UTC, never local time.
 
@@ -319,6 +465,30 @@ def _moment(value: str | None) -> datetime | None:
         return None
     parsed = datetime.fromisoformat(value)
     return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else ensure_utc(parsed)
+
+
+def _not_measured_reason(rows: Mapping[str, sw.SweepRow], records: Sequence[rc.CycleRecord]) -> str:
+    """Why a candidate contributed no measurement — never merely *that* it did not.
+
+    "Not measured" has three causes that an operator must act on differently: a halt that stopped
+    the sweep before this candidate (re-run and it fills in), rows that all failed or were all
+    contaminated (the candidate itself is broken, or its seats are substituting), and a candidate
+    that replayed cleanly but whose cycles yielded no decision at all. A note that flattened them
+    into "the sweep halted" would send the second and third to the wrong fix.
+    """
+    if not rows:
+        return "the sweep halted before reaching it — no row was recorded"
+    if not records:
+        failed = sum(1 for row in rows.values() if row.error)
+        contaminated = sum(1 for row in rows.values() if row.contaminated)
+        parts = [f"{failed} failed"] if failed else []
+        parts += [f"{contaminated} contaminated by a substitute model"] if contaminated else []
+        why = ", ".join(parts) or "none of them matched a corpus entry"
+        return (
+            f"all {len(rows)} of its rows were unusable ({why}) — nothing it produced measures "
+            "the panel it declares"
+        )
+    return f"{len(records)} cycles replayed cleanly, but none of them carried a decision to score"
 
 
 async def report(args: argparse.Namespace) -> int:
@@ -340,6 +510,112 @@ async def report(args: argparse.Namespace) -> int:
 
     scored = sc.score_records(cycles, index=index, regimes=regime_index, params=params)
     panel = meta.reference_basket.panel
+
+    corpus_obj = cp.load(args.corpus)
+    result = (
+        sw.read_meta(meta.corpus_id, args.matrix) if args.matrix else sw.latest_meta(meta.corpus_id)
+    )
+    if result is None and args.matrix:
+        # finding 4 (second half): the operator named a sweep, and no sweep by that digest ran
+        # under this corpus. Falling through would write a reference-pass-only page at exit 0 —
+        # the same silent-empty-report the ambiguity warning below exists to prevent, reached
+        # through the other branch, and worse for being asked a precise question. A mistyped or
+        # stale digest is refused, and the digests that *did* run are named so it can be fixed.
+        logger.error(
+            "report refused; no sweep with this matrix digest has run under this corpus",
+            extra={
+                "corpus_id": meta.corpus_id,
+                "requested_digest": args.matrix,
+                "available_digests": list(sw.sweep_digests(meta.corpus_id)),
+            },
+        )
+        return EXIT_CANDIDATE
+    if result is None:
+        # finding 4: `latest_meta` returns `None` both when nothing ran and when two sweeps did
+        # and neither was named — indistinguishable to the reader unless `report` says which. Not
+        # a refusal: the reference pass below still renders, exactly as it would with no sweep.
+        digests = sw.sweep_digests(meta.corpus_id)
+        if len(digests) > 1:
+            logger.warning(
+                "more than one sweep has run under this corpus; pass --matrix to pick one — "
+                "rendering the reference pass only until then",
+                extra={"matrix_digests": list(digests)},
+            )
+    ranking: tuple[cmp.Ranked, ...] = ()
+    agreement: tuple[cmp.Agreement, ...] = ()
+    candidate_seats: tuple[rd.CandidateSeats, ...] = ()
+    by_candidate: dict[str, tuple[sc.ScoredDecision, ...]] = {}
+    not_measured: list[rd.NotMeasured] = []
+    matrix: cd.Matrix | None = None
+    if result is not None:
+        # finding 2: the matrix is reloaded from the path the sweep recorded, and that file can
+        # have moved, gone missing, or simply changed since — one edited prompt is enough to mint
+        # a new `matrix_digest` (§7.1). Trusting the reload blindly would stamp the registry row
+        # below with the NEW digest while the rows read out from disk (keyed by the OLD digest,
+        # a few lines down) are the OLD experiment's, and any candidate the edit renamed would
+        # silently read zero rows instead of refusing. Both the missing-file and the
+        # changed-content cases are the same refusal: the recorded matrix can no longer be
+        # trusted to describe what actually ran.
+        try:
+            matrix = cd.load_matrix(Path(result.matrix_source), reference=meta.reference_basket)
+        except ConfigError as error:
+            logger.error(
+                "report refused; the sweep's matrix could not be reloaded",
+                extra={
+                    "matrix_source": result.matrix_source,
+                    "recorded_digest": result.matrix_digest,
+                    "reason": str(error),
+                },
+            )
+            return EXIT_CANDIDATE
+        if matrix.matrix_digest != result.matrix_digest:
+            logger.error(
+                "report refused; the matrix on disk no longer matches the one this sweep ran",
+                extra={
+                    "matrix_source": result.matrix_source,
+                    "recorded_digest": result.matrix_digest,
+                    "reloaded_digest": matrix.matrix_digest,
+                },
+            )
+            return EXIT_CANDIDATE
+
+        blocks = []
+        for candidate in matrix.candidates:
+            rows = sw.read_rows(
+                sw.rows_path(meta.corpus_id, result.matrix_digest, candidate.candidate_id)
+            )
+            records = sw.records_from_rows(corpus_obj, rows)
+            candidate_scored = sc.score_records(
+                records, index=index, regimes=regime_index, params=params
+            )
+            if not candidate_scored:
+                # finding 3: nothing this candidate produced reached scoring. `by_regime(())`
+                # would give three legitimate-looking zero rows and `_ranking_table` would sort
+                # it in as a peer at 0.0% accuracy, last: measured and worst, when it was never
+                # measured at all. Kept out of the ranking, the agreement matrix *and* the
+                # per-candidate seat tables, and named on the page with the reason instead.
+                #
+                # The test is the scored decisions, not `rows`: a candidate whose every row
+                # errored or was contaminated has a non-empty `.jsonl` and no measurement
+                # whatever, and `records_from_rows` has already dropped both (§7.7).
+                not_measured.append(
+                    rd.NotMeasured(
+                        candidate_id=candidate.candidate_id,
+                        reason=_not_measured_reason(rows, records),
+                    )
+                )
+                continue
+            blocks.append(
+                rd.CandidateSeats(
+                    candidate_id=candidate.candidate_id,
+                    seats=st.score_seats(records, candidate_scored, panel=candidate.panel),
+                )
+            )
+            by_candidate[candidate.candidate_id] = candidate_scored
+        ranking = cmp.ranking(by_candidate)
+        agreement = cmp.agreement(by_candidate)
+        candidate_seats = tuple(blocks)
+
     built = rd.LabReport(
         generated_at=SystemClock().now(),
         corpus_id=meta.corpus_id,
@@ -360,10 +636,44 @@ async def report(args: argparse.Namespace) -> int:
         cycles=len(cycles),
         regimes=sc.by_regime(scored),
         seats=st.score_seats(cycles, scored, panel=panel),
+        plumbing_check=result is not None and not result.evaluation,
+        matrix_digest=result.matrix_digest if result else "",
+        matrix_source=result.matrix_source if result else "",
+        on_fallback=result.on_fallback if result else "",
+        sweep_status=result.status.value if result else "",
+        halted_on=result.halted_on if result else "",
+        sample=result.sample if result else None,
+        budget_usd=result.budget_usd if result else ZERO,
+        spent_usd=result.spent_usd if result else ZERO,
+        contaminated=result.contaminated if result else 0,
+        ranking=ranking,
+        agreement=agreement,
+        candidate_seats=candidate_seats,
+        not_measured_candidates=tuple(not_measured),
     )
     out = args.out or reports_dir() / f"decision-lab-{meta.corpus_id}.md"
     rd.write_report(built, out)
     logger.info("report written", extra={"path": str(out), "decisions": len(scored)})
+
+    # §11: a candidate's headline metrics are filled in once it is scored, not at sweep time —
+    # the same row identity, updated in place rather than duplicated.
+    if result is not None and matrix is not None:
+        for candidate_id, rows_scored in by_candidate.items():
+            normal = next((m for m in sc.by_regime(rows_scored) if m.regime == "NORMAL"), None)
+            registry.record(
+                _registry_row(
+                    corpus_obj, matrix, SystemClock(), seed=result.sample.seed
+                ).model_copy(
+                    update={
+                        "candidate_id": candidate_id,
+                        "status": result.status.value,
+                        "scored": normal.scored if normal else 0,
+                        "accuracy": normal.accuracy if normal else ZERO,
+                        "precision_on_action": normal.precision_on_action if normal else ZERO,
+                        "cost_usd": normal.cost_usd if normal else ZERO,
+                    }
+                )
+            )
     return EXIT_OK
 
 
@@ -372,7 +682,7 @@ def _dayset_digest(data_dir: Path) -> str:
     (slice D). Recorded when present so a report can be tied to the set in force, absent
     otherwise rather than refusing a scoring run for want of a §10 artifact."""
     try:
-        return cd.require_pinned(data_dir).dayset_digest
+        return cday.require_pinned(data_dir).dayset_digest
     except ConfigError:
         return ""
 
@@ -383,7 +693,8 @@ COMMANDS: dict[tuple[str, str], Callable[[argparse.Namespace], Coroutine[Any, An
     ("dataset", "verify"): dataset_verify,
     ("dataset", "days"): dataset_days,
     ("corpus", "build"): corpus_build,
-    # `report` has no sub-action, so `getattr(args, "action", "")` yields "".
+    # `sweep` and `report` have no sub-action, so `getattr(args, "action", "")` yields "".
+    ("sweep", ""): sweep_command,
     ("report", ""): report,
 }
 

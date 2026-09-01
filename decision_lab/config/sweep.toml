@@ -1,0 +1,73 @@
+# The evaluation matrix (spec §7.1).
+#
+# Real endpoints and real model ids, so running this is a *measurement*. It refuses before spend
+# if OPENROUTER_API_KEY is absent (§7.2): a seat answering on its backup would be a panel nobody
+# configured, recorded under the name of one somebody did.
+#
+# Model ids are the ones decision/presets.py declares, which is the single place to fix them when
+# a free OpenRouter slot disappears — that churn is R11, and it is why every seat carries a
+# cross-family fallback chain rather than a second model from the same vendor.
+#
+# To exercise the machinery without spending anything, use sweep-stub.toml. That is not a flag on
+# this file: the binding decides what kind of run it is, so the answer is recorded on the report.
+
+[sweep]
+# halt    — the first substitute answer stops the sweep, completed rows kept (§7.7). The default.
+# exclude — the run continues; every cycle a seat fell back in is dropped from the score.
+on_fallback = "halt"
+
+[prompts.cautious]
+text = "Favour standing aside. State the single strongest argument against your own vote."
+
+[prompts.momentum]
+text = "Weight recent trend continuation over mean reversion. Name the invalidation level."
+
+[[candidates]]
+id = "baseline"
+protocol = "blind_then_debate"
+max_rounds = 3
+qualified_majority = "0.5"
+providers = ["openrouter", "gemini", "lmstudio"]
+
+  [[candidates.seats]]
+  seat_id = "technical"
+  role = "Technical Analyst"
+  provider_id = "openrouter"
+  model = "deepseek/deepseek-chat-v3-0324:free"
+  evidence = ["indicators", "position"]
+  prompt = "momentum"
+
+    [[candidates.seats.fallbacks]]
+    provider_id = "lmstudio"
+    model = "qwen2.5-7b-instruct"
+
+  [[candidates.seats]]
+  seat_id = "news"
+  role = "News/Sentiment Analyst"
+  provider_id = "openrouter"
+  model = "meta-llama/llama-3.3-70b-instruct:free"
+  evidence = ["news", "position"]
+  prompt = "cautious"
+
+    [[candidates.seats.fallbacks]]
+    provider_id = "gemini"
+    model = "gemini-2.0-flash"
+
+  [[candidates.seats]]
+  seat_id = "skeptic"
+  role = "Macro/Risk Skeptic"
+  provider_id = "openrouter"
+  model = "qwen/qwen-2.5-72b-instruct:free"
+  evidence = ["indicators", "news", "position"]
+  devils_advocate = true
+  prompt = "cautious"
+
+    [[candidates.seats.fallbacks]]
+    provider_id = "lmstudio"
+    model = "mistral-7b-instruct"
+
+# One blind round against three. "Does debating change the answer, and for the better" is the
+# cheapest question this tool can ask, and it is the one an operator asks first.
+[expand]
+max_rounds = [1, 3]
+limit = 8
