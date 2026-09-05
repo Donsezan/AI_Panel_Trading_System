@@ -66,6 +66,14 @@ CORPUS_META: Final = "corpus.json"
 #: they are the point of the exercise, so a quota over them would defeat it.
 SAMPLE_SIZES: Final = {"NORMAL": 60, "SHOCK_UP": 30, "SHOCK_DOWN": 30}
 
+#: `--window` values `calibrate long` accepts, in days. A month is 30 and a year 365; six months
+#: is 182 rather than 183 so `6m` and two `3m` runs cover the same span and stay comparable —
+#: §10.5's "cadences, one candidate" row is the only fair profit comparison this table protects.
+WINDOW_DAYS: Final = {"1m": 30, "3m": 91, "6m": 182, "12m": 365}
+
+#: §10.4's six-month long exposure run.
+DEFAULT_LONG_WINDOW: Final = "6m"
+
 
 def workspace_root() -> Path:
     """Scratch databases, caches and results. Gitignored, and never `data/` (§2.1)."""
