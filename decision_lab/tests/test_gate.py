@@ -117,6 +117,16 @@ def test_a_seat_that_only_answered_on_a_fallback_is_not_on_its_primary() -> None
     assert not seat.answered_on_primary
 
 
+def test_a_seat_that_answered_on_its_primary_is_on_its_primary() -> None:
+    seat = gate.SeatEvidence(
+        candidate_id="baseline",
+        seat_id="analyst",
+        primary="openrouter:model-a",
+        answered_on=("openrouter:model-a", "openrouter:model-b"),
+    )
+    assert seat.answered_on_primary
+
+
 def test_evidence_defaults_are_zero_not_none() -> None:
     """A candidate nobody measured must read as zero decisions, never as a missing field."""
     evidence = gate.CandidateEvidence(candidate_id="x")

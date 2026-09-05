@@ -27,6 +27,8 @@ conditions failed and which seat, because those need four different fixes (§15)
 from __future__ import annotations
 
 import hashlib
+import os
+import tempfile
 from datetime import date
 from pathlib import Path
 from typing import Final
@@ -157,9 +159,27 @@ def read(key: str, *, workspace: Path | None = None) -> GateRecord | None:
 
 
 def write(record: GateRecord, *, workspace: Path | None = None) -> Path:
+    """Write the gate record, crash-safe against mid-write process death.
+
+    Written to a temporary file in the record's own directory, then swapped in with
+    `os.replace` — atomic on both Windows and POSIX, so a process dying mid-write leaves the file
+    `read()` already trusts untouched rather than truncated (see registry.py for the identical
+    pattern on the same kind of JSON artifact). The temp file is on the same filesystem by
+    construction (`dir=path.parent`), which is what makes the replace atomic rather than a copy
+    that could itself be interrupted.
+    """
     path = gate_path(record.gate_key, workspace=workspace)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(record.model_dump_json(indent=2), encoding="utf-8")
+    payload = record.model_dump_json(indent=2)
+    descriptor, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+        tmp_path.replace(path)  # `Path.replace` is `os.replace`: atomic on Windows and POSIX
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
     return path
 
 
