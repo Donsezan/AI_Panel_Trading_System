@@ -1,19 +1,26 @@
 """The §10.6 conditions, on handmade rows.
 
-The gate's value is entirely in *which* condition failed and *which* seat, so these are asserted
-against constructed evidence rather than only end to end: the end-to-end run on the stub panel
-passes every condition by construction and would never exercise a refusal.
+The gate's value is entirely in *which* condition failed and *which* seat, so most of these are
+asserted against constructed evidence rather than only end to end: the end-to-end run on the stub
+panel passes every condition by construction and would never exercise a refusal. The arithmetic
+that builds that evidence in the first place (`candidate_evidence`, `sample_for`, a populated
+`days_for`) is exercised separately, on real `ScoredDecision`s and a real `Corpus` built by
+`decision_lab.tests.factories` — evidence built by hand would let a mutation of the arithmetic
+itself pass unnoticed.
 """
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 
 from decision_lab import calibration as cal
 from decision_lab import gate
 from decision_lab import sweep as sw
-from decision_lab.calibration_days import Pool
+from decision_lab.calibration_days import CalibrationDays, Pool, Thresholds
+from decision_lab.params import CADENCE_SECONDS
+from decision_lab.scoring import ScoredDecision, Truth, Verdict
+from decision_lab.tests.factories import corpus_with_entries
 from tradebot.core.config import PanelConfig, ProviderBinding, ProviderSettings, SeatConfig
 from tradebot.core.decision import SeatResponse, SeatVote
 from tradebot.core.enums import Action, SizeHint
@@ -64,8 +71,10 @@ def response(seat_id: str, model: str, *, abstained: bool = False) -> SeatRespon
     )
 
 
-def row(*responses: SeatResponse, cost: str = "0.10") -> sw.SweepRow:
-    return sw.SweepRow(cycle_id="c1", as_of=AT, responses=responses, cost_usd=Decimal(cost))
+def row(*responses: SeatResponse, cost: str = "0.10", error: str = "") -> sw.SweepRow:
+    return sw.SweepRow(
+        cycle_id="c1", as_of=AT, responses=responses, cost_usd=Decimal(cost), error=error
+    )
 
 
 class FakeCandidate:
@@ -191,32 +200,89 @@ def test_no_candidates_at_all_is_a_failure_not_a_pass() -> None:
     assert cal.failures_for((), report_written=True) != ()
 
 
+# --- candidate_evidence: the arithmetic that produces the evidence, not just its messages
+
+
+def test_candidate_evidence_counts_correct_by_verdict_not_by_truth_presence() -> None:
+    """§9's `_correct` must count `Verdict.CORRECT` and nothing else. An unscorable decision
+    (a gap in the tape) still carries a truth label — deliberately, here — and must not be
+    counted just because `truth is not None`, or the gate's accuracy would disagree with the
+    number `scoring.summarise` puts on the report for the same rows."""
+    candidate = FakeCandidate(panel(seat("analyst", "model-a")))
+    correct_decision = ScoredDecision(
+        cycle_id="c1",
+        as_of=AT,
+        instrument_key="binance:BTC/USDT",
+        regime=Pool.NORMAL,
+        action=Action.BUY,
+        conviction=Decimal("3"),
+        asked_for_an_order=True,
+        holding=False,
+        truth=Truth.BUY,
+        verdict=Verdict.CORRECT,
+    )
+    unscorable_decision = ScoredDecision(
+        cycle_id="c2",
+        as_of=AT,
+        instrument_key="binance:BTC/USDT",
+        regime=Pool.NORMAL,
+        action=Action.WAIT,
+        conviction=Decimal("1"),
+        asked_for_an_order=False,
+        holding=False,
+        truth=Truth.STAND_ASIDE,
+        verdict=Verdict.UNSCORED_GAP,
+    )
+    rows = {
+        "c1": row(response("analyst", "model-a"), cost="0.10"),
+        "c2": row(response("analyst", "model-a"), cost="0.10"),
+    }
+    found = cal.candidate_evidence(
+        candidate,  # type: ignore[arg-type]
+        rows,
+        records=(),
+        scored=(correct_decision, unscorable_decision),
+    )
+    assert found.scored == 1
+    assert found.accuracy == Decimal(1)
+    assert found.cost_per_scored == found.cost_usd
+
+
+def test_cost_per_cycle_excludes_errored_rows_from_the_denominator() -> None:
+    """§10.6: an errored row costs nothing by construction — the deliberation that would have
+    cost something never completed — so it must not pad the denominator and understate $/cycle,
+    which is exactly the direction the projection exists to guard against."""
+    candidate = FakeCandidate(panel(seat("analyst", "model-a")))
+    rows = {
+        "c1": row(response("analyst", "model-a"), cost="0.10"),
+        "c2": row(error="boom", cost="0"),
+    }
+    found = cal.candidate_evidence(
+        candidate,  # type: ignore[arg-type]
+        rows,
+        records=(),
+        scored=(),
+    )
+    assert found.rows == 2  # condition 1 counts every recorded row, errored or not
+    assert found.cost_per_cycle == Decimal("0.10")
+
+
 # --- the cost projection
 
 
 def test_the_projection_scales_with_cadence() -> None:
     """§10.6: the nine days measure $/cycle, and the projection is printed beside `--budget` so
     §7.5's ceiling stops being a guess."""
-    projected = cal.project_cost(
-        evidence(cost_per_cycle=Decimal("0.02")), window="6m", instruments=1
-    )
+    projected = cal.project_cost(evidence(cost_per_cycle=Decimal("0.02")), window="6m")
     # 182 days at 24h is 182 cycles; at 12h it is 364 — twice the spend.
     assert projected["24h"] == Decimal("3.64")
     assert projected["12h"] == projected["24h"] * 2
-    assert set(projected) == set(cal.CADENCE_SECONDS)
+    assert set(projected) == set(CADENCE_SECONDS)
 
 
 def test_the_projection_is_zero_when_nothing_was_spent() -> None:
     """A stub calibration costs nothing, and a projection of zero is the honest answer."""
-    assert cal.project_cost(evidence(), window="6m", instruments=1)["24h"] == Decimal(0)
-
-
-def test_the_projection_does_not_multiply_by_the_instrument_count() -> None:
-    """Cost is per *cycle* — one call answers for every instrument in basket mode — so the
-    instrument count moves the decision count, never the spend."""
-    one = cal.project_cost(evidence(cost_per_cycle=Decimal("0.02")), window="6m", instruments=1)
-    four = cal.project_cost(evidence(cost_per_cycle=Decimal("0.02")), window="6m", instruments=4)
-    assert one == four
+    assert cal.project_cost(evidence(), window="6m")["24h"] == Decimal(0)
 
 
 def test_an_unknown_window_refuses_naming_the_ones_that_exist() -> None:
@@ -225,7 +291,33 @@ def test_an_unknown_window_refuses_naming_the_ones_that_exist() -> None:
     from tradebot.core.errors import ConfigError
 
     with pytest.raises(ConfigError, match="6m"):
-        cal.project_cost(evidence(), window="7m", instruments=1)
+        cal.project_cost(evidence(), window="7m")
+
+
+# --- sample_for: every entry on the pinned days, folded into a Sample
+
+
+def test_sample_for_takes_every_day_and_reports_per_pool_counts() -> None:
+    """`full=True` because §10.2 runs every entry of the pinned days, never a stratified draw —
+    and `selected`/`available` are keyed by pool so a thin day is visible on the report."""
+    corpus = corpus_with_entries(count=48, as_of=datetime(2024, 1, 1, tzinfo=UTC))
+    normal_day = date(2024, 1, 1)
+    shock_day = date(2024, 1, 2)
+    pinned = CalibrationDays(
+        selected_at=AT,
+        seed=1,
+        reference_instrument="binance:BTC/USDT",
+        scoring_timeframe="1h",
+        thresholds=Thresholds(),
+        dataset_digest="d1",
+        dayset_digest="s1",
+        days={"NORMAL": (normal_day,), "SHOCK_UP": (shock_day,), "SHOCK_DOWN": ()},
+    )
+    sample = cal.sample_for(corpus, pinned, (normal_day, shock_day))
+    assert sample.full is True
+    assert len(sample.cycle_ids) == 48
+    assert sample.selected == {"NORMAL": 24, "SHOCK_UP": 24}
+    assert sample.available == sample.selected
 
 
 # --- day selection
@@ -240,11 +332,37 @@ def test_the_shock_scenario_takes_both_directions() -> None:
     assert cal.POOLS["shock"] == (Pool.SHOCK_UP, Pool.SHOCK_DOWN)
 
 
+def test_pools_and_the_gate_scenarios_name_the_same_set() -> None:
+    """`days_for` refuses on this declaration and `gate.record_scenario` refuses on the other —
+    a scenario known to only one would be recordable with no pool, or drawable with no record."""
+    assert set(cal.POOLS) == set(gate.SCENARIOS)
+
+
+def test_days_for_a_populated_set_returns_exactly_its_pool() -> None:
+    """The test a transposed `wanted` set (built from the wrong pools) would fail: `normal` must
+    return only the NORMAL days, and `shock` the union of both shock directions — never a pool
+    the scenario did not name."""
+    normal_days = (date(2024, 1, 1), date(2024, 1, 2))
+    up_days = (date(2024, 2, 1),)
+    down_days = (date(2024, 3, 1),)
+    pinned = CalibrationDays(
+        selected_at=AT,
+        seed=1,
+        reference_instrument="binance:BTC/USDT",
+        scoring_timeframe="1h",
+        thresholds=Thresholds(),
+        dataset_digest="d1",
+        dayset_digest="s1",
+        days={"NORMAL": normal_days, "SHOCK_UP": up_days, "SHOCK_DOWN": down_days},
+    )
+    assert cal.days_for(pinned, "normal") == normal_days
+    assert cal.days_for(pinned, "shock") == tuple(sorted(up_days + down_days))
+
+
 def test_an_unknown_scenario_refuses_rather_than_selecting_nothing() -> None:
     """Nine days with none selected would run zero entries and pass every condition vacuously."""
     import pytest
 
-    from decision_lab.calibration_days import CalibrationDays, Thresholds
     from tradebot.core.errors import ConfigError
 
     pinned = CalibrationDays(

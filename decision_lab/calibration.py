@@ -26,13 +26,7 @@ from decision_lab.calibration_days import CalibrationDays, Pool
 from decision_lab.candidates import Candidate
 from decision_lab.corpus import Corpus
 from decision_lab.gate import CandidateEvidence, SeatEvidence
-
-# `CADENCE_SECONDS` is re-exported (the `as CADENCE_SECONDS` is not a no-op: mypy's
-# `no_implicit_reexport` — leaked here by an unrelated `strict = true` override elsewhere in
-# pyproject.toml — otherwise refuses `cal.CADENCE_SECONDS`, which §10.6's projection test reads to
-# confirm it covers every cadence without hand-listing them a second time.
-from decision_lab.params import CADENCE_SECONDS as CADENCE_SECONDS
-from decision_lab.params import WINDOW_DAYS
+from decision_lab.params import CADENCE_SECONDS, WINDOW_DAYS
 from decision_lab.records import CycleRecord
 from decision_lab.sampling import Sample
 from decision_lab.scoring import ScoredDecision, Verdict, ratio
@@ -43,7 +37,9 @@ from tradebot.core.schema import Money
 
 #: Which pools each scenario draws. §10.3's two blocks are one *command* and two regimes: run
 #: together because they share a matrix and a gate half, reported apart because they ask opposite
-#: questions (§8.3).
+#: questions (§8.3). Keys must track `gate.SCENARIOS` — `test_calibration.py` pins the two sets
+#: equal, because `days_for` refuses on this one and `gate.record_scenario` refuses on the other,
+#: and a scenario known to only one would be recordable with no pool or drawable with no record.
 POOLS: Final[dict[str, tuple[Pool, ...]]] = {
     "normal": (Pool.NORMAL,),
     "shock": (Pool.SHOCK_UP, Pool.SHOCK_DOWN),
@@ -130,13 +126,24 @@ def candidate_evidence(
 ) -> CandidateEvidence:
     """Everything the gate and the cost projection need about one candidate.
 
-    `cost_per_cycle` divides by the rows actually bought, not by the entries requested: a resumed
-    calibration served half its answers from the §7.4 cache, and dividing by the request would
-    report a $/cycle that halves every time somebody re-runs it.
+    `records` is `sweep.records_from_rows(corpus, rows)` — this candidate's own rows
+    folded onto the corpus's frozen snapshots, never the corpus's reference-pass records:
+    `Sequence[CycleRecord]` admits either, and passing the reference pass's would make
+    `decisions` a corpus-wide constant identical for every candidate, regardless of what it
+    actually decided.
+
+    `cost_per_cycle` divides by the rows that produced an answer, not by every row `rows` holds.
+    `sweep._evaluate` gives an errored row `cost_usd=ZERO` by construction — the deliberation that
+    would have cost something never completed — so counting it in the denominator would divide
+    real spend across more cycles than were ever paid for and *understate* the $/cycle a long run
+    would face, exactly the direction §10.6's projection exists to guard against. A contaminated
+    row stays in the denominator: a substitute answered, so a real call was made and real money
+    was spent — it just cannot be scored (§7.7).
     """
     scored_count = sum(1 for row in scored if row.verdict.is_scored)
     correct = _correct(scored)
-    cost = sum((row.cost_usd for row in rows.values()), start=ZERO)
+    priced = [row for row in rows.values() if not row.error]
+    cost = sum((row.cost_usd for row in priced), start=ZERO)
     return CandidateEvidence(
         candidate_id=candidate.candidate_id,
         rows=len(rows),
@@ -145,7 +152,7 @@ def candidate_evidence(
         scored=scored_count,
         accuracy=ratio(correct, scored_count),
         cost_usd=cost,
-        cost_per_cycle=ratio(cost, len(rows)),
+        cost_per_cycle=ratio(cost, len(priced)),
         cost_per_scored=ratio(cost, scored_count),
         seats=seat_evidence(candidate, rows),
     )
@@ -206,19 +213,14 @@ def _failures_for_one(found: CandidateEvidence) -> list[str]:
     return reasons
 
 
-def project_cost(
-    evidence: CandidateEvidence,
-    *,
-    window: str,
-    instruments: int,  # noqa: ARG001 — kept for a future per-asset cost model, see below
-) -> dict[str, Money]:
+def project_cost(evidence: CandidateEvidence, *, window: str) -> dict[str, Money]:
     """§10.6's cost projection: what this candidate would spend over `window`, per cadence.
 
     Multiplied by `cost_per_cycle`, never by `cost_per_scored`. In `basket` mode one provider call
-    answers for every instrument (`total_cost` de-duplicates by `call_id`), so a basket of four
-    costs what a basket of one costs and only the *decision* count moves — which is why
-    `instruments` is taken and deliberately not used as a multiplier. It stays in the signature so
-    a future per-asset cost model has one place to land rather than a second call site to find.
+    answers for every instrument (`total_cost` de-duplicates by `call_id`), so cost is a property
+    of the cycle rather than of how many instruments it answered for — a basket of four costs
+    exactly what a basket of one costs, which is why there is no instrument count here for the
+    projection to multiply by.
     """
     if window not in WINDOW_DAYS:
         raise ConfigError(
