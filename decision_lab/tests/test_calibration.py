@@ -377,3 +377,70 @@ def test_an_unknown_scenario_refuses_rather_than_selecting_nothing() -> None:
     )
     with pytest.raises(ConfigError, match="not a calibration scenario"):
         cal.days_for(pinned, "sideways")
+
+
+# --- per_day: the report's per-day rows, labelled with the pinned pool
+
+
+def _scored(day: date, *, correct: bool) -> ScoredDecision:
+    """A minimal scored decision on `day`, using the only two verdicts `is_scored` is `True`
+    for — the same pair `scoring.summarise` and `cal._correct` split on."""
+    return ScoredDecision(
+        cycle_id="c1",
+        as_of=datetime(day.year, day.month, day.day, tzinfo=UTC),
+        instrument_key="binance:BTC/USDT",
+        regime=Pool.NORMAL,
+        action=Action.BUY,
+        conviction=Decimal("3"),
+        asked_for_an_order=True,
+        holding=False,
+        verdict=Verdict.CORRECT if correct else Verdict.WRONG,
+    )
+
+
+def test_per_day_groups_by_pinned_day_and_labels_its_pool() -> None:
+    from datetime import date
+
+    from decision_lab import render as rd
+    from decision_lab.calibration_days import CalibrationDays, Thresholds
+
+    pinned = CalibrationDays(
+        selected_at=AT,
+        seed=1,
+        reference_instrument="binance:BTC/USDT",
+        scoring_timeframe="1h",
+        thresholds=Thresholds(),
+        dataset_digest="d1",
+        dayset_digest="s1",
+        days={"NORMAL": (date(2026, 1, 1),), "SHOCK_UP": (), "SHOCK_DOWN": ()},
+    )
+    scored = (_scored(date(2026, 1, 1), correct=True), _scored(date(2026, 1, 1), correct=False))
+
+    rows = cal.per_day("baseline", scored, pinned)
+
+    assert len(rows) == 1
+    assert isinstance(rows[0], rd.DayMetrics)
+    assert rows[0].pool == "NORMAL"
+    assert rows[0].scored == 2
+    assert rows[0].correct == 1
+
+
+def test_per_day_skips_a_day_the_set_never_pinned() -> None:
+    """A corpus can hold entries either side of the nine days, and a row with a blank pool would
+    read as a day whose regime nobody could determine."""
+    from datetime import date
+
+    from decision_lab.calibration_days import CalibrationDays, Thresholds
+
+    pinned = CalibrationDays(
+        selected_at=AT,
+        seed=1,
+        reference_instrument="binance:BTC/USDT",
+        scoring_timeframe="1h",
+        thresholds=Thresholds(),
+        dataset_digest="d1",
+        dayset_digest="s1",
+        days={"NORMAL": (date(2026, 1, 1),), "SHOCK_UP": (), "SHOCK_DOWN": ()},
+    )
+
+    assert cal.per_day("baseline", (_scored(date(2026, 2, 2), correct=True),), pinned) == ()

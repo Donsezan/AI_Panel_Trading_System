@@ -28,6 +28,7 @@ from decision_lab.corpus import Corpus
 from decision_lab.gate import CandidateEvidence, SeatEvidence
 from decision_lab.params import CADENCE_SECONDS, WINDOW_DAYS
 from decision_lab.records import CycleRecord
+from decision_lab.render import DayMetrics
 from decision_lab.sampling import Sample
 from decision_lab.scoring import ScoredDecision, Verdict, ratio
 from decision_lab.sweep import SweepRow
@@ -165,6 +166,38 @@ def _correct(scored: Sequence[ScoredDecision]) -> int:
     a truth label too, and counting those would give the gate a number the report disagrees with.
     """
     return sum(1 for row in scored if row.verdict is Verdict.CORRECT)
+
+
+def per_day(
+    candidate_id: str, scored: Sequence[ScoredDecision], pinned: CalibrationDays
+) -> tuple[DayMetrics, ...]:
+    """§10.2's per-day rows, labelled with the pool each day was pinned into.
+
+    A decision falling on a day this set never pinned is skipped rather than given a blank pool: a
+    corpus can hold entries either side of the nine days, and a row labelled "" would read as a
+    day whose regime nobody could determine.
+    """
+    by_day: dict[date, list[ScoredDecision]] = {}
+    for row in scored:
+        by_day.setdefault(row.as_of.date(), []).append(row)
+    rows = []
+    for day in sorted(by_day):
+        pool = pinned.pool_of(day)
+        if pool is None:
+            continue
+        here = [row for row in by_day[day] if row.verdict.is_scored]
+        correct = _correct(here)
+        rows.append(
+            DayMetrics(
+                candidate_id=candidate_id,
+                day=day,
+                pool=pool.value,
+                scored=len(here),
+                correct=correct,
+                accuracy=ratio(correct, len(here)),
+            )
+        )
+    return tuple(rows)
 
 
 def failures_for(evidence: Sequence[CandidateEvidence], *, report_written: bool) -> tuple[str, ...]:

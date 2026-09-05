@@ -22,10 +22,12 @@ read, which `test_discipline.py` asserts structurally.
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Final
+
+from pydantic import Field
 
 from decision_lab.compare import Agreement, Ranked
 from decision_lab.sampling import Sample
@@ -60,6 +62,17 @@ PLUMBING_CHECK: Final = (
     "matrix bound to real providers to learn something."
 )
 
+#: §10.6. `--skip-gate` was used, so nobody proved every seat answered on its own model before
+#: this run. Rendered with the other banners, above the identity block: a result whose provenance
+#: reads "nobody checked the seats first" should say so on its face.
+GATE_SKIPPED: Final = (
+    "**GATE SKIPPED.** This run was started with `--skip-gate`, so the §10.6 calibration gate "
+    "was not consulted. Nothing here proves that every candidate materialised, that every seat "
+    "answered on its own model rather than on a backup, or that the panel reached a decision at "
+    "all. A seat that abstained silently would leave exactly these tables, and they would look "
+    "no different."
+)
+
 
 class CandidateSeats(DomainModel):
     """§9.7's tables, one set per candidate — a seat is only comparable within its own panel."""
@@ -78,6 +91,36 @@ class NotMeasured(DomainModel):
 
     candidate_id: str
     reason: str
+
+
+class DayMetrics(DomainModel):
+    """One candidate on one pinned day (§10.2).
+
+    Reported per day *and* pooled: a candidate whose pooled accuracy comes entirely from one of
+    three days is not a candidate the report should present as steady, and only the per-day rows
+    can say so.
+    """
+
+    candidate_id: str
+    day: date
+    pool: str
+    scored: int = 0
+    correct: int = 0
+    accuracy: Money = ZERO
+
+
+class CostProjection(DomainModel):
+    """§10.6's projection: what nine days say a long run would cost, per cadence.
+
+    `projected` is cadence label → spend over the declared window. Printed beside `--budget` so
+    §7.5's ceiling stops being a guess — and so an over-ceiling projection is learned for the
+    price of nine days rather than at hour nine.
+    """
+
+    candidate_id: str
+    cost_per_cycle: Money = ZERO
+    cost_per_scored: Money = ZERO
+    projected: dict[str, Money] = Field(default_factory=dict)
 
 
 class LabReport(DomainModel):
@@ -126,6 +169,18 @@ class LabReport(DomainModel):
     #: 0.0% accuracy, which would read as measured and worst rather than not measured at all.
     not_measured_candidates: tuple[NotMeasured, ...] = ()
 
+    # --- Slice D (§10). All empty on a sweep or reference-pass report, which then renders
+    # exactly as it did before: one command, one rendering path (§14).
+    #: "normal" or "shock" when this page is a calibration, "" otherwise.
+    scenario: str = ""
+    calibration_days: tuple[date, ...] = ()
+    per_day: tuple[DayMetrics, ...] = ()
+    gate_passed: bool = False
+    gate_failures: tuple[str, ...] = ()
+    #: §10.6's `--skip-gate`, stamped here and on the §11 row.
+    gate_skipped: bool = False
+    cost_projection: tuple[CostProjection, ...] = ()
+
 
 def report_markdown(report: LabReport) -> str:
     sections = [
@@ -139,7 +194,12 @@ def report_markdown(report: LabReport) -> str:
         sections += ["", PLUMBING_CHECK]
     if report.news_blind:
         sections += ["", NEWS_BLIND]
+    if report.gate_skipped:
+        sections += ["", GATE_SKIPPED]
     sections += ["", _identity(report)]
+    calibration_block = _calibration_block(report)
+    if calibration_block:
+        sections += ["", calibration_block]
     if report.ranking or report.not_measured_candidates:
         sections += [
             "",
@@ -163,6 +223,9 @@ def report_markdown(report: LabReport) -> str:
         "",
         _seat_tables(report.seats),
     ]
+    # §10.6: last on the page — the final `rstrip()` below absorbs the blank line an empty
+    # projection would otherwise leave, so a report with none renders exactly as before.
+    sections += ["", _cost_projection_table(report.cost_projection)]
     return "\n".join(sections).rstrip() + "\n"
 
 
@@ -424,6 +487,97 @@ def _candidate_seat_tables(blocks: Sequence[CandidateSeats]) -> str:
         return ""
     return "\n\n".join(
         f"### Seats — {block.candidate_id}\n\n{_seat_tables(block.seats)}" for block in blocks
+    )
+
+
+def _calibration_block(report: LabReport) -> str:
+    """§10.2's per-day table and its spread, and the gate verdict this page produced."""
+    if not report.scenario:
+        return ""
+    parts = [
+        f"## Calibration — {report.scenario}",
+        "",
+        "Days: " + ", ".join(day.isoformat() for day in report.calibration_days),
+        "",
+    ]
+    if report.per_day:
+        parts += [
+            _table(
+                ("candidate", "day", "pool", "scored", "correct", "accuracy"),
+                (
+                    (
+                        row.candidate_id,
+                        row.day.isoformat(),
+                        row.pool,
+                        str(row.scored),
+                        str(row.correct),
+                        _pct(row.accuracy),
+                    )
+                    for row in report.per_day
+                ),
+            ),
+            "",
+            _spread_note(report.per_day),
+            "",
+        ]
+    return "\n".join([*parts, _gate_verdict(report), ""])
+
+
+def _spread_note(rows: Sequence[DayMetrics]) -> str:
+    """The spread across the days, per candidate. §10.2: three days is not a distribution, but it
+    is enough to see when one day carried a result — and a candidate whose pooled accuracy comes
+    entirely from one of the three is not one this page should present as steady."""
+    lines = []
+    for candidate_id in dict.fromkeys(row.candidate_id for row in rows):
+        accuracies = [row.accuracy for row in rows if row.candidate_id == candidate_id]
+        lines.append(
+            f"- **{candidate_id}** — accuracy spread across its days: "
+            f"{_pct(max(accuracies) - min(accuracies))} "
+            f"({_pct(min(accuracies))} to {_pct(max(accuracies))})"
+        )
+    return "\n".join(lines)
+
+
+def _gate_verdict(report: LabReport) -> str:
+    """§10.6's four conditions, as a verdict a reader can act on."""
+    if report.gate_passed:
+        return (
+            "**Gate: PASSED.** Every candidate materialised and deliberated, every seat answered "
+            "at least once on its primary binding, the panel reached decisions, and the path "
+            "completed."
+        )
+    listed = "\n".join(f"- {reason}" for reason in report.gate_failures)
+    return (
+        "**Gate: FAILED.** The §10.6 gate is shut for this dataset, matrix and day set:\n\n"
+        f"{listed}"
+    )
+
+
+def _cost_projection_table(rows: Sequence[CostProjection]) -> str:
+    """§10.6's projection, so §7.5's ceiling stops being a guess."""
+    if not rows:
+        return ""
+    cadences = sorted({label for row in rows for label in row.projected})
+    return "\n".join(
+        [
+            "## Projected spend",
+            "",
+            "Measured over the pinned days, projected across the declared window.",
+            "",
+            _table(
+                ("candidate", "$/cycle", "$/scored", *(f"{label} run" for label in cadences)),
+                (
+                    (
+                        row.candidate_id,
+                        _num(row.cost_per_cycle),
+                        _num(row.cost_per_scored),
+                        *(_num(row.projected.get(label)) for label in cadences),
+                    )
+                    for row in rows
+                ),
+            ),
+            "",
+        ]
     )
 
 
