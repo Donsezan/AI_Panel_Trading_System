@@ -88,7 +88,10 @@ Result today: [reports/decision-lab-8ac130d8f2ed5650dff0dcb9f969d07e.md](reports
   decision_lab\config\sweep.toml` is a real measurement and needs `OPENROUTER_API_KEY`.
   `sweep-stub.toml` remains a plumbing check — every report and registry row it produces is
   stamped `PLUMBING CHECK — NOT AN EVALUATION`, so a stub run can never be mistaken for one that
-  measured judgement.
+  measured judgement. **A matrix is one kind of run or the other**, so a stub "control" candidate
+  cannot be added to `sweep.toml` as a baseline: that label is whole-run, and one stub binding
+  would both waive the missing-key refusal for the real candidates and stamp the page carrying
+  their ranking as a plumbing check. Run the two files separately.
 - **Every report is `NEWS-BLIND`** until slice E. Shock blocks measure the reaction to a violent
   price move, not to the reporting of an event.
 - **Corpus `61721dba…` (4h) is a stale 67/1080-cycle pass** and is reused at its identity, never
