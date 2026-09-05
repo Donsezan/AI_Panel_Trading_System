@@ -173,3 +173,9 @@ def test_the_window_table_covers_the_long_run_default() -> None:
 
     assert DEFAULT_LONG_WINDOW in WINDOW_DAYS
     assert WINDOW_DAYS[DEFAULT_LONG_WINDOW] == 182
+
+
+def test_status_gate_unsatisfied_has_the_expected_literal() -> None:
+    """§11: The literal is written to registry.jsonl and read back from persisted rows, so an
+    accidental rename silently orphans rows; the value, not the symbol, must be asserted."""
+    assert registry.STATUS_GATE_UNSATISFIED == "gate_unsatisfied"
