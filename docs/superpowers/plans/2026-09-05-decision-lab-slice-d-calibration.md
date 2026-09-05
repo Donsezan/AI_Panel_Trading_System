@@ -626,22 +626,20 @@ from decision_lab import calibration as cal
 from decision_lab import gate
 from decision_lab import sweep as sw
 from decision_lab.calibration_days import Pool
-from tradebot.core.config import PanelConfig, ProviderConfig, SeatConfig
+from tradebot.core.config import PanelConfig, ProviderBinding, ProviderConfig, SeatConfig
 from tradebot.core.decision import SeatResponse, SeatVote
-from tradebot.core.enums import Action
+from tradebot.core.enums import Action, SizeHint
 
 AT = datetime(2026, 1, 1, tzinfo=UTC)
 
 
 def seat(seat_id: str, model: str, *, fallbacks: tuple[tuple[str, str], ...] = ()) -> SeatConfig:
-    """One seat. `fallbacks` is built in whatever shape `SeatConfig` declares — check the field
-    before writing this, and use `ProviderBinding(...)` objects if that is the declared type."""
     return SeatConfig(
         seat_id=seat_id,
         role="analyst",
         provider_id="stub",
         model=model,
-        fallbacks=tuple({"provider_id": p, "model": m} for p, m in fallbacks),
+        fallbacks=tuple(ProviderBinding(provider_id=p, model=m) for p, m in fallbacks),
     )
 
 
@@ -654,7 +652,15 @@ def panel(*seats: SeatConfig) -> PanelConfig:
 
 
 def response(seat_id: str, model: str, *, abstained: bool = False) -> SeatResponse:
-    vote = None if abstained else SeatVote(action=Action.BUY, conviction=3, thesis="t")
+    # `SeatVote` requires `size_hint`, and its `_check_coherence` validator refuses a tradable
+    # action carrying `SizeHint.NONE` — a vote built without both fails validation, not the test.
+    vote = (
+        None
+        if abstained
+        else SeatVote(
+            action=Action.BUY, conviction=3, size_hint=SizeHint.HALF, thesis="t"
+        )
+    )
     return SeatResponse(
         seat_id=seat_id,
         role="analyst",
@@ -900,7 +906,7 @@ from decision_lab.gate import CandidateEvidence, SeatEvidence
 from decision_lab.params import CADENCE_SECONDS, WINDOW_DAYS
 from decision_lab.records import CycleRecord
 from decision_lab.sampling import Sample
-from decision_lab.scoring import ScoredDecision, ratio
+from decision_lab.scoring import ScoredDecision, Verdict, ratio
 from decision_lab.sweep import SweepRow
 from tradebot.core.errors import ConfigError
 from tradebot.core.money import ZERO, multiply
@@ -1019,10 +1025,10 @@ def candidate_evidence(
 def _correct(scored: Sequence[ScoredDecision]) -> int:
     """How many verdicts were right, by the *same* predicate `scoring.summarise` uses.
 
-    Read that function and mirror its expression here rather than inventing a second one: two
-    definitions of "correct" that drift is a gate passing on a number the report disagrees with.
+    `Verdict.CORRECT` and nothing else. Not "`truth` is not None" — an unscorable decision carries
+    a truth label too, and counting those would give the gate a number the report disagrees with.
     """
-    raise NotImplementedError("mirror scoring.summarise's own predicate — see the docstring")
+    return sum(1 for row in scored if row.verdict is Verdict.CORRECT)
 
 
 def failures_for(evidence: Sequence[CandidateEvidence], *, report_written: bool) -> tuple[str, ...]:
@@ -1092,9 +1098,9 @@ def project_cost(evidence: CandidateEvidence, *, window: str, instruments: int) 
     }
 ```
 
-- [ ] **Step 4: Replace `_correct`'s `NotImplementedError` with the real predicate**
+- [ ] **Step 4: Confirm `_correct` still matches `summarise`**
 
-Read `decision_lab/scoring.py`'s `summarise` and copy the expression it uses to count correct verdicts. It is deliberately left unwritten above because guessing it is the one way this task produces a gate that disagrees with the report it renders.
+Open `decision_lab/scoring.py`'s `summarise` and check that its correct-verdict expression is still `d.verdict is Verdict.CORRECT`. If it has changed, change `_correct` to match it — the gate and the report must count the same thing, or the gate passes on a number the page it renders disagrees with.
 
 - [ ] **Step 5: Run the tests and verify they pass**
 
@@ -1287,7 +1293,7 @@ def test_per_day_skips_a_day_the_set_never_pinned() -> None:
     assert cal.per_day("baseline", (_scored(date(2026, 2, 2), correct=True),), pinned) == ()
 ```
 
-Write a `_scored(day: date, *, correct: bool) -> ScoredDecision` helper in that file. Read `decision_lab/scoring.py`'s `Verdict` enum and pick two members whose `is_scored` is `True` — one that `summarise` counts as correct and one it does not — so this helper and `_correct` agree by construction.
+Write a `_scored(day: date, *, correct: bool) -> ScoredDecision` helper in that file, using `Verdict.CORRECT` when `correct` and `Verdict.WRONG` otherwise — the only two members whose `is_scored` is `True`, and the same pair `summarise` and `_correct` split on. Build the rest of the `ScoredDecision` from its required fields (`cycle_id`, `as_of`, `instrument_key`, `regime`, `action`, `conviction`, `asked_for_an_order`, `holding`, `verdict`); read the model before writing the helper.
 
 - [ ] **Step 2: Run the tests and verify they fail**
 
