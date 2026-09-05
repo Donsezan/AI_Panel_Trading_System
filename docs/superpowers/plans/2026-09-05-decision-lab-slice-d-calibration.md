@@ -1847,11 +1847,7 @@ async def calibrate_snapshot(args: argparse.Namespace) -> int:
                 candidate_id=found.candidate_id,
                 cost_per_cycle=found.cost_per_cycle,
                 cost_per_scored=found.cost_per_scored,
-                projected=cal.project_cost(
-                    found,
-                    window=args.window,
-                    instruments=len(corpus.meta.reference_basket.instruments),
-                ),
+                projected=cal.project_cost(found, window=args.window),
             )
             for found in evidence
         ),
