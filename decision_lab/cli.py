@@ -24,14 +24,15 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from decision_lab import calibration as cal
 from decision_lab import calibration_days as cday
 from decision_lab import candidates as cd
 from decision_lab import compare as cmp
 from decision_lab import corpus as cp
 from decision_lab import dataset as ds
+from decision_lab import gate, registry, sampling
 from decision_lab import records as rc
 from decision_lab import regimes as rg
-from decision_lab import registry, sampling
 from decision_lab import render as rd
 from decision_lab import scoring as sc
 from decision_lab import seats as st
@@ -39,8 +40,10 @@ from decision_lab import sweep as sw
 from decision_lab.params import (
     CADENCE_SECONDS,
     DAYSET_FILE,
+    DEFAULT_LONG_WINDOW,
     DEFAULT_SEED,
     DEFAULT_SHOCK_PERCENTILE,
+    WINDOW_DAYS,
     reports_dir,
 )
 from tradebot.core.clock import SystemClock, ensure_utc
@@ -174,6 +177,35 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     sweep_.add_argument("--regimes", type=Path, default=None)
     sweep_.add_argument("--scoring-timeframe", default="")
     sweep_.add_argument("--verbose", action="store_true")
+
+    calibrate = commands.add_parser(
+        "calibrate", help="the §10 scenarios: the short seat check, and the long profit run"
+    )
+    calibrate_actions = calibrate.add_subparsers(dest="action", required=True)
+    for scenario, blurb in (
+        ("normal", "every candidate over the three pinned NORMAL days"),
+        ("shock", "the three SHOCK_UP and three SHOCK_DOWN days, never pooled"),
+    ):
+        snapshot = calibrate_actions.add_parser(scenario, help=blurb)
+        snapshot.add_argument("--corpus", required=True, help="corpus id from `corpus build`")
+        # Required, deliberately unlike `sweep`'s defaulted `--configs`: the gate is keyed on
+        # `matrix_digest`, so a defaulted matrix would let an operator calibrate one matrix and
+        # sweep another and never be told the gate they opened was not the gate they needed.
+        snapshot.add_argument("--configs", type=Path, required=True, help="the candidate matrix")
+        snapshot.add_argument("--budget", type=_decimal_arg, default=Decimal(5))
+        snapshot.add_argument("--data", type=Path, default=None)
+        snapshot.add_argument("--regimes", type=Path, default=None)
+        snapshot.add_argument("--scoring-timeframe", default="")
+        snapshot.add_argument("--band-k", type=_decimal_arg, default=None)
+        snapshot.add_argument("--horizon", type=int, default=None)
+        snapshot.add_argument(
+            "--window",
+            default=DEFAULT_LONG_WINDOW,
+            choices=sorted(WINDOW_DAYS),
+            help="the long-run window the cost projection is for",
+        )
+        snapshot.add_argument("--out", type=Path, default=None)
+        snapshot.add_argument("--verbose", action="store_true")
 
     report_ = commands.add_parser(
         "report", help="score a built corpus and file the result under decision_lab/reports/"
@@ -491,6 +523,212 @@ def _not_measured_reason(rows: Mapping[str, sw.SweepRow], records: Sequence[rc.C
     return f"{len(records)} cycles replayed cleanly, but none of them carried a decision to score"
 
 
+async def calibrate_snapshot(args: argparse.Namespace) -> int:
+    """§10.2 and §10.3 — the snapshot-scored scenarios, and the gate half each one fills in.
+
+    The sweep, pointed at the pinned days instead of a stratified sample. Everything downstream of
+    `sweep.run` — cache, budget, resume, the §7.7 substitute policy — is inherited rather than
+    repeated, which is also what makes §10.1's "identical evidence" claim true by construction.
+
+    One handler serves both scenarios because they differ only in which pools `days_for` draws
+    from: `normal` takes NORMAL, `shock` takes SHOCK_UP and SHOCK_DOWN together and the renderer
+    keeps them apart (§8.3). A second handler would be the same hundred lines with one constant
+    changed, and the two would drift.
+    """
+    clock = SystemClock()
+    scenario = args.action
+    corpus = cp.load(args.corpus)
+    data_dir = args.data or Path(corpus.meta.dataset_directory)
+    audit = ds.require_verified(data_dir)
+    dataset = ReplayDataset.load(data_dir, clock)
+    # §15: a missing or stale pinned day set refuses a *calibration*, naming the command that
+    # produces one. `require_pinned` raises `ConfigError`, which `main` maps to EXIT_DATASET.
+    pinned = cday.require_pinned(data_dir)
+
+    # Both refusals happen before any spend (§7.2). Unlike `sweep`, neither writes a registry
+    # row: a row is keyed by `matrix_digest`, which a matrix that will not load does not have —
+    # and a matrix that loads but is unreachable has not been calibrated at all, so a row
+    # claiming a calibration ran is worse than no row.
+    try:
+        matrix = cd.load_matrix(args.configs, reference=corpus.meta.reference_basket)
+        cd.require_reachable(matrix)
+    except ConfigError as error:
+        logger.error("calibration refused; nothing was spent", extra={"reason": str(error)})
+        return EXIT_CANDIDATE
+
+    days = cal.days_for(pinned, scenario)
+    sample = cal.sample_for(corpus, pinned, days)
+    result = await sw.run(corpus, matrix, sample=sample, clock=clock, budget_usd=args.budget)
+    sw.write_meta(result)
+
+    params = sc.ScoringParams(
+        timeframe=args.scoring_timeframe or dataset.timeframes[0],
+        **({"band_k": args.band_k} if args.band_k is not None else {}),
+        **({"horizon_bars": args.horizon} if args.horizon is not None else {}),
+    )
+    index = await sc.build_price_index(dataset, audit, params)
+    regime_index = (await rg.index_dataset(dataset, params.timeframe)).with_windows(
+        rg.load_windows(args.regimes or rg.DEFAULT_REGIMES_TOML)
+    )
+
+    evidence: list[gate.CandidateEvidence] = []
+    by_candidate: dict[str, tuple[sc.ScoredDecision, ...]] = {}
+    day_rows: list[rd.DayMetrics] = []
+    seat_blocks: list[rd.CandidateSeats] = []
+    not_measured: list[rd.NotMeasured] = []
+    for candidate in matrix.candidates:
+        rows = sw.read_rows(
+            sw.rows_path(corpus.meta.corpus_id, matrix.matrix_digest, candidate.candidate_id)
+        )
+        records = sw.records_from_rows(corpus, rows)
+        scored = sc.score_records(records, index=index, regimes=regime_index, params=params)
+        # Evidence is appended for every candidate, measured or not: §10.6's first condition is
+        # that every candidate materialised and deliberated, so one that produced nothing must
+        # reach `failures_for` to fail it. Only the *presentation* skips it, exactly as `report`
+        # does — an unmeasured candidate ranked at 0.0% reads as measured and worst (finding 3).
+        evidence.append(cal.candidate_evidence(candidate, rows, records, scored))
+        if not scored:
+            not_measured.append(
+                rd.NotMeasured(
+                    candidate_id=candidate.candidate_id,
+                    reason=_not_measured_reason(rows, records),
+                )
+            )
+            continue
+        by_candidate[candidate.candidate_id] = scored
+        day_rows += cal.per_day(candidate.candidate_id, scored, pinned)
+        seat_blocks.append(
+            rd.CandidateSeats(
+                candidate_id=candidate.candidate_id,
+                seats=st.score_seats(records, scored, panel=candidate.panel),
+            )
+        )
+
+    failures = cal.failures_for(evidence, report_written=True)
+    key = gate.gate_key(
+        dataset_digest=audit.dataset_digest,
+        matrix_digest=matrix.matrix_digest,
+        dayset_digest=pinned.dayset_digest,
+    )
+    out = args.out or reports_dir() / f"decision-lab-calibration-{scenario}-{key}.md"
+    pooled = tuple(row for rows_ in by_candidate.values() for row in rows_)
+    built = rd.LabReport(
+        generated_at=clock.now(),
+        corpus_id=corpus.meta.corpus_id,
+        dataset_directory=str(data_dir),
+        dataset_digest=corpus.meta.dataset_digest,
+        dayset_digest=pinned.dayset_digest,
+        reference_instrument=pinned.reference_instrument,
+        reference_panel_id=corpus.meta.reference_panel_id,
+        reference_config_digest=corpus.meta.reference_config_digest,
+        cadence_seconds=corpus.meta.cadence_seconds,
+        scoring=params,
+        vol_window_bars=regime_index.window_bars,
+        shock_percentile=regime_index.shock_percentile,
+        named_windows=tuple(w.name for w in regime_index.windows),
+        start_equity=corpus.meta.start_equity,
+        news_blind=corpus.meta.news_blind,
+        panel_models=tuple(
+            dict.fromkeys(
+                f"{s.provider_id}:{s.model}"
+                for candidate in matrix.candidates
+                for s in candidate.panel.seats
+            )
+        ),
+        cycles=len(sample.cycle_ids),
+        regimes=sc.by_regime(pooled),
+        seats=(),
+        plumbing_check=not matrix.is_evaluation,
+        matrix_digest=matrix.matrix_digest,
+        matrix_source=str(matrix.source),
+        on_fallback=matrix.on_fallback.value,
+        sweep_status=result.status.value,
+        halted_on=result.halted_on,
+        sample=sample,
+        budget_usd=result.budget_usd,
+        spent_usd=result.spent_usd,
+        contaminated=result.contaminated,
+        ranking=cmp.ranking(by_candidate),
+        agreement=cmp.agreement(by_candidate),
+        candidate_seats=tuple(seat_blocks),
+        not_measured_candidates=tuple(not_measured),
+        scenario=scenario,
+        calibration_days=days,
+        per_day=tuple(day_rows),
+        gate_passed=not failures,
+        gate_failures=failures,
+        cost_projection=tuple(
+            rd.CostProjection(
+                candidate_id=found.candidate_id,
+                cost_per_cycle=found.cost_per_cycle,
+                cost_per_scored=found.cost_per_scored,
+                projected=cal.project_cost(found, window=args.window),
+            )
+            for found in evidence
+        ),
+    )
+    rd.write_report(built, out)
+
+    # The other half is read back and kept: one command fills one half, and `record_scenario`
+    # replaces only the one it names (§10.6). Building a fresh record here would silently discard
+    # a passing `calibrate normal` every time `calibrate shock` ran.
+    record = gate.read(key) or gate.GateRecord(
+        gate_key=key,
+        dataset_digest=audit.dataset_digest,
+        matrix_digest=matrix.matrix_digest,
+        dayset_digest=pinned.dayset_digest,
+    )
+    gate.write(
+        gate.record_scenario(
+            record.model_copy(update={"evaluation": matrix.is_evaluation}),
+            gate.ScenarioVerdict(
+                scenario=scenario,
+                ran_at=clock.now(),
+                cadence_seconds=corpus.meta.cadence_seconds,
+                corpus_id=corpus.meta.corpus_id,
+                days=days,
+                candidates=tuple(evidence),
+                report_path=str(out),
+                failures=failures,
+            ),
+        )
+    )
+
+    for found in evidence:
+        registry.record(
+            _registry_row(corpus, matrix, clock, seed=sample.seed).model_copy(
+                update={
+                    "scenario": f"calibrate-{scenario}",
+                    "candidate_id": found.candidate_id,
+                    "status": result.status.value,
+                    "scored": found.scored,
+                    "accuracy": found.accuracy,
+                    "cost_usd": found.cost_usd,
+                }
+            )
+        )
+
+    logger.info(
+        "calibration complete",
+        extra={
+            "scenario": scenario,
+            "gate": "passed" if not failures else "failed",
+            "failures": list(failures),
+            "days": [day.isoformat() for day in days],
+            "spent": str(result.spent_usd),
+            "report": str(out),
+        },
+    )
+    # The gate verdict outranks the halt: a run that stopped on its ceiling and one that finished
+    # with a seat that never answered both leave the gate shut, and EXIT_GATE is the one an
+    # operator must act on before spending anything larger.
+    if failures:
+        return EXIT_GATE
+    if result.status in (sw.SweepStatus.HALTED_BUDGET, sw.SweepStatus.HALTED_FALLBACK):
+        return EXIT_BUDGET
+    return EXIT_OK
+
+
 async def report(args: argparse.Namespace) -> int:
     """Score the reference pass in a built corpus and write the Markdown report."""
     meta, cycles = rc.load(args.corpus)
@@ -696,6 +934,8 @@ COMMANDS: dict[tuple[str, str], Callable[[argparse.Namespace], Coroutine[Any, An
     # `sweep` and `report` have no sub-action, so `getattr(args, "action", "")` yields "".
     ("sweep", ""): sweep_command,
     ("report", ""): report,
+    ("calibrate", "normal"): calibrate_snapshot,
+    ("calibrate", "shock"): calibrate_snapshot,
 }
 
 
