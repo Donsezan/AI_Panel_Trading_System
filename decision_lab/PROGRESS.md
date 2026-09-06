@@ -16,12 +16,17 @@ Slice order and rationale: §18.
 | **A** — integrity, day set, corpus | verified history + a frozen set of decision contexts | ✅ shipped |
 | **B** — regimes, scoring, per-seat, report | *how did this panel do, and which seat carried it* | ✅ shipped |
 | **C** — the sweep | *is a **different** panel right more often* — the stated goal | ✅ shipped |
-| **D** — calibration + dashboard | normal day / shock day / six-month profit run | ⬜ not started |
+| **D** — calibration + dashboard | normal day / shock day / six-month profit run | 🟡 pass 1 in progress |
 | **E** — news archive | shock days measure the *news*, not just the price move | ⬜ not started |
 
-**Three slices of five.** Comparing configurations — the thing the tool was built for — now runs:
-N candidates over one frozen corpus, ranked, with a pairwise agreement matrix and a per-candidate
-seat breakdown. D (calibration + dashboard) and E (news) are not built.
+**Three slices of five, and half of the fourth.** Comparing configurations — the thing the tool was
+built for — now runs: N candidates over one frozen corpus, ranked, with a pairwise agreement matrix
+and a per-candidate seat breakdown.
+
+Slice D is split into two passes. **Pass 1 — the three calibration scenarios and the §10.6 gate —
+is four tasks of nine done**, on branch `feat/decision-lab-slice-d`. Nothing of it is reachable
+from the CLI yet: the `calibrate` commands are task 5. **Pass 2 — the dashboard and the notebook —
+has not started**, and E (news) is untouched.
 
 ---
 
@@ -53,13 +58,31 @@ Result today: [reports/decision-lab-8ac130d8f2ed5650dff0dcb9f969d07e.md](reports
 - [x] Cross-candidate tables (§9.6): ranking, agreement matrix
 - [x] `registry.py` — keep every result, so two setups are compared rather than remembered
 
-## Slice D — calibration and the dashboard ⬜
+## Slice D — calibration and the dashboard 🟡
 
-- [ ] Scenario 1 — a normal day, snapshot-scored on the pinned days
-- [ ] Scenario 2 — a shock in each direction, kept apart
-- [ ] Scenario 3 — six-month long exposure, own ledger, real starting equity
-- [ ] The §10.6 calibration gate (exit 6) and the cost projection
-- [ ] Its own read-only dashboard, own port, own token; `notebooks/tuning.ipynb`
+Planned in [docs/superpowers/plans/2026-09-05-decision-lab-slice-d-calibration.md](../docs/superpowers/plans/2026-09-05-decision-lab-slice-d-calibration.md).
+Two passes; pass 1 is nine tasks, four of them done.
+
+**Pass 1 — the scenarios and the gate** (in progress)
+
+- [x] `gate.py` — the §10.6 record: its key, its persistence, and `require_satisfied`
+- [x] `registry.py` — six outcome fields and `gate_unsatisfied`; `params.WINDOW_DAYS`
+- [x] `calibration.py` — the four gate conditions, seat evidence, the cost projection
+- [~] `render.py` — the per-day table, the spread, the gate verdict, `GATE SKIPPED` *(one fix round open)*
+- [ ] `calibrate normal` and `calibrate shock` on the CLI
+- [ ] The gate refuses an uncalibrated `sweep` (exit 6); `--skip-gate` stamps the report and the row
+- [ ] `longrun.py` — the §10.4 profit arithmetic, `UNVALUABLE`, the veto breakdown
+- [ ] `calibrate long` — the six-month run and its report
+- [ ] Slice exit criterion end to end, and the docs
+
+**Pass 2 — the dashboard** (not started)
+
+- [ ] Its own read-only ASGI app, own port, own token; `notebooks/tuning.ipynb`
+
+Scenarios 1 and 2 are **the existing sweep pointed at the nine pinned days** — `sweep.run` already
+takes a `Sample`, so the cache, the budget ceiling, resume and the §7.7 substitute policy are
+inherited rather than rewritten. Only scenario 3 is a different instrument: its own
+`BacktestHarness` pass, its own ledger, its own workspace database.
 
 ## Slice E — news archive ⬜
 
@@ -98,9 +121,35 @@ Result today: [reports/decision-lab-8ac130d8f2ed5650dff0dcb9f969d07e.md](reports
   rebuilt. Delete the directory to retry it.
 - **`STUB_SEED = 2024` is pinned** in `test_slice_b_end_to_end.py` because a reference pass can die
   on [KNOWN_GAPS](../docs/KNOWN_GAPS.md) §5. Delete the pin when §5 closes.
+- **Once slice D pass 1 lands, `sweep` will refuse an uncalibrated run with exit 6**, and will
+  therefore need a pinned day set where today it does not. `--skip-gate` is the escape hatch and
+  stamps both the report and the §11 row, because a result whose provenance reads "nobody checked
+  the seats first" should say so on its face. The gate is keyed on
+  `(dataset_digest, matrix_digest, dayset_digest)` and deliberately **not** on `corpus_id`: every
+  condition it checks is a property of the candidates, the seats and the days, so keying on the
+  corpus would force a re-calibration each time the long run varied `--every` — the one axis that
+  run exists to vary.
 
 ## Next step when you pick this up
 
-Slice D — calibration and the dashboard. The sweep the tool was built for now runs; what is
-missing is the three fixed scenarios that make a run *repeatable and comparable to a gate*, and
-somewhere to watch a long one land beside itself as it goes.
+**Finish slice D pass 1, task 4's open fix round, then tasks 5–9.** State on
+`feat/decision-lab-slice-d`, ten commits in:
+
+- `render.py` and `test_render.py` carry **uncommitted** work — the three review fixes are in and
+  correct (per-pool spread, no doubled blank line, no dangling gate sentence), and one new test is
+  red. The implementation is right; the test's own assertion is wrong. It asserts `"90.0%" not in
+  text` as a proxy for "the two shock directions were not pooled", but `90.0%` legitimately
+  appears both in the per-day table and inside SHOCK_DOWN's own `(10.0% to 90.0%)` range. Replace
+  that line with one that actually discriminates — assert two spread lines exist and that no line
+  matches the un-pooled form `**baseline** — accuracy spread` (no ` / POOL` segment). The other
+  two assertions already pass and already prove the fix.
+- Then the second test the round asked for and never got: a spacing regression asserting no
+  `"\n\n\n"` in a rendered calibration report.
+- Then run `.\decision_lab\check.ps1`, commit, and continue with task 5.
+
+The full ledger — every ruling made along the way and what each costs if wrong — is in
+`.superpowers/sdd/2026-09-05-decision-lab-slice-d-calibration/progress.md`, which survives a
+session restart and is the recovery map if this context is lost.
+
+Nothing here is reachable from the CLI yet, so **"What you can run today" is unchanged**: the
+`calibrate` commands land in task 5, and the gate does not refuse a `sweep` until task 6.
