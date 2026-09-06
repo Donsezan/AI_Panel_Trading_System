@@ -16,17 +16,17 @@ Slice order and rationale: §18.
 | **A** — integrity, day set, corpus | verified history + a frozen set of decision contexts | ✅ shipped |
 | **B** — regimes, scoring, per-seat, report | *how did this panel do, and which seat carried it* | ✅ shipped |
 | **C** — the sweep | *is a **different** panel right more often* — the stated goal | ✅ shipped |
-| **D** — calibration + dashboard | normal day / shock day / six-month profit run | 🟡 pass 1 in progress |
+| **D** — calibration + dashboard | normal day / shock day / six-month profit run | 🟡 pass 1 shipped |
 | **E** — news archive | shock days measure the *news*, not just the price move | ⬜ not started |
 
-**Three slices of five, and half of the fourth.** Comparing configurations — the thing the tool was
-built for — now runs: N candidates over one frozen corpus, ranked, with a pairwise agreement matrix
-and a per-candidate seat breakdown.
+**Three slices of five, and pass 1 of the fourth.** Comparing configurations — the thing the tool
+was built for — now runs: N candidates over one frozen corpus, ranked, with a pairwise agreement
+matrix and a per-candidate seat breakdown. And it no longer runs *unchecked*: a sweep refuses
+until the seats have been calibrated over nine pinned days.
 
 Slice D is split into two passes. **Pass 1 — the three calibration scenarios and the §10.6 gate —
-is four tasks of nine done**, on branch `feat/decision-lab-slice-d`. Nothing of it is reachable
-from the CLI yet: the `calibrate` commands are task 5. **Pass 2 — the dashboard and the notebook —
-has not started**, and E (news) is untouched.
+has shipped**, all nine tasks, on branch `feat/decision-lab-slice-d`. **Pass 2 — the dashboard and
+the notebook — has not started**, and E (news) is untouched.
 
 ---
 
@@ -61,19 +61,19 @@ Result today: [reports/decision-lab-8ac130d8f2ed5650dff0dcb9f969d07e.md](reports
 ## Slice D — calibration and the dashboard 🟡
 
 Planned in [docs/superpowers/plans/2026-09-05-decision-lab-slice-d-calibration.md](../docs/superpowers/plans/2026-09-05-decision-lab-slice-d-calibration.md).
-Two passes; pass 1 is nine tasks, four of them done.
+Two passes; pass 1 is nine tasks, all of them done.
 
-**Pass 1 — the scenarios and the gate** (in progress)
+**Pass 1 — the scenarios and the gate** ✅
 
 - [x] `gate.py` — the §10.6 record: its key, its persistence, and `require_satisfied`
 - [x] `registry.py` — six outcome fields and `gate_unsatisfied`; `params.WINDOW_DAYS`
 - [x] `calibration.py` — the four gate conditions, seat evidence, the cost projection
-- [~] `render.py` — the per-day table, the spread, the gate verdict, `GATE SKIPPED` *(one fix round open)*
-- [ ] `calibrate normal` and `calibrate shock` on the CLI
-- [ ] The gate refuses an uncalibrated `sweep` (exit 6); `--skip-gate` stamps the report and the row
-- [ ] `longrun.py` — the §10.4 profit arithmetic, `UNVALUABLE`, the veto breakdown
-- [ ] `calibrate long` — the six-month run and its report
-- [ ] Slice exit criterion end to end, and the docs
+- [x] `render.py` — the per-day table, the spread, the gate verdict, `GATE SKIPPED`
+- [x] `calibrate normal` and `calibrate shock` on the CLI
+- [x] The gate refuses an uncalibrated `sweep` (exit 6); `--skip-gate` stamps the report and the row
+- [x] `longrun.py` — the §10.4 profit arithmetic, `UNVALUABLE`, the veto breakdown
+- [x] `calibrate long` — the six-month run and its report
+- [x] Slice exit criterion end to end, and the docs
 
 **Pass 2 — the dashboard** (not started)
 
@@ -100,10 +100,23 @@ inherited rather than rewritten. Only scenario 3 is a different instrument: its 
 .venv\Scripts\python.exe -m decision_lab dataset days   --data data\history
 .venv\Scripts\python.exe -m decision_lab corpus build --data data\history --every 8h --reference-panel sim
 .venv\Scripts\python.exe -m decision_lab report --corpus 8ac130d8f2ed5650dff0dcb9f969d07e
+.venv\Scripts\python.exe -m decision_lab calibrate normal --corpus <id> `
+    --configs decision_lab\config\sweep-stub.toml --budget 1
+.venv\Scripts\python.exe -m decision_lab calibrate shock  --corpus <id> `
+    --configs decision_lab\config\sweep-stub.toml --budget 1
+.venv\Scripts\python.exe -m decision_lab calibrate long --data data\history `
+    --configs decision_lab\config\sweep.toml --candidate baseline `
+    --start-equity 1000 --every 4h --window 6m
 .venv\Scripts\python.exe -m decision_lab sweep --corpus <id> --configs decision_lab\config\sweep-stub.toml --budget 1
 .venv\Scripts\python.exe -m decision_lab sweep --corpus <id> --budget 40   # needs OPENROUTER_API_KEY
 .\decision_lab\check.ps1
 ```
+
+**`sweep` and `calibrate long` now refuse with exit 6** until both calibration halves have passed
+for that exact dataset, matrix and day set — which also means a `sweep` needs a pinned day set
+where before it did not (`dataset days` first, or exit 3). `--skip-gate` proceeds anyway and
+stamps both the report and the §11 row, because a result whose provenance reads "nobody checked
+the seats first" should say so on its face.
 
 ## Open items inside what already shipped
 
@@ -121,35 +134,30 @@ inherited rather than rewritten. Only scenario 3 is a different instrument: its 
   rebuilt. Delete the directory to retry it.
 - **`STUB_SEED = 2024` is pinned** in `test_slice_b_end_to_end.py` because a reference pass can die
   on [KNOWN_GAPS](../docs/KNOWN_GAPS.md) §5. Delete the pin when §5 closes.
-- **Once slice D pass 1 lands, `sweep` will refuse an uncalibrated run with exit 6**, and will
-  therefore need a pinned day set where today it does not. `--skip-gate` is the escape hatch and
-  stamps both the report and the §11 row, because a result whose provenance reads "nobody checked
-  the seats first" should say so on its face. The gate is keyed on
-  `(dataset_digest, matrix_digest, dayset_digest)` and deliberately **not** on `corpus_id`: every
-  condition it checks is a property of the candidates, the seats and the days, so keying on the
-  corpus would force a re-calibration each time the long run varied `--every` — the one axis that
-  run exists to vary.
+- **The gate is keyed on `(dataset_digest, matrix_digest, dayset_digest)`, deliberately not on
+  `corpus_id`.** Every condition it checks is a property of the candidates, the seats and the
+  days, so keying on the corpus would force a re-calibration each time the long run varied
+  `--every` — the one axis that run exists to vary. The cost of the key it *does* have: one
+  edited prompt mints a new `matrix_digest`, so it is a calibration again. That is nine days, and
+  it is the price of the guarantee.
+- **Nothing has been calibrated against a real panel yet.** Every gate record on this machine was
+  opened by `sweep-stub.toml`, and a stub matrix can never satisfy a real matrix's gate — the
+  bindings feed `panel_digest` → `matrix_digest`, which is a third of the key. The first real
+  `sweep` will therefore need its own `calibrate normal` and `calibrate shock` first.
+- **The dashboard and `notebooks/tuning.ipynb` are pass 2** and are not started. Everything slice
+  D produces today is read as Markdown under `decision_lab/reports/` or as JSON in the workspace.
 
 ## Next step when you pick this up
 
-**Finish slice D pass 1, task 4's open fix round, then tasks 5–9.** State on
-`feat/decision-lab-slice-d`, ten commits in:
+**Slice D pass 1 is complete on `feat/decision-lab-slice-d`.** Both gates pass and
+`git diff --stat main -- tradebot/` is empty. What is left, in the order it is worth doing:
 
-- `render.py` and `test_render.py` carry **uncommitted** work — the three review fixes are in and
-  correct (per-pool spread, no doubled blank line, no dangling gate sentence), and one new test is
-  red. The implementation is right; the test's own assertion is wrong. It asserts `"90.0%" not in
-  text` as a proxy for "the two shock directions were not pooled", but `90.0%` legitimately
-  appears both in the per-day table and inside SHOCK_DOWN's own `(10.0% to 90.0%)` range. Replace
-  that line with one that actually discriminates — assert two spread lines exist and that no line
-  matches the un-pooled form `**baseline** — accuracy spread` (no ` / POOL` segment). The other
-  two assertions already pass and already prove the fix.
-- Then the second test the round asked for and never got: a spacing regression asserting no
-  `"\n\n\n"` in a rendered calibration report.
-- Then run `.\decision_lab\check.ps1`, commit, and continue with task 5.
-
-The full ledger — every ruling made along the way and what each costs if wrong — is in
-`.superpowers/sdd/2026-09-05-decision-lab-slice-d-calibration/progress.md`, which survives a
-session restart and is the recovery map if this context is lost.
-
-Nothing here is reachable from the CLI yet, so **"What you can run today" is unchanged**: the
-`calibrate` commands land in task 5, and the gate does not refuse a `sweep` until task 6.
+1. **Merge the branch**, or review it first — the full ledger of every ruling made along the way
+   and what each costs if wrong is in
+   `.superpowers/sdd/2026-09-05-decision-lab-slice-d-calibration/progress.md`.
+2. **Calibrate against a real panel and then sweep it.** This is the first thing that has ever
+   needed `OPENROUTER_API_KEY`, and the cost projection on the calibration page is what tells you
+   what the sweep after it will cost — that is the whole point of running the nine days first.
+3. **Slice D pass 2** — the read-only dashboard and `notebooks/tuning.ipynb`, or
+4. **Slice E** — the news archive, which is the only part of this design that touches `tradebot`
+   at all, and whose seam and guard tests are one commit and never two.
