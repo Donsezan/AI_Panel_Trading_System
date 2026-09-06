@@ -176,6 +176,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     sweep_.add_argument("--data", type=Path, default=None)
     sweep_.add_argument("--regimes", type=Path, default=None)
     sweep_.add_argument("--scoring-timeframe", default="")
+    sweep_.add_argument(
+        "--skip-gate",
+        action="store_true",
+        help="run without the §10.6 calibration gate; stamped on the report and the registry row",
+    )
     sweep_.add_argument("--verbose", action="store_true")
 
     calibrate = commands.add_parser(
@@ -385,7 +390,44 @@ async def sweep_command(args: argparse.Namespace) -> int:
         logger.error("sweep refused; nothing was spent", extra={"reason": str(error)})
         return EXIT_CANDIDATE
 
-    row = _registry_row(corpus, matrix, clock, seed=args.seed)
+    pinned = _pinned_calibration(data_dir)
+    row = _registry_row(corpus, matrix, clock, seed=args.seed).model_copy(
+        update={"gate_skipped": args.skip_gate}
+    )
+    if not args.skip_gate:
+        # §10.6, and it comes before the reachability check on purpose: an operator who has not
+        # calibrated must fix that first, and `calibrate` performs the same reachability refusal
+        # itself. Reporting a missing key here would send them to fix the second problem.
+        if pinned is None:
+            # Not the gate's own refusal: the gate is keyed on `dayset_digest`, so with nothing
+            # pinned there is no gate to be unsatisfied — only a prerequisite missing. Naming the
+            # gate here would send an operator to run `calibrate`, which refuses for want of the
+            # very same day set (§15).
+            logger.error(
+                "sweep refused; the §10.6 gate needs a pinned day set — run "
+                "`python -m decision_lab dataset days` first",
+                extra={"data": str(data_dir)},
+            )
+            return EXIT_DATASET
+        try:
+            gate.require_satisfied(
+                dataset_digest=corpus.meta.dataset_digest,
+                matrix_digest=matrix.matrix_digest,
+                dayset_digest=pinned.dayset_digest,
+            )
+        except ConfigError as error:
+            registry.record(
+                row.model_copy(
+                    update={
+                        "status": registry.STATUS_GATE_UNSATISFIED,
+                        "dayset_digest": pinned.dayset_digest,
+                        "note": str(error),
+                    }
+                )
+            )
+            logger.error("sweep refused; nothing was spent", extra={"reason": str(error)})
+            return EXIT_GATE
+
     try:
         cd.require_reachable(matrix)
     except ConfigError as error:
@@ -406,7 +448,6 @@ async def sweep_command(args: argparse.Namespace) -> int:
     regime_index = (await rg.index_dataset(dataset, timeframe)).with_windows(
         rg.load_windows(args.regimes or rg.DEFAULT_REGIMES_TOML)
     )
-    pinned = _pinned_calibration(data_dir)
     sample = sampling.stratified(
         corpus,
         regimes=regime_index,
