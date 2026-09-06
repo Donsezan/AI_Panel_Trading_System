@@ -18,12 +18,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
-from collections.abc import Callable, Coroutine, Mapping, Sequence
+from collections.abc import Callable, Coroutine
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from decision_lab import analysis as an
 from decision_lab import calibration as cal
 from decision_lab import calibration_days as cday
 from decision_lab import candidates as cd
@@ -559,30 +560,6 @@ def _moment(value: str | None) -> datetime | None:
     return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else ensure_utc(parsed)
 
 
-def _not_measured_reason(rows: Mapping[str, sw.SweepRow], records: Sequence[rc.CycleRecord]) -> str:
-    """Why a candidate contributed no measurement — never merely *that* it did not.
-
-    "Not measured" has three causes that an operator must act on differently: a halt that stopped
-    the sweep before this candidate (re-run and it fills in), rows that all failed or were all
-    contaminated (the candidate itself is broken, or its seats are substituting), and a candidate
-    that replayed cleanly but whose cycles yielded no decision at all. A note that flattened them
-    into "the sweep halted" would send the second and third to the wrong fix.
-    """
-    if not rows:
-        return "the sweep halted before reaching it — no row was recorded"
-    if not records:
-        failed = sum(1 for row in rows.values() if row.error)
-        contaminated = sum(1 for row in rows.values() if row.contaminated)
-        parts = [f"{failed} failed"] if failed else []
-        parts += [f"{contaminated} contaminated by a substitute model"] if contaminated else []
-        why = ", ".join(parts) or "none of them matched a corpus entry"
-        return (
-            f"all {len(rows)} of its rows were unusable ({why}) — nothing it produced measures "
-            "the panel it declares"
-        )
-    return f"{len(records)} cycles replayed cleanly, but none of them carried a decision to score"
-
-
 async def calibrate_snapshot(args: argparse.Namespace) -> int:
     """§10.2 and §10.3 — the snapshot-scored scenarios, and the gate half each one fills in.
 
@@ -600,7 +577,6 @@ async def calibrate_snapshot(args: argparse.Namespace) -> int:
     corpus = cp.load(args.corpus)
     data_dir = args.data or Path(corpus.meta.dataset_directory)
     audit = ds.require_verified(data_dir)
-    dataset = ReplayDataset.load(data_dir, clock)
     # §15: a missing or stale pinned day set refuses a *calibration*, naming the command that
     # produces one. `require_pinned` raises `ConfigError`, which `main` maps to EXIT_DATASET.
     pinned = cday.require_pinned(data_dir)
@@ -621,48 +597,34 @@ async def calibrate_snapshot(args: argparse.Namespace) -> int:
     result = await sw.run(corpus, matrix, sample=sample, clock=clock, budget_usd=args.budget)
     sw.write_meta(result)
 
-    params = sc.ScoringParams(
-        timeframe=args.scoring_timeframe or dataset.timeframes[0],
-        **({"band_k": args.band_k} if args.band_k is not None else {}),
-        **({"horizon_bars": args.horizon} if args.horizon is not None else {}),
+    scoring = await an.build_scoring(
+        data_dir,
+        clock=clock,
+        timeframe=args.scoring_timeframe,
+        band_k=args.band_k,
+        horizon=args.horizon,
+        regimes_toml=args.regimes,
     )
-    index = await sc.build_price_index(dataset, audit, params)
-    regime_index = (await rg.index_dataset(dataset, params.timeframe)).with_windows(
-        rg.load_windows(args.regimes or rg.DEFAULT_REGIMES_TOML)
-    )
+    params = scoring.params
+    regime_index = scoring.regimes
 
-    evidence: list[gate.CandidateEvidence] = []
-    by_candidate: dict[str, tuple[sc.ScoredDecision, ...]] = {}
-    day_rows: list[rd.DayMetrics] = []
-    seat_blocks: list[rd.CandidateSeats] = []
-    not_measured: list[rd.NotMeasured] = []
-    for candidate in matrix.candidates:
-        rows = sw.read_rows(
-            sw.rows_path(corpus.meta.corpus_id, matrix.matrix_digest, candidate.candidate_id)
-        )
-        records = sw.records_from_rows(corpus, rows)
-        scored = sc.score_records(records, index=index, regimes=regime_index, params=params)
-        # Evidence is appended for every candidate, measured or not: §10.6's first condition is
-        # that every candidate materialised and deliberated, so one that produced nothing must
-        # reach `failures_for` to fail it. Only the *presentation* skips it, exactly as `report`
-        # does — an unmeasured candidate ranked at 0.0% reads as measured and worst (finding 3).
-        evidence.append(cal.candidate_evidence(candidate, rows, records, scored))
-        if not scored:
-            not_measured.append(
-                rd.NotMeasured(
-                    candidate_id=candidate.candidate_id,
-                    reason=_not_measured_reason(rows, records),
-                )
-            )
-            continue
-        by_candidate[candidate.candidate_id] = scored
-        day_rows += cal.per_day(candidate.candidate_id, scored, pinned)
-        seat_blocks.append(
-            rd.CandidateSeats(
-                candidate_id=candidate.candidate_id,
-                seats=st.score_seats(records, scored, panel=candidate.panel),
-            )
-        )
+    # §10.6's first condition is that every candidate materialised and deliberated, so evidence is
+    # built for every candidate `analyse_matrix` folds — measured or not — never only the measured
+    # ones: an unmeasured candidate must still reach `failures_for` to fail the gate.
+    analysed = an.analyse_matrix(corpus, matrix, matrix.matrix_digest, scoring)
+    evidence = [
+        cal.candidate_evidence(candidate, found.rows, found.records, found.scored)
+        for candidate, found in zip(matrix.candidates, analysed.candidates, strict=True)
+    ]
+    by_candidate = analysed.by_candidate
+    not_measured = list(analysed.not_measured)
+    seat_blocks = list(analysed.candidate_seats)
+    day_rows = [
+        row
+        for found in analysed.candidates
+        if found.measured
+        for row in cal.per_day(found.candidate_id, found.scored, pinned)
+    ]
 
     failures = cal.failures_for(evidence, report_written=True)
     key = gate.gate_key(
@@ -953,20 +915,24 @@ async def report(args: argparse.Namespace) -> int:
     """Score the reference pass in a built corpus and write the Markdown report."""
     meta, cycles = rc.load(args.corpus)
     data_dir = args.data or Path(meta.dataset_directory)
-    audit = ds.require_verified(data_dir)
+    # The audit itself is re-derived inside `build_scoring` (§15); only `dataset` is read directly
+    # here, for the reference instrument's key.
+    ds.require_verified(data_dir)
     dataset = ReplayDataset.load(data_dir, SystemClock())
 
-    params = sc.ScoringParams(
-        timeframe=args.scoring_timeframe or dataset.timeframes[0],
-        **({"band_k": args.band_k} if args.band_k is not None else {}),
-        **({"horizon_bars": args.horizon} if args.horizon is not None else {}),
+    scoring = await an.build_scoring(
+        data_dir,
+        clock=SystemClock(),
+        timeframe=args.scoring_timeframe,
+        band_k=args.band_k,
+        horizon=args.horizon,
+        regimes_toml=args.regimes,
     )
-    index = await sc.build_price_index(dataset, audit, params)
-    regime_index = (await rg.index_dataset(dataset, params.timeframe)).with_windows(
-        rg.load_windows(args.regimes or rg.DEFAULT_REGIMES_TOML)
+    scored = sc.score_records(
+        cycles, index=scoring.index, regimes=scoring.regimes, params=scoring.params
     )
-
-    scored = sc.score_records(cycles, index=index, regimes=regime_index, params=params)
+    params = scoring.params
+    regime_index = scoring.regimes
     panel = meta.reference_basket.panel
 
     corpus_obj = cp.load(args.corpus)
@@ -1037,42 +1003,16 @@ async def report(args: argparse.Namespace) -> int:
             )
             return EXIT_CANDIDATE
 
-        blocks = []
-        for candidate in matrix.candidates:
-            rows = sw.read_rows(
-                sw.rows_path(meta.corpus_id, result.matrix_digest, candidate.candidate_id)
-            )
-            records = sw.records_from_rows(corpus_obj, rows)
-            candidate_scored = sc.score_records(
-                records, index=index, regimes=regime_index, params=params
-            )
-            if not candidate_scored:
-                # finding 3: nothing this candidate produced reached scoring. `by_regime(())`
-                # would give three legitimate-looking zero rows and `_ranking_table` would sort
-                # it in as a peer at 0.0% accuracy, last: measured and worst, when it was never
-                # measured at all. Kept out of the ranking, the agreement matrix *and* the
-                # per-candidate seat tables, and named on the page with the reason instead.
-                #
-                # The test is the scored decisions, not `rows`: a candidate whose every row
-                # errored or was contaminated has a non-empty `.jsonl` and no measurement
-                # whatever, and `records_from_rows` has already dropped both (§7.7).
-                not_measured.append(
-                    rd.NotMeasured(
-                        candidate_id=candidate.candidate_id,
-                        reason=_not_measured_reason(rows, records),
-                    )
-                )
-                continue
-            blocks.append(
-                rd.CandidateSeats(
-                    candidate_id=candidate.candidate_id,
-                    seats=st.score_seats(records, candidate_scored, panel=candidate.panel),
-                )
-            )
-            by_candidate[candidate.candidate_id] = candidate_scored
-        ranking = cmp.ranking(by_candidate)
-        agreement = cmp.agreement(by_candidate)
-        candidate_seats = tuple(blocks)
+        # finding 3: a candidate is measured only if a scored decision survived — `analyse_matrix`
+        # holds that rule once, so `report` cannot drift from what `calibrate_snapshot` enforces
+        # for the same fold. Kept out of the ranking, the agreement matrix *and* the per-candidate
+        # seat tables, and named on the page with the reason instead (§12.2).
+        analysed = an.analyse_matrix(corpus_obj, matrix, result.matrix_digest, scoring)
+        ranking = analysed.ranking
+        agreement = analysed.agreement
+        candidate_seats = analysed.candidate_seats
+        not_measured = list(analysed.not_measured)
+        by_candidate = analysed.by_candidate
 
     built = rd.LabReport(
         generated_at=SystemClock().now(),
