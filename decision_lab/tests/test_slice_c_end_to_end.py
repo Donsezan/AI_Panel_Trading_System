@@ -58,8 +58,20 @@ def test_a_second_sweep_buys_nothing_and_the_registry_holds_one_row_per_identity
 def cli_sweep(corpus_id: str) -> int:
     from decision_lab import cli
 
+    # Slice C's exit criterion is the sweep itself, not §10.6's gate — which slice D asserts in
+    # `test_cli_sweep.py` and `test_slice_d_end_to_end.py`. Skipping it keeps this test about
+    # what it was written to prove.
     return cli.main(
-        ["sweep", "--corpus", corpus_id, "--configs", str(cd.STUB_MATRIX), "--budget", "1"]
+        [
+            "sweep",
+            "--corpus",
+            corpus_id,
+            "--configs",
+            str(cd.STUB_MATRIX),
+            "--budget",
+            "1",
+            "--skip-gate",
+        ]
     )
 
 

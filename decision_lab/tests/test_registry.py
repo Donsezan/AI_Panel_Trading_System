@@ -120,3 +120,62 @@ def test_a_failed_write_never_corrupts_the_registry_already_on_disk(
     rows = registry.read_all(workspace=tmp_path)
     assert [r.candidate_id for r in rows] == ["a"], "the original file must survive a failed swap"
     assert list(tmp_path.glob("*.tmp")) == [], "a failed write must not leave a temp file behind"
+
+
+def test_slice_d_fields_are_recorded_but_never_identity() -> None:
+    """§11: `run_id` is over the parameters of the experiment. What a run *produced* — profit,
+    whether the gate was skipped — is recorded beside it and must never split one experiment
+    into two rows."""
+    base = registry.RunRow(
+        recorded_at=datetime(2026, 1, 1, tzinfo=UTC),
+        scenario="calibrate-long",
+        dataset_digest="d1",
+        matrix_digest="m1",
+        dayset_digest="s1",
+        candidate_id="baseline",
+        cadence_seconds=14_400,
+        start_equity=Decimal(1000),
+        window="6m",
+    )
+    produced = base.model_copy(
+        update={
+            "gate_skipped": True,
+            "total_profit": Decimal("80.00"),
+            "realized_pnl": Decimal("50.00"),
+            "unrealized_pnl": Decimal("30.00"),
+            "net_profit": Decimal("-40.00"),
+            "unvaluable": False,
+        }
+    )
+    assert produced.identity == base.identity, "an outcome is not a parameter"
+
+
+def test_window_and_start_equity_do_split_the_identity() -> None:
+    """They are §10.4 parameters, and §11 put them in `run_id` from the start for this reason."""
+    base = registry.RunRow(
+        recorded_at=datetime(2026, 1, 1, tzinfo=UTC), scenario="calibrate-long", window="6m"
+    )
+    assert base.identity != base.model_copy(update={"window": "3m"}).identity
+    assert base.identity != base.model_copy(update={"start_equity": Decimal(500)}).identity
+
+
+def test_net_profit_may_be_negative() -> None:
+    """A panel that made $80 on $120 of tokens lost money, and the row must be able to say so."""
+    row = registry.RunRow(
+        recorded_at=datetime(2026, 1, 1, tzinfo=UTC), net_profit=Decimal("-40.00")
+    )
+    assert row.net_profit < 0
+    assert '"net_profit":"-40.00"' in row.model_dump_json()
+
+
+def test_the_window_table_covers_the_long_run_default() -> None:
+    from decision_lab.params import DEFAULT_LONG_WINDOW, WINDOW_DAYS
+
+    assert DEFAULT_LONG_WINDOW in WINDOW_DAYS
+    assert WINDOW_DAYS[DEFAULT_LONG_WINDOW] == 182
+
+
+def test_status_gate_unsatisfied_has_the_expected_literal() -> None:
+    """§11: The literal is written to registry.jsonl and read back from persisted rows, so an
+    accidental rename silently orphans rows; the value, not the symbol, must be asserted."""
+    assert registry.STATUS_GATE_UNSATISFIED == "gate_unsatisfied"

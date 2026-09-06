@@ -21,3 +21,34 @@ def built_corpus_id(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator
     """A verified dataset, a pinned day set and one reference pass, all under `tmp_path`."""
     monkeypatch.setattr(registry, "workspace_root", lambda: tmp_path / "workspace")
     yield built_corpus(tmp_path, monkeypatch, shock_up=(5,), shock_down=(9,))
+
+
+@pytest.fixture
+def calibrated_corpus(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[tuple[str, Path]]:
+    """A corpus whose dataset also carries a pinned day set — what §10 requires and a sweep does
+    not.
+
+    Sixty days with four up-shocks and three down, which is `test_calibration_days`' own
+    configuration and its arithmetic: nearest-rank p90 over sixty days admits exactly seven, so
+    three per pool fits with one up-day to spare. `built_corpus_id`'s forty would admit five —
+    `dataset days` would then refuse a pool for want of a day, and every test here would fail on
+    the fixture rather than on the command it exercises.
+    """
+    from decision_lab import cli
+    from decision_lab import gate as gate_module
+    from decision_lab import longrun as longrun_module
+
+    # Each of these imported `workspace_root` into its own namespace, so each needs its own
+    # rebinding — `corpus`'s is done inside `built_corpus`. Missing one is not a failing test but
+    # a test that writes into the operator's real `decision_lab/workspace/`: `longrun`'s absence
+    # here put a `long-*` directory, database and all, beside their actual corpora.
+    for module in (registry, gate_module, longrun_module):
+        monkeypatch.setattr(module, "workspace_root", lambda: tmp_path / "workspace")
+    corpus_id = built_corpus(
+        tmp_path, monkeypatch, days=60, shock_up=(3, 11, 19, 27), shock_down=(7, 15, 23)
+    )
+    data = tmp_path / "history"
+    assert cli.main(["dataset", "days", "--data", str(data)]) == cli.EXIT_OK
+    yield corpus_id, data

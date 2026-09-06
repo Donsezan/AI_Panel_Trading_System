@@ -2,6 +2,11 @@
 
 A distinct code per distinct refusal, so a script can tell "you forgot a key" from "you ran out of
 budget" without parsing a log line — the convention the bot's own CLI follows.
+
+Every invocation written before slice D passes `--skip-gate`: each was written to prove one
+particular refusal, and the §10.6 gate would now refuse them all first, for a reason none of
+them is about. The gate's own behaviour is asserted at the foot of this file, on a corpus
+that has a pinned day set to be calibrated against.
 """
 
 from __future__ import annotations
@@ -25,7 +30,9 @@ def test_an_unreachable_evaluation_exits_4_and_leaves_a_registry_row(
 ) -> None:
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
 
-    code = cli.main(["sweep", "--corpus", built_corpus_id, "--configs", str(cd.DEFAULT_MATRIX)])
+    code = cli.main(
+        ["sweep", "--corpus", built_corpus_id, "--configs", str(cd.DEFAULT_MATRIX), "--skip-gate"]
+    )
 
     assert code == cli.EXIT_CANDIDATE
     rows = registry.read_all(workspace=tmp_path / "workspace")
@@ -42,16 +49,25 @@ def test_an_invalid_matrix_exits_4_before_any_spend(tmp_path: Path, built_corpus
         encoding="utf-8",
     )
 
-    assert cli.main(["sweep", "--corpus", built_corpus_id, "--configs", str(bad)]) == (
-        cli.EXIT_CANDIDATE
-    )
+    assert cli.main(
+        ["sweep", "--corpus", built_corpus_id, "--configs", str(bad), "--skip-gate"]
+    ) == (cli.EXIT_CANDIDATE)
 
 
 def test_a_budget_of_zero_exits_5_with_partial_results_written(
     tmp_path: Path, built_corpus_id: str
 ) -> None:
     code = cli.main(
-        ["sweep", "--corpus", built_corpus_id, "--configs", str(cd.STUB_MATRIX), "--budget", "0"]
+        [
+            "sweep",
+            "--corpus",
+            built_corpus_id,
+            "--configs",
+            str(cd.STUB_MATRIX),
+            "--budget",
+            "0",
+            "--skip-gate",
+        ]
     )
 
     assert code == cli.EXIT_BUDGET
@@ -70,6 +86,7 @@ def test_a_plumbing_sweep_runs_and_the_report_says_what_it_was(
                 str(cd.STUB_MATRIX),
                 "--budget",
                 "1",
+                "--skip-gate",
             ]
         )
         == cli.EXIT_OK
@@ -103,7 +120,18 @@ def test_report_refuses_when_the_matrix_no_longer_matches_the_sweep_that_ran(
     configs = tmp_path / "m.toml"
     configs.write_text(STUB_MATRIX, encoding="utf-8")
     assert (
-        cli.main(["sweep", "--corpus", built_corpus_id, "--configs", str(configs), "--budget", "1"])
+        cli.main(
+            [
+                "sweep",
+                "--corpus",
+                built_corpus_id,
+                "--configs",
+                str(configs),
+                "--budget",
+                "1",
+                "--skip-gate",
+            ]
+        )
         == cli.EXIT_OK
     )
 
@@ -126,7 +154,18 @@ def test_report_refuses_when_the_recorded_matrix_file_is_gone(
     configs = tmp_path / "m.toml"
     configs.write_text(STUB_MATRIX, encoding="utf-8")
     assert (
-        cli.main(["sweep", "--corpus", built_corpus_id, "--configs", str(configs), "--budget", "1"])
+        cli.main(
+            [
+                "sweep",
+                "--corpus",
+                built_corpus_id,
+                "--configs",
+                str(configs),
+                "--budget",
+                "1",
+                "--skip-gate",
+            ]
+        )
         == cli.EXIT_OK
     )
 
@@ -149,7 +188,18 @@ def test_report_marks_a_candidate_the_sweep_never_reached_as_not_measured(
         STUB_MATRIX + '\n[expand]\ndecision_mode = ["per_asset", "basket"]\n', encoding="utf-8"
     )
     assert (
-        cli.main(["sweep", "--corpus", built_corpus_id, "--configs", str(configs), "--budget", "1"])
+        cli.main(
+            [
+                "sweep",
+                "--corpus",
+                built_corpus_id,
+                "--configs",
+                str(configs),
+                "--budget",
+                "1",
+                "--skip-gate",
+            ]
+        )
         == cli.EXIT_OK
     )
 
@@ -200,7 +250,18 @@ def test_report_does_not_rank_a_candidate_whose_every_row_failed(
         STUB_MATRIX + '\n[expand]\ndecision_mode = ["per_asset", "basket"]\n', encoding="utf-8"
     )
     assert (
-        cli.main(["sweep", "--corpus", built_corpus_id, "--configs", str(configs), "--budget", "1"])
+        cli.main(
+            [
+                "sweep",
+                "--corpus",
+                built_corpus_id,
+                "--configs",
+                str(configs),
+                "--budget",
+                "1",
+                "--skip-gate",
+            ]
+        )
         == cli.EXIT_OK
     )
 
@@ -246,7 +307,16 @@ def test_report_warns_when_two_sweeps_are_ambiguous_and_names_the_digests(
 
     for configs in (first, second):
         args = cli.parse_args(
-            ["sweep", "--corpus", built_corpus_id, "--configs", str(configs), "--budget", "1"]
+            [
+                "sweep",
+                "--corpus",
+                built_corpus_id,
+                "--configs",
+                str(configs),
+                "--budget",
+                "1",
+                "--skip-gate",
+            ]
         )
         assert asyncio.run(cli.sweep_command(args)) == cli.EXIT_OK
 
@@ -288,9 +358,87 @@ def test_the_sample_stratifies_on_the_pinned_day_sets_reference_instrument(
     configs = tmp_path / "m.toml"
     configs.write_text(STUB_MATRIX, encoding="utf-8")
     assert (
-        cli.main(["sweep", "--corpus", built_corpus_id, "--configs", str(configs), "--budget", "1"])
+        cli.main(
+            [
+                "sweep",
+                "--corpus",
+                built_corpus_id,
+                "--configs",
+                str(configs),
+                "--budget",
+                "1",
+                "--skip-gate",
+            ]
+        )
         == cli.EXIT_OK
     )
 
     assert captured["reference_instrument"] == "binance:ETH/USDT"
     assert captured["pinned"] == pinned.all_days
+
+
+def test_an_uncalibrated_sweep_refuses(tmp_path: Path, calibrated_corpus: tuple[str, Path]) -> None:
+    """§10.6: the sweep refuses to start unless scenarios 1 and 2 have passed for this exact
+    dataset, matrix and day set."""
+    corpus_id, _ = calibrated_corpus
+    assert _sweep(corpus_id) == cli.EXIT_GATE
+
+
+def test_a_refused_sweep_files_a_row_saying_why(
+    tmp_path: Path, calibrated_corpus: tuple[str, Path]
+) -> None:
+    """§11: a run that never produced a number is still a fact about the experiment."""
+    corpus_id, _ = calibrated_corpus
+    _sweep(corpus_id)
+
+    rows = registry.read_all(workspace=tmp_path / "workspace")
+    assert any(row.status == registry.STATUS_GATE_UNSATISFIED for row in rows)
+
+
+def test_skip_gate_proceeds_and_stamps_the_row(
+    tmp_path: Path, calibrated_corpus: tuple[str, Path]
+) -> None:
+    corpus_id, _ = calibrated_corpus
+
+    assert _sweep(corpus_id, skip_gate=True) == cli.EXIT_OK
+
+    rows = registry.read_all(workspace=tmp_path / "workspace")
+    assert any(row.gate_skipped for row in rows)
+
+
+def test_a_calibrated_sweep_runs(tmp_path: Path, calibrated_corpus: tuple[str, Path]) -> None:
+    corpus_id, _ = calibrated_corpus
+    for scenario in ("normal", "shock"):
+        assert (
+            cli.main(
+                [
+                    "calibrate",
+                    scenario,
+                    "--corpus",
+                    corpus_id,
+                    "--configs",
+                    str(cd.STUB_MATRIX),
+                    "--budget",
+                    "1",
+                    "--out",
+                    str(tmp_path / f"{scenario}.md"),
+                ]
+            )
+            == cli.EXIT_OK
+        )
+
+    assert _sweep(corpus_id) == cli.EXIT_OK
+
+
+def test_a_sweep_with_no_pinned_day_set_says_so_rather_than_naming_the_gate(
+    tmp_path: Path, built_corpus_id: str
+) -> None:
+    """§15: the gate is keyed on `dayset_digest`, so with nothing pinned there is no gate to be
+    unsatisfied — only a prerequisite missing. Refusing with the gate's own message would send an
+    operator to run `calibrate`, which would itself refuse for want of the same day set."""
+    assert _sweep(built_corpus_id) == cli.EXIT_DATASET
+
+
+def _sweep(corpus_id: str, *, skip_gate: bool = False) -> int:
+    argv = ["sweep", "--corpus", corpus_id, "--configs", str(cd.STUB_MATRIX), "--budget", "1"]
+    return cli.main([*argv, "--skip-gate"] if skip_gate else argv)

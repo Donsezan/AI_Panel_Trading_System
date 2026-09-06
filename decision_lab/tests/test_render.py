@@ -43,6 +43,26 @@ def report(**overrides: object) -> rd.LabReport:
     return rd.LabReport(**{**base, **overrides})
 
 
+def _minimal_report() -> rd.LabReport:
+    """Only `LabReport`'s required fields — the base every slice D test `model_copy`s from, so a
+    field this test does not care about stays at its slice-D default (empty, meaning "no
+    calibration on this page")."""
+    return rd.LabReport(
+        generated_at=AT,
+        corpus_id="abc123",
+        dataset_directory="data/history",
+        dataset_digest="d0",
+        reference_instrument="binance:BTC/USDT",
+        reference_panel_id="sim",
+        reference_config_digest="c0",
+        cadence_seconds=14_400,
+        scoring=sc.ScoringParams(timeframe="1h"),
+        vol_window_bars=30,
+        shock_percentile=Decimal("0.90"),
+        start_equity=Decimal(10_000),
+    )
+
+
 def test_the_contamination_banner_is_unconditional() -> None:
     """§1.1: every model in `validation/cutoffs.py` was trained on this period."""
     assert BANNER in rd.report_markdown(report())
@@ -99,3 +119,203 @@ def test_the_report_is_written_to_a_file(tmp_path: Path) -> None:
 def test_identical_input_renders_identically() -> None:
     """Deterministic, so two reports diff cleanly — which is how a tuning result is compared."""
     assert rd.report_markdown(report()) == rd.report_markdown(report())
+
+
+def test_a_calibration_report_carries_the_gate_verdict_and_the_spread() -> None:
+    """§10.2: three days is not a distribution, but it is enough to see when one day carried a
+    result — so the spread across the three is on the page beside the pooled figure."""
+    from datetime import date
+
+    from decision_lab import render as rd
+
+    report = _minimal_report().model_copy(
+        update={
+            "scenario": "normal",
+            "calibration_days": (date(2026, 1, 1), date(2026, 1, 2)),
+            "per_day": (
+                rd.DayMetrics(
+                    candidate_id="baseline",
+                    day=date(2026, 1, 1),
+                    pool="NORMAL",
+                    scored=10,
+                    correct=9,
+                    accuracy=Decimal("0.90"),
+                ),
+                rd.DayMetrics(
+                    candidate_id="baseline",
+                    day=date(2026, 1, 2),
+                    pool="NORMAL",
+                    scored=10,
+                    correct=3,
+                    accuracy=Decimal("0.30"),
+                ),
+            ),
+            "gate_passed": True,
+        }
+    )
+
+    text = rd.report_markdown(report)
+
+    assert "## Calibration — normal" in text
+    assert "2026-01-01" in text and "2026-01-02" in text
+    assert "spread" in text.lower()
+    assert "60.0" in text, "the spread between 90% and 30% is 60 points"
+    assert "Gate: PASSED" in text
+
+
+def test_a_failed_gate_lists_every_reason() -> None:
+    from decision_lab import render as rd
+
+    report = _minimal_report().model_copy(
+        update={
+            "scenario": "shock",
+            "gate_passed": False,
+            "gate_failures": ("shock: baseline / analyst: never answered at all",),
+        }
+    )
+
+    text = rd.report_markdown(report)
+
+    assert "Gate: FAILED" in text
+    assert "never answered at all" in text
+
+
+def test_the_skip_gate_banner_is_above_the_numbers() -> None:
+    """§14: a reader must meet the banner before they meet a number."""
+    from decision_lab import render as rd
+
+    text = rd.report_markdown(_minimal_report().model_copy(update={"gate_skipped": True}))
+
+    assert rd.GATE_SKIPPED in text
+    assert text.index(rd.GATE_SKIPPED) < text.index("## ")
+
+
+def test_a_report_with_no_scenario_renders_exactly_as_before() -> None:
+    """§14: one command, one rendering path. A sweep's page must not grow an empty section."""
+    from decision_lab import render as rd
+
+    text = rd.report_markdown(_minimal_report())
+
+    assert "## Calibration" not in text
+    assert "Projected spend" not in text
+    assert rd.GATE_SKIPPED not in text
+
+
+def test_the_cost_projection_is_rendered_per_cadence() -> None:
+    from decision_lab import render as rd
+
+    report = _minimal_report().model_copy(
+        update={
+            "cost_projection": (
+                rd.CostProjection(
+                    candidate_id="baseline",
+                    cost_per_cycle=Decimal("0.02"),
+                    cost_per_scored=Decimal("0.01"),
+                    projected={"24h": Decimal("3.64"), "4h": Decimal("21.84")},
+                ),
+            )
+        }
+    )
+
+    text = rd.report_markdown(report)
+
+    assert "Projected spend" in text
+    assert "3.64" in text and "21.84" in text
+
+
+def test_shock_spread_is_never_pooled_across_up_and_down() -> None:
+    """§8.3: SHOCK_UP and SHOCK_DOWN ask opposite questions of a long-only system — did the seats
+    catch the move, did they protect capital — and must never be pooled. A candidate that is
+    excellent on every up day and dangerous on every down day must read as exactly that, never as
+    merely "inconsistent"."""
+    from datetime import date
+
+    from decision_lab import render as rd
+
+    report = _minimal_report().model_copy(
+        update={
+            "scenario": "shock",
+            "calibration_days": (
+                date(2026, 2, 1),
+                date(2026, 2, 2),
+                date(2026, 3, 1),
+                date(2026, 3, 2),
+            ),
+            "per_day": (
+                rd.DayMetrics(
+                    candidate_id="baseline",
+                    day=date(2026, 2, 1),
+                    pool="SHOCK_UP",
+                    scored=10,
+                    correct=10,
+                    accuracy=Decimal("1.00"),
+                ),
+                rd.DayMetrics(
+                    candidate_id="baseline",
+                    day=date(2026, 2, 2),
+                    pool="SHOCK_UP",
+                    scored=10,
+                    correct=6,
+                    accuracy=Decimal("0.60"),
+                ),
+                rd.DayMetrics(
+                    candidate_id="baseline",
+                    day=date(2026, 3, 1),
+                    pool="SHOCK_DOWN",
+                    scored=10,
+                    correct=1,
+                    accuracy=Decimal("0.10"),
+                ),
+                rd.DayMetrics(
+                    candidate_id="baseline",
+                    day=date(2026, 3, 2),
+                    pool="SHOCK_DOWN",
+                    scored=10,
+                    correct=9,
+                    accuracy=Decimal("0.90"),
+                ),
+            ),
+            "gate_passed": True,
+        }
+    )
+
+    text = rd.report_markdown(report)
+
+    assert "**baseline** / SHOCK_UP — accuracy spread across its days: 40.0%" in text
+    assert "**baseline** / SHOCK_DOWN — accuracy spread across its days: 80.0%" in text
+    spreads = [line for line in text.splitlines() if "accuracy spread" in line]
+    assert len(spreads) == 2, "one spread line per pool, never one line covering both directions"
+    assert "**baseline** — accuracy spread" not in text, (
+        "a spread line with no ` / POOL` segment is one pooled across SHOCK_UP and SHOCK_DOWN"
+    )
+
+
+def test_no_calibration_report_has_a_doubled_blank_line() -> None:
+    """The `_calibration_block` sits mid-document, not last: a stray trailing separator would
+    triple up with the caller's own "" and the next heading's, unlike `_cost_projection_table`
+    whose trailing blank is absorbed by the document's final `.rstrip()`."""
+    from datetime import date
+
+    from decision_lab import render as rd
+
+    report = _minimal_report().model_copy(
+        update={
+            "scenario": "normal",
+            "calibration_days": (date(2026, 1, 1),),
+            "per_day": (
+                rd.DayMetrics(
+                    candidate_id="baseline",
+                    day=date(2026, 1, 1),
+                    pool="NORMAL",
+                    scored=10,
+                    correct=9,
+                    accuracy=Decimal("0.90"),
+                ),
+            ),
+            "gate_passed": True,
+        }
+    )
+
+    text = rd.report_markdown(report)
+
+    assert "\n\n\n" not in text

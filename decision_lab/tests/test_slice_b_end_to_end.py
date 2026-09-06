@@ -46,13 +46,21 @@ def seeded_stub(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-def built_corpus(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **shocks: object) -> str:
-    """Verify a dataset and build one reference pass over it. Returns the corpus id."""
+def built_corpus(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, days: int = 40, **shocks: object
+) -> str:
+    """Verify a dataset and build one reference pass over it. Returns the corpus id.
+
+    `days` is a parameter because the length decides how many shock days a pool can hold at all:
+    nearest-rank admits exactly `days - ceil(0.9 * days) + 1` of them, which is five over the
+    forty a scoring test needs and seven over the sixty `dataset days` needs to fill three pools
+    (`test_calibration_days.DAYS`). A caller wanting a pinned day set must ask for the longer one.
+    """
     data = tmp_path / "history"
     workspace = tmp_path / "workspace"
     monkeypatch.setattr(cp, "workspace_root", lambda: workspace)
     seeded_stub(monkeypatch)
-    f.write_dataset(data, {(f.instrument(), "1h"): f.shocked_walk(days=40, **shocks)})  # type: ignore[arg-type]
+    f.write_dataset(data, {(f.instrument(), "1h"): f.shocked_walk(days=days, **shocks)})  # type: ignore[arg-type]
 
     assert cli.main(["dataset", "verify", "--data", str(data)]) == cli.EXIT_OK
     assert (

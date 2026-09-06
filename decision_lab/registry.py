@@ -36,6 +36,10 @@ from tradebot.core.schema import DomainModel, Money, UtcDatetime
 
 REGISTRY_FILE: Final = "registry.jsonl"
 
+#: §11's statuses, plus slice D's. A run that never produced a number is still a fact about the
+#: experiment, and "the gate was shut" is a different fact from "no provider answered".
+STATUS_GATE_UNSATISFIED: Final = "gate_unsatisfied"
+
 
 class RunRow(DomainModel):
     """One experiment: every parameter that identifies it, and what it produced."""
@@ -70,6 +74,24 @@ class RunRow(DomainModel):
     precision_on_action: Money = ZERO
     contaminated: int = 0
     cost_usd: Money = ZERO
+
+    #: §10.6. A run whose provenance reads "nobody checked the seats first" says so on its face.
+    #: Not identity: skipping the gate changes nothing the run produces, only what is known
+    #: about it beforehand, and a row that split on it would show one experiment as two.
+    gate_skipped: bool = False
+
+    # --- §10.4's profit block, filled by `calibrate long` alone and zero everywhere else.
+    #: Mark-to-market: `aggregate(...).equity − start_equity`. **Not** `Evidence.realized_pnl`,
+    #: which sums closed round trips only and would ignore an open position at the window's end —
+    #: the same class of error as a drawdown gate measuring cost basis (ADR 0027).
+    total_profit: Money = ZERO
+    realized_pnl: Money = ZERO
+    unrealized_pnl: Money = ZERO
+    #: `total_profit − cost_usd`. The ask is *efficient*, not merely profitable.
+    net_profit: Money = ZERO
+    #: A frozen aggregate at the window's end. No figure at all is reported: freezing is
+    #: ignorance, and a number produced in ignorance is worse than its absence (§10.4).
+    unvaluable: bool = False
 
     @property
     def identity(self) -> str:

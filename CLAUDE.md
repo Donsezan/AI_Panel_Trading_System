@@ -131,8 +131,17 @@ was lost.
 .venv\Scripts\python.exe -m decision_lab dataset days   --data data\history   # pin the nine calibration days
 .venv\Scripts\python.exe -m decision_lab corpus build --data data\history --every 8h --reference-panel sim
 .venv\Scripts\python.exe -m decision_lab report --corpus <corpus_id>          # writes decision_lab\reports\*.md
+.venv\Scripts\python.exe -m decision_lab calibrate normal --corpus <id> --configs <matrix.toml>
+.venv\Scripts\python.exe -m decision_lab calibrate shock  --corpus <id> --configs <matrix.toml>
+.venv\Scripts\python.exe -m decision_lab calibrate long --data data\history --configs <matrix.toml> `
+    --candidate baseline --start-equity 1000 --every 4h --window 6m
 .\decision_lab\check.ps1                                                      # its own format/lint/mypy/tests
 ```
+
+`sweep` and `calibrate long` **refuse with exit 6** until both calibration halves have passed for
+that exact dataset, matrix and day set — so a sweep now needs a pinned day set where before it did
+not (`dataset days` first, or exit 3). `--skip-gate` proceeds and stamps both the report and the
+§11 registry row.
 
 Both gates must pass: `.\decision_lab\check.ps1` **and** the root `.\check.ps1`.
 
@@ -223,9 +232,9 @@ A separate top-level package, not a bot phase. The bot can say what happened to 
 could never say whether a decision was *right*, which mixes good judgement with good luck. This
 scores decisions against what the market did next, over recorded history, per regime and per seat.
 Specced in [docs/superpowers/specs/2026-08-23-decision-lab-design.md](docs/superpowers/specs/2026-08-23-decision-lab-design.md);
-five slices, of which **A (integrity, day set, corpus), B (regimes, scoring, per-seat, report) and
-C (the sweep) have shipped**. D (calibration) and E (news) are not built, and only E touches
-`tradebot` at all.
+five slices, of which **A (integrity, day set, corpus), B (regimes, scoring, per-seat, report),
+C (the sweep) and D pass 1 (calibration and the gate) have shipped**. D pass 2 — the read-only
+dashboard and the notebook — and E (news) are not built, and only E touches `tradebot` at all.
 
 ```
 dataset.py             audit recorded history, repair holes, refuse an unverified dataset
@@ -241,6 +250,9 @@ dataset.py             audit recorded history, repair holes, refuse an unverifie
         compare.py     the cross-candidate ranking and the pairwise agreement matrix
           registry.py  every run kept, so two setups are compared rather than remembered
           render.py    Markdown to decision_lab/reports/, never printed
+      gate.py          the §10.6 record alone: its key, its file, and `require_satisfied`
+        calibration.py scenarios 1 and 2 — the pinned days through `sweep.run`, then four conditions
+        longrun.py     scenario 3 — one candidate's own six months, its own ledger, its own profit
 ```
 
 Rules that are easy to get backwards:
@@ -326,6 +338,36 @@ Rules that are easy to get backwards:
   else — so adding one candidate re-pays for none of the others. The `sweep-<matrix_digest>/`
   directories are scoped, because two matrices both hold a `baseline` and a flat layout would
   resume one experiment into the other's file.
+- **The gate is keyed on the dataset, the matrix and the day set — never on the corpus.** All four
+  §10.6 conditions are properties of the candidates, the seats and the days. Keying on `corpus_id`
+  would force a re-calibration every time the long run varied `--every`, which is the one axis it
+  exists to vary; the cadence is recorded on the verdict for provenance and never scopes the gate.
+  The other direction of the same rule: **a stub matrix cannot satisfy a real matrix's gate**, and
+  needs no runtime check to say so, because the bindings feed `panel_digest` → `matrix_digest`,
+  which is a third of the key.
+- **A seat that only ever answered on its fallback fails the gate, and an abstention is not an
+  answer.** A seat whose key is missing abstains quietly, and over six months that is a panel you
+  paid to run and never tested. Read off `SeatResponse.fingerprint` — the same field §7.7's
+  contamination check reads — so "substituted" and "never answered on its primary" can never
+  disagree. Every `calibrate` command also refuses *before spend* on an unreachable provider,
+  exactly as `sweep` does. In `sweep` the gate consult comes **first**, ahead of that reachability
+  check: an operator who has not calibrated must fix that before they are told about a missing
+  key, because `calibrate` tells them itself. `calibrate long` orders the two the other way — it
+  is the command they would be sent to, so there is no second command to defer the key to.
+- **"Total profit" is mark-to-market, and it is not `Evidence.realized_pnl`.** That property sums
+  closed round trips only, so a run ending with an open position would report a profit that
+  ignores it. Realized and unrealized are both always printed, and `net_profit` subtracts what
+  deliberation cost — a panel that made $80 on $120 of tokens lost money, and nothing else in the
+  design says so. A frozen aggregate reports `UNVALUABLE` and **no figure at all**, not even the
+  realized half: freezing is ignorance, and a partial number produced in ignorance is the
+  cost-basis fallback ADR 0027 forbids, arriving through the other door. §10.5 prints the
+  snapshot accuracy beside the profit and never blends them — profit over one path is the weaker
+  of the two, because positions compound and one lucky early fill compounds for six months.
+- **A long run lives in `workspace/long-<run_id>/`, never in the corpus directory**, though it
+  derives its own `corpus_id` for §11 provenance. The two have different windows by construction,
+  and sharing the directory would turn §5.4's window-mismatch refusal into a refusal of an
+  unrelated command. Like a corpus it is reused at its identity and refuses to build over the
+  database an interrupted pass left behind — that file is the record of why the pass failed.
 
 ### Phase 11 — the instrument master
 

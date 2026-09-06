@@ -22,10 +22,12 @@ read, which `test_discipline.py` asserts structurally.
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Final
+
+from pydantic import Field
 
 from decision_lab.compare import Agreement, Ranked
 from decision_lab.sampling import Sample
@@ -60,6 +62,17 @@ PLUMBING_CHECK: Final = (
     "matrix bound to real providers to learn something."
 )
 
+#: §10.6. `--skip-gate` was used, so nobody proved every seat answered on its own model before
+#: this run. Rendered with the other banners, above the identity block: a result whose provenance
+#: reads "nobody checked the seats first" should say so on its face.
+GATE_SKIPPED: Final = (
+    "**GATE SKIPPED.** This run was started with `--skip-gate`, so the §10.6 calibration gate "
+    "was not consulted. Nothing here proves that every candidate materialised, that every seat "
+    "answered on its own model rather than on a backup, or that the panel reached a decision at "
+    "all. A seat that abstained silently would leave exactly these tables, and they would look "
+    "no different."
+)
+
 
 class CandidateSeats(DomainModel):
     """§9.7's tables, one set per candidate — a seat is only comparable within its own panel."""
@@ -78,6 +91,36 @@ class NotMeasured(DomainModel):
 
     candidate_id: str
     reason: str
+
+
+class DayMetrics(DomainModel):
+    """One candidate on one pinned day (§10.2).
+
+    Reported per day *and* pooled: a candidate whose pooled accuracy comes entirely from one of
+    three days is not a candidate the report should present as steady, and only the per-day rows
+    can say so.
+    """
+
+    candidate_id: str
+    day: date
+    pool: str
+    scored: int = 0
+    correct: int = 0
+    accuracy: Money = ZERO
+
+
+class CostProjection(DomainModel):
+    """§10.6's projection: what nine days say a long run would cost, per cadence.
+
+    `projected` is cadence label → spend over the declared window. Printed beside `--budget` so
+    §7.5's ceiling stops being a guess — and so an over-ceiling projection is learned for the
+    price of nine days rather than at hour nine.
+    """
+
+    candidate_id: str
+    cost_per_cycle: Money = ZERO
+    cost_per_scored: Money = ZERO
+    projected: dict[str, Money] = Field(default_factory=dict)
 
 
 class LabReport(DomainModel):
@@ -126,6 +169,18 @@ class LabReport(DomainModel):
     #: 0.0% accuracy, which would read as measured and worst rather than not measured at all.
     not_measured_candidates: tuple[NotMeasured, ...] = ()
 
+    # --- Slice D (§10). All empty on a sweep or reference-pass report, which then renders
+    # exactly as it did before: one command, one rendering path (§14).
+    #: "normal" or "shock" when this page is a calibration, "" otherwise.
+    scenario: str = ""
+    calibration_days: tuple[date, ...] = ()
+    per_day: tuple[DayMetrics, ...] = ()
+    gate_passed: bool = False
+    gate_failures: tuple[str, ...] = ()
+    #: §10.6's `--skip-gate`, stamped here and on the §11 row.
+    gate_skipped: bool = False
+    cost_projection: tuple[CostProjection, ...] = ()
+
 
 def report_markdown(report: LabReport) -> str:
     sections = [
@@ -139,7 +194,12 @@ def report_markdown(report: LabReport) -> str:
         sections += ["", PLUMBING_CHECK]
     if report.news_blind:
         sections += ["", NEWS_BLIND]
+    if report.gate_skipped:
+        sections += ["", GATE_SKIPPED]
     sections += ["", _identity(report)]
+    calibration_block = _calibration_block(report)
+    if calibration_block:
+        sections += ["", calibration_block]
     if report.ranking or report.not_measured_candidates:
         sections += [
             "",
@@ -163,6 +223,9 @@ def report_markdown(report: LabReport) -> str:
         "",
         _seat_tables(report.seats),
     ]
+    # §10.6: last on the page — the final `rstrip()` below absorbs the blank line an empty
+    # projection would otherwise leave, so a report with none renders exactly as before.
+    sections += ["", _cost_projection_table(report.cost_projection)]
     return "\n".join(sections).rstrip() + "\n"
 
 
@@ -427,6 +490,112 @@ def _candidate_seat_tables(blocks: Sequence[CandidateSeats]) -> str:
     )
 
 
+def _calibration_block(report: LabReport) -> str:
+    """§10.2's per-day table and its spread, and the gate verdict this page produced."""
+    if not report.scenario:
+        return ""
+    parts = [
+        f"## Calibration — {report.scenario}",
+        "",
+        "Days: " + (", ".join(day.isoformat() for day in report.calibration_days) or "none"),
+        "",
+    ]
+    if report.per_day:
+        parts += [
+            _table(
+                ("candidate", "day", "pool", "scored", "correct", "accuracy"),
+                (
+                    (
+                        row.candidate_id,
+                        row.day.isoformat(),
+                        row.pool,
+                        str(row.scored),
+                        str(row.correct),
+                        _pct(row.accuracy),
+                    )
+                    for row in report.per_day
+                ),
+            ),
+            "",
+            _spread_note(report.per_day),
+            "",
+        ]
+    # No trailing "" here, unlike `_cost_projection_table`: that one is the last section on the
+    # page, so the document's final `.rstrip()` absorbs it. This block sits in the middle — the
+    # caller already supplies one "" separator before it and the next heading supplies its own —
+    # so a trailing blank line here would triple up into "\n\n\n" instead of the document's one.
+    return "\n".join([*parts, _gate_verdict(report)])
+
+
+def _spread_note(rows: Sequence[DayMetrics]) -> str:
+    """The spread across the days, per candidate *and per pool* — never pooled across regimes
+    (§8.3). `calibration.POOLS["shock"]` runs SHOCK_UP and SHOCK_DOWN together, so a shock
+    scenario's rows legitimately mix both, and they ask opposite questions of a long-only system:
+    did the seats catch the move, did they protect capital. Blending them into one spread would
+    let a candidate that is excellent on every up day and dangerous on every down day read as
+    merely "inconsistent" — the one reading this page must never produce.
+
+    Three days is not a distribution, but it is enough to see when one day carried a result — and
+    a candidate whose pooled accuracy comes entirely from one of the three is not one this page
+    should present as steady."""
+    lines = []
+    for candidate_id, pool in dict.fromkeys((row.candidate_id, row.pool) for row in rows):
+        accuracies = [
+            row.accuracy for row in rows if row.candidate_id == candidate_id and row.pool == pool
+        ]
+        lines.append(
+            f"- **{candidate_id}** / {pool} — accuracy spread across its days: "
+            f"{_pct(max(accuracies) - min(accuracies))} "
+            f"({_pct(min(accuracies))} to {_pct(max(accuracies))})"
+        )
+    return "\n".join(lines)
+
+
+def _gate_verdict(report: LabReport) -> str:
+    """§10.6's four conditions, as a verdict a reader can act on."""
+    if report.gate_passed:
+        return (
+            "**Gate: PASSED.** Every candidate materialised and deliberated, every seat answered "
+            "at least once on its primary binding, the panel reached decisions, and the path "
+            "completed."
+        )
+    # `calibration.failures_for` guarantees at least one reason today, but this function must not
+    # depend on a caller's invariant to avoid rendering a sentence that stops mid-thought.
+    listed = "\n".join(f"- {reason}" for reason in report.gate_failures) or "- no reason recorded"
+    return (
+        "**Gate: FAILED.** The §10.6 gate is shut for this dataset, matrix and day set:\n\n"
+        f"{listed}"
+    )
+
+
+def _cost_projection_table(rows: Sequence[CostProjection]) -> str:
+    """§10.6's projection, so §7.5's ceiling stops being a guess."""
+    if not rows:
+        return ""
+    cadences = sorted({label for row in rows for label in row.projected})
+    return "\n".join(
+        [
+            "## Projected spend",
+            "",
+            "Measured over the pinned days, projected across the declared window.",
+            "",
+            _table(
+                ("candidate", "$/cycle", "$/scored", *(f"{label} run" for label in cadences)),
+                (
+                    (
+                        row.candidate_id,
+                        _num(row.cost_per_cycle),
+                        _num(row.cost_per_scored),
+                        *(_num(row.projected.get(label)) for label in cadences),
+                    )
+                    for row in rows
+                ),
+            ),
+            "",
+        ]
+    )
+
+
 def _table(headers: Sequence[str], rows: Iterable[Sequence[str]]) -> str:
     lines = ["| " + " | ".join(headers) + " |", "|" + "---|" * len(headers)]
     lines += ["| " + " | ".join(row) + " |" for row in rows]
@@ -448,4 +617,177 @@ def _stamp(moment: datetime) -> str:
 def write_report(report: LabReport, path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(report_markdown(report), encoding="utf-8")
+    return path
+
+
+class LongRunReport(DomainModel):
+    """§10.4's page. A different kind of number from a calibration's, never on one scale."""
+
+    generated_at: UtcDatetime
+    run_id: str
+    corpus_id: str
+    dataset_directory: str
+    dataset_digest: str
+    candidate_id: str
+    panel_digest: str
+    panel_models: tuple[str, ...] = ()
+    cadence_seconds: int
+    window: str
+    requested_start: UtcDatetime
+    window_start: UtcDatetime
+    window_end: UtcDatetime
+    warmup_seconds: int = 0
+    planned_cycles: int = 0
+    ran_cycles: int = 0
+    news_blind: bool = True
+    plumbing_check: bool = False
+    gate_skipped: bool = False
+    #: `longrun.Profit`, carried as its own fields so `render` need not import `longrun`.
+    unvaluable: bool = False
+    freeze_reason: str = ""
+    equity: Money = ZERO
+    start_equity: Money = ZERO
+    total_profit: Money = ZERO
+    realized: Money = ZERO
+    unrealized: Money = ZERO
+    cost_usd: Money = ZERO
+    net_profit: Money = ZERO
+    #: rule, action, count — §10.4's veto breakdown.
+    vetoes: tuple[tuple[str, str, int], ...] = ()
+    incidents: int = 0
+    decisions: int = 0
+    fills: int = 0
+    #: §10.5. This candidate's snapshot-scored accuracy from the gate record, so the two rankings
+    #: sit side by side. Empty under `--skip-gate`, which the page then says rather than leaving
+    #: a blank column.
+    snapshot_accuracy: Money | None = None
+
+
+def long_run_markdown(report: LongRunReport) -> str:
+    """§10.4's page, in the same banner order as `report_markdown` — a reader meets every
+    disclaimer before they meet a number, whichever command wrote the page (§14)."""
+    sections = [
+        "# decision_lab — six months of long exposure",
+        "",
+        BANNER,
+        "",
+        DISCLAIMER,
+    ]
+    if report.news_blind:
+        sections += ["", NEWS_BLIND]
+    if report.plumbing_check:
+        sections += ["", PLUMBING_CHECK]
+    if report.gate_skipped:
+        sections += ["", GATE_SKIPPED]
+    sections += [
+        "",
+        _long_identity(report),
+        "",
+        "## Profit",
+        "",
+        _profit_block(report),
+        "",
+        "## Vetoes",
+        "",
+        _veto_table(report.vetoes),
+        "",
+        "## Rankings (§10.5)",
+        "",
+        _rankings_note(report),
+    ]
+    return "\n".join(sections).rstrip() + "\n"
+
+
+def _long_identity(report: LongRunReport) -> str:
+    return _table(
+        ("parameter", "value"),
+        (
+            ("generated", _stamp(report.generated_at)),
+            ("run", report.run_id),
+            ("corpus", report.corpus_id),
+            ("dataset", f"{report.dataset_directory} (`{report.dataset_digest}`)"),
+            ("candidate", f"{report.candidate_id} (`{report.panel_digest}`)"),
+            ("panel models", ", ".join(report.panel_models) or "none recorded"),
+            ("cadence", f"{report.cadence_seconds}s"),
+            ("window", report.window),
+            ("requested start", _stamp(report.requested_start)),
+            # Both, always: §10.4's window starts after the indicators' warm-up, and a page whose
+            # window silently differs from the one asked for is a page about another experiment
+            # (ADR 0017).
+            ("window", f"{_stamp(report.window_start)} → {_stamp(report.window_end)}"),
+            ("warm-up", f"{report.warmup_seconds}s"),
+            ("cycles", f"{report.ran_cycles} of {report.planned_cycles} planned"),
+            ("decisions", str(report.decisions)),
+            ("fills", str(report.fills)),
+            ("incidents", str(report.incidents)),
+        ),
+    )
+
+
+def _profit_block(report: LongRunReport) -> str:
+    """The table, or the refusal to draw one.
+
+    An unvaluable run renders **no table at all**, not a table of zeroes: every cell would be a
+    figure produced in ignorance, and §10.4 holds that such a number is worse than its absence.
+    """
+    if report.unvaluable:
+        return (
+            f"**UNVALUABLE** — {report.freeze_reason}\n\n"
+            "The portfolio could not be valued at the window's end, so no profit figure is "
+            "reported. A stale mark is not a mark, and valuing the position at what it cost "
+            "would be differently wrong rather than conservative (ADR 0027)."
+        )
+    return _table(
+        ("figure", "amount"),
+        (
+            ("equity", str(report.equity)),
+            ("start equity", str(report.start_equity)),
+            # Mark-to-market, so an open position at the window's end counts — never
+            # `Evidence.realized_pnl`, which sums closed round trips only (§10.4).
+            ("total profit", str(report.total_profit)),
+            ("realized", str(report.realized)),
+            ("unrealized", str(report.unrealized)),
+            ("deliberation cost", str(report.cost_usd)),
+            ("net profit", str(report.net_profit)),
+        ),
+    )
+
+
+def _veto_table(rows: Sequence[tuple[str, str, int]]) -> str:
+    """§10.4: a panel right often but only in ways the collar, the cooldown or the daily cap
+    refuse is not an improvement — and a corpus sweep can never discover that."""
+    if not rows:
+        return "No rule refused anything over this run."
+    return _table(
+        ("rule", "action", "count"),
+        ((rule, action or "—", str(count)) for rule, action, count in rows),
+    )
+
+
+def _rankings_note(report: LongRunReport) -> str:
+    """§10.5's two rankings, side by side and never blended.
+
+    Profit over one path is a *weak* comparison and the page says so beside the number rather
+    than under it: positions compound, so one lucky early fill compounds for six months, and a
+    candidate can top this ranking on a single decision the snapshot scoring would call luck.
+    """
+    if report.snapshot_accuracy is None:
+        return (
+            "The §10.6 gate was skipped, so no snapshot-scored accuracy was measured for this "
+            "candidate and there is no second ranking to set beside its profit. Run "
+            "`calibrate normal` and `calibrate shock` against this matrix to get one."
+        )
+    return (
+        f"Snapshot-scored accuracy **{_pct(report.snapshot_accuracy)}**, net profit "
+        f"**{report.net_profit}** over this one path.\n\n"
+        "The two are not on one scale and must never be blended into a single score. Profit "
+        "over one path is the weaker of the pair: positions compound, so one lucky early fill "
+        "compounds for six months and can carry a candidate to the top of this ranking on a "
+        "single decision. Where the two disagree, that disagreement is the finding."
+    )
+
+
+def write_long_run(report: LongRunReport, path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(long_run_markdown(report), encoding="utf-8")
     return path
