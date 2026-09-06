@@ -25,8 +25,8 @@ matrix and a per-candidate seat breakdown. And it no longer runs *unchecked*: a 
 until the seats have been calibrated over nine pinned days.
 
 Slice D is split into two passes. **Pass 1 — the three calibration scenarios and the §10.6 gate —
-has shipped**, all nine tasks, on branch `feat/decision-lab-slice-d`. **Pass 2 — the dashboard and
-the notebook — has not started**, and E (news) is untouched.
+has shipped**, all nine tasks, merged to `main`. **Pass 2 — the dashboard and the notebook — has
+not started**, and E (news) is untouched.
 
 ---
 
@@ -149,15 +149,19 @@ the seats first" should say so on its face.
 
 ## Next step when you pick this up
 
-**Slice D pass 1 is complete on `feat/decision-lab-slice-d`.** Both gates pass and
+**Slice D pass 1 is merged to `main`** (merge commit `5c65068`), unpushed. Both gates passed on
+the merged result — decision_lab 703, root 2848 with every coverage gate met — and
 `git diff --stat main -- tradebot/` is empty. What is left, in the order it is worth doing:
 
-1. **Merge the branch**, or review it first — the full ledger of every ruling made along the way
-   and what each costs if wrong is in
-   `.superpowers/sdd/2026-09-05-decision-lab-slice-d-calibration/progress.md`.
-2. **Calibrate against a real panel and then sweep it.** This is the first thing that has ever
-   needed `OPENROUTER_API_KEY`, and the cost projection on the calibration page is what tells you
-   what the sweep after it will cost — that is the whole point of running the nine days first.
-3. **Slice D pass 2** — the read-only dashboard and `notebooks/tuning.ipynb`, or
-4. **Slice E** — the news archive, which is the only part of this design that touches `tradebot`
+1. **Calibrate against a real panel and then sweep it.** This is the first thing here that has
+   ever needed `OPENROUTER_API_KEY`, and the cost projection on the calibration page is what tells
+   you what the sweep after it will cost — that is the whole point of running the nine days first.
+2. **Slice D pass 2** — the read-only dashboard and `notebooks/tuning.ipynb`, or
+3. **Slice E** — the news archive, which is the only part of this design that touches `tradebot`
    at all, and whose seam and guard tests are one commit and never two.
+
+Pass 1 was written across two sessions and **carries no independent task review for tasks 4–9** —
+the reviewing agents in session 1 stalled, and session 2 was executed directly. The full ledger of
+every ruling made along the way and what each costs if wrong is in
+`.superpowers/sdd/2026-09-05-decision-lab-slice-d-calibration/progress.md`; the diffs worth a
+second pair of eyes are `2554c00..8408d86`.
