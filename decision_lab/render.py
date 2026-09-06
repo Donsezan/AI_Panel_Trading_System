@@ -497,7 +497,7 @@ def _calibration_block(report: LabReport) -> str:
     parts = [
         f"## Calibration — {report.scenario}",
         "",
-        "Days: " + ", ".join(day.isoformat() for day in report.calibration_days),
+        "Days: " + (", ".join(day.isoformat() for day in report.calibration_days) or "none"),
         "",
     ]
     if report.per_day:
@@ -520,18 +520,31 @@ def _calibration_block(report: LabReport) -> str:
             _spread_note(report.per_day),
             "",
         ]
-    return "\n".join([*parts, _gate_verdict(report), ""])
+    # No trailing "" here, unlike `_cost_projection_table`: that one is the last section on the
+    # page, so the document's final `.rstrip()` absorbs it. This block sits in the middle — the
+    # caller already supplies one "" separator before it and the next heading supplies its own —
+    # so a trailing blank line here would triple up into "\n\n\n" instead of the document's one.
+    return "\n".join([*parts, _gate_verdict(report)])
 
 
 def _spread_note(rows: Sequence[DayMetrics]) -> str:
-    """The spread across the days, per candidate. §10.2: three days is not a distribution, but it
-    is enough to see when one day carried a result — and a candidate whose pooled accuracy comes
-    entirely from one of the three is not one this page should present as steady."""
+    """The spread across the days, per candidate *and per pool* — never pooled across regimes
+    (§8.3). `calibration.POOLS["shock"]` runs SHOCK_UP and SHOCK_DOWN together, so a shock
+    scenario's rows legitimately mix both, and they ask opposite questions of a long-only system:
+    did the seats catch the move, did they protect capital. Blending them into one spread would
+    let a candidate that is excellent on every up day and dangerous on every down day read as
+    merely "inconsistent" — the one reading this page must never produce.
+
+    Three days is not a distribution, but it is enough to see when one day carried a result — and
+    a candidate whose pooled accuracy comes entirely from one of the three is not one this page
+    should present as steady."""
     lines = []
-    for candidate_id in dict.fromkeys(row.candidate_id for row in rows):
-        accuracies = [row.accuracy for row in rows if row.candidate_id == candidate_id]
+    for candidate_id, pool in dict.fromkeys((row.candidate_id, row.pool) for row in rows):
+        accuracies = [
+            row.accuracy for row in rows if row.candidate_id == candidate_id and row.pool == pool
+        ]
         lines.append(
-            f"- **{candidate_id}** — accuracy spread across its days: "
+            f"- **{candidate_id}** / {pool} — accuracy spread across its days: "
             f"{_pct(max(accuracies) - min(accuracies))} "
             f"({_pct(min(accuracies))} to {_pct(max(accuracies))})"
         )
@@ -546,7 +559,9 @@ def _gate_verdict(report: LabReport) -> str:
             "at least once on its primary binding, the panel reached decisions, and the path "
             "completed."
         )
-    listed = "\n".join(f"- {reason}" for reason in report.gate_failures)
+    # `calibration.failures_for` guarantees at least one reason today, but this function must not
+    # depend on a caller's invariant to avoid rendering a sentence that stops mid-thought.
+    listed = "\n".join(f"- {reason}" for reason in report.gate_failures) or "- no reason recorded"
     return (
         "**Gate: FAILED.** The §10.6 gate is shut for this dataset, matrix and day set:\n\n"
         f"{listed}"

@@ -221,3 +221,101 @@ def test_the_cost_projection_is_rendered_per_cadence() -> None:
 
     assert "Projected spend" in text
     assert "3.64" in text and "21.84" in text
+
+
+def test_shock_spread_is_never_pooled_across_up_and_down() -> None:
+    """§8.3: SHOCK_UP and SHOCK_DOWN ask opposite questions of a long-only system — did the seats
+    catch the move, did they protect capital — and must never be pooled. A candidate that is
+    excellent on every up day and dangerous on every down day must read as exactly that, never as
+    merely "inconsistent"."""
+    from datetime import date
+
+    from decision_lab import render as rd
+
+    report = _minimal_report().model_copy(
+        update={
+            "scenario": "shock",
+            "calibration_days": (
+                date(2026, 2, 1),
+                date(2026, 2, 2),
+                date(2026, 3, 1),
+                date(2026, 3, 2),
+            ),
+            "per_day": (
+                rd.DayMetrics(
+                    candidate_id="baseline",
+                    day=date(2026, 2, 1),
+                    pool="SHOCK_UP",
+                    scored=10,
+                    correct=10,
+                    accuracy=Decimal("1.00"),
+                ),
+                rd.DayMetrics(
+                    candidate_id="baseline",
+                    day=date(2026, 2, 2),
+                    pool="SHOCK_UP",
+                    scored=10,
+                    correct=6,
+                    accuracy=Decimal("0.60"),
+                ),
+                rd.DayMetrics(
+                    candidate_id="baseline",
+                    day=date(2026, 3, 1),
+                    pool="SHOCK_DOWN",
+                    scored=10,
+                    correct=1,
+                    accuracy=Decimal("0.10"),
+                ),
+                rd.DayMetrics(
+                    candidate_id="baseline",
+                    day=date(2026, 3, 2),
+                    pool="SHOCK_DOWN",
+                    scored=10,
+                    correct=9,
+                    accuracy=Decimal("0.90"),
+                ),
+            ),
+            "gate_passed": True,
+        }
+    )
+
+    text = rd.report_markdown(report)
+
+    assert "**baseline** / SHOCK_UP — accuracy spread across its days: 40.0%" in text
+    assert "**baseline** / SHOCK_DOWN — accuracy spread across its days: 80.0%" in text
+    spreads = [line for line in text.splitlines() if "accuracy spread" in line]
+    assert len(spreads) == 2, "one spread line per pool, never one line covering both directions"
+    assert "**baseline** — accuracy spread" not in text, (
+        "a spread line with no ` / POOL` segment is one pooled across SHOCK_UP and SHOCK_DOWN"
+    )
+
+
+def test_no_calibration_report_has_a_doubled_blank_line() -> None:
+    """The `_calibration_block` sits mid-document, not last: a stray trailing separator would
+    triple up with the caller's own "" and the next heading's, unlike `_cost_projection_table`
+    whose trailing blank is absorbed by the document's final `.rstrip()`."""
+    from datetime import date
+
+    from decision_lab import render as rd
+
+    report = _minimal_report().model_copy(
+        update={
+            "scenario": "normal",
+            "calibration_days": (date(2026, 1, 1),),
+            "per_day": (
+                rd.DayMetrics(
+                    candidate_id="baseline",
+                    day=date(2026, 1, 1),
+                    pool="NORMAL",
+                    scored=10,
+                    correct=9,
+                    accuracy=Decimal("0.90"),
+                ),
+            ),
+            "gate_passed": True,
+        }
+    )
+
+    text = rd.report_markdown(report)
+
+    assert "\n\n\n" not in text
