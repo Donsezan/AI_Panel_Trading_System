@@ -68,8 +68,11 @@ AI_Panel_Trading_System\
     calibrate.py            §10 scenarios 1, 2 and 3
     registry.py             §11 the results registry
     render.py               Markdown report
-    dashboard\              §12 its own read-only ASGI app
-      app.py  routes.py  templates\  static\
+    analysis.py             §12.2 the one read assembly, shared by CLI, dashboard and notebook
+    matrices.py             §12.3 the workspace seat-set store, versioned TOML
+    jobs.py                 §12.4 the run launcher and the workspace lock
+    dashboard\              §12 its own ASGI app: read, edit, run
+      app.py  auth.py  views.py  routes\  templates\  static\
     config\
       sweep.toml            the candidate matrix
       regimes.toml          named event windows
@@ -87,7 +90,7 @@ AI_Panel_Trading_System\
 | Bot config untouched | matrices are TOML files in `decision_lab/config/`, never `ConfigStore` documents | none |
 | Bot CLI untouched | `python -m decision_lab …`; `tradebot/__main__.py` is not edited | none |
 | Bot database untouched | every pass opens `decision_lab/workspace/<id>/*.db` via `build_sim(db_path=…)` | none |
-| Bot dashboard untouched | `decision_lab/dashboard/` is its own ASGI app, own port, own token env var | none — it *reuses* `tradebot.dashboard.auth`, which is a one-way import |
+| Bot dashboard untouched | `decision_lab/dashboard/` is its own ASGI app, own port, own token env var, **own session cookie name** — cookies are not port-scoped (§12) | none — it *reuses* `tradebot.dashboard.auth`, which is a one-way import |
 | Bot packaging untouched | matrices are TOML, read with stdlib `tomllib`; **no new dependency** | none |
 | Bot wheel untouched | `packages = ["tradebot"]` already excludes siblings | none |
 | Bot gates untouched | `mypy tradebot`, `testpaths = ["tests"]`, `coverage source = ["tradebot"]` all name the bot | the tool needs its own `check.ps1` |
@@ -1114,21 +1117,41 @@ that deletion is the one irreversible step.
 
 ## 12. The dashboard
 
-`decision_lab/dashboard/` is **its own ASGI app**, on its own port, behind its own token
-(`DECISION_LAB_DASHBOARD_TOKEN`), reusing `tradebot.dashboard.auth`'s `Session`,
-`SessionMiddleware` and `assert_bind_allowed` — a one-way import, so the separation contract is
-untouched and the ADR 0014 auth posture is inherited rather than re-argued.
+`decision_lab/dashboard/` is **its own ASGI app**, on its own port (8788), behind its own token
+(`DECISION_LAB_DASHBOARD_TOKEN`), reusing `tradebot.dashboard.auth`'s `Session`, its refusal
+semantics and `assert_bind_allowed` — a one-way import, so the separation contract is untouched and
+the ADR 0014 auth posture is inherited rather than re-argued.
 
 Separate rather than a page in the bot's dashboard, for three reasons: a sweep is not a running
 bot, so it must be readable with nothing else up; its data lives in the workspace, not in a mode
 database; and putting it in `tradebot/dashboard/` would have deleted `test_separation.py` and
 pulled tuning code inside the bot's mypy and coverage gates.
 
-**It is read-only.** No control surface at all — nothing on it can start, stop, arm, publish or
-change anything. That is a genuine simplification against the bot's dashboard, and it means the
-whole ADR 0021 supervision story has no analogue here.
+**It carries its own session cookie name.** Cookies are not port-scoped: a lab app setting
+`tradebot_session` on `127.0.0.1` would overwrite the bot dashboard's cookie on another port,
+signed with a different token — so logging in here would silently log the operator out of the
+surface holding the kill switch, at the moment they reached for it. `Session` does the signing;
+the cookie name is ours.
 
-Four views:
+### 12.1 It is not read-only, and that is a reversal
+
+This section previously specified a read-only surface with no control at all. That was wrong for
+the goal. The tool exists to find a better panel, and a loop that means editing TOML in one window,
+running a command in a second and reading Markdown in a third is a loop nobody closes. The
+dashboard is therefore **three surfaces over one shell** — read a result, build a seat set, run it
+— and the read views are what the other two display into.
+
+What the reversal does *not* license, none of which has moved:
+
+- **No authority over the bot.** Nothing here starts, stops, arms, pauses or publishes anything in
+  `tradebot`. It reaches no bot database, no venue broker and no live process; §15's prohibition is
+  unchanged and still structurally asserted.
+- **No promotion authority** (§17). A result here justifies a decision a human makes through
+  `validation/promotion.py`; it never makes one.
+- **No automatic search** (§1.1). A person picks every candidate and every run. A page that
+  launches a run is not an optimiser: nothing here iterates on its own.
+
+### 12.2 Read — four views
 
 | View | Shows |
 |---|---|
@@ -1137,12 +1160,89 @@ Four views:
 | **Seat detail** | §9.7 in full: per seat, per regime, round 0 beside final, with swing rate and marginal contribution |
 | **Decision drill-down** | one snapshot: the evidence the panel saw, every seat's vote and raw text, the truth label, and why the verdict landed as it did |
 
-Because §7.6 already appends results as they are produced, the Runs view **tails a sweep in
-progress** — which is the other half of "see the performance of each test run": not only what a
-finished run scored, but what a running one is scoring while it still has budget left to stop.
+Because §7.6 already appends results as they are produced, the Runs view **tails a run in
+progress** — not only what a finished run scored, but what a running one is scoring while it still
+has budget left to stop.
 
-Sizes, sorting and the selected run follow the bot's own rule (Phase 10): selection is in the URL,
-so a reload and a bookmark land on the same view; only display preferences live client-side.
+Selection is in the URL, following the bot's Phase 10 rule, so a reload and a bookmark land on the
+same view. An instrument key carries a `/`, so it is a query parameter and never a path segment.
+
+**One assembly, three front doors.** `analysis.py` turns a corpus and a sweep's rows into scored
+decisions, the ranking and the seat blocks; the CLI's `report`, these views and the notebook all
+call it. A second assembly would be §14's rejected second `report` command arriving through another
+door — two pages that disagree about the same run.
+
+Derivation is live rather than precomputed, cached in the process on (corpus, matrix, scoring
+parameters, the rows files' modification times), so a running job invalidates its own cache and
+nothing has to be written to disk for a page to be current. A reader tolerates an unparseable
+**final** line in a `.jsonl` and nothing else: a row being appended by another process is half a
+line for as long as it takes to write it, and that is not corruption.
+
+### 12.3 Edit — seat sets
+
+Seats, roles, standing instructions, models, protocol and the expansion matrix, edited as a form
+and stored as **versioned TOML in the workspace**: `workspace/matrices/<name>/<version>.toml`.
+Every save is a new version and nothing is overwritten, so the seat set that produced the best row
+in the registry can still be opened. The shipped `config/*.toml` stay read-only templates to
+duplicate — they are curated, commented and in git, and a form writer would destroy the first two
+and dirty the third from a browser click.
+
+One format serves both front doors: the CLI's `--configs` takes a path, and `matrix_digest` is
+computed exactly as it is today.
+
+Three rules that are easy to get backwards:
+
+- **Validation is `candidates.load_matrix` itself.** Nothing in the form restates a rule, exactly
+  as the bot's Configure page defers to its pydantic models. A matrix that will not load is a
+  refusal carrying the loader's own message — §7.2's whole-run stub rule included.
+- **An edit mints a new `matrix_digest`, which is a third of the §10.6 gate key**, so a saved seat
+  set is *uncalibrated* until `calibrate normal` and `calibrate shock` have run over the nine days
+  again. The page says so at the moment of saving: discovering it later as an exit 6 from a sweep
+  is a worse way to learn it, and those nine days are the price of the guarantee.
+- **The form round-trips the whole document**, so a tab may hide inputs and may never omit them —
+  the bot's `_panel.html` hazard, one level up. Adding or removing a seat is a server round-trip
+  that re-renders the submitted form with one more or one fewer block, so the editor works with
+  scripting off and there is one rendering path.
+
+### 12.4 Run — a launcher, not a second engine
+
+A start runs `python -m decision_lab <argv>` as a **child process**. Four things follow, and
+together they are why it is not an in-process call:
+
+- **The page cannot diverge from the CLI, because the page *is* the CLI.** Every refusal already
+  has an exit code — 3 dataset, 4 candidate, 5 budget, 6 gate — so the page renders what the code
+  means rather than reimplementing the check behind it.
+- **A six-month `calibrate long` drives `BacktestHarness`**, which is not a thing to run on the
+  event loop that is also serving the page.
+- **Stop is a real termination**, not a cooperative cancel through code that offers none.
+- **What was bought is kept**, because rows are appended as they are produced (§7.6) and a resumed
+  run reads them back.
+
+Launchable: `corpus build`, `calibrate normal`, `calibrate shock`, `sweep`, `calibrate long`.
+
+**One run at a time.** A `JobRecord` in the workspace — argv, pid, started at, log file, exit code
+— is both the history and the lock, and a refusal names the holder. The registry's atomic rewrite
+and the append-only row files already make a *reader* safe at any moment; a second *writer* is what
+this prevents. The CLI takes the same lock and refuses with exit code 7, so a run launched from a
+terminal and one launched from the page cannot collide.
+
+**A budget is a required field with no default**, because a start here spends real credit and a
+defaulted ceiling is one nobody chose. Beside it the page shows the projection from that seat set's
+last calibration — `cost_per_cycle` over the entries this run will buy, which is what the nine days
+were for (§10.2).
+
+**`calibrate long` has no mid-run ceiling, and the page says so** rather than implying one.
+Scenario 3 drives `BacktestHarness` directly, with no engine seam to meter, so its form shows
+cycles × projected cost and states two things plainly: the ceiling is the operator stopping it, and
+stopping it means deleting that run's directory before it can run again — the database it leaves
+behind is deliberately the record of why the pass failed (§10.4).
+
+### 12.5 No JavaScript
+
+Server-rendered Jinja, one small stylesheet, and a meta refresh **only while a job is running**.
+The editor is a form, the views are tables, and selection is the URL: there is no client state to
+keep in step, nothing to vendor and nothing to hash-pin. That is a genuine simplification against
+the bot's dashboard — the whole ADR 0024 live-update story has no analogue here.
 
 ---
 
@@ -1163,8 +1263,12 @@ python -m decision_lab calibrate long   --data data\history --configs config\swe
 python -m decision_lab sweep            --corpus <id> --configs config\sweep.toml `
                                         --budget 40 [--full] [--seed 20260823]
 python -m decision_lab report           --corpus <id> [--out reports\...]
-python -m decision_lab dashboard        [--host 127.0.0.1] [--port 8788]
+python -m decision_lab dashboard        [--host 127.0.0.1] [--port 8788] [--allow-remote]
 ```
+
+`--allow-remote` is `assert_bind_allowed`'s second lock, inherited from the bot: auth is already
+mandatory, so this exists so a `--host 0.0.0.0` typo cannot put a surface that spends money on a
+LAN without anyone deciding to.
 
 Exit codes, following the bot's convention of distinct codes for distinct refusals:
 
@@ -1176,6 +1280,7 @@ Exit codes, following the bot's convention of distinct codes for distinct refusa
 | 4 | a candidate failed `Basket` validation |
 | 5 | budget ceiling reached — partial results written |
 | 6 | the §10.6 calibration gate is unsatisfied for this dataset, matrix and day set |
+| 7 | the workspace is held by another run (§12.4), which the refusal names |
 
 ---
 
@@ -1229,9 +1334,15 @@ sweep, renders the tables inline, and diffs a result against a previous one from
 - **An archive source that refuses is a refusal, not a fallback.** A robots denial, a 403, or a
   paywalled range names the other backend and stops; it never silently degrades to the other one,
   because provenance that depends on what failed is provenance nobody can cite.
+- **A second run refuses while one holds the workspace** (§12.4), naming the holder, its argv and
+  when it started — exit code 7, from the CLI and the dashboard alike. The lock exists to keep two
+  writers off one workspace, so it binds whichever front door asked second.
+- **A start with no budget is refused, not defaulted** (§12.4), and a matrix the loader rejects is
+  refused with the loader's own message. The dashboard restates no rule it did not write.
 - **`decision_lab` never writes to a bot database, never constructs a venue broker, and has no code
   path from a candidate's `Decision` to an `OrderIntent`.** Scenario 3's orders reach `SimBroker`
-  only, in a workspace database.
+  only, in a workspace database. The dashboard of §12 adds no exception: it launches this tool's
+  own CLI and nothing else, and holds no authority over a bot process.
 
 ---
 
@@ -1244,9 +1355,10 @@ sweep, renders the tables inline, and diffs a result against a previous one from
 |---|---|
 | unit | scoring truth table across all five snapshot/move combinations; regime labelling **including the sign split**; gap classification; day-set eligibility and pool refusal; TOML matrix expansion and its cap; budget accounting; cache keys; `net_profit` arithmetic; registry identity |
 | property | scoring is invariant to instrument scale — the same ATR-relative move scores identically for BTC and XRP |
-| structural | `decision_lab` uses no float in the scoring path; no module under `tradebot/` names `decision_lab`; **the archive row model has no body field**; no dashboard route resolves a path under `data/` |
+| structural | `decision_lab` uses no float in the scoring path; no module under `tradebot/` names `decision_lab`; **the archive row model has no body field**; no dashboard route resolves a path under `data/`; **every dashboard route refuses without a session**, walked route by route as the bot's auth suite does, and the lab's session cookie name differs from the bot's |
 | round-trip | a corpus written and re-read yields identical snapshot digests; a pinned day set re-read yields identical days and digest |
 | scenario | a small end-to-end run on the stub panel: two candidates, one pinned day of each kind, a short long-run at 24h cadence, a rendered report — offline, deterministic, free |
+| dashboard | a seat set built through the form, saved as a new version, launched as a stub sweep, and its ranking read back — the §12 loop end to end, offline; plus the refusals: no budget, a matrix that will not load, an unsatisfied gate, and a second start while one run holds the workspace |
 | **contamination** | **the point-in-time and hindsight guards, asserted directly — see below** |
 
 ### 16.1 Per-seat scoring tests
@@ -1315,7 +1427,7 @@ testable — a property worth preserving, because the value arrives before the l
 | **A — integrity, day set, corpus** | §4 dataset audit and repair, §4.5 the pinned day set, §5 corpus build, the separation test, `check.ps1` | Yes: it repairs the holed history the bot's own backtests already run on |
 | **B — scoring and regimes** | §8 labelling **with the direction split**, §9 scoring, §9.7 per-seat scoring, §14 report, run over the *reference* pass alone | Yes: scores the existing panel over six months in all three regimes, and says which seat carried it — the core question, one configuration |
 | **C — the sweep** | §7 matrix, cache, budget, resume; the cross-candidate tables of §9.6; §11 the registry | Yes: the seat and prompt comparison, which is the stated goal |
-| **D — calibration and the dashboard** | §10 all three scenarios and the §10.6 gate, §12 the dashboard, the notebook | Yes: the short-horizon seat check and the six-month profit run, on whatever news the corpus has |
+| **D — calibration and the dashboard** | §10 all three scenarios and the §10.6 gate (pass 1), §12 the dashboard and the notebook (pass 2) | Yes: the short-horizon seat check and the six-month profit run, on whatever news the corpus has — and after pass 2, the whole loop from one page |
 | **E — news** | §2.2 seam **with the §2.3 guard tests and §16.2 contamination tests landing in the same change**, §6 the archive, both backends, the summarizer, `ArchiveNewsFeed` | Completes the news-driven half of the shock scenarios |
 
 Slice A is worth doing first even in isolation: the gap audit found a real defect in
