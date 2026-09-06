@@ -30,7 +30,7 @@ from decision_lab import candidates as cd
 from decision_lab import compare as cmp
 from decision_lab import corpus as cp
 from decision_lab import dataset as ds
-from decision_lab import gate, registry, sampling
+from decision_lab import gate, longrun, registry, sampling
 from decision_lab import records as rc
 from decision_lab import regimes as rg
 from decision_lab import render as rd
@@ -46,10 +46,12 @@ from decision_lab.params import (
     WINDOW_DAYS,
     reports_dir,
 )
+from tradebot.app import dataset_basket, select_panel
 from tradebot.core.clock import SystemClock, ensure_utc
 from tradebot.core.errors import ConfigError, MoneyError, TradebotError
 from tradebot.core.logging import configure_logging, get_logger
 from tradebot.core.money import ZERO, to_decimal
+from tradebot.core.schema import Money
 from tradebot.interfaces.exchange import VenueTransport
 from tradebot.marketdata.recorder import MANIFEST, ReplayDataset
 
@@ -211,6 +213,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         )
         snapshot.add_argument("--out", type=Path, default=None)
         snapshot.add_argument("--verbose", action="store_true")
+
+    # Scenario 3 takes no `--corpus`: it builds its own path from the dataset, and reading a
+    # corpus's frozen snapshots is the very thing that makes 1 and 2 unable to answer §10.4.
+    long_ = calibrate_actions.add_parser("long", help="six months of long exposure, own ledger")
+    long_.add_argument("--data", type=Path, required=True)
+    long_.add_argument("--configs", type=Path, required=True)
+    long_.add_argument("--candidate", required=True, help="which candidate to run")
+    long_.add_argument("--start-equity", type=_decimal_arg, default=Decimal(1000))
+    long_.add_argument("--every", default="4h", choices=sorted(CADENCE_SECONDS))
+    long_.add_argument("--window", default=DEFAULT_LONG_WINDOW, choices=sorted(WINDOW_DAYS))
+    long_.add_argument(
+        "--skip-gate",
+        action="store_true",
+        help="run without the §10.6 calibration gate; stamped on the report and the registry row",
+    )
+    long_.add_argument("--out", type=Path, default=None)
+    long_.add_argument("--verbose", action="store_true")
 
     report_ = commands.add_parser(
         "report", help="score a built corpus and file the result under decision_lab/reports/"
@@ -770,6 +789,166 @@ async def calibrate_snapshot(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+async def calibrate_long(args: argparse.Namespace) -> int:
+    """§10.4 — one candidate's own six months, with its own ledger.
+
+    Scenario 3 is the one genuinely different instrument in §10 (§10.1): positions compound, so
+    this is a full `BacktestHarness` pass rather than a snapshot rescoring, and its numbers are
+    not on the same scale as a calibration's accuracy. `--corpus` is deliberately absent — a long
+    run builds its own path from the dataset, and reading a corpus's frozen snapshots would be
+    the very thing that makes scenarios 1 and 2 unable to answer §10.4's question.
+    """
+    clock = SystemClock()
+    audit = ds.require_verified(args.data)
+    dataset = ReplayDataset.load(args.data, clock)
+
+    # The same reference `corpus.build` derives, so a matrix expands against the same basket it
+    # would there. `every_seconds` differs by design and reaches neither `panel_digest` nor
+    # `matrix_digest` — which is what lets §10.6's gate stay valid across cadences.
+    try:
+        reference = dataset_basket(
+            dataset,
+            select_panel("sim"),
+            basket_id="reference",
+            every_seconds=CADENCE_SECONDS[args.every],
+        )
+        matrix = cd.load_matrix(args.configs, reference=reference)
+        cd.require_reachable(matrix)
+    except ConfigError as error:
+        logger.error("long run refused; nothing was spent", extra={"reason": str(error)})
+        return EXIT_CANDIDATE
+
+    candidate = next((one for one in matrix.candidates if one.candidate_id == args.candidate), None)
+    if candidate is None:
+        # Naming the ids that do exist, because an expansion suffix is exactly the sort of thing
+        # a hand-typed `--candidate` gets wrong, and the matrix is the only place to read them.
+        logger.error(
+            "long run refused; no candidate by that id is in this matrix",
+            extra={
+                "requested": args.candidate,
+                "available": [one.candidate_id for one in matrix.candidates],
+            },
+        )
+        return EXIT_MISUSE
+
+    record: gate.GateRecord | None = None
+    dayset_digest = ""
+    if not args.skip_gate:
+        # §10.6: the long run is the expensive one, so it refuses on the same evidence a sweep
+        # does. `require_pinned` raises `ConfigError`, which `main` maps to EXIT_DATASET.
+        pinned = cday.require_pinned(args.data)
+        dayset_digest = pinned.dayset_digest
+        try:
+            record = gate.require_satisfied(
+                dataset_digest=audit.dataset_digest,
+                matrix_digest=matrix.matrix_digest,
+                dayset_digest=pinned.dayset_digest,
+            )
+        except ConfigError as error:
+            logger.error("long run refused; nothing was spent", extra={"reason": str(error)})
+            return EXIT_GATE
+
+    meta = await longrun.run(
+        data_dir=args.data,
+        candidate=candidate,
+        cadence_seconds=CADENCE_SECONDS[args.every],
+        window=args.window,
+        start_equity=args.start_equity,
+        wall_clock=clock,
+    )
+
+    built = rd.LongRunReport(
+        generated_at=clock.now(),
+        run_id=meta.run_id,
+        corpus_id=meta.corpus_id,
+        dataset_directory=meta.dataset_directory,
+        dataset_digest=meta.dataset_digest,
+        candidate_id=meta.candidate_id,
+        panel_digest=meta.panel_digest,
+        panel_models=tuple(
+            dict.fromkeys(f"{s.provider_id}:{s.model}" for s in candidate.panel.seats)
+        ),
+        cadence_seconds=meta.cadence_seconds,
+        window=meta.window,
+        requested_start=meta.requested_start,
+        window_start=meta.window_start,
+        window_end=meta.window_end,
+        warmup_seconds=meta.warmup_seconds,
+        planned_cycles=meta.planned_cycles,
+        ran_cycles=meta.ran_cycles,
+        plumbing_check=not matrix.is_evaluation,
+        gate_skipped=args.skip_gate,
+        unvaluable=meta.profit.unvaluable,
+        freeze_reason=meta.profit.freeze_reason,
+        equity=meta.profit.equity,
+        start_equity=meta.profit.start_equity,
+        total_profit=meta.profit.total,
+        realized=meta.profit.realized,
+        unrealized=meta.profit.unrealized,
+        cost_usd=meta.profit.cost_usd,
+        net_profit=meta.profit.net,
+        vetoes=tuple((row.rule, row.action_taken, row.count) for row in meta.vetoes),
+        incidents=meta.incidents,
+        decisions=meta.decisions,
+        fills=meta.fills,
+        snapshot_accuracy=_snapshot_accuracy(record, meta.candidate_id),
+    )
+    out = args.out or reports_dir() / f"decision-lab-long-{meta.run_id}.md"
+    rd.write_long_run(built, out)
+
+    registry.record(
+        registry.RunRow(
+            recorded_at=clock.now(),
+            scenario="calibrate-long",
+            dataset_digest=audit.dataset_digest,
+            corpus_id=meta.corpus_id,
+            matrix_digest=matrix.matrix_digest,
+            dayset_digest=dayset_digest,
+            candidate_id=meta.candidate_id,
+            cadence_seconds=meta.cadence_seconds,
+            start_equity=args.start_equity,
+            window=args.window,
+            evaluation=matrix.is_evaluation,
+            on_fallback=matrix.on_fallback.value,
+            gate_skipped=args.skip_gate,
+            cost_usd=meta.profit.cost_usd,
+            total_profit=meta.profit.total,
+            realized_pnl=meta.profit.realized,
+            unrealized_pnl=meta.profit.unrealized,
+            net_profit=meta.profit.net,
+            unvaluable=meta.profit.unvaluable,
+        )
+    )
+    logger.info(
+        "long run reported",
+        extra={
+            "run_id": meta.run_id,
+            "candidate": meta.candidate_id,
+            "window": meta.window,
+            "cycles": meta.ran_cycles,
+            "net": str(meta.profit.net),
+            "unvaluable": meta.profit.unvaluable,
+            "report": str(out),
+        },
+    )
+    return EXIT_OK
+
+
+def _snapshot_accuracy(record: gate.GateRecord | None, candidate_id: str) -> Money | None:
+    """§10.5's other ranking, read off the gate record this run was cleared by.
+
+    `None` when the gate was skipped *or* when this candidate is absent from the NORMAL half —
+    the page then says which, rather than printing a zero that would read as "measured, and
+    got everything wrong".
+    """
+    if record is None or record.normal is None:
+        return None
+    found = next(
+        (one for one in record.normal.candidates if one.candidate_id == candidate_id), None
+    )
+    return None if found is None else found.accuracy
+
+
 async def report(args: argparse.Namespace) -> int:
     """Score the reference pass in a built corpus and write the Markdown report."""
     meta, cycles = rc.load(args.corpus)
@@ -977,6 +1156,7 @@ COMMANDS: dict[tuple[str, str], Callable[[argparse.Namespace], Coroutine[Any, An
     ("report", ""): report,
     ("calibrate", "normal"): calibrate_snapshot,
     ("calibrate", "shock"): calibrate_snapshot,
+    ("calibrate", "long"): calibrate_long,
 }
 
 

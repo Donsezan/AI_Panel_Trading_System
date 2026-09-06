@@ -618,3 +618,176 @@ def write_report(report: LabReport, path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(report_markdown(report), encoding="utf-8")
     return path
+
+
+class LongRunReport(DomainModel):
+    """§10.4's page. A different kind of number from a calibration's, never on one scale."""
+
+    generated_at: UtcDatetime
+    run_id: str
+    corpus_id: str
+    dataset_directory: str
+    dataset_digest: str
+    candidate_id: str
+    panel_digest: str
+    panel_models: tuple[str, ...] = ()
+    cadence_seconds: int
+    window: str
+    requested_start: UtcDatetime
+    window_start: UtcDatetime
+    window_end: UtcDatetime
+    warmup_seconds: int = 0
+    planned_cycles: int = 0
+    ran_cycles: int = 0
+    news_blind: bool = True
+    plumbing_check: bool = False
+    gate_skipped: bool = False
+    #: `longrun.Profit`, carried as its own fields so `render` need not import `longrun`.
+    unvaluable: bool = False
+    freeze_reason: str = ""
+    equity: Money = ZERO
+    start_equity: Money = ZERO
+    total_profit: Money = ZERO
+    realized: Money = ZERO
+    unrealized: Money = ZERO
+    cost_usd: Money = ZERO
+    net_profit: Money = ZERO
+    #: rule, action, count — §10.4's veto breakdown.
+    vetoes: tuple[tuple[str, str, int], ...] = ()
+    incidents: int = 0
+    decisions: int = 0
+    fills: int = 0
+    #: §10.5. This candidate's snapshot-scored accuracy from the gate record, so the two rankings
+    #: sit side by side. Empty under `--skip-gate`, which the page then says rather than leaving
+    #: a blank column.
+    snapshot_accuracy: Money | None = None
+
+
+def long_run_markdown(report: LongRunReport) -> str:
+    """§10.4's page, in the same banner order as `report_markdown` — a reader meets every
+    disclaimer before they meet a number, whichever command wrote the page (§14)."""
+    sections = [
+        "# decision_lab — six months of long exposure",
+        "",
+        BANNER,
+        "",
+        DISCLAIMER,
+    ]
+    if report.news_blind:
+        sections += ["", NEWS_BLIND]
+    if report.plumbing_check:
+        sections += ["", PLUMBING_CHECK]
+    if report.gate_skipped:
+        sections += ["", GATE_SKIPPED]
+    sections += [
+        "",
+        _long_identity(report),
+        "",
+        "## Profit",
+        "",
+        _profit_block(report),
+        "",
+        "## Vetoes",
+        "",
+        _veto_table(report.vetoes),
+        "",
+        "## Rankings (§10.5)",
+        "",
+        _rankings_note(report),
+    ]
+    return "\n".join(sections).rstrip() + "\n"
+
+
+def _long_identity(report: LongRunReport) -> str:
+    return _table(
+        ("parameter", "value"),
+        (
+            ("generated", _stamp(report.generated_at)),
+            ("run", report.run_id),
+            ("corpus", report.corpus_id),
+            ("dataset", f"{report.dataset_directory} (`{report.dataset_digest}`)"),
+            ("candidate", f"{report.candidate_id} (`{report.panel_digest}`)"),
+            ("panel models", ", ".join(report.panel_models) or "none recorded"),
+            ("cadence", f"{report.cadence_seconds}s"),
+            ("window", report.window),
+            ("requested start", _stamp(report.requested_start)),
+            # Both, always: §10.4's window starts after the indicators' warm-up, and a page whose
+            # window silently differs from the one asked for is a page about another experiment
+            # (ADR 0017).
+            ("window", f"{_stamp(report.window_start)} → {_stamp(report.window_end)}"),
+            ("warm-up", f"{report.warmup_seconds}s"),
+            ("cycles", f"{report.ran_cycles} of {report.planned_cycles} planned"),
+            ("decisions", str(report.decisions)),
+            ("fills", str(report.fills)),
+            ("incidents", str(report.incidents)),
+        ),
+    )
+
+
+def _profit_block(report: LongRunReport) -> str:
+    """The table, or the refusal to draw one.
+
+    An unvaluable run renders **no table at all**, not a table of zeroes: every cell would be a
+    figure produced in ignorance, and §10.4 holds that such a number is worse than its absence.
+    """
+    if report.unvaluable:
+        return (
+            f"**UNVALUABLE** — {report.freeze_reason}\n\n"
+            "The portfolio could not be valued at the window's end, so no profit figure is "
+            "reported. A stale mark is not a mark, and valuing the position at what it cost "
+            "would be differently wrong rather than conservative (ADR 0027)."
+        )
+    return _table(
+        ("figure", "amount"),
+        (
+            ("equity", str(report.equity)),
+            ("start equity", str(report.start_equity)),
+            # Mark-to-market, so an open position at the window's end counts — never
+            # `Evidence.realized_pnl`, which sums closed round trips only (§10.4).
+            ("total profit", str(report.total_profit)),
+            ("realized", str(report.realized)),
+            ("unrealized", str(report.unrealized)),
+            ("deliberation cost", str(report.cost_usd)),
+            ("net profit", str(report.net_profit)),
+        ),
+    )
+
+
+def _veto_table(rows: Sequence[tuple[str, str, int]]) -> str:
+    """§10.4: a panel right often but only in ways the collar, the cooldown or the daily cap
+    refuse is not an improvement — and a corpus sweep can never discover that."""
+    if not rows:
+        return "No rule refused anything over this run."
+    return _table(
+        ("rule", "action", "count"),
+        ((rule, action or "—", str(count)) for rule, action, count in rows),
+    )
+
+
+def _rankings_note(report: LongRunReport) -> str:
+    """§10.5's two rankings, side by side and never blended.
+
+    Profit over one path is a *weak* comparison and the page says so beside the number rather
+    than under it: positions compound, so one lucky early fill compounds for six months, and a
+    candidate can top this ranking on a single decision the snapshot scoring would call luck.
+    """
+    if report.snapshot_accuracy is None:
+        return (
+            "The §10.6 gate was skipped, so no snapshot-scored accuracy was measured for this "
+            "candidate and there is no second ranking to set beside its profit. Run "
+            "`calibrate normal` and `calibrate shock` against this matrix to get one."
+        )
+    return (
+        f"Snapshot-scored accuracy **{_pct(report.snapshot_accuracy)}**, net profit "
+        f"**{report.net_profit}** over this one path.\n\n"
+        "The two are not on one scale and must never be blended into a single score. Profit "
+        "over one path is the weaker of the pair: positions compound, so one lucky early fill "
+        "compounds for six months and can carry a candidate to the top of this ranking on a "
+        "single decision. Where the two disagree, that disagreement is the finding."
+    )
+
+
+def write_long_run(report: LongRunReport, path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(long_run_markdown(report), encoding="utf-8")
+    return path

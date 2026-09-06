@@ -38,9 +38,14 @@ def calibrated_corpus(
     """
     from decision_lab import cli
     from decision_lab import gate as gate_module
+    from decision_lab import longrun as longrun_module
 
-    monkeypatch.setattr(registry, "workspace_root", lambda: tmp_path / "workspace")
-    monkeypatch.setattr(gate_module, "workspace_root", lambda: tmp_path / "workspace")
+    # Each of these imported `workspace_root` into its own namespace, so each needs its own
+    # rebinding — `corpus`'s is done inside `built_corpus`. Missing one is not a failing test but
+    # a test that writes into the operator's real `decision_lab/workspace/`: `longrun`'s absence
+    # here put a `long-*` directory, database and all, beside their actual corpora.
+    for module in (registry, gate_module, longrun_module):
+        monkeypatch.setattr(module, "workspace_root", lambda: tmp_path / "workspace")
     corpus_id = built_corpus(
         tmp_path, monkeypatch, days=60, shock_up=(3, 11, 19, 27), shock_down=(7, 15, 23)
     )
