@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import sys
 from collections.abc import Callable, Coroutine
 from datetime import UTC, date, datetime
 from decimal import Decimal
@@ -31,7 +32,7 @@ from decision_lab import candidates as cd
 from decision_lab import compare as cmp
 from decision_lab import corpus as cp
 from decision_lab import dataset as ds
-from decision_lab import gate, longrun, registry, sampling
+from decision_lab import gate, jobs, longrun, registry, sampling
 from decision_lab import records as rc
 from decision_lab import regimes as rg
 from decision_lab import render as rd
@@ -65,10 +66,24 @@ EXIT_DATASET = 3  # unverified, holed beyond repair, or no pinned day set
 EXIT_CANDIDATE = 4  # a candidate failed `Basket` validation            (slice C)
 EXIT_BUDGET = 5  # budget ceiling reached, partial results written      (slice C)
 EXIT_GATE = 6  # the §10.6 calibration gate is unsatisfied              (slice D)
+EXIT_BUSY = 7  # the workspace is held by another run                    (slice D pass 2)
 
 #: `mode` is a static field on every log line the bot emits. This is not a bot mode and never
 #: opens a bot database, so it says what it is rather than borrowing `sim`.
 LOG_MODE = "decision_lab"
+
+#: Commands that write the workspace, and therefore take the lock. `dataset` and `dashboard` are
+#: absent because they write nothing a second writer could interleave with (§12.4).
+LOCKED: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("corpus", "build"),
+        ("sweep", ""),
+        ("report", ""),
+        ("calibrate", "normal"),
+        ("calibrate", "shock"),
+        ("calibrate", "long"),
+    }
+)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -1105,9 +1120,22 @@ def main(argv: list[str] | None = None) -> int:
     configure_logging(
         mode=LOG_MODE, level=logging.DEBUG if getattr(args, "verbose", False) else logging.INFO
     )
-    handler = COMMANDS[(args.command, getattr(args, "action", ""))]
+    key = (args.command, getattr(args, "action", ""))
+    handler = COMMANDS[key]
     try:
-        return asyncio.run(handler(args))
+        if key not in LOCKED:
+            return asyncio.run(handler(args))
+        lock = jobs.WorkspaceLock()
+        lock.acquire(argv if argv is not None else sys.argv[1:], clock=SystemClock())
+        try:
+            return asyncio.run(handler(args))
+        finally:
+            lock.release()
+    except jobs.Busy as error:
+        # Ahead of `TradebotError`: `Busy` is a `ConfigError`, and the generic handler would
+        # report a workspace held by a running sweep as a dataset problem (exit 3).
+        logger.error(str(error), extra={"kind": "Busy"})
+        return EXIT_BUSY
     except TradebotError as error:
         # Every refusal this tool can raise is about the evidence it was pointed at: an absent
         # dataset, an unverified one, a venue that would not answer for it. `ConfigError` is the

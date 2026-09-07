@@ -11,6 +11,7 @@ said otherwise, and the report prints whichever was used.
 
 from __future__ import annotations
 
+import os
 from decimal import Decimal
 from pathlib import Path
 from typing import Final
@@ -88,8 +89,14 @@ DEFAULT_DASHBOARD_PORT: Final = 8788
 
 
 def workspace_root() -> Path:
-    """Scratch databases, caches and results. Gitignored, and never `data/` (§2.1)."""
-    return Path(__file__).parent / "workspace"
+    """Scratch databases, caches and results. Gitignored, and never `data/` (§2.1).
+
+    `DECISION_LAB_WORKSPACE` overrides it, which is how §12.4's launcher points a child process at
+    the same workspace the page is reading — a child is a separate process and cannot inherit a
+    monkeypatched module attribute.
+    """
+    override = os.environ.get("DECISION_LAB_WORKSPACE", "").strip()
+    return Path(override) if override else Path(__file__).parent / "workspace"
 
 
 def reports_dir() -> Path:

@@ -137,6 +137,14 @@ disallow_any_explicit = false
 module = ["ccxt.*", "feedparser.*"]
 ignore_missing_imports = true
 
+# `fcntl` exists on POSIX and `msvcrt` on Windows; `decision_lab/jobs.py` takes an advisory lock
+# through whichever this platform ships. mypy resolves one of them and must not fail on the
+# other — and an inline ignore would itself be an error under `warn_unused_ignores` on the
+# platform where the import does resolve.
+[[tool.mypy.overrides]]
+module = ["fcntl", "msvcrt"]
+ignore_missing_imports = true
+
 # ---------------------------------------------------------------- pytest
 
 [tool.pytest.ini_options]
