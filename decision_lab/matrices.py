@@ -15,11 +15,14 @@ way to carry (see `test_discipline.py`).
 
 Failure semantics: validation is `candidates.load_matrix` itself, run against a temporary file
 before any version is minted, so a matrix that will not load leaves the store exactly as it was.
-An absent store reads as no seat sets, never as an error.
+A version number is minted by exclusive create rather than by counting what is already there, so
+two saves racing take two numbers instead of one of them quietly erasing the other. An absent store
+reads as no seat sets, never as an error.
 """
 
 from __future__ import annotations
 
+import os
 import re
 import tomllib
 from collections.abc import Mapping
@@ -75,7 +78,7 @@ def _emit(lines: list[str], table: Mapping[str, Any], *, prefix: tuple[str, ...]
     """Every scalar first, because a key written after a `[header]` belongs to that header."""
     for key, value in table.items():
         if not _is_table(value) and not _is_table_array(value):
-            lines.append(f"{key} = {_scalar(value)}")
+            lines.append(f"{key} = {_scalar(value, key='.'.join((*prefix, key)))}")
     for key, value in table.items():
         path = ".".join((*prefix, key))
         if _is_table(value):
@@ -87,7 +90,13 @@ def _emit(lines: list[str], table: Mapping[str, Any], *, prefix: tuple[str, ...]
                 _emit(lines, entry, prefix=(*prefix, key))
 
 
-def _scalar(value: Any) -> str:
+def _scalar(value: Any, *, key: str) -> str:
+    """`key` is this value's dotted path, carried down from `_emit` for the refusal alone.
+
+    "a matrix holds no value of type float" says nothing about *which* field to fix, and a seat
+    set has a dozen fields that could hold one — so the refusal names the path, the way
+    `read_document`, `_require_name` and `_basket_for` all name what they are refusing.
+    """
     # `bool` before `int`: `isinstance(True, int)` is True, and `max_rounds = true` is nonsense.
     if isinstance(value, bool):
         return "true" if value else "false"
@@ -96,16 +105,40 @@ def _scalar(value: Any) -> str:
     if isinstance(value, str):
         return _quoted(value)
     if isinstance(value, list):
-        return "[" + ", ".join(_scalar(one) for one in value) + "]"
+        return "[" + ", ".join(_scalar(one, key=key) for one in value) + "]"
     raise ConfigError(
-        f"a matrix holds no value of type {type(value).__name__} ({value!r}). Money and every "
-        "ratio is a quoted string, and a seat's temperature is deliberately not editable here"
+        f"{key} is a {type(value).__name__} ({value!r}), which a matrix has no place for. Money "
+        "and every ratio is a quoted string, and a seat's temperature is deliberately not "
+        "editable here"
     )
 
 
+#: TOML basic strings require every control character in U+0000-U+001F except tab, plus U+007F
+#: (DEL), to be escaped — not merely `\`, `"` and `\n`. `\r` is the one that bites: a seat's
+#: `instruction` is browser-textarea text and arrives CRLF, and an unescaped `\r` produces output
+#: that `tomllib.loads` itself refuses, so the writer would have produced a file its own reader
+#: could not read back.
+_NAMED_ESCAPES: Final[dict[str, str]] = {
+    "\\": "\\\\",
+    '"': '\\"',
+    "\b": "\\b",
+    "\t": "\\t",
+    "\n": "\\n",
+    "\f": "\\f",
+    "\r": "\\r",
+}
+
+
 def _quoted(value: str) -> str:
-    escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
-    return f'"{escaped}"'
+    escaped: list[str] = []
+    for char in value:
+        if char in _NAMED_ESCAPES:
+            escaped.append(_NAMED_ESCAPES[char])
+        elif char == "\x7f" or ord(char) < 0x20:
+            escaped.append(f"\\u{ord(char):04x}")
+        else:
+            escaped.append(char)
+    return '"' + "".join(escaped) + '"'
 
 
 # ---------------------------------------------------------------- the store
@@ -161,6 +194,38 @@ def read(
     return chosen, tomllib.loads(path.read_text(encoding="utf-8"))
 
 
+#: `O_EXCL` is the whole mint: it is atomic on both Windows and POSIX, so of two savers that
+#: computed the same next number exactly one creates the file. `O_BINARY` matters only on Windows,
+#: where `os.open` otherwise honours the C runtime's text mode and rewrites every `\n` in the
+#: payload — the version lands with `\r\r\n` endings, a bare CR that `tomllib.loads` refuses
+#: outright. There is no such flag on POSIX, where there is nothing to turn off.
+_MINT_FLAGS: Final = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0)
+
+
+def _mint(name: str, payload: bytes, *, workspace: Path | None) -> int:
+    """Claim the lowest free version number, exclusively, and write `payload` into it.
+
+    Not `versions(...)[-1] + 1` followed by a write: nothing excludes a second saver between
+    those two halves, and `Path.replace` is a rename, which succeeds onto an existing path by
+    design — so two submits (two browser tabs, a double-submit) computing the same number would
+    leave one of them silently erased, the one thing §12.3's "every save is a new version and
+    nothing is overwritten" exists to rule out. The read is still where the search *starts*, so a
+    store holding forty versions does not cost forty failed opens; a number already taken is
+    stepped over, which costs a retry and nothing else.
+    """
+    existing = versions(name, workspace=workspace)
+    candidate = (existing[-1] if existing else 0) + 1
+    while True:
+        try:
+            descriptor = os.open(path_for(name, candidate, workspace=workspace), _MINT_FLAGS)
+        except FileExistsError:
+            candidate += 1
+            continue
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(payload)
+        return candidate
+
+
 def save(
     name: str,
     document: Mapping[str, Any],
@@ -168,25 +233,27 @@ def save(
     reference: Basket,
     workspace: Path | None = None,
 ) -> tuple[int, Matrix]:
-    """Validate through `load_matrix`, then mint the next version.
+    """Validate through `load_matrix`, then mint the next version exclusively.
 
-    The temporary file is written into the seat set's own directory so `load_matrix` reads exactly
-    the bytes that will be stored — a validator run against a different rendering of the same
-    document proves nothing about the file the CLI will later be pointed at.
+    The draft is written into the seat set's own directory and the *same bytes* are what land in
+    the version, so `load_matrix` reads exactly the file the CLI will later be pointed at — a
+    validator run against a different rendering of the same document proves nothing about the one
+    that was stored.
+
+    The draft is removed on every exit — a refusal, a successful mint, or a filesystem error —
+    because a `.draft.toml` left in the store is a half-written matrix sitting beside the real
+    ones, and `versions()`'s `path.stem.isdigit()` filter is the only thing keeping it out.
     """
     directory = root(workspace=workspace) / _require_name(name)
     directory.mkdir(parents=True, exist_ok=True)
+    payload = dumps(document).encode("utf-8")
     draft = directory / ".draft.toml"
-    draft.write_text(dumps(document), encoding="utf-8")
+    draft.write_bytes(payload)
     try:
         matrix = load_matrix(draft, reference=reference)
-    except ConfigError:
+        return _mint(name, payload, workspace=workspace), matrix
+    finally:
         draft.unlink(missing_ok=True)
-        raise
-    existing = versions(name, workspace=workspace)
-    version = (existing[-1] if existing else 0) + 1
-    draft.replace(path_for(name, version, workspace=workspace))
-    return version, matrix
 
 
 def templates() -> tuple[str, ...]:
