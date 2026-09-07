@@ -15,9 +15,9 @@ way to carry (see `test_discipline.py`).
 
 Failure semantics: validation is `candidates.load_matrix` itself, run against a temporary file
 before any version is minted, so a matrix that will not load leaves the store exactly as it was.
-A version number is minted by exclusive create rather than by counting what is already there, so
-two saves racing take two numbers instead of one of them quietly erasing the other. An absent store
-reads as no seat sets, never as an error.
+A version number is claimed by exclusive create rather than by counting what is already there,
+and the file is published by a single rename, so two saves racing take two numbers and a reader
+never opens one half-written. An absent store reads as no seat sets, never as an error.
 """
 
 from __future__ import annotations
@@ -25,7 +25,9 @@ from __future__ import annotations
 import os
 import re
 import tomllib
+import uuid
 from collections.abc import Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Final
 
@@ -194,35 +196,66 @@ def read(
     return chosen, tomllib.loads(path.read_text(encoding="utf-8"))
 
 
-#: `O_EXCL` is the whole mint: it is atomic on both Windows and POSIX, so of two savers that
-#: computed the same next number exactly one creates the file. `O_BINARY` matters only on Windows,
-#: where `os.open` otherwise honours the C runtime's text mode and rewrites every `\n` in the
-#: payload — the version lands with `\r\r\n` endings, a bare CR that `tomllib.loads` refuses
-#: outright. There is no such flag on POSIX, where there is nothing to turn off.
-_MINT_FLAGS: Final = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0)
+#: A version number is *claimed* by creating this marker, and the claim is what excludes a second
+#: saver: `O_CREAT | O_EXCL` is atomic on both Windows and POSIX, so of two savers computing the
+#: same next number exactly one gets it. It is deliberately not named `<n>.toml` — a marker the
+#: `*.toml` glob could reach would be a version number existing before its bytes do, which is the
+#: very thing `_mint` publishes by rename to avoid.
+_CLAIM_FLAGS: Final = os.O_CREAT | os.O_EXCL | os.O_WRONLY
 
 
-def _mint(name: str, payload: bytes, *, workspace: Path | None) -> int:
-    """Claim the lowest free version number, exclusively, and write `payload` into it.
+def _claim(directory: Path, version: int) -> Path:
+    return directory / f".claim-{version}.tmp"
 
-    Not `versions(...)[-1] + 1` followed by a write: nothing excludes a second saver between
-    those two halves, and `Path.replace` is a rename, which succeeds onto an existing path by
-    design — so two submits (two browser tabs, a double-submit) computing the same number would
-    leave one of them silently erased, the one thing §12.3's "every save is a new version and
-    nothing is overwritten" exists to rule out. The read is still where the search *starts*, so a
-    store holding forty versions does not cost forty failed opens; a number already taken is
-    stepped over, which costs a retry and nothing else.
+
+def _mint(name: str, draft: Path, *, workspace: Path | None) -> int:
+    """Claim the lowest free version number, then publish `draft` into it with one rename.
+
+    There are two races here and the two halves close one each.
+
+    *Writer against writer.* `versions(...)[-1] + 1` followed by a write is a read-then-write with
+    nothing excluding a second saver between the halves, and `Path.replace` overwrites by design —
+    so two submits (two browser tabs, a double-submit) computing the same number would leave one
+    of them silently erased, the one thing §12.3's "every save is a new version and nothing is
+    overwritten" exists to rule out. The read is still where the search *starts*, so a store
+    holding forty versions does not cost forty failed opens; a number found taken is stepped over,
+    which costs a retry and nothing else.
+
+    *Writer against reader.* The publish is a rename, never a create-then-write. `versions()` and
+    `read()` glob `*.toml` with no readiness check, so a version that exists before its bytes do
+    is one a reader can open half-written — `tomllib` raising `TOMLDecodeError` out of a module
+    whose whole contract is to raise `ConfigError`. A rename is atomic, so `N.toml` is never
+    partial.
+
+    The marker is released on the way out rather than kept, so the directory does not silt up with
+    them — and the target is therefore re-checked *while the claim is held*, because a saver whose
+    `versions()` read predates a completed save would find that save's marker already gone and
+    rename straight over it. A process that dies mid-save leaves its marker, and that number is
+    skipped for good: a gap in the numbering is honest, since a version is an opaque identifier
+    and not a count, and reusing the number would mean two different documents both calling
+    themselves version 3.
     """
     existing = versions(name, workspace=workspace)
     candidate = (existing[-1] if existing else 0) + 1
     while True:
+        # Bound before the loop body touches `candidate`: the release below must name the marker
+        # that was taken, not the number the search has moved on to — releasing that one would
+        # both strand this claim and free a number another saver is holding.
+        claim = _claim(draft.parent, candidate)
         try:
-            descriptor = os.open(path_for(name, candidate, workspace=workspace), _MINT_FLAGS)
+            descriptor = os.open(claim, _CLAIM_FLAGS)
         except FileExistsError:
             candidate += 1
             continue
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(payload)
+        os.close(descriptor)
+        try:
+            target = path_for(name, candidate, workspace=workspace)
+            if target.exists():
+                candidate += 1
+                continue
+            draft.replace(target)
+        finally:
+            claim.unlink(missing_ok=True)
         return candidate
 
 
@@ -233,25 +266,31 @@ def save(
     reference: Basket,
     workspace: Path | None = None,
 ) -> tuple[int, Matrix]:
-    """Validate through `load_matrix`, then mint the next version exclusively.
+    """Validate through `load_matrix`, then publish that exact file under the next version.
 
-    The draft is written into the seat set's own directory and the *same bytes* are what land in
-    the version, so `load_matrix` reads exactly the file the CLI will later be pointed at — a
-    validator run against a different rendering of the same document proves nothing about the one
-    that was stored.
+    The draft `load_matrix` reads is the file `_mint` renames into place, so the bytes that were
+    validated are the bytes stored — a validator run against a different rendering of the same
+    document, or against a file some other save has since rewritten, proves nothing about what the
+    CLI will later be pointed at.
 
-    The draft is removed on every exit — a refusal, a successful mint, or a filesystem error —
-    because a `.draft.toml` left in the store is a half-written matrix sitting beside the real
-    ones, and `versions()`'s `path.stem.isdigit()` filter is the only thing keeping it out.
+    Its name carries a `uuid4` for that second reason: on one shared `.draft.toml`, two saves of
+    the same seat set would read each other's bytes, and A could return a `Matrix` describing B's
+    document while publishing A's. `.tmp` rather than `.toml`, so a draft is never reachable by
+    the `*.toml` glob `versions()` reads, and it is removed on every exit — a refusal, a
+    successful publish (where the rename has already taken it) or a filesystem error.
+
+    `source` is re-pointed at the published file: `load_matrix` records the path it read, and a
+    returned matrix naming a temporary file that no longer exists is the same misdescription one
+    field over.
     """
     directory = root(workspace=workspace) / _require_name(name)
     directory.mkdir(parents=True, exist_ok=True)
-    payload = dumps(document).encode("utf-8")
-    draft = directory / ".draft.toml"
-    draft.write_bytes(payload)
+    draft = directory / f".draft-{uuid.uuid4().hex}.tmp"
+    draft.write_bytes(dumps(document).encode("utf-8"))
     try:
         matrix = load_matrix(draft, reference=reference)
-        return _mint(name, payload, workspace=workspace), matrix
+        version = _mint(name, draft, workspace=workspace)
+        return version, replace(matrix, source=path_for(name, version, workspace=workspace))
     finally:
         draft.unlink(missing_ok=True)
 
