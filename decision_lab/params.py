@@ -74,6 +74,18 @@ WINDOW_DAYS: Final = {"1m": 30, "3m": 91, "6m": 182, "12m": 365}
 #: §10.4's six-month long exposure run.
 DEFAULT_LONG_WINDOW: Final = "6m"
 
+#: §12.3's seat-set store and §12.4's job records, both under the workspace so nothing the
+#: dashboard writes is ever mistaken for the curated, committed matrices in `config/`.
+MATRICES_DIR: Final = "matrices"
+JOBS_DIR: Final = "jobs"
+
+#: §12.4's advisory lock, and the sidecar naming who holds it.
+LOCK_FILE: Final = ".run.lock"
+HOLDER_FILE: Final = ".run.holder.json"
+
+#: §13. Loopback by default; a non-loopback bind needs `--allow-remote` on top of the token.
+DEFAULT_DASHBOARD_PORT: Final = 8788
+
 
 def workspace_root() -> Path:
     """Scratch databases, caches and results. Gitignored, and never `data/` (§2.1)."""
