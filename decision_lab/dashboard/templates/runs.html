@@ -1,8 +1,52 @@
 {% extends "base.html" %}
+{% import "_tables.html" as tables %}
 {% block title %}decision_lab — runs{% endblock %}
 {% block content %}
 <h1>Runs</h1>
+
 {% if not rows %}
-<p>No runs recorded yet. Build a <a href="/matrices">seat set</a> and run it to see results here.</p>
+  <p class="empty">No runs recorded yet. Build a seat set, then start a run from
+  <a href="/matrices">Seat sets</a>.</p>
+{% else %}
+<table>
+  <thead>
+    <tr>
+      <th></th>
+      {% for column in sorts %}
+      <th><a href="/?sort={{ column }}&dir={{ 'asc' if sort == column and direction == 'desc' else 'desc' }}">{{ column.replace('_', ' ') }}</a></th>
+      {% endfor %}
+      <th>status</th><th></th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for row in rows %}
+    <tr>
+      <td><a href="/?compare={{ row.run_id }}{% for one in selected %}&compare={{ one }}{% endfor %}">compare</a></td>
+      <td>{{ row.recorded_at | moment }}</td>
+      <td>{{ row.accuracy | percent }}</td>
+      <td>{{ row.net_profit | money }}</td>
+      <td>{{ row.cost_usd | money }}</td>
+      <td>{{ row.scored | count }}</td>
+      <td>{{ row.scenario }} · {{ row.candidate_id }}</td>
+      <td>{{ row.status }}{% if row.gate_skipped %} <span class="warning">gate skipped</span>{% endif %}{% if not row.evaluation %} <span class="warning">plumbing check</span>{% endif %}</td>
+      <td><a href="/runs/{{ row.run_id }}">detail</a></td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+{% if comparison %}
+<h2>Two runs, side by side</h2>
+<table>
+  <thead><tr><th>field</th><th>{{ chosen[0].candidate_id }}</th><th>{{ chosen[1].candidate_id }}</th></tr></thead>
+  <tbody>
+  {% for name, left, right in comparison %}
+    <tr><td>{{ name }}</td><td>{{ left }}</td><td>{{ right }}</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% elif selected | length == 1 %}
+<p>One run selected. Pick a second to compare it against.</p>
 {% endif %}
 {% endblock %}
