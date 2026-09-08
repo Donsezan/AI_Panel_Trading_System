@@ -1,0 +1,146 @@
+/* decision_lab's tuning surface (spec §12). One stylesheet, no JS: every page is a plain form or
+   a plain table, refreshed by the `<meta http-equiv="refresh">` in base.html while a run is
+   writing, never by a script. */
+
+:root {
+  color-scheme: light dark;
+  --fg: #1a1a1a;
+  --bg: #fbfbfa;
+  --muted: #6b6b6b;
+  --border: #d8d8d4;
+  --accent: #2b5fb0;
+  --error: #a4262c;
+  --warning: #8a5a00;
+  --warning-bg: #fff3d6;
+  --busy-bg: #eef3fb;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg: #e8e8e6;
+    --bg: #1c1d1f;
+    --muted: #9a9a96;
+    --border: #3a3b3d;
+    --accent: #7aa7e8;
+    --error: #e5898d;
+    --warning: #e0b23c;
+    --warning-bg: #3a2f00;
+    --busy-bg: #16233a;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 0 1.5rem 3rem;
+  max-width: 72rem;
+  margin-inline: auto;
+  font-family: -apple-system, "Segoe UI", system-ui, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--fg);
+  background: var(--bg);
+}
+
+header {
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 1.5rem;
+  padding-top: 1rem;
+}
+
+nav a {
+  margin-right: 1.25rem;
+  color: var(--accent);
+  text-decoration: none;
+  font-weight: 600;
+}
+
+nav a:hover {
+  text-decoration: underline;
+}
+
+h1 {
+  font-size: 1.4rem;
+}
+
+code {
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  background: var(--busy-bg);
+  padding: 0.1rem 0.3rem;
+  border-radius: 3px;
+}
+
+table {
+  display: block;
+  overflow-x: auto;
+  border-collapse: collapse;
+  width: 100%;
+  margin: 1rem 0;
+}
+
+th,
+td {
+  text-align: left;
+  padding: 0.4rem 0.6rem;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+
+th {
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.error {
+  color: var(--error);
+  font-weight: 600;
+}
+
+.busy {
+  background: var(--busy-bg);
+  padding: 0.5rem 0.75rem;
+  margin: 0 0 0.75rem;
+  border-radius: 4px;
+}
+
+.unmeasured,
+.warning {
+  color: var(--warning);
+  background: var(--warning-bg);
+  padding: 0.15rem 0.4rem;
+  border-radius: 3px;
+}
+
+footer {
+  margin-top: 2rem;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+form label {
+  display: block;
+  margin-bottom: 0.75rem;
+}
+
+input,
+select,
+button,
+textarea {
+  font: inherit;
+  padding: 0.35rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--fg);
+}
+
+button {
+  cursor: pointer;
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+  font-weight: 600;
+}

@@ -113,6 +113,10 @@ class ScoringParams(DomainModel):
     #: previous close. Read from the registry so a change to the indicator moves this with it.
     atr_lookback_bars: int = REGISTRY["ATR"].period + 1
 
+    def digest(self) -> str:
+        """Identity of the parameters a verdict was derived under (§12.2's cache key)."""
+        return f"{self.timeframe}:{self.band_k}:{self.horizon_bars}"
+
 
 class Forward(DomainModel):
     """What the market did over the horizon, from the price the panel saw."""

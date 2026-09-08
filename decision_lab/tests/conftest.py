@@ -7,13 +7,21 @@ does not.
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Iterator
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
 from decision_lab import registry
 from decision_lab.tests.test_slice_b_end_to_end import built_corpus
+
+if TYPE_CHECKING:
+    # Only for the `lab_client` fixture's return annotation below. The real import is deferred to
+    # the fixture body and wrapped against the `StarletteDeprecationWarning` `TestClient` now
+    # raises in this repo's pinned environment (see that fixture's own comment).
+    from fastapi.testclient import TestClient
 
 
 @pytest.fixture
@@ -63,3 +71,24 @@ def calibrated_corpus(
     data = tmp_path / "history"
     assert cli.main(["dataset", "days", "--data", str(data)]) == cli.EXIT_OK
     yield corpus_id, data
+
+
+@pytest.fixture
+def lab_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
+    """A signed-in client over an empty workspace under `tmp_path`."""
+    # See test_lab_dashboard_auth.py's own note: starlette's TestClient now prefers `httpx2`,
+    # which is not one of this repo's pinned dependencies, and falls back to `httpx` with a
+    # `StarletteDeprecationWarning` the root `filterwarnings = ["error"]` would otherwise turn
+    # into a failure of whatever test happens to import it first.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        from fastapi.testclient import TestClient
+
+    from decision_lab.dashboard.app import create_lab_dashboard
+
+    token = "decision-lab-token-0123456789"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    client = TestClient(create_lab_dashboard(workspace=workspace, token=token))
+    client.post("/login", data={"token": token})
+    yield client

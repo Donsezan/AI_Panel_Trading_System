@@ -25,6 +25,8 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+import uvicorn
+
 from decision_lab import analysis as an
 from decision_lab import calibration as cal
 from decision_lab import calibration_days as cday
@@ -39,9 +41,12 @@ from decision_lab import render as rd
 from decision_lab import scoring as sc
 from decision_lab import seats as st
 from decision_lab import sweep as sw
+from decision_lab.dashboard import auth as lab_auth
+from decision_lab.dashboard import create_lab_dashboard
 from decision_lab.params import (
     CADENCE_SECONDS,
     DAYSET_FILE,
+    DEFAULT_DASHBOARD_PORT,
     DEFAULT_LONG_WINDOW,
     DEFAULT_SEED,
     DEFAULT_SHOCK_PERCENTILE,
@@ -54,6 +59,7 @@ from tradebot.core.errors import ConfigError, MoneyError, TradebotError
 from tradebot.core.logging import configure_logging, get_logger
 from tradebot.core.money import ZERO, to_decimal
 from tradebot.core.schema import Money
+from tradebot.dashboard.auth import assert_bind_allowed
 from tradebot.interfaces.exchange import VenueTransport
 from tradebot.marketdata.recorder import MANIFEST, ReplayDataset
 
@@ -265,6 +271,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--matrix", default="", help="matrix digest, when more than one sweep ran on this corpus"
     )
     report_.add_argument("--verbose", action="store_true")
+
+    dash = commands.add_parser("dashboard", help="serve the tuning surface (§12)")
+    dash.add_argument("--host", default="127.0.0.1")
+    dash.add_argument("--port", type=int, default=DEFAULT_DASHBOARD_PORT)
+    dash.add_argument(
+        "--allow-remote",
+        action="store_true",
+        help="bind a non-loopback address. Auth is already mandatory; this is the second lock, "
+        "so a --host 0.0.0.0 typo cannot put a surface that spends money on a LAN",
+    )
+    dash.add_argument("--verbose", action="store_true")
 
     return parser.parse_args(argv)
 
@@ -1090,6 +1107,25 @@ async def report(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+async def dashboard_command(args: argparse.Namespace) -> int:
+    """Serve §12's surface until interrupted. Takes no workspace lock — it writes nothing itself.
+
+    The token is read here rather than inside the factory so a missing one is a refusal to start
+    with an exit code, exactly as the bot's `serve` refuses (ADR 0014).
+    """
+    assert_bind_allowed(args.host, allow_remote=args.allow_remote)
+    app = create_lab_dashboard(token=lab_auth.require_token())
+    logger.info(
+        "decision_lab dashboard listening",
+        extra={"host": args.host, "port": args.port},
+    )
+    server = uvicorn.Server(
+        uvicorn.Config(app, host=args.host, port=args.port, log_config=None, access_log=False)
+    )
+    await server.serve()
+    return EXIT_OK
+
+
 def _dayset_digest(data_dir: Path) -> str:
     """The pinned day set is not required to score a corpus — it is required to *calibrate* one
     (slice D). Recorded when present so a report can be tied to the set in force, absent
@@ -1112,6 +1148,7 @@ COMMANDS: dict[tuple[str, str], Callable[[argparse.Namespace], Coroutine[Any, An
     ("calibrate", "normal"): calibrate_snapshot,
     ("calibrate", "shock"): calibrate_snapshot,
     ("calibrate", "long"): calibrate_long,
+    ("dashboard", ""): dashboard_command,
 }
 
 
