@@ -107,13 +107,17 @@ def test_static_is_the_only_route_that_serves_a_file(client: TestClient) -> None
     assert mounts[0].path == "/static"
 
 
-def test_nothing_in_the_lab_core_imports_the_dashboard() -> None:
-    """The dashboard is a front door, never a dependency — so the CLI stays importable headless."""
+def _lab_core_dashboard_imports(directory: Path) -> list[str]:
+    """Every top-level `*.py` in `directory` that imports `decision_lab.dashboard`.
+
+    `cli.py` is exempt: it is the one entry point permitted to import the dashboard (spec §12,
+    the module docstring in `cli.py`). Factored out so `test_the_guard_can_actually_fail` can
+    prove this detector actually detects something, rather than trusting the walk by inspection.
+    """
     import ast
 
-    root = Path(auth.__file__).resolve().parents[2]
     offenders = []
-    for path in sorted(root.glob("*.py")):
+    for path in sorted(directory.glob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             names = []
@@ -123,4 +127,33 @@ def test_nothing_in_the_lab_core_imports_the_dashboard() -> None:
                 names = [alias.name for alias in node.names]
             if any("decision_lab.dashboard" in name for name in names) and path.name != "cli.py":
                 offenders.append(f"{path.name}:{node.lineno}")  # type: ignore[attr-defined]
+    return offenders
+
+
+def test_nothing_in_the_lab_core_imports_the_dashboard() -> None:
+    """The dashboard is a front door, never a dependency — so the CLI stays importable headless.
+
+    `parents[1]` of `decision_lab/dashboard/auth.py` is `decision_lab/` itself — the lab-core
+    top level this guards. (`parents[2]` lands on the repo root, which has no loose `.py` files
+    and so would pass vacuously whatever any lab-core module imported.)
+    """
+    root = Path(auth.__file__).resolve().parents[1]
+    offenders = _lab_core_dashboard_imports(root)
     assert not offenders, f"lab core modules importing the dashboard: {offenders}"
+
+
+def test_the_guard_can_actually_fail(tmp_path: Path) -> None:
+    """A structural test that cannot fail is a comment (`test_discipline.py`'s own standard).
+
+    A module that imports the dashboard is flagged; `cli.py`, imported identically, is not — so
+    the one deliberate exception is proven to be *why* the real scan comes back clean, not an
+    accident of the walk finding nothing at all.
+    """
+    (tmp_path / "matrices.py").write_text(
+        "from decision_lab.dashboard import auth\n", encoding="utf-8"
+    )
+    (tmp_path / "cli.py").write_text("from decision_lab.dashboard import auth\n", encoding="utf-8")
+
+    offenders = _lab_core_dashboard_imports(tmp_path)
+
+    assert offenders == ["matrices.py:1"]

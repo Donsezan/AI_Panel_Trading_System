@@ -91,9 +91,13 @@ def _rows_stamp(
         path = sw.rows_path(
             corpus.meta.corpus_id, matrix_digest, candidate.candidate_id, workspace=workspace
         )
-        if path.is_file():
+        # `stat()` alone, not `is_file()` then `stat()`: a sweep's rows are exactly what an
+        # operator deletes to retry, and a later route (Task 6) reaches this with the file gone
+        # between the two calls — the miss is the same "-" marker the absent branch always meant.
+        try:
             stat = path.stat()
-            parts.append(f"{candidate.candidate_id}:{stat.st_size}:{stat.st_mtime_ns}")
-        else:
+        except FileNotFoundError:
             parts.append(f"{candidate.candidate_id}:-")
+        else:
+            parts.append(f"{candidate.candidate_id}:{stat.st_size}:{stat.st_mtime_ns}")
     return "|".join(parts)
