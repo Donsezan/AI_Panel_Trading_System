@@ -20,6 +20,13 @@ from decision_lab.tests.test_slice_b_end_to_end import built_corpus
 def built_corpus_id(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
     """A verified dataset, a pinned day set and one reference pass, all under `tmp_path`."""
     monkeypatch.setattr(registry, "workspace_root", lambda: tmp_path / "workspace")
+    # `jobs.WorkspaceLock` (taken by `cli.main` for every §12.4-locked command: `corpus build`,
+    # `sweep`, `report`, `calibrate *`) reads `params.workspace_root()` directly, which none of the
+    # per-module rebindings above reach — a monkeypatched attribute is invisible to a module that
+    # was never told to look at it. The env var is the one redirection `params.workspace_root()`
+    # itself understands, so it is the only kind that also reaches a child process, and it is what
+    # keeps every test here from taking the lock in the operator's real `decision_lab/workspace/`.
+    monkeypatch.setenv("DECISION_LAB_WORKSPACE", str(tmp_path / "workspace"))
     yield built_corpus(tmp_path, monkeypatch, shock_up=(5,), shock_down=(9,))
 
 
@@ -46,6 +53,10 @@ def calibrated_corpus(
     # here put a `long-*` directory, database and all, beside their actual corpora.
     for module in (registry, gate_module, longrun_module):
         monkeypatch.setattr(module, "workspace_root", lambda: tmp_path / "workspace")
+    # `jobs.WorkspaceLock`, taken by `cli.main` for every locked command this fixture's tests run
+    # (`sweep`, `report`, `calibrate *`), reads `params.workspace_root()` directly — none of the
+    # three rebindings above reach it, the same gap `built_corpus_id` closes the same way.
+    monkeypatch.setenv("DECISION_LAB_WORKSPACE", str(tmp_path / "workspace"))
     corpus_id = built_corpus(
         tmp_path, monkeypatch, days=60, shock_up=(3, 11, 19, 27), shock_down=(7, 15, 23)
     )

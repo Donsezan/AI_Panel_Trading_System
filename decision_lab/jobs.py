@@ -130,11 +130,21 @@ class WorkspaceLock:
         if not _take(handle):
             handle.close()
             raise Busy(_busy_message(holder(workspace=self._workspace)))
+        # `_take` succeeded, so the OS lock is live from this line on: everything after it must
+        # release that lock on its own way out, not just the `_take`-failure branch above. An
+        # in-process caller — a dashboard route, a test harness — outlives a CLI subprocess, so a
+        # write that fails here (disk full, a permission fault, a bad `Holder`) must not strand the
+        # lock for the rest of that process's life.
+        try:
+            self._sidecar.write_text(
+                Holder(pid=os.getpid(), argv=tuple(argv), started_at=clock.now()).model_dump_json(),
+                encoding="utf-8",
+            )
+        except BaseException:
+            _drop(handle)
+            handle.close()
+            raise
         self._handle = handle
-        self._sidecar.write_text(
-            Holder(pid=os.getpid(), argv=tuple(argv), started_at=clock.now()).model_dump_json(),
-            encoding="utf-8",
-        )
 
     def release(self) -> None:
         if self._handle is None:

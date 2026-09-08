@@ -112,6 +112,43 @@ def test_start_records_the_job_and_stop_ends_it(tmp_path: Path, clock: ManualClo
     assert jobs.status_of(ended, workspace=tmp_path) != "running"
 
 
+def test_acquire_drops_the_lock_if_setup_fails_after_taking_it(
+    tmp_path: Path, clock: ManualClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failure between `_take` succeeding and `acquire` returning must not strand the OS lock.
+
+    The `_take`-failure branch (tested above, via `Busy`) already releases correctly; this is the
+    other branch — a fault writing the sidecar (disk full, permissions, a bad `Holder`) — which
+    must `_drop` the lock and close the handle just the same, or an in-process caller (unlike a CLI
+    subprocess, which death eventually releases for) blocks every later `acquire` on this workspace
+    for the rest of its life.
+    """
+    lock = jobs.WorkspaceLock(workspace=tmp_path)
+    original = jobs.Holder.model_dump_json
+    calls = {"n": 0}
+
+    def _fails_once(self: jobs.Holder) -> str:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("disk full")
+        return original(self)
+
+    monkeypatch.setattr(jobs.Holder, "model_dump_json", _fails_once)
+
+    with pytest.raises(OSError):
+        lock.acquire(("sweep",), clock=clock)
+    assert lock._handle is None, "the failed acquire must not leave a handle behind"
+
+    # The proof the OS lock was actually released, not merely forgotten about in Python: a second
+    # `WorkspaceLock` over the same workspace can take it.
+    second = jobs.WorkspaceLock(workspace=tmp_path)
+    second.acquire(("sweep",), clock=clock)
+    try:
+        assert jobs.holder(workspace=tmp_path) is not None
+    finally:
+        second.release()
+
+
 def test_start_refuses_while_the_workspace_is_held(tmp_path: Path, clock: ManualClock) -> None:
     lock = jobs.WorkspaceLock(workspace=tmp_path)
     lock.acquire(("sweep",), clock=clock)

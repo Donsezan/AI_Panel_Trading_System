@@ -31,6 +31,11 @@ def test_verify_then_days_then_corpus(tmp_path: Path, monkeypatch: pytest.Monkey
     data = tmp_path / "history"
     workspace = tmp_path / "workspace"
     monkeypatch.setattr(cp, "workspace_root", lambda: workspace)
+    # `corpus build`, called below through `cli.main`, is §12.4-locked: `main` takes
+    # `jobs.WorkspaceLock()` around it, which reads `params.workspace_root()` directly — untouched
+    # by the rebinding above. Left unset, this would take that lock in the operator's real
+    # `decision_lab/workspace/`.
+    monkeypatch.setenv("DECISION_LAB_WORKSPACE", str(workspace))
     bars = f.shocked_walk(days=60, shock_up=SHOCK_UP, shock_down=SHOCK_DOWN)
     f.write_dataset(data, {(f.instrument(), "1h"): bars})
 
@@ -70,6 +75,9 @@ def test_corpus_build_refuses_an_unverified_dataset(
 ) -> None:
     data = tmp_path / "history"
     monkeypatch.setattr(cp, "workspace_root", lambda: tmp_path / "workspace")
+    # See `test_verify_then_days_then_corpus`: `corpus build` is §12.4-locked and `main`'s lock
+    # reads `params.workspace_root()`, which the rebinding above does not reach.
+    monkeypatch.setenv("DECISION_LAB_WORKSPACE", str(tmp_path / "workspace"))
     f.write_dataset(data, {(f.instrument(), "1h"): f.walk(["100"] * 500)})
 
     assert cli.main(["corpus", "build", "--data", str(data), "--every", "4h"]) == cli.EXIT_DATASET
@@ -82,6 +90,8 @@ def test_rebuilding_the_same_corpus_reuses_its_identity(
     data = tmp_path / "history"
     workspace = tmp_path / "workspace"
     monkeypatch.setattr(cp, "workspace_root", lambda: workspace)
+    # See `test_verify_then_days_then_corpus`.
+    monkeypatch.setenv("DECISION_LAB_WORKSPACE", str(workspace))
     f.write_dataset(data, {(f.instrument(), "1h"): f.shocked_walk(days=20)})
     assert cli.main(["dataset", "verify", "--data", str(data)]) == cli.EXIT_OK
 
@@ -106,6 +116,8 @@ def test_a_cadence_the_bot_has_no_timeframe_for_is_still_a_cadence(
     data = tmp_path / "history"
     workspace = tmp_path / "workspace"
     monkeypatch.setattr(cp, "workspace_root", lambda: workspace)
+    # See `test_verify_then_days_then_corpus`.
+    monkeypatch.setenv("DECISION_LAB_WORKSPACE", str(workspace))
     f.write_dataset(data, {(f.instrument(), "1h"): f.shocked_walk(days=20)})
     cli.main(["dataset", "verify", "--data", str(data)])
 

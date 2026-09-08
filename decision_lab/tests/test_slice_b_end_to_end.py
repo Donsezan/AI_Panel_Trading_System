@@ -59,6 +59,13 @@ def built_corpus(
     data = tmp_path / "history"
     workspace = tmp_path / "workspace"
     monkeypatch.setattr(cp, "workspace_root", lambda: workspace)
+    # `corpus build` and `report`, both called below through `cli.main`, are §12.4-locked: `main`
+    # takes `jobs.WorkspaceLock()` around them, which reads `params.workspace_root()` directly —
+    # untouched by the rebinding above, since that only redirects `corpus.py`'s own copy of the
+    # name. Left unset, every caller of this helper (four tests, two of them through the
+    # `built_corpus_id`/`calibrated_corpus` fixtures) would take that lock in the operator's real
+    # `decision_lab/workspace/`.
+    monkeypatch.setenv("DECISION_LAB_WORKSPACE", str(workspace))
     seeded_stub(monkeypatch)
     f.write_dataset(data, {(f.instrument(), "1h"): f.shocked_walk(days=days, **shocks)})  # type: ignore[arg-type]
 
