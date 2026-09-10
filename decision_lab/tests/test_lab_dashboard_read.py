@@ -16,6 +16,7 @@ with warnings.catch_warnings():
     from fastapi.testclient import TestClient
 
 from decision_lab import registry
+from decision_lab import sweep as sw
 from decision_lab.dashboard.routes import runs
 
 
@@ -106,3 +107,94 @@ def test_comparing_one_run_is_not_an_error(lab_client: TestClient, tmp_path: Pat
     only = registry.read_all(workspace=workspace)[0].run_id
 
     assert lab_client.get(f"/?compare={only}").status_code == 200
+
+
+def _sweep_meta(workspace: Path) -> sw.SweepResult:
+    """The one sweep under this workspace, whatever corpus it belongs to."""
+    found = sorted(workspace.rglob("sweep.json"))
+    assert found, "no sweep meta was written"
+    return sw.SweepResult.model_validate_json(found[0].read_text(encoding="utf-8"))
+
+
+def test_run_detail_ranks_the_candidates_that_swept(
+    lab_client: TestClient, swept_workspace: tuple[str, Path]
+) -> None:
+    """The fixture runs a real stub sweep, so this asserts the whole read path end to end."""
+    run_id, _ = swept_workspace
+
+    page = lab_client.get(f"/runs/{run_id}").text
+
+    assert "NORMAL" in page
+    assert "varied-three" in page, "the stub matrix's candidate is ranked"
+    assert "Agreement" in page
+
+
+def test_run_detail_for_an_unknown_run_is_a_404_that_says_so(lab_client: TestClient) -> None:
+    response = lab_client.get("/runs/deadbeef")
+    assert response.status_code == 404
+    assert "no run" in response.text.lower()
+
+
+def test_run_detail_says_when_the_matrix_on_disk_has_changed(
+    lab_client: TestClient, swept_workspace: tuple[str, Path]
+) -> None:
+    """The same refusal `cli.report` makes, rendered instead of raised (finding 2).
+
+    A page that re-derived from an edited matrix would attribute one experiment's rows to another
+    experiment's candidates.
+    """
+    run_id, workspace = swept_workspace
+    meta = _sweep_meta(workspace)
+    matrix_path = Path(meta.matrix_source)
+    # Still valid TOML, still parseable — exactly "one edited prompt" (§7.1's own example) and
+    # the same scenario `test_report_refuses_when_the_matrix_no_longer_matches_the_sweep_that_ran`
+    # exercises for `cli.report`. Overwriting with something that fails `Basket` validation would
+    # hit the *other* refusal (`context_for`'s `ConfigError` branch) instead of this one.
+    matrix_path.write_text(
+        matrix_path.read_text(encoding="utf-8").replace('id = "varied-three"', 'id = "renamed"'),
+        encoding="utf-8",
+    )
+
+    page = lab_client.get(f"/runs/{run_id}").text
+
+    assert "no longer matches" in page
+    assert "NORMAL" not in page, "nothing derived is shown when the matrix cannot be trusted"
+
+
+def test_a_long_run_row_shows_its_profit_block_and_no_ranking(
+    lab_client: TestClient, tmp_path: Path
+) -> None:
+    workspace = tmp_path / "workspace"
+    registry.record(
+        a_row(
+            scenario="calibrate-long",
+            total_profit=Decimal("120"),
+            realized_pnl=Decimal("100"),
+            unrealized_pnl=Decimal("20"),
+            net_profit=Decimal("118.50"),
+        ),
+        workspace=workspace,
+    )
+    run_id = registry.read_all(workspace=workspace)[0].run_id
+
+    page = lab_client.get(f"/runs/{run_id}").text
+
+    assert "118.50" in page and "Realized" in page and "Unrealized" in page
+    assert "Agreement" not in page, "scenario 3 has no cross-candidate tables"
+
+
+def test_an_unvaluable_long_run_reports_no_figure_at_all(
+    lab_client: TestClient, tmp_path: Path
+) -> None:
+    """§10.4: freezing is ignorance, and a partial number produced in ignorance is worse."""
+    workspace = tmp_path / "workspace"
+    registry.record(
+        a_row(scenario="calibrate-long", realized_pnl=Decimal("100"), unvaluable=True),
+        workspace=workspace,
+    )
+    run_id = registry.read_all(workspace=workspace)[0].run_id
+
+    page = lab_client.get(f"/runs/{run_id}").text
+
+    assert "UNVALUABLE" in page
+    assert "100" not in page, "not even the realized half is quoted"

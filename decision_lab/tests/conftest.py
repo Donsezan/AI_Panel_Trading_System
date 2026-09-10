@@ -74,6 +74,56 @@ def calibrated_corpus(
 
 
 @pytest.fixture
+def swept_workspace(
+    calibrated_corpus: tuple[str, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[tuple[str, Path]]:
+    """A corpus with one real stub sweep run over it, and the registry row that names it.
+
+    The stub matrix, so this is offline, free and deterministic — a plumbing check by
+    construction (§7.2), which is exactly what a rendering test should be measuring.
+    """
+    import shutil
+
+    from decision_lab import cli, registry
+
+    corpus_id, _data = calibrated_corpus
+    workspace = tmp_path / "workspace"
+    # Belt and braces: `calibrated_corpus` already points `DECISION_LAB_WORKSPACE` here, and
+    # `cli.main`'s sweep path reads it fresh through `params.workspace_root()` rather than a
+    # rebound module attribute (see that fixture's own comment) — but this fixture is what Tasks
+    # 6, 7 and 10 all build on, and a silent redirection this test never checks for itself is
+    # exactly the kind of thing that quietly starts writing into the operator's real
+    # `decision_lab/workspace/` the day the upstream fixture's plumbing changes.
+    monkeypatch.setenv("DECISION_LAB_WORKSPACE", str(workspace))
+    # `sweep.SweepResult.matrix_source` records this path verbatim, and a Task 6 test edits the
+    # file at that path to prove the drill-down refuses a matrix that no longer matches its
+    # digest (finding 2). Pointing that at the committed `decision_lab/config/sweep-stub.toml`
+    # would let that test overwrite the tracked file every checked-out clone builds from — a
+    # copy under `tmp_path` is what keeps the mutation inside this one test's own sandbox.
+    committed = Path(__file__).resolve().parents[1] / "config" / "sweep-stub.toml"
+    matrix = tmp_path / "sweep-stub.toml"
+    shutil.copyfile(committed, matrix)
+    assert (
+        cli.main(
+            [
+                "sweep",
+                "--corpus",
+                corpus_id,
+                "--configs",
+                str(matrix),
+                "--budget",
+                "1",
+                "--skip-gate",
+            ]
+        )
+        == cli.EXIT_OK
+    )
+    rows = registry.read_all(workspace=workspace)
+    assert rows, "the sweep recorded no registry row; the fixture is not testing anything"
+    yield rows[0].run_id, workspace
+
+
+@pytest.fixture
 def lab_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
     """A signed-in client over an empty workspace under `tmp_path`."""
     # See test_lab_dashboard_auth.py's own note: starlette's TestClient now prefers `httpx2`,

@@ -1,0 +1,109 @@
+{% extends "base.html" %}
+{% import "_tables.html" as tables %}
+{% block title %}decision_lab — run {{ missing or context.row.run_id }}{% endblock %}
+{% block content %}
+{% if not context %}
+<h1>Run not found</h1>
+<p class="empty">no run recorded with id <code>{{ missing }}</code>.</p>
+{% else %}
+<h1>Run <code>{{ context.row.run_id }}</code></h1>
+
+<table>
+  <tbody>
+    <tr><th>scenario</th><td>{{ context.row.scenario }}</td></tr>
+    <tr><th>candidate</th><td>{{ context.row.candidate_id or absent }}</td></tr>
+    <tr><th>corpus</th><td>{{ context.row.corpus_id or absent }}</td></tr>
+    <tr><th>matrix</th><td>{{ context.row.matrix_digest or absent }}</td></tr>
+    <tr><th>cadence</th><td>{{ context.row.cadence_seconds | count }}s</td></tr>
+    <tr><th>seed</th><td>{{ context.row.sample_seed | count }}</td></tr>
+    <tr>
+      <th>status</th>
+      <td>
+        {{ context.row.status }}
+        {% if context.row.gate_skipped %}<span class="warning">gate skipped</span>{% endif %}
+        {% if not context.row.evaluation %}<span class="warning">plumbing check</span>{% endif %}
+      </td>
+    </tr>
+  </tbody>
+</table>
+
+{% if context.problem %}
+{# finding 2, rendered rather than raised: the row is still worth showing, but nothing derived
+   from a matrix that no longer matches its recorded digest can be trusted to describe this run. #}
+<p class="warning">{{ context.problem }}</p>
+{% elif context.analysis %}
+
+{# §8.3: every regime row is always rendered. An absent SHOCK_DOWN reads as "not measured",
+   which is the opposite of "never happened". #}
+{% for regime in ["NORMAL", "SHOCK_UP", "SHOCK_DOWN"] %}
+  <h3>{{ regime }}</h3>
+  {{ tables.regime_table(context.analysis.ranking | selectattr("regime", "equalto", regime) | list) }}
+{% endfor %}
+
+<h3>Agreement</h3>
+{# finding 6: `compare.agreement` returns `()` both when one candidate ran and when none was
+   measured — opposite facts about the run, told apart by how many reached the ranking at all. #}
+{% if not context.analysis.agreement %}
+  {% if context.analysis.by_candidate | length == 1 %}
+  <p class="empty">Only one candidate ran, so there is nothing to compare it against.</p>
+  {% else %}
+  <p class="empty">No candidate was measured, so there is nothing to compare. See Not measured
+  below.</p>
+  {% endif %}
+{% else %}
+<table>
+  <thead><tr>
+    <th>regime</th><th>left</th><th>right</th><th>compared</th><th>agreement</th>
+    <th>tradable divergence</th>
+  </tr></thead>
+  <tbody>
+  {% for row in context.analysis.agreement %}
+    <tr>
+      <td>{{ row.regime }}</td>
+      <td><code>{{ row.left }}</code></td>
+      <td><code>{{ row.right }}</code></td>
+      <td>{{ row.compared | count }}</td>
+      <td>{{ row.rate | percent }}</td>
+      <td>{{ row.tradable_divergences | count }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+<h3>Unscored</h3>
+{{ tables.unscored_table(regimes) }}
+
+{# finding 3: a candidate that produced no scored decision is named with its reason, never
+   ranked at 0.0% — that reads as measured and worst. #}
+{% if context.analysis.not_measured %}
+<h3>Not measured</h3>
+<ul>{% for one in context.analysis.not_measured %}
+  <li><code>{{ one.candidate_id }}</code> — {{ one.reason }}</li>
+{% endfor %}</ul>
+{% endif %}
+
+{% endif %}
+
+{# §10.4: a frozen aggregate reports UNVALUABLE and no figure at all, not even the realized half. #}
+{% if context.row.scenario == "calibrate-long" %}
+<h2>Profit</h2>
+{% if context.row.unvaluable %}
+  <p class="warning">UNVALUABLE — the portfolio could not be valued at the window's end, so no
+  figure is reported. Freezing is ignorance, and a number produced in ignorance is worse than
+  its absence.</p>
+{% else %}
+<table>
+  <tbody>
+    <tr><th>Total (mark to market)</th><td>{{ context.row.total_profit | money }}</td></tr>
+    <tr><th>Realized</th><td>{{ context.row.realized_pnl | money }}</td></tr>
+    <tr><th>Unrealized</th><td>{{ context.row.unrealized_pnl | money }}</td></tr>
+    <tr><th>Deliberation cost</th><td>{{ context.row.cost_usd | money }}</td></tr>
+    <tr><th>Net</th><td>{{ context.row.net_profit | money }}</td></tr>
+  </tbody>
+</table>
+{% endif %}
+{% endif %}
+
+{% endif %}
+{% endblock %}

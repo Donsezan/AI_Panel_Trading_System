@@ -11,13 +11,21 @@ someone reading it mid-run.
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Annotated, Any, Final
 
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import HTMLResponse
 
+from decision_lab import analysis as an
+from decision_lab import candidates as cd
+from decision_lab import corpus as cp
 from decision_lab import registry
+from decision_lab import scoring as sc
+from decision_lab import sweep as sw
 from decision_lab.dashboard.views import render, state_of
+from tradebot.core.errors import ConfigError
 
 router = APIRouter()
 
@@ -79,3 +87,79 @@ async def index(
         comparison=diff(chosen[0], chosen[1]) if len(chosen) == 2 else (),
         chosen=tuple(chosen),
     )
+
+
+@dataclass(frozen=True, slots=True)
+class RunContext:
+    """One registry row, and everything derivable from it — or why nothing is.
+
+    `problem` is a rendered refusal rather than an exception on purpose: the row itself is worth
+    showing even when the sweep it names can no longer be re-derived, and that is exactly the
+    case an operator needs explained.
+    """
+
+    row: registry.RunRow
+    corpus: cp.Corpus | None = None
+    matrix: cd.Matrix | None = None
+    analysis: an.MatrixAnalysis | None = None
+    problem: str = ""
+
+
+async def context_for(request: Request, run_id: str) -> RunContext | None:
+    """Re-derive a run from what it recorded. `None` when no row has that id."""
+    state = state_of(request)
+    row = next(
+        (one for one in registry.read_all(workspace=state.workspace) if one.run_id == run_id),
+        None,
+    )
+    if row is None:
+        return None
+    # Scenario 3 has no corpus of frozen snapshots to re-score: its numbers are the profit block
+    # on the row itself (§10.4), and there is nothing to reload.
+    if row.scenario == "calibrate-long" or not row.corpus_id:
+        return RunContext(row=row)
+
+    result = sw.read_meta(row.corpus_id, row.matrix_digest, workspace=state.workspace)
+    if result is None:
+        return RunContext(row=row, problem="no sweep files remain under this corpus for it")
+    corpus = cp.load(row.corpus_id, workspace=state.workspace)
+    try:
+        matrix = cd.load_matrix(Path(result.matrix_source), reference=corpus.meta.reference_basket)
+    except ConfigError as error:
+        return RunContext(
+            row=row,
+            corpus=corpus,
+            problem=f"the matrix this sweep ran could not be reloaded: {error}",
+        )
+    if matrix.matrix_digest != result.matrix_digest:
+        # finding 2, one level over: re-deriving from an edited matrix would attribute one
+        # experiment's rows to another experiment's candidates.
+        return RunContext(
+            row=row,
+            corpus=corpus,
+            problem=(
+                f"the matrix at {result.matrix_source} no longer matches the one this sweep ran "
+                f"({result.matrix_digest} recorded, {matrix.matrix_digest} on disk), so nothing "
+                "derived from it would describe this run"
+            ),
+        )
+    _, analysed = await state.cache.matrix_analysis(
+        corpus, matrix, result.matrix_digest, workspace=state.workspace
+    )
+    return RunContext(row=row, corpus=corpus, matrix=matrix, analysis=analysed)
+
+
+@router.get("/runs/{run_id}", response_class=HTMLResponse)
+async def detail(request: Request, run_id: str) -> HTMLResponse:
+    """§12.2's drill-down: one run, its per-regime ranking, and what was not measured."""
+    found = await context_for(request, run_id)
+    if found is None:
+        page = render(request, "run_detail.html", missing=run_id, context=None, regimes=())
+        page.status_code = 404
+        return page
+    regimes = (
+        sc.by_regime(tuple(row for rows in found.analysis.by_candidate.values() for row in rows))
+        if found.analysis
+        else ()
+    )
+    return render(request, "run_detail.html", missing="", context=found, regimes=regimes)
