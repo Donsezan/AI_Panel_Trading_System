@@ -1,0 +1,126 @@
+{% extends "base.html" %}
+{% block title %}decision_lab — decision{% if scored %} {{ scored.instrument_key }}{% endif %}{% endblock %}
+{# §9.4: the verdict's own value already carries the reason (`UNSCORED (gap)`); this mapping adds
+   the one-line explanation of *why*, so a reader never meets a bare code with no context. #}
+{% set unscored_reasons = {
+  "UNSCORED (gap)": "the ATR lookback or the forward window crosses a known hole in the data",
+  "UNSCORED (horizon)": "the forward window runs past the end of the recorded history",
+  "UNSCORED (no ATR)": "the frozen snapshot carried no ATR reading for the scoring timeframe",
+} %}
+{% block content %}
+{% if not scored or not record %}
+<h1>Decision not found</h1>
+<p class="empty">
+  {% if instrument is defined %}
+  no scored decision for candidate <code>{{ candidate }}</code>, cycle <code>{{ cycle }}</code>,
+  instrument <code>{{ instrument }}</code> — either it never ran, or the cycle carried no decision
+  for that instrument.
+  {% else %}
+  no run recorded with id <code>{{ missing }}</code>, or its candidate never ran in this sweep.
+  {% endif %}
+</p>
+{% else %}
+<h1>Decision — <code>{{ scored.instrument_key }}</code></h1>
+<p>
+  <a href="/runs/{{ run_id }}">&larr; back to run <code>{{ run_id }}</code></a>
+  &middot;
+  <a href="/runs/{{ run_id }}/seats/{{ candidate | urlencode }}">back to <code>{{ candidate }}</code>'s seats</a>
+</p>
+
+<table>
+  <tbody>
+    <tr><th>Instrument</th><td><code>{{ scored.instrument_key }}</code></td></tr>
+    <tr><th>Instant</th><td>{{ scored.as_of | moment }}</td></tr>
+    <tr><th>Regime</th><td>{{ scored.regime }}</td></tr>
+    <tr><th>Window</th><td>{{ scored.window_name or absent }}</td></tr>
+    <tr><th>Action</th><td>{{ scored.action }}</td></tr>
+    <tr><th>Conviction</th><td>{{ scored.conviction | money(2) }}</td></tr>
+    <tr><th>Asked for an order</th><td>{{ scored.asked_for_an_order }}</td></tr>
+    <tr><th>Holding</th><td>{{ scored.holding }}</td></tr>
+    <tr><th>Degraded</th><td>{{ scored.degraded }}</td></tr>
+    <tr><th>Truth</th><td>{{ scored.truth or absent }}</td></tr>
+    <tr>
+      <th>Verdict</th>
+      <td>
+        <code>{{ scored.verdict }}</code>
+        {% if scored.verdict in unscored_reasons %}
+        <span class="warning">— {{ unscored_reasons[scored.verdict] }}</span>
+        {% endif %}
+      </td>
+    </tr>
+    <tr><th>Band (k&times;ATR)</th><td>{{ scored.band | money(4) }}</td></tr>
+    <tr><th>Forward move</th><td>{{ scored.move | money(4) }}</td></tr>
+    <tr><th>MFE</th><td>{{ scored.mfe | money(4) }}</td></tr>
+    <tr><th>MAE</th><td>{{ scored.mae | money(4) }}</td></tr>
+    <tr><th>Regret</th><td>{{ scored.regret | money(4) }}</td></tr>
+    <tr><th>Deliberation cost</th><td>{{ scored.cost_usd | money(4) }}</td></tr>
+  </tbody>
+</table>
+
+<h3>Seat votes</h3>
+{# Round 0 beside final, exactly as `seats.html` reports it — the two answer different questions
+   for the same reason at the level of one decision as they do at the level of a whole sweep. #}
+<table>
+  <thead><tr>
+    <th>seat</th><th>round</th><th>action</th><th>conviction</th><th>size hint</th>
+    <th>thesis</th><th>abstain reason</th>
+  </tr></thead>
+  <tbody>
+  {% for response in round_zero %}
+    <tr>
+      <td><code>{{ response.seat_id }}</code></td>
+      <td>round 0</td>
+      <td>{{ response.vote.action if response.vote else absent }}</td>
+      <td>{{ response.vote.conviction | count if response.vote else absent }}</td>
+      <td>{{ response.vote.size_hint if response.vote else absent }}</td>
+      <td>{{ response.vote.thesis if response.vote else absent }}</td>
+      <td>{{ response.abstain_reason or absent }}</td>
+    </tr>
+  {% endfor %}
+  {% for response in final_round %}
+    <tr>
+      <td><code>{{ response.seat_id }}</code></td>
+      <td>final</td>
+      <td>{{ response.vote.action if response.vote else absent }}</td>
+      <td>{{ response.vote.conviction | count if response.vote else absent }}</td>
+      <td>{{ response.vote.size_hint if response.vote else absent }}</td>
+      <td>{{ response.vote.thesis if response.vote else absent }}</td>
+      <td>{{ response.abstain_reason or absent }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+
+<h3>Raw seat responses</h3>
+{# §9.7 / finding: `raw_text` is the audit record worth having — a compacted `SEAT_RESPONDED` has
+   lost it, so an absent value is shown as absent rather than as an empty box. #}
+{% for response in round_zero %}
+<h4><code>{{ response.seat_id }}</code> — round 0</h4>
+<pre>{{ response.raw_text or absent }}</pre>
+{% endfor %}
+{% for response in final_round %}
+<h4><code>{{ response.seat_id }}</code> — final</h4>
+<pre>{{ response.raw_text or absent }}</pre>
+{% endfor %}
+
+<h3>Snapshot indicators</h3>
+{% set instrument_context = record.snapshot.context_for(instrument) %}
+{% if not instrument_context.indicators %}
+<p class="empty">No indicator readings recorded on this snapshot.</p>
+{% else %}
+<table>
+  <thead><tr><th>indicator</th><th>timeframe</th><th>value</th><th>reading</th></tr></thead>
+  <tbody>
+  {% for reading in instrument_context.indicators %}
+    <tr>
+      <td>{{ reading.name }}</td>
+      <td>{{ reading.timeframe }}</td>
+      <td>{{ reading.value | money(4) }}</td>
+      <td>{{ reading.text }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+{% endif %}
+{% endblock %}

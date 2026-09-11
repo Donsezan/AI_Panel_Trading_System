@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import re
 import warnings
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
+
+import pytest
 
 # See test_lab_dashboard_auth.py's own note: starlette's TestClient now prefers `httpx2`, which is
 # not one of this repo's pinned dependencies, and falls back to `httpx` with a
@@ -15,9 +18,13 @@ with warnings.catch_warnings():
     warnings.simplefilter("ignore")
     from fastapi.testclient import TestClient
 
+from decision_lab import analysis as an
 from decision_lab import registry
+from decision_lab import scoring as sc
 from decision_lab import sweep as sw
+from decision_lab.calibration_days import Pool
 from decision_lab.dashboard.routes import runs
+from tradebot.core.enums import Action
 
 
 def a_row(**fields: object) -> registry.RunRow:
@@ -198,3 +205,117 @@ def test_an_unvaluable_long_run_reports_no_figure_at_all(
 
     assert "UNVALUABLE" in page
     assert "100" not in page, "not even the realized half is quoted"
+
+
+def test_seat_detail_shows_round_zero_beside_the_final_vote(
+    lab_client: TestClient, swept_workspace: tuple[str, Path]
+) -> None:
+    """§9.7: 'which seat reasons well' and 'which is easily talked round' are two questions.
+
+    Correction 1: `sweep-stub.toml`'s `[expand] max_rounds = [1, 3]` mints
+    `varied-three~max_rounds=1` and `varied-three~max_rounds=3` — there is no candidate literally
+    called `varied-three`. Reaching the page by following the run detail page's own link (rather
+    than hardcoding that suffix format) makes the id correct by construction and proves the link
+    the run detail page now owes every ranked candidate actually resolves.
+    """
+    run_id, _ = swept_workspace
+    run_page = lab_client.get(f"/runs/{run_id}").text
+    seat_href = run_page.split(f'href="/runs/{run_id}/seats/')[1].split('"')[0]
+
+    page = lab_client.get(f"/runs/{run_id}/seats/{seat_href}").text
+
+    assert "round 0" in page and "final" in page
+    assert "swing" in page.lower() and "contribution" in page.lower()
+
+
+def test_seat_detail_for_an_unmeasured_candidate_says_so(
+    lab_client: TestClient, swept_workspace: tuple[str, Path]
+) -> None:
+    run_id, _ = swept_workspace
+    response = lab_client.get(f"/runs/{run_id}/seats/never-ran")
+    assert response.status_code == 404
+    assert "not measured" in response.text.lower() or "no candidate" in response.text.lower()
+
+
+def test_the_drill_down_shows_the_vote_the_truth_and_the_verdict(
+    lab_client: TestClient, swept_workspace: tuple[str, Path]
+) -> None:
+    run_id, _ = swept_workspace
+    run_page = lab_client.get(f"/runs/{run_id}").text
+    seat_href = run_page.split(f'href="/runs/{run_id}/seats/')[1].split('"')[0]
+    listing = lab_client.get(f"/runs/{run_id}/seats/{seat_href}").text
+
+    # Correction 2: select by shape, not position. The seat page also carries a breadcrumb back
+    # to `/runs/{run_id}` — the obvious thing for it to carry — so the *first* `/runs/`-prefixed
+    # href would silently fetch the run page instead of a decision.
+    decision_href = next(
+        href for href in re.findall(r'href="([^"]+)"', listing) if "/decision?" in href
+    )
+
+    page = lab_client.get(decision_href).text
+
+    assert "Verdict" in page and "Truth" in page
+    assert "raw" in page.lower(), "a seat's raw text is the audit record worth having"
+
+
+def test_an_unscored_decision_shows_its_reason_not_a_blank(
+    lab_client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """§9.4: unscorable is a verdict with a reason — gap, horizon or no ATR — never a drop.
+
+    Correction 3: the brief's original assertion (`"UNSCORED" not in page or "gap" in page or ...`)
+    passes vacuously whenever the page carries no literal "UNSCORED" text, which is the common
+    case — checked empirically, `swept_workspace`'s smooth synthetic walk scores all 314 decisions
+    cleanly and never exercises this path at all. A vacuous assertion cannot catch a template that
+    regresses to a bare count, so this hand-builds one candidate with a genuinely unscorable
+    decision (the same construction `test_scoring_metrics.py` uses for `ScoredDecision`) and
+    checks both halves of Task 6's `unscored_table`: the column header renders unconditionally,
+    and the one regime actually carrying an unscored decision names its reason rather than "0".
+    """
+    workspace = tmp_path / "workspace"
+    row = a_row(candidate_id="baseline")
+    registry.record(row, workspace=workspace)
+    run_id = registry.read_all(workspace=workspace)[0].run_id
+
+    def decision(verdict: sc.Verdict, regime: Pool) -> sc.ScoredDecision:
+        return sc.ScoredDecision(
+            cycle_id="c1",
+            as_of=datetime(2026, 1, 1, tzinfo=UTC),
+            instrument_key="binance:BTC/USDT",
+            regime=regime,
+            action=Action.WAIT,
+            conviction=Decimal("0.5"),
+            asked_for_an_order=False,
+            holding=False,
+            verdict=verdict,
+        )
+
+    analysis = an.MatrixAnalysis(
+        candidates=(
+            an.CandidateAnalysis(
+                candidate_id="baseline",
+                rows={},
+                records=(),
+                # NORMAL gets the one decision the forward window ran off the end of the dataset
+                # for; SHOCK_UP gets one that scored cleanly, so the page renders one regime of
+                # each kind and the test can tell "0" (correctly empty) from "0 with no reason"
+                # (the regression this test exists to catch) apart.
+                scored=(
+                    decision(sc.Verdict.UNSCORED_HORIZON, Pool.NORMAL),
+                    decision(sc.Verdict.CORRECT, Pool.SHOCK_UP),
+                ),
+                not_measured_reason="",
+                seats=(),
+            ),
+        )
+    )
+
+    async def fake_context_for(request: object, requested_run_id: str) -> runs.RunContext:
+        return runs.RunContext(row=row, analysis=analysis)
+
+    monkeypatch.setattr(runs, "context_for", fake_context_for)
+
+    page = lab_client.get(f"/runs/{run_id}").text
+
+    assert "unscored, by reason" in page, "the column is rendered whatever it holds"
+    assert "UNSCORED (horizon): 1" in page, "the regime with an unscored decision names its reason"

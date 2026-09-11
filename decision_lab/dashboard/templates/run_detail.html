@@ -37,7 +37,7 @@
    which is the opposite of "never happened". #}
 {% for regime in ["NORMAL", "SHOCK_UP", "SHOCK_DOWN"] %}
   <h3>{{ regime }}</h3>
-  {{ tables.regime_table(context.analysis.ranking | selectattr("regime", "equalto", regime) | list) }}
+  {{ tables.regime_table(context.analysis.ranking | selectattr("regime", "equalto", regime) | list, context.row.run_id) }}
 {% endfor %}
 
 <h3>Agreement</h3>

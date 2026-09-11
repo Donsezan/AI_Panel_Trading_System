@@ -1,0 +1,88 @@
+{% extends "base.html" %}
+{% block title %}decision_lab — seats{% if candidate %} {{ candidate.candidate_id }}{% endif %}{% endblock %}
+{% block content %}
+{% if found is none %}
+<h1>Run not found</h1>
+<p class="empty">no run recorded with id <code>{{ missing }}</code>.</p>
+{% elif candidate is none or not candidate.measured %}
+<h1>Seat detail{% if candidate %} — <code>{{ candidate.candidate_id }}</code>{% endif %}</h1>
+<p><a href="/runs/{{ found.row.run_id }}">&larr; back to run <code>{{ found.row.run_id }}</code></a></p>
+{# finding 3, at this drill-down level: a candidate that produced no scored decision is named
+   with its reason, never shown as though there were simply nothing here to look at. #}
+<p class="empty">{{ reason }}</p>
+{% else %}
+<h1>Seats for <code>{{ candidate.candidate_id }}</code></h1>
+<p><a href="/runs/{{ found.row.run_id }}">&larr; back to run <code>{{ found.row.run_id }}</code></a></p>
+
+{% if identical_rounds %}
+<p>This candidate ran <code>single_round</code>: round 0 <em>is</em> the final vote, so one
+column is shown rather than the same numbers twice (§9.7).</p>
+{% endif %}
+
+{# One table per regime, one row per (seat, round label) — round 0 immediately beside final,
+   because "which seat reasons well" and "which seat is easily talked round" are two different
+   questions and one column answers neither (§9.7). Swing rate and marginal contribution are
+   final-round concepts only: `seats.py` never computes them for round 0, so a round-0 row shows
+   them as absent rather than a misleading zero. #}
+{% for regime in ["NORMAL", "SHOCK_UP", "SHOCK_DOWN"] %}
+<h3>{{ regime }}</h3>
+{% set regime_rows = candidate.seats | selectattr("regime", "equalto", regime) | list %}
+{% if identical_rounds %}
+{% set regime_rows = regime_rows | selectattr("round_label", "equalto", "final") | list %}
+{% endif %}
+{% if not regime_rows %}
+<p class="empty">No seat activity recorded in this regime.</p>
+{% else %}
+<table>
+  <thead><tr>
+    <th>seat</th><th>round</th><th>turns</th><th>scored</th><th>accuracy</th>
+    <th>action rate</th><th>precision on action</th><th>conviction gap</th>
+    <th>abstention rate</th><th>fallback rate</th><th>swing rate</th>
+    <th>marginal contribution</th><th>cost / vote</th>
+  </tr></thead>
+  <tbody>
+  {% for row in regime_rows %}
+    <tr>
+      <td><code>{{ row.seat_id }}</code></td>
+      <td>{{ row.round_label }}</td>
+      <td>{{ row.turns | count }}</td>
+      <td>{{ row.scored | count }}</td>
+      <td>{{ row.accuracy | percent }}</td>
+      <td>{{ row.action_rate | percent }}</td>
+      <td>{{ row.precision_on_action | percent }}</td>
+      <td>{{ row.mean_conviction_gap | money(3) }}</td>
+      <td>{{ row.abstention_rate | percent }}</td>
+      <td>{{ row.fallback_rate | percent }}</td>
+      <td>{{ row.swing_rate | percent if row.round_label == "final" else absent }}</td>
+      <td>{{ row.marginal_contribution | count if row.round_label == "final" else absent }}</td>
+      <td>{{ row.cost_per_vote | money(4) }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+{% endfor %}
+
+<h3>Decisions</h3>
+{% if not candidate.scored %}
+<p class="empty">No scored decisions.</p>
+{% else %}
+<table>
+  <thead><tr><th>instant</th><th>instrument</th><th>regime</th><th>action</th><th>verdict</th></tr></thead>
+  <tbody>
+  {% for one in candidate.scored %}
+    <tr>
+      <td>
+        <a href="/runs/{{ found.row.run_id }}/decision?cycle={{ one.cycle_id | urlencode }}&instrument={{ one.instrument_key | urlencode }}&candidate={{ candidate.candidate_id | urlencode }}">{{ one.as_of | moment }}</a>
+      </td>
+      <td><code>{{ one.instrument_key }}</code></td>
+      <td>{{ one.regime }}{% if one.window_name %} ({{ one.window_name }}){% endif %}</td>
+      <td>{{ one.action }}</td>
+      <td>{{ one.verdict }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+{% endif %}
+{% endblock %}

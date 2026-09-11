@@ -1,4 +1,6 @@
-{% macro regime_table(rows) %}
+{# `run_id` is threaded through so every ranked candidate links to its own seat page (§9.7,
+   §12.2's drill-down) — a page nothing points at is unreachable by navigation alone. #}
+{% macro regime_table(rows, run_id) %}
   {% if not rows %}
     <p class="empty">No candidate was measured in this regime.</p>
   {% else %}
@@ -11,7 +13,11 @@
     <tbody>
     {% for row in rows %}
       <tr>
-        <td><code>{{ row.candidate_id }}</code></td>
+        <td>
+          <a href="/runs/{{ run_id }}/seats/{{ row.candidate_id | urlencode }}">
+            <code>{{ row.candidate_id }}</code>
+          </a>
+        </td>
         <td>{{ row.scored | count }}</td>
         <td>{{ row.accuracy | percent }}</td>
         <td>{{ row.action_rate | percent }}</td>
