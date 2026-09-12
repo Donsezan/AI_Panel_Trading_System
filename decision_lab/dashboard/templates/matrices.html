@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block title %}decision_lab — seat sets{% endblock %}
+{% block content %}
+<h1>Seat sets</h1>
+
+{% if not stored %}
+  <p class="empty">Nothing saved yet. Duplicate one of the shipped templates below to start one.</p>
+{% else %}
+<table>
+  <thead><tr><th>name</th><th>versions</th></tr></thead>
+  <tbody>
+  {% for name, versions in stored.items() %}
+    <tr>
+      <td>{{ name }}</td>
+      <td>
+        {% for one in versions %}
+        <a href="/matrices/{{ name }}?version={{ one }}">v{{ one }}</a>{{ " " if not loop.last }}
+        {% endfor %}
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+<h2>Shipped templates</h2>
+{# §12.3: the shipped matrices in `decision_lab/config/` are curated, committed and read-only — a
+   template is a starting point, and duplicating one opens an editor that will save under a new
+   name of its own rather than ever writing back over the file it started from. #}
+<ul>
+{% for template in shipped %}
+  <li><a href="/matrices/{{ template }}?from_template={{ template }}">{{ template }}</a>
+      (duplicate to edit)</li>
+{% endfor %}
+</ul>
+{% endblock %}
