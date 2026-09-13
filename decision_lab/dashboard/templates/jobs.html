@@ -1,0 +1,195 @@
+{% extends "base.html" %}
+{% block title %}decision_lab — runs in progress{% endblock %}
+{% block content %}
+<h1>Runs in progress</h1>
+
+{% if error %}
+<p class="error">{{ error }}</p>
+{% endif %}
+
+{% if busy %}
+<p>
+  Holding the workspace: <code>{{ busy.argv | join(" ") }}</code> (pid {{ busy.pid }}) since
+  {{ busy.started_at | moment }}.
+  {% if stoppable %}
+  <form method="post" action="/jobs/stop" style="display:inline">
+    <input type="hidden" name="job_id" value="{{ stoppable }}">
+    <button type="submit">Stop</button>
+  </form>
+  {% else %}
+  (started outside this dashboard process; nothing here can stop it — see the Runs page)
+  {% endif %}
+</p>
+{% else %}
+<p class="empty">The workspace is free. Start a run below.</p>
+{% endif %}
+
+<h2>Cost projection</h2>
+{# §10.2: what a run would cost, read off the last calibration for this exact seat set and
+   dataset — never recomputed, so the number on the page is the number the gate itself trusts. #}
+<form method="get" action="/jobs">
+  <label>corpus id <input type="text" name="corpus" value="{{ corpus }}"></label>
+  <label>seat set (TOML path) <input type="text" name="configs" value="{{ configs }}"></label>
+  <button type="submit">Show cost projection</button>
+</form>
+
+{% if projection is string %}
+<p>{{ projection }}</p>
+{% elif not projection %}
+<p class="empty">No candidate in this seat set has a recorded calibration.</p>
+{% else %}
+<table>
+  <thead><tr><th>candidate</th><th>cost / cycle</th><th>entries</th><th>projected</th></tr></thead>
+  <tbody>
+  {% for row in projection %}
+    <tr>
+      <td><code>{{ row.candidate_id }}</code></td>
+      <td>{{ row.cost_per_cycle | money(4) }}</td>
+      <td>{{ row.entries | count }}</td>
+      <td>{{ row.projected | money }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+<h2>History</h2>
+{% if not history %}
+<p class="empty">No run has been started from this page yet.</p>
+{% else %}
+<table>
+  <thead><tr><th>started</th><th>label</th><th>argv</th><th>status</th><th></th></tr></thead>
+  <tbody>
+  {% for record in history %}
+    <tr{% if record.job_id == selected %} class="selected"{% endif %}>
+      <td>{{ record.started_at | moment }}</td>
+      <td>{{ record.label }}</td>
+      <td><code>{{ record.argv | join(" ") }}</code></td>
+      <td>{{ statuses[record.job_id] }}</td>
+      <td>
+        <a href="/jobs?job={{ record.job_id }}&corpus={{ corpus }}&configs={{ configs }}">log</a>
+        {% if record.job_id == stoppable %}
+        <form method="post" action="/jobs/stop" style="display:inline">
+          <input type="hidden" name="job_id" value="{{ record.job_id }}">
+          <button type="submit">Stop</button>
+        </form>
+        {% endif %}
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+{% if selected %}
+<h2>Log: {{ selected }}</h2>
+<pre>{{ log }}</pre>
+{% endif %}
+
+<h2>Start a run</h2>
+
+{% if 'corpus-build' in commands %}
+<form method="post" action="/jobs/start">
+  <fieldset>
+    <legend>corpus build</legend>
+    <input type="hidden" name="command" value="corpus-build">
+    <label>dataset directory <input type="text" name="data" required></label>
+    <label>cadence
+      <select name="every">
+        <option value="1h">1h</option><option value="2h">2h</option>
+        <option value="4h" selected>4h</option><option value="8h">8h</option>
+        <option value="12h">12h</option><option value="24h">24h</option>
+      </select>
+    </label>
+    <label>reference panel <input type="text" name="reference_panel" value="sim" required></label>
+    <button type="submit">Start</button>
+  </fieldset>
+</form>
+{% endif %}
+
+{% if 'calibrate-normal' in commands %}
+<form method="post" action="/jobs/start">
+  <fieldset>
+    {# The legend deliberately does not read "calibrate normal" verbatim — that exact phrase is
+       what an uncalibrated projection message names, and a static label repeating it here would
+       make that page's own assertion pass whether or not the message itself said so. #}
+    <legend>calibrate — the three pinned NORMAL days (§10.2)</legend>
+    <input type="hidden" name="command" value="calibrate-normal">
+    <label>corpus id <input type="text" name="corpus" required></label>
+    <label>seat set (TOML path) <input type="text" name="configs" required></label>
+    {% if 'calibrate-normal' in budgeted %}
+    <label>budget (USD, required) <input name="budget" required></label>
+    {% endif %}
+    <button type="submit">Start</button>
+  </fieldset>
+</form>
+{% endif %}
+
+{% if 'calibrate-shock' in commands %}
+<form method="post" action="/jobs/start">
+  <fieldset>
+    <legend>calibrate — the three SHOCK_UP and three SHOCK_DOWN days (§10.3)</legend>
+    <input type="hidden" name="command" value="calibrate-shock">
+    <label>corpus id <input type="text" name="corpus" required></label>
+    <label>seat set (TOML path) <input type="text" name="configs" required></label>
+    {% if 'calibrate-shock' in budgeted %}
+    <label>budget (USD, required) <input name="budget" required></label>
+    {% endif %}
+    <button type="submit">Start</button>
+  </fieldset>
+</form>
+{% endif %}
+
+{% if 'sweep' in commands %}
+<form method="post" action="/jobs/start">
+  <fieldset>
+    <legend>sweep (§7 — every candidate in the matrix, over the corpus)</legend>
+    <input type="hidden" name="command" value="sweep">
+    <label>corpus id <input type="text" name="corpus" required></label>
+    <label>seat set (TOML path) <input type="text" name="configs" required></label>
+    {% if 'sweep' in budgeted %}
+    <label>budget (USD, required) <input name="budget" required></label>
+    {% endif %}
+    <label>seed (optional) <input type="text" name="seed"></label>
+    <label><input type="checkbox" name="full"> every entry, not a stratified sample</label>
+    <label><input type="checkbox" name="skip_gate"> skip the §10.6 gate (stamped on the report)</label>
+    <button type="submit">Start</button>
+  </fieldset>
+</form>
+{% endif %}
+
+{% if 'calibrate-long' in commands %}
+<form method="post" action="/jobs/start">
+  <fieldset>
+    <legend>calibrate long (§10.4 — one candidate's own six months, own ledger)</legend>
+    <input type="hidden" name="command" value="calibrate-long">
+    <label>dataset directory <input type="text" name="data" required></label>
+    <label>seat set (TOML path) <input type="text" name="configs" required></label>
+    <label>candidate id <input type="text" name="candidate" required></label>
+    <label>start equity <input type="text" name="start_equity" value="1000" required></label>
+    <label>cadence
+      <select name="every">
+        <option value="1h">1h</option><option value="2h">2h</option>
+        <option value="4h" selected>4h</option><option value="8h">8h</option>
+        <option value="12h">12h</option><option value="24h">24h</option>
+      </select>
+    </label>
+    <label>window
+      <select name="window">
+        <option value="1m">1m</option><option value="3m">3m</option>
+        <option value="6m" selected>6m</option><option value="12m">12m</option>
+      </select>
+    </label>
+    <label><input type="checkbox" name="skip_gate"> skip the §10.6 gate (stamped on the report)</label>
+    <button type="submit">Start</button>
+    {# §12.4: `calibrate long` has no mid-run ceiling, and the page says so rather than implying
+       one. #}
+    <p class="warning">This run has <strong>no mid-run ceiling</strong>: scenario 3 drives
+    <code>BacktestHarness</code> directly, with no engine seam to meter. The ceiling is you
+    stopping it — and stopping it means you must <strong>delete that run's directory</strong>
+    before it can run again, because the database it leaves behind is the record of why the pass
+    failed (§10.4).</p>
+  </fieldset>
+</form>
+{% endif %}
+{% endblock %}
