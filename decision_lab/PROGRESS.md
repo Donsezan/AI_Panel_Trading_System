@@ -26,7 +26,8 @@ until the seats have been calibrated over nine pinned days.
 
 Slice D is split into two passes. **Pass 1 — the three calibration scenarios and the §10.6 gate —
 has shipped**, all nine tasks, merged to `main`. **Pass 2 — the dashboard and the notebook — is
-half-built on the branch `slice-d-pass-2-dashboard`** and is not merged; E (news) is untouched.
+nine of its ten tasks done on the branch `slice-d-pass-2-dashboard`** and is not merged; only the
+notebook, the slice exit criterion and the docs remain. E (news) is untouched.
 
 **Pass 2 is no longer the read-only surface §12 first specified.** That was reversed deliberately
 and the spec records the reversal at §12.1: the tool exists to find a better panel, and a loop
@@ -101,8 +102,9 @@ Ten tasks, executed subagent-per-task with a review after each.
 - [x] **7** seat detail and the decision drill-down
 - [x] **8** the seat-set editor — `4ba6e09`, fixed at `5918a91` (it was deleting expansion axes,
       and every "+ seat" click silently *saved* the document instead of re-rendering the form)
-- [~] **9** the run forms — argv builders, required budgets, the cost projection, stop —
-      **written, uncommitted, gate unverified**
+- [x] **9** the run forms — argv builders, required budgets, the cost projection, stop —
+      `424ef86`, fixed at `0737851` (a vacuous assertion that passed on every possible page, and a
+      refusal page that reported a finished job's status differently from the index page)
 - [ ] **10** `notebooks/tuning.ipynb`, the slice exit criterion, and the docs
 
 Three rules this pass added that are easy to get backwards:
@@ -197,26 +199,31 @@ the seats first" should say so on its face.
 
 ## Next step when you pick this up
 
-**You are mid-run on `slice-d-pass-2-dashboard`.** Fourteen commits, head `5918a91`, branched from
+**You are mid-run on `slice-d-pass-2-dashboard`.** Seventeen commits, head `0737851`, branched from
 `main` at `4ef58d8` plus the spec revision `e578e24` and the plan `ab1365c`. Nothing is merged and
 nothing is pushed. `git diff --stat main -- tradebot/` is empty, which is the slice's exit
 criterion, and the root `.\check.ps1` passed at the Task 3 and Task 7 boundaries.
 
 ### Where exactly
 
-- **Tasks 1–8: complete and independently reviewed**, each with its fix rounds closed. Task 8's
-  review found 2 Critical and 2 Important; all four are fixed in `5918a91` and re-reviewed.
-- **Task 9 (the run forms): written but uncommitted, and its test gate is unverified.**
-  `git status` shows modified `dashboard/routes/jobs.py` and untracked
-  `dashboard/templates/jobs.html` and `tests/test_lab_dashboard_run.py`. Two implementers failed
-  to land it and **two of their logs disagree about whether the gate passed** — so the next
-  implementer must trust neither and run the gate itself. That was escalated to a more capable
-  model; the ruling and its reasoning are in the ledger.
+- **Tasks 1–9: complete and independently reviewed**, each with its fix rounds closed. Task 8's
+  review found 2 Critical and 2 Important, all four fixed in `5918a91`. Task 9's found 0 Critical
+  and 2 Important, both fixed in `0737851`.
+- **Task 9 (the run forms) landed, and the gate question that cost it two sessions is settled.**
+  The two contradictory logs were resolved by running the three fast stages directly against the
+  bytes on disk rather than escalating a model: `ruff format --check`, `ruff check` and `mypy` were
+  all green, and a full `pytest decision_lab/tests` against the committed `424ef86` came back
+  **809 passed, exit 0** — which is exactly the figure the *earlier* of the two disputed logs
+  reported. So that log was truthful and the later "Found 925 errors" one was false. **A later log
+  is not a newer truth**; neither is worth anything without knowing its bytes.
 - **Task 10: not started.** Pre-flighted, and the two defects found in the plan's own test code
   are already ruled on in the ledger — including a vacuous assertion in the slice's own
   exit-criterion test. The corrections belong in the dispatch, not in a transcription of the plan.
-- **Still owed after Task 10:** the final root `.\check.ps1`, the `tradebot/` diff check, and the
-  whole-branch review with one fix wave and one scoped re-review.
+- **Still owed after Task 10:** one authoritative gate — `.\decision_lab\check.ps1` **and** the root
+  `.\check.ps1` — the `tradebot/` diff check, and the whole-branch review with one fix wave and one
+  scoped re-review. No full-suite number was recorded at the Task 9 boundary, deliberately: a second
+  ten-minute run racing Task 10's implementer would have produced exactly the ambiguous-bytes
+  evidence this run exists to stop producing.
 
 ### How to resume
 
@@ -248,9 +255,23 @@ every interruption this run has had.
   is current. Keep it that way: a line before and after every dispatch, not only at completion.
 - **Never grep or tail an agent's `.output` file.** They are full JSONL transcripts and reading one
   floods the context. Only plain bash-command logs are safe to read.
-- **A half-finished task leaves its work in the tree, and that is the normal case here.** Four of
+- **A half-finished task leaves its work in the tree, and that is the normal case here.** Five of
   the ten tasks were inherited that way. The next implementer verifies, finishes and commits what
   is there; it does not start over.
+- **Settle a contradiction yourself before escalating a model at it.** Task 9 was escalated to opus
+  because two gate logs disagreed — but the disagreement was answerable in four minutes by running
+  `ruff format --check`, `ruff check` and `mypy` against the bytes on disk. A more capable model
+  cannot make an old log describe a tree it never ran against.
+- **Move the ~600s gate off the implementer's plate entirely.** It exceeds the Bash tool's 600s cap,
+  so the harness backgrounds it out from under whoever launched it — the shape of ten of this run's
+  stalls. The controller runs it; the implementer runs targeted files only, in the foreground.
+- **Verify the bytes a test run describes.** One full-suite run here was silently invalidated when
+  an implementer edited a template after it started. A number that does not name its commit is not
+  evidence; kill the run and re-launch rather than record it.
+- **Write the ledger line AFTER the tool call returns, never before.** The controller wrote
+  "Task 10: dispatching implementer" and then did not dispatch, leaving a false entry in the one
+  file a resuming session is told to trust. The ledger is only a recovery map if every line in it
+  describes something that actually happened.
 
 ### After this branch lands
 
