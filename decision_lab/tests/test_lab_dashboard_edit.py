@@ -14,7 +14,11 @@ from pathlib import Path
 from typing import Any
 
 from decision_lab import matrices
+from decision_lab.candidates import load_matrix
 from decision_lab.dashboard import forms
+from tradebot.app import demo_basket, select_panel
+from tradebot.core.enums import DecisionMode
+from tradebot.marketdata.catalogue import sim_catalogue
 
 # See test_lab_dashboard_read.py's own note: starlette's TestClient now prefers `httpx2`, which is
 # not one of this repo's pinned dependencies, and falls back to `httpx` with a
@@ -92,6 +96,21 @@ def test_an_empty_field_is_omitted_not_stored_as_empty() -> None:
     assert "prompt" not in document["candidates"][0]["seats"][0]
 
 
+def test_a_conflicting_path_is_skipped_not_raised() -> None:
+    """`nest`'s own docstring promises it never raises. `candidates.x` and `candidates.0.id`
+    disagree on whether `candidates` is a table or a list — before this fix, `_place` called
+    `setdefault` blind to what was already there and raised a `KeyError` or a `TypeError`
+    depending on `items`' iteration order, unhandled in `edit_post` and surfacing as a 500
+    (controller ruling, Important 3). Checked both orders: which path wins is deterministic
+    (whichever is placed first), but *whether it raises* must never depend on order at all.
+    """
+    first = forms.nest({"candidates.x": "1", "candidates.0.id": "a"})
+    assert first == {"candidates": {"x": "1"}}, "the conflicting second path is dropped, not raised"
+
+    second = forms.nest({"candidates.0.id": "a", "candidates.x": "1"})
+    assert second == {"candidates": [{"id": "a"}]}, "whichever path is placed first wins"
+
+
 def test_the_editor_lists_the_shipped_templates(lab_client: TestClient) -> None:
     page = lab_client.get("/matrices").text
     assert "sweep-stub" in page and "sweep" in page
@@ -165,12 +184,100 @@ def test_every_field_of_a_stored_seat_set_is_rendered_as_an_input(
     """Two-sided, like the bot's own configure test: a control that stops being rendered deletes
     that part of the document on the next save."""
     document = tomllib.loads((SHIPPED / "sweep-stub.toml").read_text(encoding="utf-8"))
-    lab_client.post("/matrices/mine", data=_flatten(document) | {"action": "save"})
+    _assert_round_trips(lab_client, tmp_path, document, "mine")
 
-    page = lab_client.get("/matrices/mine").text
 
-    for name in _flatten(document):
-        assert f'name="{name}"' in page, f"{name} is not editable, so a save would drop it"
+def test_a_non_default_decision_mode_and_a_generic_expand_axis_survive_the_round_trip(
+    lab_client: TestClient, tmp_path: Path
+) -> None:
+    """This test's own blind spot in the one above: `sweep-stub.toml` never sets `decision_mode`
+    on a candidate, and its only `[expand]` axis is the one the old template hardcoded a field
+    for (`max_rounds`). Neither exercises what Critical 1 was about: a `decision_mode` input the
+    old template never rendered at all (silently deleting it on every save), and an `[expand]`
+    axis besides `max_rounds`, which the old fieldset had no generic loop to render at all — both
+    are one of §7.1's four matrix axes and `candidates._axes` accepts either. This must fail
+    before the template fix (neither field name would ever appear on the page) and pass after.
+    """
+    document = tomllib.loads((SHIPPED / "sweep-stub.toml").read_text(encoding="utf-8"))
+    document["candidates"][0]["decision_mode"] = "basket"
+    document["expand"]["protocol"] = ["blind_then_debate"]
+    _assert_round_trips(lab_client, tmp_path, document, "mine-augmented")
+
+
+def _assert_round_trips(
+    lab_client: TestClient, tmp_path: Path, document: dict[str, Any], name: str
+) -> None:
+    """Save `document` under `name`, then assert every field it carries is still an editable
+    input on the page the store now serves — the shared body of the two tests above."""
+    lab_client.post(f"/matrices/{name}", data=_flatten(document) | {"action": "save"})
+    assert matrices.versions(name, workspace=tmp_path / "workspace") == (1,), "the save must land"
+
+    page = lab_client.get(f"/matrices/{name}").text
+
+    for field_name in _flatten(document):
+        assert f'name="{field_name}"' in page, (
+            f"{field_name} is not editable, so a save would drop it"
+        )
+
+
+async def test_the_saved_digest_does_not_depend_on_which_reference_basket_validated_it(
+    lab_client: TestClient, tmp_path: Path
+) -> None:
+    """Critical 2: `Candidate.panel_digest` hashes `basket.decision_mode` alongside the panel
+    (candidates.py:224), and `_basket_for` only overwrites `decision_mode` when the candidate
+    entry declares it (candidates.py:320-321) — so a candidate that omits it inherits whichever
+    reference basket happened to validate it, and the digest this page reports at save time is
+    not guaranteed to equal the one a later `sweep` computes against a different reference.
+
+    Critical 1's fix closes this by always rendering the field with a real option pre-selected, so
+    a real "Save" click carries it explicitly even when the operator never touches it. This proves
+    both halves: the page really does default-select `per_asset` for a candidate that never set
+    it (so a genuine click reproduces exactly this), and saving with that default produces a
+    digest that no longer depends on which reference basket happened to validate it.
+    """
+    template_page = lab_client.get("/matrices/digest-check?from_template=sweep-stub").text
+    assert '<option value="per_asset" selected>' in template_page, (
+        "the form must default-select per_asset for a candidate that never set decision_mode"
+    )
+
+    document = tomllib.loads((SHIPPED / "sweep-stub.toml").read_text(encoding="utf-8"))
+    posted = _flatten(document) | {"candidates.0.decision_mode": "per_asset", "action": "save"}
+    lab_client.post("/matrices/digest-check", data=posted)
+    assert matrices.versions("digest-check", workspace=tmp_path / "workspace") == (1,)
+
+    path = matrices.path_for("digest-check", 1, workspace=tmp_path / "workspace")
+    reference_a = await demo_basket(sim_catalogue(), select_panel("stub"))
+    reference_b = reference_a.model_copy(update={"decision_mode": DecisionMode.BASKET})
+    assert reference_a.decision_mode != reference_b.decision_mode, (
+        "the fixture must actually differ"
+    )
+
+    digest_a = load_matrix(path, reference=reference_a).matrix_digest
+    digest_b = load_matrix(path, reference=reference_b).matrix_digest
+    assert digest_a == digest_b, "the saved digest must not depend on which reference validated it"
+
+
+def test_an_unreadable_corpus_json_is_skipped_not_a_500(
+    lab_client: TestClient, tmp_path: Path
+) -> None:
+    """Important 4: `_reference_basket` scans every corpus directory in the workspace for a usable
+    reference basket. An interrupted build or a schema an older version wrote leaves a
+    `corpus.json` this process cannot parse — before this fix, `CorpusMeta.model_validate_json`
+    raised bare and turned every save in a workspace holding such a directory into an unhandled
+    500, even though another corpus, or the offline fallback, could validate the save just fine.
+    """
+    workspace = tmp_path / "workspace"
+    broken = workspace / "not-a-real-corpus"
+    broken.mkdir(parents=True)
+    (broken / "corpus.json").write_text("{ this is not valid json", encoding="utf-8")
+
+    document = tomllib.loads((SHIPPED / "sweep-stub.toml").read_text(encoding="utf-8"))
+    response = lab_client.post(
+        "/matrices/mine", data=_flatten(document) | {"action": "save"}, follow_redirects=True
+    )
+
+    assert response.status_code == 200, response.text
+    assert matrices.versions("mine", workspace=workspace) == (1,)
 
 
 def _flatten(document: dict[str, Any], prefix: str = "") -> dict[str, str]:

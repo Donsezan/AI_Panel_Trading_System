@@ -103,9 +103,20 @@ async def _reference_basket(workspace: Path | None) -> tuple[Basket, str]:
     if root.is_dir():
         for entry in sorted(root.iterdir()):
             meta_path = entry / CORPUS_META
-            if meta_path.is_file():
+            if not meta_path.is_file():
+                continue
+            try:
                 meta = CorpusMeta.model_validate_json(meta_path.read_text(encoding="utf-8"))
-                return meta.reference_basket, f"corpus {meta.corpus_id}"
+            except (ValueError, OSError):
+                # An interrupted build or a schema an older version wrote leaves a `corpus.json`
+                # this process cannot read. This function is a best-effort scan for *any* usable
+                # reference, not a request for one specific corpus by name — `corpus.load` is that
+                # request, and it raises bare, deliberately, because a name the operator typed
+                # should fail loudly. Here, a save must not be blocked by an unrelated, unreadable
+                # directory sitting in the workspace when another corpus — or the offline fallback
+                # below — validates it just as well: skip it and keep looking.
+                continue
+            return meta.reference_basket, f"corpus {meta.corpus_id}"
     basket = await demo_basket(sim_catalogue(), select_panel("stub"))
     return basket, "the demo basket (no corpus is built in this workspace)"
 

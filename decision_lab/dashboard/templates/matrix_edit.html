@@ -63,6 +63,19 @@ against the dataset you intend to sweep. A sweep will refuse until they have.
       <legend>Candidate {{ c }}</legend>
       <label>id <input type="text" name="candidates.{{ c }}.id" value="{{ candidate.get('id', '') }}"></label>
       <label>protocol <input type="text" name="candidates.{{ c }}.protocol" value="{{ candidate.get('protocol', '') }}"></label>
+      {# §7.1: decision_mode is one of the four matrix axes, and `Candidate.panel_digest` hashes
+         it alongside the panel (candidates.py:224). A candidate that never sets it inherits
+         whichever reference basket happened to validate it, so the digest this page reports would
+         depend on a basket the operator never chose — not on anything they edited. Rendering it
+         here, always, with a real option pre-selected, means every save carries it explicitly and
+         the reference can never reach the digest again (controller ruling, Critical 1 & 2). #}
+      <label>decision_mode
+        {% set current_mode = candidate.get("decision_mode", "per_asset") %}
+        <select name="candidates.{{ c }}.decision_mode">
+          <option value="per_asset" {% if current_mode == "per_asset" %}selected{% endif %}>per_asset — one vote per instrument</option>
+          <option value="basket" {% if current_mode == "basket" %}selected{% endif %}>basket — one vote for the whole basket</option>
+        </select>
+      </label>
       <label>max_rounds <input type="text" name="candidates.{{ c }}.max_rounds" value="{{ candidate.get('max_rounds', '') }}"></label>
       <label>qualified_majority <input type="text" name="candidates.{{ c }}.qualified_majority" value="{{ candidate.get('qualified_majority', '') }}"></label>
       <label>max_abstain_fraction <input type="text" name="candidates.{{ c }}.max_abstain_fraction" value="{{ candidate.get('max_abstain_fraction', '') }}"></label>
@@ -102,8 +115,16 @@ against the dataset you intend to sweep. A sweep will refuse until they have.
   <fieldset>
     <legend>Expansion matrix (§7.1)</legend>
     <label>limit <input type="text" name="expand.limit" value="{{ expand.get('limit', '') }}"></label>
-    <label>max_rounds, comma-separated (e.g. "1, 3")
-      <input type="text" name="expand.max_rounds" value="{{ expand.get('max_rounds', []) | join(', ') }}"></label>
+    {# Every `[expand]` key besides `limit` and `prompts` is one of §7.1's axes, and
+       `candidates._axes` (candidates.py:150-156) accepts *any* such key as a valid axis — not
+       only `max_rounds`. A hardcoded, enumerated field list here would silently delete any other
+       axis (`protocol`, `decision_mode`, …) on the next save, the very hazard this whole page
+       exists to avoid — so this loops over whatever the document actually carries (controller
+       ruling, Critical 1). #}
+    {% for axis_name, values in expand.items() if axis_name not in ("limit", "prompts") %}
+    <label>{{ axis_name }}, comma-separated (e.g. "1, 3")
+      <input type="text" name="expand.{{ axis_name }}" value="{{ values | join(', ') }}"></label>
+    {% endfor %}
     {% for seat_id, values in expand.get("prompts", {}).items() %}
     <label>prompts.{{ seat_id }}, comma-separated library names
       <input type="text" name="expand.prompts.{{ seat_id }}" value="{{ values | join(', ') }}"></label>

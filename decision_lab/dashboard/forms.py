@@ -110,6 +110,23 @@ def _expand_axis(raw: str) -> list[Any]:
 
 
 def _place(document: dict[str, Any], segments: Sequence[str], value: Any) -> None:
+    """Descend `segments` into `document`, creating tables and lists as needed.
+
+    A segment can conflict with what an *earlier* value in the same submission already placed —
+    `candidates.x` and `candidates.0.id` disagree on whether `candidates` is a table or a list —
+    and the docstring above promises `nest` never raises. The old code called `setdefault` blind
+    to what was already there: on a list where a table was wanted (or the reverse) it either
+    silently returned the existing, wrongly-shaped container and then indexed or assigned into it
+    incorrectly (`list["x"] = …` raises `TypeError`; `dict[0]` raises `KeyError`), and which one
+    happened depended on `items`' iteration order — a form is reachable only by someone who
+    already holds the token, but a malformed name must never be able to take the page away from an
+    operator mid-edit. The fix checks the existing value's shape before trusting it: a conflict
+    means this whole leaf is dropped (`return`) rather than corrupting or crashing, and whichever
+    of the two conflicting paths was placed *first* is the one that survives — deterministic, if
+    not meaningful, and only a hand-built request can produce it at all, since every name the
+    editor itself submits was rendered from `document` at `GET` time and cannot disagree with
+    itself.
+    """
     cursor: dict[str, Any] = document
     for index, segment in enumerate(segments):
         last = index == len(segments) - 1
@@ -120,18 +137,42 @@ def _place(document: dict[str, Any], segments: Sequence[str], value: Any) -> Non
             cursor[segment] = value
             return
         if following.isdigit():
-            cursor.setdefault(segment, [])
+            bucket = cursor.get(segment, [])
+            if not isinstance(bucket, list):
+                return  # `segment` already names a table here; a list would corrupt it
+            cursor[segment] = bucket
             position = int(following)
-            while len(cursor[segment]) <= position:
-                cursor[segment].append({})
-            cursor = cursor[segment][position]
+            while len(bucket) <= position:
+                bucket.append({})
+            cursor = bucket[position]
         else:
-            cursor = cursor.setdefault(segment, {})
+            table = cursor.get(segment, {})
+            if not isinstance(table, dict):
+                return  # `segment` already names a list here; a table would corrupt it
+            cursor[segment] = table
+            cursor = table
 
 
 def _default_missing_checkboxes(document: dict[str, Any]) -> None:
-    """Every seat gets every boolean field, present in the submission or not (see `BOOL_FIELDS`)."""
-    for candidate in document.get("candidates", ()):
-        for seat in candidate.get("seats", ()):
+    """Every seat gets every boolean field, present in the submission or not (see `BOOL_FIELDS`).
+
+    Skips anything not shaped like a list of candidate tables, each holding a list of seat tables.
+    `nest`'s own contract is that it never raises, and `_place`'s conflict handling can legitimately
+    leave `document["candidates"]` as something other than a list of dicts — a submission that
+    disagreed with itself about the shape of `candidates` (see `_place`) has already had its second,
+    conflicting path dropped, and this must not then crash on what the first path left behind.
+    """
+    candidates = document.get("candidates", ())
+    if not isinstance(candidates, list):
+        return
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        seats = candidate.get("seats", ())
+        if not isinstance(seats, list):
+            continue
+        for seat in seats:
+            if not isinstance(seat, dict):
+                continue
             for field in BOOL_FIELDS:
                 seat.setdefault(field, False)
