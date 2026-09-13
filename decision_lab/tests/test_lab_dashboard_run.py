@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 import warnings
 from pathlib import Path
 
@@ -92,9 +93,13 @@ def test_starting_while_the_workspace_is_held_is_refused_on_the_page(
 
 
 def test_a_missing_field_is_a_refusal_on_the_page_not_a_500(lab_client: TestClient) -> None:
+    """`"configs" in response.text` alone is vacuous: every rendering of `jobs.html` already
+    contains that literal string via `name="configs"` on the calibrate-normal, calibrate-shock and
+    sweep forms, which are always rendered — so that assertion would pass even if `_required`'s
+    refusal were never rendered at all. Assert on the actual message `_required` raises instead."""
     response = lab_client.post("/jobs/start", data={"command": "sweep", "corpus": "abc"})
     assert response.status_code == 400
-    assert "configs" in response.text
+    assert "configs is required, and nothing was started" in response.text
 
 
 def test_an_unknown_command_is_refused(lab_client: TestClient) -> None:
@@ -133,6 +138,58 @@ def test_starting_and_stopping_a_real_child(lab_client: TestClient, tmp_path: Pa
     finally:
         for record in started:
             jobs.stop(record.job_id, workspace=workspace)
+
+
+def test_a_refusal_page_reports_the_same_status_as_the_index_page(
+    lab_client: TestClient, tmp_path: Path
+) -> None:
+    """Finding 2 (Task 9 fix round 1): before `_history_context` was pulled out, `_refusal` built
+    its history table without the `jobs.refresh` call `index` makes first, so a job that finished
+    in the window between a refused start and the read rendered as "ended without being recorded"
+    on the refusal page while the index page, reading the very same record, would have reported
+    its real exit code. Both must now agree.
+    """
+    workspace = tmp_path / "workspace"
+    lab_client.post(
+        "/jobs/start",
+        data={
+            "command": "corpus-build",
+            "data": str(tmp_path / "nothing"),
+            "every": "8h",
+            "reference_panel": "stub",
+        },
+        follow_redirects=False,
+    )
+    started = jobs.history(workspace=workspace)
+    assert started, "the job was recorded"
+    record = started[0]
+
+    # Wait for the real child - which refuses almost immediately against a dataset directory that
+    # does not exist - to actually exit. `jobs.status_of` is the non-mutating probe: unlike
+    # `jobs.refresh`, it never writes the exit code back to disk, so polling it is how the test
+    # catches the record in the exact window this bug lived in — the process has exited but
+    # nothing has yet noticed and persisted its exit code. (A lock-release probe is not the same
+    # signal: the child releases the workspace lock in its own `finally`, slightly *before* the
+    # OS reports the process as exited, which raced this loop when it was written against
+    # `jobs.holder` instead.)
+    deadline = time.monotonic() + 10
+    status = jobs.status_of(record, workspace=workspace)
+    while status == "running" and time.monotonic() < deadline:
+        time.sleep(0.05)
+        status = jobs.status_of(record, workspace=workspace)
+    assert status != "running", "the child did not exit in time"
+
+    refusal = lab_client.post("/jobs/start", data={"command": "rm -rf"})
+    assert refusal.status_code == 400
+    assert "ended without being recorded" not in refusal.text, (
+        "a finished job must report its real exit code on a refusal page, not read as still-live"
+    )
+
+    finished = jobs.history(workspace=workspace)[0]
+    assert finished.exit_code is not None, "the refusal's own refresh should have recorded it"
+    status_line = f"exit {finished.exit_code}"
+    assert status_line in refusal.text
+    assert status_line in lab_client.get("/jobs").text
 
 
 def test_the_projection_says_so_when_nothing_has_been_calibrated(

@@ -19,7 +19,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final
+from typing import Any, Final
 
 from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -29,7 +29,7 @@ from decision_lab import calibration_days as cday
 from decision_lab import candidates as cd
 from decision_lab import corpus as cp
 from decision_lab import gate, jobs
-from decision_lab.dashboard.views import render, state_of
+from decision_lab.dashboard.views import LabState, render, state_of
 from tradebot.core.errors import ConfigError
 from tradebot.core.schema import Money
 
@@ -186,25 +186,40 @@ async def projection_for(
     )
 
 
-@router.get("/jobs", response_class=HTMLResponse)
-async def index(request: Request, job: str = "", corpus: str = "", configs: str = "") -> Response:
-    state = state_of(request)
+def _history_context(state: LabState) -> dict[str, Any]:
+    """The history table, refreshed, and which row (if any) this process can stop.
+
+    Shared by `index` and `_refusal` so a refusal never tells the operator something different
+    about a job's status than the normal page would — before this was pulled out, `_refusal` built
+    the same two values without the `jobs.refresh` call `index` makes first, so a job that finished
+    in the window between a refused start and the read rendered as "ended without being recorded"
+    on the refusal page while the index page, reading the same record, would have reported its
+    real exit code.
+    """
     history = tuple(
         jobs.refresh(one, clock=state.clock, workspace=state.workspace)
         for one in jobs.history(workspace=state.workspace)
     )
     statuses = {one.job_id: jobs.status_of(one, workspace=state.workspace) for one in history}
-    return render(
-        request,
-        "jobs.html",
-        history=history,
-        statuses=statuses,
+    return {
+        "history": history,
+        "statuses": statuses,
         # The one record (there can be at most one, the lock enforces it) whose status is
         # "running" *is* the current holder when the holder is a job this page recorded — the
         # dashboard restart case `status_of` documents reports every stale record as "ended
         # without being recorded" instead, so a Stop button here always names a job `jobs.stop`
         # can actually act on rather than one merely read off the sidecar.
-        stoppable=next((one.job_id for one in history if statuses[one.job_id] == "running"), ""),
+        "stoppable": next((one.job_id for one in history if statuses[one.job_id] == "running"), ""),
+    }
+
+
+@router.get("/jobs", response_class=HTMLResponse)
+async def index(request: Request, job: str = "", corpus: str = "", configs: str = "") -> Response:
+    state = state_of(request)
+    return render(
+        request,
+        "jobs.html",
+        **_history_context(state),
         selected=job,
         log=jobs.log_tail(job, workspace=state.workspace) if job else "",
         commands=tuple(BUILDERS),
@@ -247,14 +262,10 @@ async def stop(request: Request, job_id: str = Form(default="")) -> Response:
 
 async def _refusal(request: Request, reason: str, status: int) -> Response:
     state = state_of(request)
-    history = jobs.history(workspace=state.workspace)
-    statuses = {one.job_id: jobs.status_of(one, workspace=state.workspace) for one in history}
     page = render(
         request,
         "jobs.html",
-        history=history,
-        statuses=statuses,
-        stoppable=next((one.job_id for one in history if statuses[one.job_id] == "running"), ""),
+        **_history_context(state),
         selected="",
         log="",
         commands=tuple(BUILDERS),
