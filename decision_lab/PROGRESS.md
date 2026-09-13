@@ -99,8 +99,10 @@ Ten tasks, executed subagent-per-task with a review after each.
 - [x] **5** Runs — the §11 registry, sortable, two rows diffable
 - [x] **6** run detail — the ranking per regime, and what was not measured, with its reason
 - [x] **7** seat detail and the decision drill-down
-- [~] **8** the seat-set editor — committed at `4ba6e09`, **fix round 1 in flight, uncommitted**
-- [ ] **9** the run forms — argv builders, required budgets, the cost projection, stop
+- [x] **8** the seat-set editor — `4ba6e09`, fixed at `5918a91` (it was deleting expansion axes,
+      and every "+ seat" click silently *saved* the document instead of re-rendering the form)
+- [~] **9** the run forms — argv builders, required budgets, the cost projection, stop —
+      **written, uncommitted, gate unverified**
 - [ ] **10** `notebooks/tuning.ipynb`, the slice exit criterion, and the docs
 
 Three rules this pass added that are easy to get backwards:
@@ -195,21 +197,26 @@ the seats first" should say so on its face.
 
 ## Next step when you pick this up
 
-**You are mid-run on `slice-d-pass-2-dashboard`.** Twelve commits, `bfe4145..4ba6e09`, branched
-from `main` at `4ef58d8` plus the spec revision `e578e24` and the plan `ab1365c`. Nothing is
-merged and nothing is pushed. `git diff --stat main -- tradebot/` is empty, which is the slice's
-exit criterion, and the root `.\check.ps1` passed at the Task 3 and Task 7 boundaries.
+**You are mid-run on `slice-d-pass-2-dashboard`.** Fourteen commits, head `5918a91`, branched from
+`main` at `4ef58d8` plus the spec revision `e578e24` and the plan `ab1365c`. Nothing is merged and
+nothing is pushed. `git diff --stat main -- tradebot/` is empty, which is the slice's exit
+criterion, and the root `.\check.ps1` passed at the Task 3 and Task 7 boundaries.
 
 ### Where exactly
 
-- **Tasks 1–7: complete and independently reviewed**, each with its fix rounds closed.
-- **Task 8 (the seat-set editor): committed at `4ba6e09`, and its review found 2 Critical and 2
-  Important.** Fix round 1 is **in flight and uncommitted** — `git status` shows modified
-  `dashboard/forms.py`, `dashboard/routes/matrices.py`, `dashboard/templates/matrix_edit.html`
-  and `tests/test_lab_dashboard_edit.py`. Verify that work, commit it, and re-review before
-  moving on. The rulings on all four findings are already written in the ledger.
-- **Tasks 9 and 10: not started.** Both were pre-flighted and their plan defects already ruled on
-  in the ledger — the corrections belong in the dispatch, not in a transcription of the plan.
+- **Tasks 1–8: complete and independently reviewed**, each with its fix rounds closed. Task 8's
+  review found 2 Critical and 2 Important; all four are fixed in `5918a91` and re-reviewed.
+- **Task 9 (the run forms): written but uncommitted, and its test gate is unverified.**
+  `git status` shows modified `dashboard/routes/jobs.py` and untracked
+  `dashboard/templates/jobs.html` and `tests/test_lab_dashboard_run.py`. Two implementers failed
+  to land it and **two of their logs disagree about whether the gate passed** — so the next
+  implementer must trust neither and run the gate itself. That was escalated to a more capable
+  model; the ruling and its reasoning are in the ledger.
+- **Task 10: not started.** Pre-flighted, and the two defects found in the plan's own test code
+  are already ruled on in the ledger — including a vacuous assertion in the slice's own
+  exit-criterion test. The corrections belong in the dispatch, not in a transcription of the plan.
+- **Still owed after Task 10:** the final root `.\check.ps1`, the `tradebot/` diff check, and the
+  whole-branch review with one fix wave and one scoped re-review.
 
 ### How to resume
 
@@ -232,11 +239,18 @@ every interruption this run has had.
 
 - **Seven implementers have parked on a long test run.** They background the suite or
   `check.ps1` behind a monitor and then wait instead of finishing. Dispatch with
-  foreground-only verification stated explicitly, and when a child goes quiet, check whether it is
-  *dead* rather than slow — no python process, and a log whose last line stops advancing.
-- **The session rate limit has killed the controller and its implementer simultaneously, four
+  foreground-only verification stated explicitly — as *two* commands, the targeted file then
+  `pytest decision_lab/tests -q`, split by file if one call cannot hold it — and when a child goes
+  quiet, check whether it is *dead* rather than slow: no python process, and a log whose last line
+  stops advancing.
+- **The session rate limit has killed the controller and its implementer simultaneously, seven
   times.** Nothing to do but resume after the reset — which is cheap precisely because the ledger
   is current. Keep it that way: a line before and after every dispatch, not only at completion.
+- **Never grep or tail an agent's `.output` file.** They are full JSONL transcripts and reading one
+  floods the context. Only plain bash-command logs are safe to read.
+- **A half-finished task leaves its work in the tree, and that is the normal case here.** Four of
+  the ten tasks were inherited that way. The next implementer verifies, finishes and commits what
+  is there; it does not start over.
 
 ### After this branch lands
 
