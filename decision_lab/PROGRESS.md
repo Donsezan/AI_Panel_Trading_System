@@ -16,7 +16,7 @@ Slice order and rationale: §18.
 | **A** — integrity, day set, corpus | verified history + a frozen set of decision contexts | ✅ shipped |
 | **B** — regimes, scoring, per-seat, report | *how did this panel do, and which seat carried it* | ✅ shipped |
 | **C** — the sweep | *is a **different** panel right more often* — the stated goal | ✅ shipped |
-| **D** — calibration + dashboard | normal day / shock day / six-month profit run | 🟡 pass 1 shipped |
+| **D** — calibration + dashboard | normal day / shock day / six-month profit run | 🟡 pass 1 shipped, pass 2 in flight |
 | **E** — news archive | shock days measure the *news*, not just the price move | ⬜ not started |
 
 **Three slices of five, and pass 1 of the fourth.** Comparing configurations — the thing the tool
@@ -25,8 +25,15 @@ matrix and a per-candidate seat breakdown. And it no longer runs *unchecked*: a 
 until the seats have been calibrated over nine pinned days.
 
 Slice D is split into two passes. **Pass 1 — the three calibration scenarios and the §10.6 gate —
-has shipped**, all nine tasks, merged to `main`. **Pass 2 — the dashboard and the notebook — has
-not started**, and E (news) is untouched.
+has shipped**, all nine tasks, merged to `main`. **Pass 2 — the dashboard and the notebook — is
+half-built on the branch `slice-d-pass-2-dashboard`** and is not merged; E (news) is untouched.
+
+**Pass 2 is no longer the read-only surface §12 first specified.** That was reversed deliberately
+and the spec records the reversal at §12.1: the tool exists to find a better panel, and a loop
+that means editing TOML in one window, running a command in a second and reading Markdown in a
+third is a loop nobody closes. The dashboard is now **three surfaces over one shell** — read a
+result, build a seat set, run it. What the reversal did *not* license is unchanged: no authority
+over the bot, no promotion authority, no automatic search.
 
 ---
 
@@ -75,14 +82,39 @@ Two passes; pass 1 is nine tasks, all of them done.
 - [x] `calibrate long` — the six-month run and its report
 - [x] Slice exit criterion end to end, and the docs
 
-**Pass 2 — the dashboard** (not started)
-
-- [ ] Its own read-only ASGI app, own port, own token; `notebooks/tuning.ipynb`
-
 Scenarios 1 and 2 are **the existing sweep pointed at the nine pinned days** — `sweep.run` already
 takes a `Sample`, so the cache, the budget ceiling, resume and the §7.7 substitute policy are
 inherited rather than rewritten. Only scenario 3 is a different instrument: its own
 `BacktestHarness` pass, its own ledger, its own workspace database.
+
+**Pass 2 — read, edit, run** 🟡 on branch `slice-d-pass-2-dashboard`, **not merged**
+
+Planned in [docs/superpowers/plans/2026-09-06-decision-lab-slice-d-pass-2-dashboard.md](../docs/superpowers/plans/2026-09-06-decision-lab-slice-d-pass-2-dashboard.md).
+Ten tasks, executed subagent-per-task with a review after each.
+
+- [x] **1** `analysis.py` — one read assembly, shared by the CLI, the dashboard and the notebook
+- [x] **2** `matrices.py` — seat sets as versioned TOML in the workspace, and a TOML writer
+- [x] **3** `jobs.py` — the OS advisory lock and the child-process launcher; CLI exit 7
+- [x] **4** the shell — own token, own cookie name, pure-ASGI auth, the derivation cache
+- [x] **5** Runs — the §11 registry, sortable, two rows diffable
+- [x] **6** run detail — the ranking per regime, and what was not measured, with its reason
+- [x] **7** seat detail and the decision drill-down
+- [~] **8** the seat-set editor — committed at `4ba6e09`, **fix round 1 in flight, uncommitted**
+- [ ] **9** the run forms — argv builders, required budgets, the cost projection, stop
+- [ ] **10** `notebooks/tuning.ipynb`, the slice exit criterion, and the docs
+
+Three rules this pass added that are easy to get backwards:
+
+- **A run started from the page is a child process of this tool's own CLI.** The page cannot
+  diverge from the command, a six-month `calibrate long` never blocks the event loop serving the
+  page, and Stop is a real termination. Every refusal it renders is an exit code the CLI already
+  had.
+- **One writer at a time, through an OS advisory lock — never a pid file.** The OS releases it when
+  the holder dies, and there is no portable way to ask whether a pid is alive: on Windows
+  `os.kill(pid, 0)` *terminates* the process. The CLI takes the same lock and refuses with exit 7.
+- **The lab's session cookie has its own name.** Cookies are not port-scoped, so a lab app setting
+  `tradebot_session` on `127.0.0.1` would overwrite the bot dashboard's cookie on another port and
+  log the operator out of the surface holding the kill switch.
 
 ## Slice E — news archive ⬜
 
@@ -110,6 +142,14 @@ inherited rather than rewritten. Only scenario 3 is a different instrument: its 
 .venv\Scripts\python.exe -m decision_lab sweep --corpus <id> --configs decision_lab\config\sweep-stub.toml --budget 1
 .venv\Scripts\python.exe -m decision_lab sweep --corpus <id> --budget 40   # needs OPENROUTER_API_KEY
 .\decision_lab\check.ps1
+```
+
+On the `slice-d-pass-2-dashboard` branch only, the tuning surface serves as well. Its token is its
+own — never the bot's — and it refuses to start without one:
+
+```powershell
+$env:DECISION_LAB_DASHBOARD_TOKEN = "at-least-sixteen-characters"
+.venv\Scripts\python.exe -m decision_lab dashboard --port 8788   # --allow-remote to leave loopback
 ```
 
 **`sweep` and `calibrate long` now refuse with exit 6** until both calibration halves have passed
@@ -144,24 +184,69 @@ the seats first" should say so on its face.
   opened by `sweep-stub.toml`, and a stub matrix can never satisfy a real matrix's gate — the
   bindings feed `panel_digest` → `matrix_digest`, which is a third of the key. The first real
   `sweep` will therefore need its own `calibrate normal` and `calibrate shock` first.
-- **The dashboard and `notebooks/tuning.ipynb` are pass 2** and are not started. Everything slice
-  D produces today is read as Markdown under `decision_lab/reports/` or as JSON in the workspace.
+- **On `main`, everything slice D produces is read as Markdown** under `decision_lab/reports/` or
+  as JSON in the workspace. The dashboard exists only on the pass-2 branch.
+- **`calibrate long` has no `--budget` and no mid-run ceiling.** Found while planning pass 2:
+  scenario 3 drives `BacktestHarness` directly, with no engine seam to meter, so the only ceiling
+  is the operator stopping it — and stopping it means deleting that run's directory before it can
+  run again, because the database it leaves behind is the record of why the pass failed. The
+  dashboard's form says so rather than implying a ceiling that does not exist; the CLI says
+  nothing, which is a gap worth closing.
 
 ## Next step when you pick this up
 
-**Slice D pass 1 is merged to `main`** (merge commit `5c65068`), unpushed. Both gates passed on
-the merged result — decision_lab 703, root 2848 with every coverage gate met — and
-`git diff --stat main -- tradebot/` is empty. What is left, in the order it is worth doing:
+**You are mid-run on `slice-d-pass-2-dashboard`.** Twelve commits, `bfe4145..4ba6e09`, branched
+from `main` at `4ef58d8` plus the spec revision `e578e24` and the plan `ab1365c`. Nothing is
+merged and nothing is pushed. `git diff --stat main -- tradebot/` is empty, which is the slice's
+exit criterion, and the root `.\check.ps1` passed at the Task 3 and Task 7 boundaries.
 
-1. **Calibrate against a real panel and then sweep it.** This is the first thing here that has
-   ever needed `OPENROUTER_API_KEY`, and the cost projection on the calibration page is what tells
-   you what the sweep after it will cost — that is the whole point of running the nine days first.
-2. **Slice D pass 2** — the read-only dashboard and `notebooks/tuning.ipynb`, or
-3. **Slice E** — the news archive, which is the only part of this design that touches `tradebot`
-   at all, and whose seam and guard tests are one commit and never two.
+### Where exactly
+
+- **Tasks 1–7: complete and independently reviewed**, each with its fix rounds closed.
+- **Task 8 (the seat-set editor): committed at `4ba6e09`, and its review found 2 Critical and 2
+  Important.** Fix round 1 is **in flight and uncommitted** — `git status` shows modified
+  `dashboard/forms.py`, `dashboard/routes/matrices.py`, `dashboard/templates/matrix_edit.html`
+  and `tests/test_lab_dashboard_edit.py`. Verify that work, commit it, and re-review before
+  moving on. The rulings on all four findings are already written in the ledger.
+- **Tasks 9 and 10: not started.** Both were pre-flighted and their plan defects already ruled on
+  in the ledger — the corrections belong in the dispatch, not in a transcription of the plan.
+
+### How to resume
+
+The run is driven by `superpowers:subagent-driven-development`, controller in a subagent so the
+main session stays clean. Two files carry everything:
+
+- `.superpowers/sdd/2026-09-06-decision-lab-slice-d-pass-2-dashboard/progress.md` — the ledger:
+  the pre-flight conflict scan, every ruling made and what each costs if wrong, and a
+  `Task N: complete` line per finished task. **Trust it and `git log` over any recollection.**
+- `.../handover.md` — the running summary, updated as each task closed.
+
+A fresh session resumes by reading those two, checking `git status` and `git log`, and dispatching
+the next step. A dirty tree means an implementer died mid-task: its work is inherited, and the
+next implementer verifies, finishes and commits it rather than starting over.
+
+### What has actually gone wrong, so you can avoid it
+
+Neither failure has been in the work; both are operational, and between them they account for
+every interruption this run has had.
+
+- **Seven implementers have parked on a long test run.** They background the suite or
+  `check.ps1` behind a monitor and then wait instead of finishing. Dispatch with
+  foreground-only verification stated explicitly, and when a child goes quiet, check whether it is
+  *dead* rather than slow — no python process, and a log whose last line stops advancing.
+- **The session rate limit has killed the controller and its implementer simultaneously, four
+  times.** Nothing to do but resume after the reset — which is cheap precisely because the ledger
+  is current. Keep it that way: a line before and after every dispatch, not only at completion.
+
+### After this branch lands
+
+1. **Calibrate against a real panel and then sweep it.** The first thing here that has ever needed
+   `OPENROUTER_API_KEY`, and the cost projection on the calibration page is what tells you what
+   the sweep after it will cost — the whole point of running the nine days first.
+2. **Slice E** — the news archive, the only part of this design that touches `tradebot` at all,
+   and whose seam and guard tests are one commit and never two.
 
 Pass 1 was written across two sessions and **carries no independent task review for tasks 4–9** —
-the reviewing agents in session 1 stalled, and session 2 was executed directly. The full ledger of
-every ruling made along the way and what each costs if wrong is in
+the reviewing agents in session 1 stalled, and session 2 was executed directly. Its ledger is
 `.superpowers/sdd/2026-09-05-decision-lab-slice-d-calibration/progress.md`; the diffs worth a
 second pair of eyes are `2554c00..8408d86`.
