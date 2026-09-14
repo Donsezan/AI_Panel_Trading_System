@@ -26,7 +26,7 @@ calibrated over nine pinned days.
 
 Slice D is split into two passes. **Pass 1 — the three calibration scenarios and the §10.6 gate —
 has shipped**, all nine tasks, merged to `main`. **Pass 2 — the dashboard and the notebook — has
-shipped, all ten tasks**, on the branch `slice-d-pass-2-dashboard`, not yet merged. E (news) is
+shipped too, all ten tasks, and is merged to `main`.** E (news) is the only slice left, and it is
 untouched.
 
 **Pass 2 is no longer the read-only surface §12 first specified.** That was reversed deliberately
@@ -88,7 +88,7 @@ takes a `Sample`, so the cache, the budget ceiling, resume and the §7.7 substit
 inherited rather than rewritten. Only scenario 3 is a different instrument: its own
 `BacktestHarness` pass, its own ledger, its own workspace database.
 
-**Pass 2 — read, edit, run** ✅ on branch `slice-d-pass-2-dashboard`, **not yet merged**
+**Pass 2 — read, edit, run** ✅ **merged to `main`**
 
 Planned in [docs/superpowers/plans/2026-09-06-decision-lab-slice-d-pass-2-dashboard.md](../docs/superpowers/plans/2026-09-06-decision-lab-slice-d-pass-2-dashboard.md).
 Ten tasks, executed subagent-per-task with a review after each.
@@ -154,8 +154,8 @@ Three rules this pass added that are easy to get backwards:
 .\decision_lab\check.ps1
 ```
 
-The tuning dashboard serves as well, on the `slice-d-pass-2-dashboard` branch (not yet merged to
-`main`). Its token is its own — never the bot's — and it refuses to start without one:
+The tuning dashboard serves as well. Its token is its own — never the bot's — and it refuses to
+start without one:
 
 ```powershell
 $env:DECISION_LAB_DASHBOARD_TOKEN = "at-least-sixteen-characters"
@@ -194,6 +194,10 @@ the seats first" should say so on its face.
   opened by `sweep-stub.toml`, and a stub matrix can never satisfy a real matrix's gate — the
   bindings feed `panel_digest` → `matrix_digest`, which is a third of the key. The first real
   `sweep` will therefore need its own `calibrate normal` and `calibrate shock` first.
+- **§9.7's `single_round` banner almost never fires**, because `_fold` zeroes swing rate and
+  marginal contribution on the round-0 row while `rounds_are_identical` compares whole rows — so a
+  round-0 row can never equal its final twin for any seat that ever swung. Pre-existing and
+  presentation-only; found by pass 2's fix wave and deliberately left alone. Detail below.
 - **`calibrate long` has no `--budget` and no mid-run ceiling.** Found while planning pass 2:
   scenario 3 drives `BacktestHarness` directly, with no engine seam to meter, so the only ceiling
   is the operator stopping it — and stopping it means deleting that run's directory before it can
@@ -201,33 +205,42 @@ the seats first" should say so on its face.
   dashboard's form says so rather than implying a ceiling that does not exist; the CLI says
   nothing, which is a gap worth closing.
 
-## Next step when you pick this up
+## How pass 2 was closed out
 
-**The branch is finished, and unmerged.** `slice-d-pass-2-dashboard`, twenty-one commits including
-this one, branched from `main` at `4ef58d8` plus the spec revision `e578e24` and the plan
-`ab1365c`. **Nothing is merged and nothing is pushed.** `git diff --stat main -- tradebot/` is
-empty, which is the slice's exit criterion.
+`slice-d-pass-2-dashboard` was merged to `main` with an explicit merge commit, matching how slices
+A, C and D-pass-1 landed. It branched from `main` at `4ef58d8` plus the spec revision `e578e24` and
+the plan `ab1365c`, and carried twenty-two commits. `git diff --stat main -- tradebot/` is empty,
+which is the slice's exit criterion, and `decision_lab/candidates.py` is byte-identical to the
+merge base — so nothing here renumbered an experiment or invalidated a stored §10.6 verdict.
 
-### Where exactly
+- **All ten tasks complete and independently reviewed**, each with its fix rounds closed. Task 8's
+  review found 2 Critical and 2 Important, all four fixed in `5918a91`. Task 9's found 0 Critical
+  and 2 Important, both fixed in `0737851`. Task 10 — the notebook, the exit criterion and the
+  docs — landed in `177dd75`.
+- **The whole-branch review returned 0 Critical, 5 Important.** Two further items were ruled in,
+  making seven, and all seven landed as one fix wave in `4d2f525`. What it changed: the slice's own
+  exit-criterion test could not tell a *ranked* candidate from one merely named in the **Not
+  measured** list; the round-0 test passed on exactly the page state that suppresses round-0 rows;
+  `jobs.py` had neither Task 8's unreadable-file guard nor the rename-atomic write the package's
+  three other writers have; the `dashboard` CLI command had no tests at all, including nothing
+  pinning its deliberate absence from `LOCKED`; `seats.rounds_are_identical` keyed across regimes
+  and so could hide round-0 rows on a false positive; and the seat-set editor rendered no control
+  for `SeatConfig.instruction`, silently deleting one on save.
+- **The scoped re-review of that wave verdicted all seven ADDRESSED, with no new breakage.** It
+  reproduced the claims rather than accepting them — running Jinja's installed `do_urlencode` to
+  confirm the exit criterion asserts on markup that actually exists, and confirming
+  `rounds_are_identical` has exactly two callers, neither feeding a digest or a gate key.
+- **Both authoritative gates green at `1f16908`**, the tree that was merged:
+  `.\decision_lab\check.ps1` — **826 passed**, mypy clean over 82 source files — and the root
+  `.\check.ps1` — **2848 passed**, all seventeen coverage gates met.
 
-- **All ten tasks are complete and independently reviewed**, each with its fix rounds closed.
-  Task 8's review found 2 Critical and 2 Important, all four fixed in `5918a91`. Task 9's found 0
-  Critical and 2 Important, both fixed in `0737851`. Task 10 — the notebook, the exit criterion
-  and the docs — landed in `177dd75`.
-- **Both authoritative gates were green at `177dd75`**, run by the controller rather than by an
-  implementer: `.\decision_lab\check.ps1` — **815 passed**, mypy clean over 81 files — and the
-  root `.\check.ps1` — **2848 passed**, all 17 coverage gates met.
-- **The whole-branch review is done: 0 Critical, 5 Important.** The controller ruled two further
-  items in, making seven, and all seven landed as one fix wave in `4d2f525`. What it changed:
-  the slice's own exit-criterion test could not tell a *ranked* candidate from one merely named in
-  the **Not measured** list; the round-0 test passed on exactly the page state that suppresses
-  round-0 rows; `jobs.py` had neither Task 8's unreadable-file guard nor the rename-atomic write
-  the package's three other writers have; the `dashboard` CLI command had no tests at all,
-  including nothing pinning its deliberate absence from `LOCKED`; `seats.rounds_are_identical`
-  keyed across regimes and so could hide round-0 rows on a false positive; and the seat-set editor
-  rendered no control for `SeatConfig.instruction`, silently deleting one on save.
-- **This file is the last commit of that wave.** After it, the branch is ready to be offered for
-  merge — a scoped re-review of the fix wave is the only thing still scheduled.
+**Three assertions on this branch were found to be vacuous and fixed** — `assert "configs" in
+response.text` (satisfied by `name="configs"` on three always-rendered forms), `assert
+rows[0].candidate_id in listing` (a sweep row carries no `candidate_id`, so this was `assert "" in
+listing`), and the exit criterion's own. Every one was a substring match against a whole rendered
+page. The defence, applied throughout the fix wave: **when asserting that a page shows a derived
+value, assert on the markup only the deriving branch emits** — `href="/runs/…/seats/…"`,
+`<td>round 0</td>` — never on the bare value.
 
 ### One thing the fix wave found and deliberately left alone
 
@@ -239,24 +252,18 @@ the stub sweep: neither expanded candidate reaches it, under the old keying or t
 pre-existing, presentation-only, and outside the seven items; it is recorded here rather than
 fixed, and the dashboard's suppression branch now has a test of its own either way.
 
-### How to resume
+### Where the run's own record lives
 
-The run was driven by `superpowers:subagent-driven-development`, controller in a subagent so the
-main session stays clean. Two files carry everything:
+Pass 2 was driven by `superpowers:subagent-driven-development`. Its ledger —
+`.superpowers/sdd/2026-09-06-decision-lab-slice-d-pass-2-dashboard/progress.md` — holds the
+pre-flight conflict scan, all twenty-three rulings with what each costs if wrong, every task
+review's findings, and a `Task N: complete` line per task. It is git-ignored scratch, so it exists
+only on the machine that ran it; `git log` is the durable record. **Trust either over recollection.**
 
-- `.superpowers/sdd/2026-09-06-decision-lab-slice-d-pass-2-dashboard/progress.md` — the ledger:
-  the pre-flight conflict scan, every ruling made and what each costs if wrong, and a
-  `Task N: complete` line per finished task. **Trust it and `git log` over any recollection.**
-- `.../handover.md` — the running summary, updated as each task closed.
+### What went wrong during the run, so the next one can avoid it
 
-A fresh session resumes by reading those two, checking `git status` and `git log`, and dispatching
-the next step. A dirty tree means an implementer died mid-task: its work is inherited, and the
-next implementer verifies, finishes and commits it rather than starting over.
-
-### What has actually gone wrong, so you can avoid it
-
-Neither failure has been in the work; both are operational, and between them they account for
-every interruption this run has had.
+None of it was in the work — all of it was operational, and between them these account for every
+interruption a nine-session run had.
 
 - **Seven implementers have parked on a long test run.** They background the suite or
   `check.ps1` behind a monitor and then wait instead of finishing. Dispatch with
@@ -287,7 +294,7 @@ every interruption this run has had.
   file a resuming session is told to trust. The ledger is only a recovery map if every line in it
   describes something that actually happened.
 
-### After this branch lands
+### What comes next
 
 1. **Calibrate against a real panel and then sweep it.** The first thing here that has ever needed
    `OPENROUTER_API_KEY`, and the cost projection on the calibration page is what tells you what
