@@ -23,6 +23,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import tempfile
 import uuid
 from collections.abc import Sequence
 from pathlib import Path
@@ -190,9 +191,19 @@ def holder(*, workspace: Path | None = None) -> Holder | None:
             _drop(handle)
             return None
     sidecar = _root(workspace) / HOLDER_FILE
+    anonymous = Holder(pid=0, argv=(), started_at=_epoch())
     if not sidecar.is_file():
-        return Holder(pid=0, argv=(), started_at=_epoch())
-    return Holder.model_validate_json(sidecar.read_text(encoding="utf-8"))
+        return anonymous
+    try:
+        return Holder.model_validate_json(sidecar.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        # The OS lock is the decision and this file is only the message, so an unreadable sidecar
+        # — a process killed mid-write, a schema an older version wrote — degrades to the same
+        # anonymous holder an absent one already produces. Raised bare it would be far worse than
+        # a missing name: `views.render` calls this on *every* page, so one bad file would take
+        # the whole surface down (Task 8's ruling, applied to this module).
+        logger.warning("unreadable lock holder, reporting the workspace as held anonymously")
+        return anonymous
 
 
 def _epoch() -> Any:
@@ -254,9 +265,25 @@ def start(
 
 
 def _write(record: JobRecord, *, workspace: Path | None) -> None:
-    record_path(record.job_id, workspace=workspace).write_text(
-        record.model_dump_json(), encoding="utf-8"
-    )
+    """Publish one job record by rename, never in place.
+
+    The same crash-safety `matrices._mint`, `registry.record` and `gate.write` already give the
+    package's other artifacts: a record written in place is one a process death truncates, and
+    `history` would then skip it — losing the job rather than the bytes of a single write. The
+    temporary file is in the target's own directory, which is what makes the replace atomic
+    rather than a copy that could itself be interrupted.
+    """
+    path = record_path(record.job_id, workspace=workspace)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(record.model_dump_json())
+        tmp_path.replace(path)  # `Path.replace` is `os.replace`: atomic on Windows and POSIX
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
 
 
 def refresh(record: JobRecord, *, clock: Clock, workspace: Path | None = None) -> JobRecord:
@@ -296,13 +323,22 @@ def stop(job_id: str, *, workspace: Path | None = None) -> bool:  # noqa: ARG001
 
 
 def history(*, limit: int = 20, workspace: Path | None = None) -> tuple[JobRecord, ...]:
+    """Every job this workspace has a record of, newest first.
+
+    A record that will not parse costs its own row and nothing else — a killed process, or a
+    schema an older version wrote, must not take the page away from an operator reading it. The
+    same ruling Task 8 made for `_reference_basket`'s unreadable `corpus.json`: this is a scan for
+    whatever is readable, never a request for one record by name.
+    """
     directory = _jobs_dir(workspace)
     if not directory.is_dir():
         return ()
-    found = [
-        JobRecord.model_validate_json(path.read_text(encoding="utf-8"))
-        for path in directory.glob("*.json")
-    ]
+    found: list[JobRecord] = []
+    for path in directory.glob("*.json"):
+        try:
+            found.append(JobRecord.model_validate_json(path.read_text(encoding="utf-8")))
+        except (ValueError, OSError):
+            logger.warning("unreadable job record, skipped", extra={"path": str(path)})
     return tuple(sorted(found, key=lambda one: one.started_at, reverse=True))[:limit]
 
 

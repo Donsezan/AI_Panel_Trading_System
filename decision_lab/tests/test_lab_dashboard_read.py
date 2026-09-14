@@ -21,6 +21,7 @@ with warnings.catch_warnings():
 from decision_lab import analysis as an
 from decision_lab import registry
 from decision_lab import scoring as sc
+from decision_lab import seats as st
 from decision_lab import sweep as sw
 from decision_lab.calibration_days import Pool
 from decision_lab.dashboard.routes import runs
@@ -217,15 +218,87 @@ def test_seat_detail_shows_round_zero_beside_the_final_vote(
     called `varied-three`. Reaching the page by following the run detail page's own link (rather
     than hardcoding that suffix format) makes the id correct by construction and proves the link
     the run detail page now owes every ranked candidate actually resolves.
+
+    Important 2: the assertion is a round-0 **table row**, never the bare string "round 0". That
+    string also appears in `seats.html`'s own banner — *"round 0 is the final vote"* — which is
+    rendered on exactly the page state where every round-0 row has been filtered *out* (`:30-32`).
+    A substring match was therefore satisfied by the one page shape that violates the rule this
+    test exists to guard. The banner's own marker is asserted absent here for the same reason, and
+    the suppressed state is driven explicitly by the test below.
     """
     run_id, _ = swept_workspace
     run_page = lab_client.get(f"/runs/{run_id}").text
-    seat_href = run_page.split(f'href="/runs/{run_id}/seats/')[1].split('"')[0]
+    debated = next(
+        href
+        for href in re.findall(rf'href="(/runs/{run_id}/seats/[^"]+)"', run_page)
+        if href.endswith("3")  # `max_rounds=3`, urlencoded — the candidate that actually debated
+    )
 
-    page = lab_client.get(f"/runs/{run_id}/seats/{seat_href}").text
+    page = lab_client.get(debated).text
 
-    assert "round 0" in page and "final" in page
+    assert "<td>round 0</td>" in page, "round 0 is a row of the table, not a sentence about it"
+    assert "<td>final</td>" in page
+    assert "<code>single_round</code>" not in page, "the suppression banner must not be showing"
     assert "swing" in page.lower() and "contribution" in page.lower()
+
+
+def test_a_single_round_candidate_is_shown_as_one_column_and_says_why(
+    lab_client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """§9.7's other half: when the two rounds really are the same, one column plus the reason.
+
+    Driven from a hand-built analysis rather than the stub sweep, because `_fold` reports swing
+    rate and marginal contribution as final-round concepts only — so a round-0 row differs from
+    its final twin in those three fields for any seat that ever swung, and no candidate of the
+    stub matrix (`max_rounds=1` included) reaches `rounds_are_identical` at all. Without this the
+    suppression branch has no test whatever, which is exactly how a substring assertion came to
+    stand in for one.
+    """
+    workspace = tmp_path / "workspace"
+    row = a_row(candidate_id="quiet")
+    registry.record(row, workspace=workspace)
+    run_id = registry.read_all(workspace=workspace)[0].run_id
+
+    def seat(label: str) -> st.SeatMetrics:
+        return st.SeatMetrics(
+            seat_id="technical", regime="NORMAL", round_label=label, turns=4, scored=4, correct=2
+        )
+
+    analysis = an.MatrixAnalysis(
+        candidates=(
+            an.CandidateAnalysis(
+                candidate_id="quiet",
+                rows={},
+                records=(),
+                scored=(
+                    sc.ScoredDecision(
+                        cycle_id="c1",
+                        as_of=datetime(2026, 1, 1, tzinfo=UTC),
+                        instrument_key="binance:BTC/USDT",
+                        regime=Pool.NORMAL,
+                        action=Action.WAIT,
+                        conviction=Decimal("0.5"),
+                        asked_for_an_order=False,
+                        holding=False,
+                        verdict=sc.Verdict.CORRECT,
+                    ),
+                ),
+                not_measured_reason="",
+                seats=(seat(st.ROUND_ZERO), seat(st.FINAL)),
+            ),
+        )
+    )
+
+    async def fake_context_for(request: object, requested_run_id: str) -> runs.RunContext:
+        return runs.RunContext(row=row, analysis=analysis)
+
+    monkeypatch.setattr(runs, "context_for", fake_context_for)
+
+    page = lab_client.get(f"/runs/{run_id}/seats/quiet").text
+
+    assert "<code>single_round</code>" in page, "the page must say why one column is shown"
+    assert "<td>round 0</td>" not in page, "and then show one column, not the same numbers twice"
+    assert "<td>final</td>" in page
 
 
 def test_seat_detail_for_an_unmeasured_candidate_says_so(

@@ -11,10 +11,12 @@ import contextlib
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from decision_lab import jobs
+from decision_lab.params import HOLDER_FILE, JOBS_DIR
 from tradebot.core.clock import ManualClock
 
 
@@ -172,3 +174,76 @@ def test_the_cli_refuses_a_locked_workspace_with_exit_seven(
         assert cli.main(["report", "--corpus", "abc"]) == cli.EXIT_BUSY
     finally:
         lock.release()
+
+
+def test_an_unreadable_job_record_is_skipped_not_a_refusal(
+    tmp_path: Path, clock: ManualClock
+) -> None:
+    """Important 3: Task 8's ruling, applied to Task 9's module.
+
+    A sidecar truncated by a killed process, or written by an older schema, must cost its own row
+    and nothing else. Parsed bare, one such file made `GET /jobs` a permanent 500 — and, through
+    `views.render`'s `holder()` call, every other page with it.
+    """
+    record = jobs.start(
+        ["dataset", "verify", "--data", str(tmp_path / "nothing")],
+        label="verify",
+        clock=clock,
+        workspace=tmp_path,
+    )
+    jobs.stop(record.job_id, workspace=tmp_path)
+    (tmp_path / JOBS_DIR / "truncated.json").write_text('{"job_id": "tru', encoding="utf-8")
+
+    found = jobs.history(workspace=tmp_path)
+
+    assert [one.job_id for one in found] == [record.job_id], "the readable record still lists"
+
+
+def test_an_unreadable_holder_sidecar_still_reports_the_workspace_as_held(
+    tmp_path: Path, clock: ManualClock
+) -> None:
+    """The OS lock is the decision and the sidecar is only the message (this module's docstring).
+
+    An unparseable sidecar must therefore degrade to the same anonymous holder an absent one
+    already produces — never to `None`, which would report a held workspace as free, and never to
+    an exception, which would take down every page `views.render` touches.
+    """
+    lock = jobs.WorkspaceLock(workspace=tmp_path)
+    lock.acquire(("sweep", "--corpus", "abc"), clock=clock)
+    try:
+        (tmp_path / HOLDER_FILE).write_text("{ not json at all", encoding="utf-8")
+
+        found = jobs.holder(workspace=tmp_path)
+
+        assert found is not None, "the lock is still held; only the name of the holder is lost"
+        assert found.argv == ()
+    finally:
+        lock.release()
+
+
+def test_a_job_record_is_published_by_rename_never_written_in_place(
+    tmp_path: Path, clock: ManualClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Important 3(b): the same crash-safety `matrices._mint`, `registry.record` and `gate.write`
+    already have. A record written in place is one a process death truncates, and the reader above
+    would then skip it — losing the job rather than the bytes of one write.
+
+    Asserted by failing the publish *after* the payload is written: the target must be untouched,
+    which is only true of a write that lands in a temporary file first.
+    """
+    first = jobs.JobRecord(
+        job_id="abc123", argv=("sweep",), started_at=clock.now(), exit_code=0, pid=1
+    )
+    jobs._write(first, workspace=tmp_path)
+    path = jobs.record_path("abc123", workspace=tmp_path)
+    original = path.read_text(encoding="utf-8")
+
+    def _dies(self: Path, target: Any) -> None:
+        raise OSError("interrupted between the write and the rename")
+
+    monkeypatch.setattr(Path, "replace", _dies)
+    with pytest.raises(OSError):
+        jobs._write(first.model_copy(update={"exit_code": 7}), workspace=tmp_path)
+
+    assert path.read_text(encoding="utf-8") == original, "a failed publish leaves the record whole"
+    assert not list(path.parent.glob(".*.tmp")), "and leaves no temporary file behind"

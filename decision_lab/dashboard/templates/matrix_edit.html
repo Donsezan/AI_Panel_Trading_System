@@ -92,6 +92,15 @@ against the dataset you intend to sweep. A sweep will refuse until they have.
         <label>model <input type="text" name="candidates.{{ c }}.seats.{{ s }}.model" value="{{ seat.get('model', '') }}"></label>
         <label>evidence (comma-separated) <input type="text" name="candidates.{{ c }}.seats.{{ s }}.evidence" value="{{ seat.get('evidence', []) | join(', ') }}"></label>
         <label>prompt (library name) <input type="text" name="candidates.{{ c }}.seats.{{ s }}.prompt" value="{{ seat.get('prompt', '') }}"></label>
+        {# `SeatConfig.instruction` is operator-authored, versioned text that sits above the rules
+           it cannot relax (CLAUDE.md, Phase 4) — so a hand-authored matrix can carry one even
+           though nothing this editor writes ever produces it, and an editor that did not render
+           it would delete it on the first save. A **textarea**, and its value is its element
+           *body*: a control copied from the inputs above would render an empty box that still
+           posts its name, which is the same deletion one step quieter (controller ruling, 7). #}
+        <label>instruction
+          <textarea name="candidates.{{ c }}.seats.{{ s }}.instruction" rows="3" cols="80">{{ seat.get('instruction', '') }}</textarea>
+        </label>
         <label><input type="checkbox" name="candidates.{{ c }}.seats.{{ s }}.devils_advocate" {% if seat.get("devils_advocate") %}checked{% endif %}> devil's advocate</label>
 
         {% for fallback in seat.get("fallbacks", []) %}

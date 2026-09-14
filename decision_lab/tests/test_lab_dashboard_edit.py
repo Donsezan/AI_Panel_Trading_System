@@ -204,6 +204,31 @@ def test_a_non_default_decision_mode_and_a_generic_expand_axis_survive_the_round
     _assert_round_trips(lab_client, tmp_path, document, "mine-augmented")
 
 
+def test_a_seats_standing_instruction_survives_the_round_trip(
+    lab_client: TestClient, tmp_path: Path
+) -> None:
+    """Controller ruling, item 7: the editor rendered no `instruction` control at all.
+
+    `SeatConfig.instruction` is operator-authored, versioned text and the whole mechanism for
+    comparing two wordings (CLAUDE.md, Phase 4). No shipped matrix sets it and no fixture carried
+    one, so nothing caught that opening a hand-authored matrix which *did* and pressing Save
+    deleted it silently — the `_panel.html` hazard arriving through a field the editor's own
+    output never produces.
+
+    The second half is what `name=` alone cannot prove: a textarea's value is its element **body**,
+    so a control copied from the neighbouring `<input …value="…">` would render an empty box that
+    still posts its name and clears the instruction on the very next save.
+    """
+    document = tomllib.loads((SHIPPED / "sweep-stub.toml").read_text(encoding="utf-8"))
+    wording = "Weigh funding and open interest before the trend, and name the invalidation level."
+    document["candidates"][0]["seats"][0]["instruction"] = wording
+    _assert_round_trips(lab_client, tmp_path, document, "mine-instructed")
+
+    page = lab_client.get("/matrices/mine-instructed").text
+    body = page.split('name="candidates.0.seats.0.instruction"')[1].split("</textarea>")[0]
+    assert wording in body, "the stored wording must be the textarea's body, not a lost value"
+
+
 def _assert_round_trips(
     lab_client: TestClient, tmp_path: Path, document: dict[str, Any], name: str
 ) -> None:

@@ -9,11 +9,22 @@ line the plan first proposed: `_registry_row` (`cli.py`) never sets `candidate_i
 so that assertion is `"" in listing` — true of every possible page, and the least useful test in
 the suite would have proven nothing. Part (a) below asserts the run is findable on the Runs list
 by its `run_id` (real: `runs.html` renders it into the compare and detail links, never
-unconditionally elsewhere). Part (b) follows the detail link and asserts one of the *expanded*
-candidate ids the sweep actually produced (`varied-three~max_rounds=...`) appears in the ranking
-table — real too: nothing in `run_detail.html` or the macros it imports names "varied-three"
-outside `_tables.regime_table`'s per-row loop, and that loop renders only when a candidate was
-actually ranked in that regime.
+unconditionally elsewhere).
+
+Part (b) follows the detail link, and Important 1 corrected what it asserts there. The earlier
+claim — that nothing on that page names "varied-three" outside `_tables.regime_table`'s per-row
+loop — was simply false: `run_detail.html:79-84` renders `{{ one.candidate_id }}` for every entry
+in `analysis.not_measured`. So a sweep that exited 0 having measured *nothing* still rendered the
+"NORMAL" heading (the regime loop at `:38` is unconditional), "gate skipped" and "plumbing check"
+(off the registry row at `:23-24`), and both expanded candidate ids — in the **Not measured**
+list. All four assertions passed on a run that measured nothing, which is the whole of what this
+file exists to rule out.
+
+What only the ranking loop emits is the *seats link* `_tables.html:17` builds inside
+`{% for row in rows %}`, and nothing else on the page carries an `href` into `/seats/` at all.
+That is what is asserted, together with the absence of the Not-measured heading — the two halves
+of "this candidate was ranked" rather than "this candidate was named". The `=` of the expanded id
+reaches the markup as `%3D`, because the template urlencodes the id into the path.
 """
 
 from __future__ import annotations
@@ -92,12 +103,16 @@ def test_build_a_seat_set_run_it_and_read_its_ranking(
     listing = lab_client.get("/").text
     assert rows[0].run_id in listing
 
-    # (b) following that link, the ranking names one of the expanded candidates the stub matrix's
-    #     `[expand] max_rounds = [1, 3]` actually produced — not `rows[0].candidate_id`, which a
-    #     sweep row never sets, and not rendered anywhere on this page outside the per-candidate
-    #     row of `_tables.regime_table`, which is empty unless a candidate was actually ranked.
+    # (b) following that link, the *ranking* carries one of the expanded candidates the stub
+    #     matrix's `[expand] max_rounds = [1, 3]` actually produced. Asserted on the seats link
+    #     `_tables.regime_table` builds inside its per-row loop — the only `href` into `/seats/`
+    #     anywhere on this page — and never on the bare candidate id, which the Not-measured list
+    #     renders just as readily for a candidate that scored nothing at all (Important 1).
     detail = lab_client.get(f"/runs/{rows[0].run_id}").text
     assert "NORMAL" in detail
     assert "gate skipped" in detail.lower()
     assert "plumbing check" in detail.lower()
-    assert "varied-three~max_rounds=" in detail, "the stub matrix's expanded candidate is ranked"
+    assert f'href="/runs/{rows[0].run_id}/seats/varied-three~max_rounds%3D' in detail, (
+        "the stub matrix's expanded candidate is ranked, not merely named"
+    )
+    assert "Not measured" not in detail, "every candidate produced a scored decision"

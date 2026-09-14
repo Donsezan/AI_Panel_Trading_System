@@ -18,6 +18,7 @@ with warnings.catch_warnings():
 
 from decision_lab import jobs
 from decision_lab.dashboard.routes import jobs as jobs_routes
+from decision_lab.params import HOLDER_FILE, JOBS_DIR
 from tradebot.core.errors import ConfigError
 
 
@@ -208,3 +209,40 @@ def test_the_projection_says_so_when_nothing_has_been_calibrated(
 def test_the_projection_with_no_corpus_named_asks_for_one(lab_client: TestClient) -> None:
     """The bare page must not read as 'nothing has been calibrated' — it asked nothing yet."""
     assert "Name a corpus and a seat set" in lab_client.get("/jobs").text
+
+
+def test_an_unreadable_job_record_does_not_take_the_page_down(
+    lab_client: TestClient, tmp_path: Path
+) -> None:
+    """Important 3, at the surface: one bad sidecar must cost its own row, not the whole page.
+
+    `jobs.history` is read by `GET /jobs`, and `jobs.holder` by `views.render` on *every* page —
+    so parsed bare, a truncated `jobs/*.json` or an unreadable `.run.holder.json` made the entire
+    dashboard a 500 until someone found and deleted the file by hand.
+
+    The lock is genuinely held for the duration, because `holder` probes the OS lock first and
+    returns before it ever opens the sidecar on a free workspace: corrupting that file without
+    holding the lock would assert nothing at all about the parse this test exists to cover.
+    """
+    from datetime import UTC, datetime
+
+    from tradebot.core.clock import ManualClock
+
+    workspace = tmp_path / "workspace"
+    (workspace / JOBS_DIR).mkdir(parents=True, exist_ok=True)
+    (workspace / JOBS_DIR / "truncated.json").write_text('{"job_id": "tr', encoding="utf-8")
+
+    lock = jobs.WorkspaceLock(workspace=workspace)
+    lock.acquire(("sweep",), clock=ManualClock(datetime(2026, 9, 6, tzinfo=UTC)))
+    try:
+        (workspace / HOLDER_FILE).write_text("{ not json at all", encoding="utf-8")
+        assert jobs.holder(workspace=workspace) is not None, "the fixture must hold the lock"
+
+        listing = lab_client.get("/jobs")
+        elsewhere = lab_client.get("/")
+    finally:
+        lock.release()
+
+    assert listing.status_code == 200, listing.text
+    assert "Name a corpus and a seat set" in listing.text, "the page rendered, not an error body"
+    assert elsewhere.status_code == 200, "every page calls `holder()` through `views.render`"

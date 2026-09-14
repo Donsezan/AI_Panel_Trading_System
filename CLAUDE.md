@@ -397,9 +397,15 @@ Rules that are easy to get backwards:
 - **An edit mints a new `matrix_digest`**, a third of the §10.6 gate key, so a saved seat set is
   uncalibrated until the nine days run again — said at the moment of saving, not discovered as an
   exit 6.
-- **The editor renders every field of the document**, because the form round-trips the whole
-  thing and a control that stopped being rendered would delete that part of the seat set on the
-  next save — the `_panel.html` hazard, one level up.
+- **The editor renders every field a stored seat set can carry**, because the form round-trips the
+  whole thing and a control that stopped being rendered would delete that part of the seat set on
+  the next save — the `_panel.html` hazard, one level up. `SeatConfig.instruction` is the one that
+  was missed, and it is a `<textarea>` whose value is its element **body**: nothing the editor
+  itself writes ever produces an instruction, so only a hand-authored matrix carried one and no
+  fixture caught its deletion. The single deliberate omission is `SeatConfig.temperature`
+  (`forms.py`), and it is safe only because `matrices.dumps` refuses a float outright, naming the
+  path — so no document the store can serve ever holds one, and the failure is a refusal rather
+  than a silent deletion.
 - **`analysis.py` is the one read assembly**, shared by the CLI, the dashboard and the notebook.
   A second one would be §14's rejected second `report` command arriving through another door.
 - **The derivation cache keys on the rows files' size and mtime**, so a running job invalidates
