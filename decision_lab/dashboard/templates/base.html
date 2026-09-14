@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}decision_lab{% endblock %}</title>
+  <link rel="stylesheet" href="/static/app.css">
+  {# §12.4: the only refresh on the whole surface, and only while a run is writing. #}
+  {% if busy %}<meta http-equiv="refresh" content="5">{% endif %}
+</head>
+<body>
+<header>
+  <nav>
+    <a href="/">Runs</a>
+    <a href="/matrices">Seat sets</a>
+    <a href="/jobs">Runs in progress</a>
+    <a href="/logout">Log out</a>
+  </nav>
+  {% if busy %}
+  <p class="busy">Running <code>{{ busy.argv | join(" ") }}</code> since {{ busy.started_at | moment }} (pid {{ busy.pid }}).</p>
+  {% endif %}
+</header>
+<main>
+  {% block content %}{% endblock %}
+</main>
+<footer><p>{{ disclaimer }}</p></footer>
+</body>
+</html>

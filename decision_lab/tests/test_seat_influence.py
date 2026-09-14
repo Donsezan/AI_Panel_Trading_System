@@ -135,3 +135,41 @@ def test_single_round_reports_the_two_as_identical() -> None:
         votes, truth=sc.Truth.BUY, regime=Pool.NORMAL, panel=panel("a", "b"), instrument_key=KEY
     )
     assert st.rounds_are_identical(rows) is True
+
+
+def test_one_regime_agreeing_does_not_speak_for_the_others() -> None:
+    """Controller ruling, item 6: the round-0-vs-final check is per regime, not per seat.
+
+    `rounds_are_identical` keyed `zero` and `final` by `seat_id` alone across every regime at
+    once, so one seat's rows overwrote each other and only the last regime placed survived the
+    comparison. A thin `SHOCK_DOWN` in which debate happened to change nothing therefore made the
+    whole candidate read as `single_round` — and both readers of this answer (`render._seat_tables`
+    and the dashboard's `seats.html`) then *suppress every round-0 row*, so a genuinely debated
+    `NORMAL` block is shown as one column, which is the one thing §9.7 exists to prevent.
+
+    NORMAL here is debated (WAIT in round 0, BUY in the final round); SHOCK_DOWN carries a single
+    round, so its two labels are identical by construction. Asserted in both concatenation orders
+    because the answer is a property of the rows, never of the order they arrive in: `_fold` emits
+    them sorted by regime, so the buggy keying survived on the alphabetically-last regime alone.
+    """
+    debated = st.score_seats_for_instrument(
+        [
+            response("a", Action.WAIT, round_index=0),
+            response("a", Action.BUY, round_index=1),
+        ],
+        truth=sc.Truth.BUY,
+        regime=Pool.NORMAL,
+        panel=panel("a", "b"),
+        instrument_key=KEY,
+    )
+    single = st.score_seats_for_instrument(
+        [response("a", Action.BUY, round_index=0)],
+        truth=sc.Truth.BUY,
+        regime=Pool.SHOCK_DOWN,
+        panel=panel("a", "b"),
+        instrument_key=KEY,
+    )
+
+    assert st.rounds_are_identical(single) is True, "the fixture's quiet regime really is single"
+    assert st.rounds_are_identical(debated + single) is False
+    assert st.rounds_are_identical(single + debated) is False

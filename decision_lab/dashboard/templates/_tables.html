@@ -1,0 +1,57 @@
+{# `run_id` is threaded through so every ranked candidate links to its own seat page (§9.7,
+   §12.2's drill-down) — a page nothing points at is unreachable by navigation alone. #}
+{% macro regime_table(rows, run_id) %}
+  {% if not rows %}
+    <p class="empty">No candidate was measured in this regime.</p>
+  {% else %}
+  <table>
+    <thead><tr>
+      <th>candidate</th><th>scored</th><th>accuracy</th><th>action rate</th>
+      <th>precision on action</th><th>conviction gap</th><th>regret / decision</th>
+      <th>degraded</th><th>cost</th><th>cost / scored</th>
+    </tr></thead>
+    <tbody>
+    {% for row in rows %}
+      <tr>
+        <td>
+          <a href="/runs/{{ run_id }}/seats/{{ row.candidate_id | urlencode }}">
+            <code>{{ row.candidate_id }}</code>
+          </a>
+        </td>
+        <td>{{ row.scored | count }}</td>
+        <td>{{ row.accuracy | percent }}</td>
+        <td>{{ row.action_rate | percent }}</td>
+        <td>{{ row.precision_on_action | percent }}</td>
+        <td>{{ row.mean_conviction_gap | money(3) }}</td>
+        <td>{{ row.regret_per_decision | money(3) }}</td>
+        <td>{{ row.degradation_rate | percent }}</td>
+        <td>{{ row.cost_usd | money }}</td>
+        <td>{{ row.cost_per_scored | money(4) }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+{% endmacro %}
+
+{# §9.4: unscorable is a verdict with a reason, never a drop. A regime with no unscored
+   decisions still gets its row, so an empty cell reads as zero rather than as unmeasured. #}
+{% macro unscored_table(regimes) %}
+<table>
+  <thead><tr><th>regime</th><th>decisions</th><th>scored</th><th>unscored, by reason</th></tr></thead>
+  <tbody>
+  {% for regime in regimes %}
+    <tr>
+      <td>{{ regime.regime }}</td>
+      <td>{{ regime.decisions | count }}</td>
+      <td>{{ regime.scored | count }}</td>
+      <td>
+        {% if regime.unscored %}
+          {% for reason, number in regime.unscored | dictsort %}{{ reason }}: {{ number }}{% if not loop.last %} · {% endif %}{% endfor %}
+        {% else %}0{% endif %}
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endmacro %}

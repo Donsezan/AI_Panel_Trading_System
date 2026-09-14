@@ -206,6 +206,11 @@ def corpus_with_entries(
     return Corpus(meta=meta, entries=entries)
 
 
+def stub_matrix_file() -> Path:
+    """The shipped plumbing-check matrix. Offline, free, and a real `load_matrix` input."""
+    return Path(__file__).resolve().parents[1] / "config" / "sweep-stub.toml"
+
+
 def _reference_basket() -> Basket:
     return Basket(
         basket_id="reference",

@@ -204,12 +204,20 @@ def score_seats_for_instrument(
 
 def rounds_are_identical(rows: Sequence[SeatMetrics]) -> bool:
     """§9.7: under `single_round` the two are the same, and the report says so rather than
-    printing the same numbers twice."""
-    zero = {r.seat_id: r for r in rows if r.round_label == ROUND_ZERO}
-    final = {r.seat_id: r for r in rows if r.round_label == FINAL}
+    printing the same numbers twice.
+
+    Keyed by `(regime, seat_id)`, because a row's identity is both: `_fold` emits one row per
+    (seat, regime, round label), so keying by `seat_id` alone let one seat's regimes overwrite
+    each other and left only the alphabetically-last one actually compared. A thin `SHOCK_DOWN`
+    in which debate happened to change nothing then made the whole candidate read as
+    `single_round`, and both readers of this answer — `render._seat_tables` and the dashboard's
+    `seats.html` — suppress every round-0 row when it is true, hiding a genuinely debated `NORMAL`
+    block behind one column.
+    """
+    zero = {(r.regime, r.seat_id): r for r in rows if r.round_label == ROUND_ZERO}
+    final = {(r.regime, r.seat_id): r for r in rows if r.round_label == FINAL}
     return all(
-        zero[seat_id].model_copy(update={"round_label": FINAL}) == final.get(seat_id)
-        for seat_id in zero
+        row.model_copy(update={"round_label": FINAL}) == final.get(key) for key, row in zero.items()
     )
 
 

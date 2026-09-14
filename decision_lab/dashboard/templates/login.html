@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block title %}decision_lab — sign in{% endblock %}
+{% block content %}
+<h1>decision_lab</h1>
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+<form method="post" action="/login">
+  <label>Token <input type="password" name="token" autofocus></label>
+  <button type="submit">Sign in</button>
+</form>
+{% endblock %}

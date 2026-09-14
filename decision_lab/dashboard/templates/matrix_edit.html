@@ -1,0 +1,145 @@
+{% extends "base.html" %}
+{% block title %}decision_lab — {{ name }}{% endblock %}
+{% block content %}
+{% set sweep = document.get("sweep", {}) %}
+{% set prompts = document.get("prompts", {}) %}
+{% set candidates = document.get("candidates", []) %}
+{% set expand = document.get("expand", {}) %}
+
+<h1>Seat set: {{ name }}{% if version %} (version {{ version }}){% endif %}</h1>
+
+{% if saved %}
+{# §10.6: `matrix_digest` is a third of the gate key, and an edit always mints a new one — so the
+   page says the seat set is uncalibrated at the moment it saves rather than leaving it to be
+   discovered later as an exit 6 from `sweep` or `calibrate long`. #}
+<p class="warning">Saved as version {{ saved }}. Its matrix digest is <code>{{ digest }}</code>,
+which is a third of the §10.6 gate key — so this seat set is <strong>uncalibrated</strong> until
+<code>calibrate normal</code> and <code>calibrate shock</code> have run over the nine pinned days
+against the dataset you intend to sweep. A sweep will refuse until they have.
+{% if reference_label %}Validated against {{ reference_label }}.{% endif %}</p>
+{% endif %}
+
+{% if error %}
+<p class="error">{{ error }}</p>
+{% endif %}
+
+{% if reference_label and not saved %}
+<p>Will validate against {{ reference_label }}.</p>
+{% endif %}
+
+{# §12.3: one form, the whole document. Nothing below is ever conditionally rendered — `forms.nest`
+   builds only what it is given, so a field that stopped appearing here is a field the next save
+   would delete, the `_panel.html` hazard one level up. #}
+<form method="post" action="/matrices/{{ name }}">
+
+  <fieldset>
+    <legend>Sweep policy (§7.7)</legend>
+    <label>On a substitute answering
+      <select name="sweep.on_fallback">
+        <option value="halt" {% if sweep.get("on_fallback", "halt") == "halt" %}selected{% endif %}>
+          halt — keep completed rows, stop the run
+        </option>
+        <option value="exclude" {% if sweep.get("on_fallback") == "exclude" %}selected{% endif %}>
+          exclude — drop the contaminated cycle, keep going
+        </option>
+      </select>
+    </label>
+  </fieldset>
+
+  <fieldset>
+    <legend>Prompt library</legend>
+    {% for prompt_name, prompt in prompts.items() %}
+    <label>{{ prompt_name }}
+      <textarea name="prompts.{{ prompt_name }}.text" rows="2" cols="80">{{ prompt.get("text", "") }}</textarea>
+    </label>
+    {% endfor %}
+  </fieldset>
+
+  <fieldset>
+    <legend>Candidates</legend>
+    {% for candidate in candidates %}
+    {% set c = loop.index0 %}
+    <fieldset>
+      <legend>Candidate {{ c }}</legend>
+      <label>id <input type="text" name="candidates.{{ c }}.id" value="{{ candidate.get('id', '') }}"></label>
+      <label>protocol <input type="text" name="candidates.{{ c }}.protocol" value="{{ candidate.get('protocol', '') }}"></label>
+      {# §7.1: decision_mode is one of the four matrix axes, and `Candidate.panel_digest` hashes
+         it alongside the panel (candidates.py:224). A candidate that never sets it inherits
+         whichever reference basket happened to validate it, so the digest this page reports would
+         depend on a basket the operator never chose — not on anything they edited. Rendering it
+         here, always, with a real option pre-selected, means every save carries it explicitly and
+         the reference can never reach the digest again (controller ruling, Critical 1 & 2). #}
+      <label>decision_mode
+        {% set current_mode = candidate.get("decision_mode", "per_asset") %}
+        <select name="candidates.{{ c }}.decision_mode">
+          <option value="per_asset" {% if current_mode == "per_asset" %}selected{% endif %}>per_asset — one vote per instrument</option>
+          <option value="basket" {% if current_mode == "basket" %}selected{% endif %}>basket — one vote for the whole basket</option>
+        </select>
+      </label>
+      <label>max_rounds <input type="text" name="candidates.{{ c }}.max_rounds" value="{{ candidate.get('max_rounds', '') }}"></label>
+      <label>qualified_majority <input type="text" name="candidates.{{ c }}.qualified_majority" value="{{ candidate.get('qualified_majority', '') }}"></label>
+      <label>max_abstain_fraction <input type="text" name="candidates.{{ c }}.max_abstain_fraction" value="{{ candidate.get('max_abstain_fraction', '') }}"></label>
+      <label>max_cost_usd_per_cycle <input type="text" name="candidates.{{ c }}.max_cost_usd_per_cycle" value="{{ candidate.get('max_cost_usd_per_cycle', '') }}"></label>
+      <label>providers (comma-separated) <input type="text" name="candidates.{{ c }}.providers" value="{{ candidate.get('providers', []) | join(', ') }}"></label>
+
+      {% for seat in candidate.get("seats", []) %}
+      {% set s = loop.index0 %}
+      <fieldset>
+        <legend>Seat {{ c }}.{{ s }}</legend>
+        <label>seat_id <input type="text" name="candidates.{{ c }}.seats.{{ s }}.seat_id" value="{{ seat.get('seat_id', '') }}"></label>
+        <label>role <input type="text" name="candidates.{{ c }}.seats.{{ s }}.role" value="{{ seat.get('role', '') }}"></label>
+        <label>provider_id <input type="text" name="candidates.{{ c }}.seats.{{ s }}.provider_id" value="{{ seat.get('provider_id', '') }}"></label>
+        <label>model <input type="text" name="candidates.{{ c }}.seats.{{ s }}.model" value="{{ seat.get('model', '') }}"></label>
+        <label>evidence (comma-separated) <input type="text" name="candidates.{{ c }}.seats.{{ s }}.evidence" value="{{ seat.get('evidence', []) | join(', ') }}"></label>
+        <label>prompt (library name) <input type="text" name="candidates.{{ c }}.seats.{{ s }}.prompt" value="{{ seat.get('prompt', '') }}"></label>
+        {# `SeatConfig.instruction` is operator-authored, versioned text that sits above the rules
+           it cannot relax (CLAUDE.md, Phase 4) — so a hand-authored matrix can carry one even
+           though nothing this editor writes ever produces it, and an editor that did not render
+           it would delete it on the first save. A **textarea**, and its value is its element
+           *body*: a control copied from the inputs above would render an empty box that still
+           posts its name, which is the same deletion one step quieter (controller ruling, 7). #}
+        <label>instruction
+          <textarea name="candidates.{{ c }}.seats.{{ s }}.instruction" rows="3" cols="80">{{ seat.get('instruction', '') }}</textarea>
+        </label>
+        <label><input type="checkbox" name="candidates.{{ c }}.seats.{{ s }}.devils_advocate" {% if seat.get("devils_advocate") %}checked{% endif %}> devil's advocate</label>
+
+        {% for fallback in seat.get("fallbacks", []) %}
+        {% set f = loop.index0 %}
+        <label>fallback {{ f }} provider_id <input type="text" name="candidates.{{ c }}.seats.{{ s }}.fallbacks.{{ f }}.provider_id" value="{{ fallback.get('provider_id', '') }}"></label>
+        <label>fallback {{ f }} model <input type="text" name="candidates.{{ c }}.seats.{{ s }}.fallbacks.{{ f }}.model" value="{{ fallback.get('model', '') }}"></label>
+        {% endfor %}
+
+        <button type="submit" name="add_fallback" value="{{ c }}.{{ s }}">+ fallback</button>
+        <button type="submit" name="remove_seat" value="{{ c }}.{{ s }}">remove this seat</button>
+      </fieldset>
+      {% endfor %}
+
+      <button type="submit" name="add_seat" value="{{ c }}">+ seat</button>
+      <button type="submit" name="remove_candidate" value="{{ c }}">remove this candidate</button>
+    </fieldset>
+    {% endfor %}
+    <button type="submit" name="action" value="add_candidate">+ candidate</button>
+  </fieldset>
+
+  <fieldset>
+    <legend>Expansion matrix (§7.1)</legend>
+    <label>limit <input type="text" name="expand.limit" value="{{ expand.get('limit', '') }}"></label>
+    {# Every `[expand]` key besides `limit` and `prompts` is one of §7.1's axes, and
+       `candidates._axes` (candidates.py:150-156) accepts *any* such key as a valid axis — not
+       only `max_rounds`. A hardcoded, enumerated field list here would silently delete any other
+       axis (`protocol`, `decision_mode`, …) on the next save, the very hazard this whole page
+       exists to avoid — so this loops over whatever the document actually carries (controller
+       ruling, Critical 1). #}
+    {% for axis_name, values in expand.items() if axis_name not in ("limit", "prompts") %}
+    <label>{{ axis_name }}, comma-separated (e.g. "1, 3")
+      <input type="text" name="expand.{{ axis_name }}" value="{{ values | join(', ') }}"></label>
+    {% endfor %}
+    {% for seat_id, values in expand.get("prompts", {}).items() %}
+    <label>prompts.{{ seat_id }}, comma-separated library names
+      <input type="text" name="expand.prompts.{{ seat_id }}" value="{{ values | join(', ') }}"></label>
+    {% endfor %}
+  </fieldset>
+
+  <button type="submit" name="action" value="save">Save</button>
+</form>
+{% endblock %}
