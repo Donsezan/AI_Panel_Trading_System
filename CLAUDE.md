@@ -138,6 +138,15 @@ was lost.
 .\decision_lab\check.ps1                                                      # its own format/lint/mypy/tests
 ```
 
+The tuning dashboard reads a result, builds a seat set and runs one — never the bot, never a
+promotion. Its token and its session cookie are its own, never the bot dashboard's, because
+cookies are not port-scoped:
+
+```powershell
+$env:DECISION_LAB_DASHBOARD_TOKEN = "at-least-sixteen-characters"
+.venv\Scripts\python.exe -m decision_lab dashboard --port 8788
+```
+
 `sweep` and `calibrate long` **refuse with exit 6** until both calibration halves have passed for
 that exact dataset, matrix and day set — so a sweep now needs a pinned day set where before it did
 not (`dataset days` first, or exit 3). `--skip-gate` proceeds and stamps both the report and the
@@ -233,8 +242,12 @@ could never say whether a decision was *right*, which mixes good judgement with 
 scores decisions against what the market did next, over recorded history, per regime and per seat.
 Specced in [docs/superpowers/specs/2026-08-23-decision-lab-design.md](docs/superpowers/specs/2026-08-23-decision-lab-design.md);
 five slices, of which **A (integrity, day set, corpus), B (regimes, scoring, per-seat, report),
-C (the sweep) and D pass 1 (calibration and the gate) have shipped**. D pass 2 — the read-only
-dashboard and the notebook — and E (news) are not built, and only E touches `tradebot` at all.
+C (the sweep) and D — both pass 1 (calibration and the gate) and pass 2 (the tuning dashboard and
+the notebook) — have shipped**. E (news) is not built, and it is the only slice that touches
+`tradebot` at all. Pass 2 is **not** the read-only surface §12 first specified — that was reversed
+deliberately, and §12.1 records why: a loop that means editing TOML in one window, running a
+command in a second and reading Markdown in a third is a loop nobody closes. What the reversal did
+not license is unchanged — no authority over the bot, no promotion authority, no automatic search.
 
 ```
 dataset.py             audit recorded history, repair holes, refuse an unverified dataset
@@ -368,6 +381,30 @@ Rules that are easy to get backwards:
   and sharing the directory would turn §5.4's window-mismatch refusal into a refusal of an
   unrelated command. Like a corpus it is reused at its identity and refuses to build over the
   database an interrupted pass left behind — that file is the record of why the pass failed.
+- **The dashboard is not read-only, and the spec says so at §12.1.** It configures, runs and
+  reads; what it still refuses is authority over the bot, promotion authority and automatic search.
+- **Its session cookie name is its own.** Cookies are not port-scoped, so sharing
+  `tradebot_session` would log the operator out of the surface holding the kill switch.
+- **A run from the page is a child process of this tool's own CLI**, so the page cannot diverge
+  from the command, and every refusal it renders is an exit code the command already had.
+- **One writer at a time, through an OS advisory lock** — not a pid file, because the OS releases
+  a lock when the holder dies and there is no portable way to ask whether a pid is alive:
+  `os.kill(pid, 0)` *terminates* the process on Windows. The CLI takes the same lock, exit 7.
+- **A budget is required with no default** on the commands whose CLI takes one, and the two that
+  do not name instead what actually bounds them — `corpus build`'s own `--reference-panel` choice,
+  `calibrate long`'s explicit warning that it has no mid-run ceiling, said on the page rather than
+  implied.
+- **An edit mints a new `matrix_digest`**, a third of the §10.6 gate key, so a saved seat set is
+  uncalibrated until the nine days run again — said at the moment of saving, not discovered as an
+  exit 6.
+- **The editor renders every field of the document**, because the form round-trips the whole
+  thing and a control that stopped being rendered would delete that part of the seat set on the
+  next save — the `_panel.html` hazard, one level up.
+- **`analysis.py` is the one read assembly**, shared by the CLI, the dashboard and the notebook.
+  A second one would be §14's rejected second `report` command arriving through another door.
+- **The derivation cache keys on the rows files' size and mtime**, so a running job invalidates
+  its own entry — size as well as mtime, because a one-second mtime resolution would serve a
+  stale page for the length of a write burst.
 
 ### Phase 11 — the instrument master
 

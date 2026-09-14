@@ -16,18 +16,18 @@ Slice order and rationale: §18.
 | **A** — integrity, day set, corpus | verified history + a frozen set of decision contexts | ✅ shipped |
 | **B** — regimes, scoring, per-seat, report | *how did this panel do, and which seat carried it* | ✅ shipped |
 | **C** — the sweep | *is a **different** panel right more often* — the stated goal | ✅ shipped |
-| **D** — calibration + dashboard | normal day / shock day / six-month profit run | 🟡 pass 1 shipped, pass 2 in flight |
+| **D** — calibration + dashboard | normal day / shock day / six-month profit run | ✅ shipped |
 | **E** — news archive | shock days measure the *news*, not just the price move | ⬜ not started |
 
-**Three slices of five, and pass 1 of the fourth.** Comparing configurations — the thing the tool
-was built for — now runs: N candidates over one frozen corpus, ranked, with a pairwise agreement
-matrix and a per-candidate seat breakdown. And it no longer runs *unchecked*: a sweep refuses
-until the seats have been calibrated over nine pinned days.
+**Four slices of five.** Comparing configurations — the thing the tool was built for — now runs:
+N candidates over one frozen corpus, ranked, with a pairwise agreement matrix and a per-candidate
+seat breakdown. And it no longer runs *unchecked*: a sweep refuses until the seats have been
+calibrated over nine pinned days.
 
 Slice D is split into two passes. **Pass 1 — the three calibration scenarios and the §10.6 gate —
-has shipped**, all nine tasks, merged to `main`. **Pass 2 — the dashboard and the notebook — is
-nine of its ten tasks done on the branch `slice-d-pass-2-dashboard`** and is not merged; only the
-notebook, the slice exit criterion and the docs remain. E (news) is untouched.
+has shipped**, all nine tasks, merged to `main`. **Pass 2 — the dashboard and the notebook — has
+shipped, all ten tasks**, on the branch `slice-d-pass-2-dashboard`, not yet merged. E (news) is
+untouched.
 
 **Pass 2 is no longer the read-only surface §12 first specified.** That was reversed deliberately
 and the spec records the reversal at §12.1: the tool exists to find a better panel, and a loop
@@ -66,10 +66,10 @@ Result today: [reports/decision-lab-8ac130d8f2ed5650dff0dcb9f969d07e.md](reports
 - [x] Cross-candidate tables (§9.6): ranking, agreement matrix
 - [x] `registry.py` — keep every result, so two setups are compared rather than remembered
 
-## Slice D — calibration and the dashboard 🟡
+## Slice D — calibration and the dashboard ✅
 
 Planned in [docs/superpowers/plans/2026-09-05-decision-lab-slice-d-calibration.md](../docs/superpowers/plans/2026-09-05-decision-lab-slice-d-calibration.md).
-Two passes; pass 1 is nine tasks, all of them done.
+Two passes, both now complete: pass 1 is nine tasks, pass 2 is ten.
 
 **Pass 1 — the scenarios and the gate** ✅
 
@@ -88,7 +88,7 @@ takes a `Sample`, so the cache, the budget ceiling, resume and the §7.7 substit
 inherited rather than rewritten. Only scenario 3 is a different instrument: its own
 `BacktestHarness` pass, its own ledger, its own workspace database.
 
-**Pass 2 — read, edit, run** 🟡 on branch `slice-d-pass-2-dashboard`, **not merged**
+**Pass 2 — read, edit, run** ✅ on branch `slice-d-pass-2-dashboard`, **not yet merged**
 
 Planned in [docs/superpowers/plans/2026-09-06-decision-lab-slice-d-pass-2-dashboard.md](../docs/superpowers/plans/2026-09-06-decision-lab-slice-d-pass-2-dashboard.md).
 Ten tasks, executed subagent-per-task with a review after each.
@@ -105,7 +105,13 @@ Ten tasks, executed subagent-per-task with a review after each.
 - [x] **9** the run forms — argv builders, required budgets, the cost projection, stop —
       `424ef86`, fixed at `0737851` (a vacuous assertion that passed on every possible page, and a
       refusal page that reported a finished job's status differently from the index page)
-- [ ] **10** `notebooks/tuning.ipynb`, the slice exit criterion, and the docs
+- [x] **10** `notebooks/tuning.ipynb`, the slice exit criterion, and the docs
+
+Result today: `python -m decision_lab dashboard --port 8788` serves three surfaces over one
+shell — Runs (sortable, two rows diffable), the seat-set editor, and a job launcher that starts,
+watches and stops a real child process of this tool's own CLI — plus `notebooks/tuning.ipynb`,
+which reads the same `analysis.py` through a kernel instead of a browser.
+`git diff --stat main -- tradebot/` is empty, the slice's own exit criterion.
 
 Three rules this pass added that are easy to get backwards:
 
@@ -148,8 +154,8 @@ Three rules this pass added that are easy to get backwards:
 .\decision_lab\check.ps1
 ```
 
-On the `slice-d-pass-2-dashboard` branch only, the tuning surface serves as well. Its token is its
-own — never the bot's — and it refuses to start without one:
+The tuning dashboard serves as well, on the `slice-d-pass-2-dashboard` branch (not yet merged to
+`main`). Its token is its own — never the bot's — and it refuses to start without one:
 
 ```powershell
 $env:DECISION_LAB_DASHBOARD_TOKEN = "at-least-sixteen-characters"
@@ -188,8 +194,6 @@ the seats first" should say so on its face.
   opened by `sweep-stub.toml`, and a stub matrix can never satisfy a real matrix's gate — the
   bindings feed `panel_digest` → `matrix_digest`, which is a third of the key. The first real
   `sweep` will therefore need its own `calibrate normal` and `calibrate shock` first.
-- **On `main`, everything slice D produces is read as Markdown** under `decision_lab/reports/` or
-  as JSON in the workspace. The dashboard exists only on the pass-2 branch.
 - **`calibrate long` has no `--budget` and no mid-run ceiling.** Found while planning pass 2:
   scenario 3 drives `BacktestHarness` directly, with no engine seam to meter, so the only ceiling
   is the operator stopping it — and stopping it means deleting that run's directory before it can
