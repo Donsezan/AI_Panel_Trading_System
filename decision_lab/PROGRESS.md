@@ -203,35 +203,45 @@ the seats first" should say so on its face.
 
 ## Next step when you pick this up
 
-**You are mid-run on `slice-d-pass-2-dashboard`.** Seventeen commits, head `0737851`, branched from
-`main` at `4ef58d8` plus the spec revision `e578e24` and the plan `ab1365c`. Nothing is merged and
-nothing is pushed. `git diff --stat main -- tradebot/` is empty, which is the slice's exit
-criterion, and the root `.\check.ps1` passed at the Task 3 and Task 7 boundaries.
+**The branch is finished, and unmerged.** `slice-d-pass-2-dashboard`, twenty-one commits including
+this one, branched from `main` at `4ef58d8` plus the spec revision `e578e24` and the plan
+`ab1365c`. **Nothing is merged and nothing is pushed.** `git diff --stat main -- tradebot/` is
+empty, which is the slice's exit criterion.
 
 ### Where exactly
 
-- **Tasks 1–9: complete and independently reviewed**, each with its fix rounds closed. Task 8's
-  review found 2 Critical and 2 Important, all four fixed in `5918a91`. Task 9's found 0 Critical
-  and 2 Important, both fixed in `0737851`.
-- **Task 9 (the run forms) landed, and the gate question that cost it two sessions is settled.**
-  The two contradictory logs were resolved by running the three fast stages directly against the
-  bytes on disk rather than escalating a model: `ruff format --check`, `ruff check` and `mypy` were
-  all green, and a full `pytest decision_lab/tests` against the committed `424ef86` came back
-  **809 passed, exit 0** — which is exactly the figure the *earlier* of the two disputed logs
-  reported. So that log was truthful and the later "Found 925 errors" one was false. **A later log
-  is not a newer truth**; neither is worth anything without knowing its bytes.
-- **Task 10: not started.** Pre-flighted, and the two defects found in the plan's own test code
-  are already ruled on in the ledger — including a vacuous assertion in the slice's own
-  exit-criterion test. The corrections belong in the dispatch, not in a transcription of the plan.
-- **Still owed after Task 10:** one authoritative gate — `.\decision_lab\check.ps1` **and** the root
-  `.\check.ps1` — the `tradebot/` diff check, and the whole-branch review with one fix wave and one
-  scoped re-review. No full-suite number was recorded at the Task 9 boundary, deliberately: a second
-  ten-minute run racing Task 10's implementer would have produced exactly the ambiguous-bytes
-  evidence this run exists to stop producing.
+- **All ten tasks are complete and independently reviewed**, each with its fix rounds closed.
+  Task 8's review found 2 Critical and 2 Important, all four fixed in `5918a91`. Task 9's found 0
+  Critical and 2 Important, both fixed in `0737851`. Task 10 — the notebook, the exit criterion
+  and the docs — landed in `177dd75`.
+- **Both authoritative gates were green at `177dd75`**, run by the controller rather than by an
+  implementer: `.\decision_lab\check.ps1` — **815 passed**, mypy clean over 81 files — and the
+  root `.\check.ps1` — **2848 passed**, all 17 coverage gates met.
+- **The whole-branch review is done: 0 Critical, 5 Important.** The controller ruled two further
+  items in, making seven, and all seven landed as one fix wave in `4d2f525`. What it changed:
+  the slice's own exit-criterion test could not tell a *ranked* candidate from one merely named in
+  the **Not measured** list; the round-0 test passed on exactly the page state that suppresses
+  round-0 rows; `jobs.py` had neither Task 8's unreadable-file guard nor the rename-atomic write
+  the package's three other writers have; the `dashboard` CLI command had no tests at all,
+  including nothing pinning its deliberate absence from `LOCKED`; `seats.rounds_are_identical`
+  keyed across regimes and so could hide round-0 rows on a false positive; and the seat-set editor
+  rendered no control for `SeatConfig.instruction`, silently deleting one on save.
+- **This file is the last commit of that wave.** After it, the branch is ready to be offered for
+  merge — a scoped re-review of the fix wave is the only thing still scheduled.
+
+### One thing the fix wave found and deliberately left alone
+
+`_fold` reports swing rate and marginal contribution as **final-round concepts only**, zeroing
+them on the round-0 row. `rounds_are_identical` compares whole rows, so a round-0 row can never
+equal its final twin for any seat that ever swung — which means §9.7's "say so rather than
+printing the same numbers twice" banner almost never fires, `max_rounds = 1` included. Verified on
+the stub sweep: neither expanded candidate reaches it, under the old keying or the new. That is
+pre-existing, presentation-only, and outside the seven items; it is recorded here rather than
+fixed, and the dashboard's suppression branch now has a test of its own either way.
 
 ### How to resume
 
-The run is driven by `superpowers:subagent-driven-development`, controller in a subagent so the
+The run was driven by `superpowers:subagent-driven-development`, controller in a subagent so the
 main session stays clean. Two files carry everything:
 
 - `.superpowers/sdd/2026-09-06-decision-lab-slice-d-pass-2-dashboard/progress.md` — the ledger:
