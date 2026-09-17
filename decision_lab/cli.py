@@ -20,7 +20,7 @@ import asyncio
 import logging
 import sys
 from collections.abc import Callable, Coroutine
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -41,6 +41,14 @@ from decision_lab import render as rd
 from decision_lab import scoring as sc
 from decision_lab import seats as st
 from decision_lab import sweep as sw
+from decision_lab.archive.collect import (
+    DEFAULT_BODY_RETRIES,
+    DEFAULT_PAUSE,
+    collect,
+    collect_site,
+)
+from decision_lab.archive.sites import PROFILES
+from decision_lab.archive.store import RAW_DIR, RawStore
 from decision_lab.dashboard import auth as lab_auth
 from decision_lab.dashboard import create_lab_dashboard
 from decision_lab.params import (
@@ -62,6 +70,7 @@ from tradebot.core.schema import Money
 from tradebot.dashboard.auth import assert_bind_allowed
 from tradebot.interfaces.exchange import VenueTransport
 from tradebot.marketdata.recorder import MANIFEST, ReplayDataset
+from tradebot.news.http import build_fetcher
 
 logger = get_logger("decision_lab.cli")
 
@@ -151,6 +160,45 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="add a day by hand",
     )
     days.add_argument("--verbose", action="store_true")
+
+    archive = commands.add_parser("archive", help="collect recorded news beside the dataset (§6)")
+    archive_actions = archive.add_subparsers(dest="action", required=True)
+
+    archive_build_parser = archive_actions.add_parser(
+        "build", help="crawl one year of a publisher's archive into the raw store"
+    )
+    archive_build_parser.add_argument("--data", type=Path, required=True, help="dataset directory")
+    archive_build_parser.add_argument(
+        "--source",
+        default="coindesk",
+        choices=("coindesk", *sorted(PROFILES)),
+        help="which publisher. `coindesk` is addressed by a dated year listing and honours "
+        "--since/--until; the others are Yoast sitemaps and take the year whole",
+    )
+    archive_build_parser.add_argument(
+        "--year", type=int, required=True, help="the archive year to walk; listings are per year"
+    )
+    archive_build_parser.add_argument(
+        "--since", default=None, help="window start (YYYY-MM-DD); defaults to 1 January"
+    )
+    archive_build_parser.add_argument(
+        "--until", default=None, help="window end (YYYY-MM-DD); defaults to 31 December"
+    )
+    archive_build_parser.add_argument(
+        "--pause-ms",
+        type=int,
+        default=int(DEFAULT_PAUSE.total_seconds() * 1000),
+        help="gap between article fetches. Milliseconds rather than seconds because the package "
+        "admits no `float` (test_discipline.py), and this is a transport interval either way",
+    )
+    archive_build_parser.add_argument(
+        "--body-retries",
+        type=int,
+        default=DEFAULT_BODY_RETRIES,
+        help="re-fetches when a page arrives without its article text. The publisher serves "
+        "the same URL with and without a body, varying per request",
+    )
+    archive_build_parser.add_argument("--verbose", action="store_true")
 
     corpus = commands.add_parser("corpus", help="build the frozen decision contexts a sweep reads")
     corpus_actions = corpus.add_subparsers(dest="action", required=True)
@@ -1136,11 +1184,75 @@ def _dayset_digest(data_dir: Path) -> str:
         return ""
 
 
+async def archive_build(args: argparse.Namespace) -> int:
+    """Crawl one year of a publisher's archive into the raw staging store (§6.3.1).
+
+    Resumable by construction: the store is keyed by canonical URL, so re-running after an
+    interruption asks the publisher only for what is missing. Deliberately not in `LOCKED` — it
+    writes beside the dataset, not into the workspace, and a multi-hour crawl must not hold the
+    lock against every sweep and report.
+    """
+    clock = SystemClock()
+    since = date.fromisoformat(args.since) if args.since else date(args.year, 1, 1)
+    until = date.fromisoformat(args.until) if args.until else date(args.year, 12, 31)
+    if since > until:
+        raise ConfigError(f"--since {since} is after --until {until}; the window is empty")
+
+    store = RawStore.open(args.data / RAW_DIR, source_id=args.source)
+    fetcher = build_fetcher(clock)
+    pause = timedelta(milliseconds=args.pause_ms)
+    try:
+        # The two source shapes are addressed differently, so they do not share a walk: a dated
+        # year listing and a Yoast sitemap index have nothing in common but the word "archive",
+        # and pointing one walk at the other's entry point finds nothing and calls it success.
+        if args.source in PROFILES:
+            report = await collect_site(
+                fetcher,
+                store,
+                clock,
+                profile=PROFILES[args.source],
+                year=args.year,
+                pause=pause,
+                body_retries=args.body_retries,
+            )
+        else:
+            report = await collect(
+                fetcher,
+                store,
+                clock,
+                year=args.year,
+                since=since,
+                until=until,
+                pause=pause,
+                body_retries=args.body_retries,
+            )
+    finally:
+        await fetcher.close()
+
+    logger.info(
+        "archive collected",
+        extra={
+            "source": args.source,
+            "window": f"{since}..{until}",
+            "pages": report.pages,
+            "listed": report.seen,
+            "collected": report.collected,
+            "already_held": report.already_held,
+            "refused": report.refused,
+            "bodyless": report.bodyless,
+            "missing": report.missing,
+            "store": str(store.path),
+        },
+    )
+    return 0
+
+
 #: Command → coroutine. Dispatch over a table rather than a chain of `if`s, per the repo's own
 #: convention (CLAUDE.md, "prefer dispatch over branching").
 COMMANDS: dict[tuple[str, str], Callable[[argparse.Namespace], Coroutine[Any, Any, int]]] = {
     ("dataset", "verify"): dataset_verify,
     ("dataset", "days"): dataset_days,
+    ("archive", "build"): archive_build,
     ("corpus", "build"): corpus_build,
     # `sweep` and `report` have no sub-action, so `getattr(args, "action", "")` yields "".
     ("sweep", ""): sweep_command,

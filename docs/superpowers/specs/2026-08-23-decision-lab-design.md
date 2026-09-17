@@ -499,21 +499,75 @@ class ArchiveSource(Protocol):
     async def items_between(self, since: datetime, until: datetime) -> AsyncIterator[ArchiveRow]: ...
 ```
 
-- **`ApiArchiveSource`** — the CoinDesk Data / CryptoCompare News API. Squarely inside the existing
-  policy: an official API, a declared key, published terms. **Preferred, and the default.**
+- **`ApiArchiveSource`** — an official news API: a declared key, published terms, and a date-range
+  query. Squarely inside the existing policy. **Preferred, and the default.** Which API is settled
+  in §6.3.1, and it is no longer the one this section first named.
 - **`SitemapArchiveSource`** — reads `https://www.coindesk.com/sitemap/archive/`, a file publishers
-  publish *for* crawlers, and follows it to each article. **The fallback**, for when the API is
-  unavailable or its historical range is behind a paid plan.
+  publish *for* crawlers, and follows it to each article. **The fallback**, for when no API is
+  available or its historical range is behind a paid plan.
 
 **The backend is chosen explicitly (`--source api|sitemap`), never by silent fallback.** An archive
 whose provenance depends on whether a key happened to be set is an archive nobody can cite. A
 missing key refuses, naming `--source sitemap` as the alternative; the choice is recorded in the
 archive header and travels into `archive_digest`.
 
-> **Open at time of writing.** Secondary sources report that CoinDesk retired its free API tier on
-> 21 May 2026 and that current plans are sales-quoted. This was not confirmed against an
-> authoritative source. The two-backend design exists precisely so the answer does not block the
-> build: if the API is paid and unwanted, `--source sitemap` is a supported first-class path.
+#### 6.3.1 Which API — settled 2026-09-16
+
+This section originally named the CoinDesk Data / CryptoCompare News API and carried an open
+question about its free tier. **That question is now closed, and closed against the backend it
+called preferred.** CoinDesk's own notice confirms the free tier was retired on **21 May 2026**;
+accounts without a paid subscription lost API access, and every remaining plan is sales-quoted with
+no self-serve pricing. The two-backend design is what kept this from blocking the build, exactly as
+it was written to.
+
+**The `api` backend binds to Alpaca's news endpoint instead** — `GET
+https://data.alpaca.markets/v1beta1/news`, Benzinga-sourced:
+
+| | |
+|---|---|
+| Range | `start` / `end`, RFC-3339 or `YYYY-MM-DD`; history to 2015 |
+| Selection | `symbols` (e.g. `BTCUSD,ETHUSD`), `sort=asc`, `page_token`, `exclude_contentless` |
+| Per article | `headline`, `summary`, `content`, `url`, `symbols`, `source`, `created_at`, `updated_at` (RFC-3339) |
+| Access | the free plan a paper account already carries, 200 req/min; `401` without a key |
+
+Surveyed and rejected: **GDELT DOC 2.0** — free and genuinely historical, but throttled to one
+request every five seconds and a *search* API rather than a bulk archive, its own `429` steering
+bulk users to other datasets; **cryptocurrency.cv** — advertises a no-key historical archive,
+answers a plain request with `403 BOT_BLOCKED`, and republishes an aggregator, putting its
+provenance two layers from the publisher; **CryptoPanic** — free tier is shallow, the archive is
+paid.
+
+**What this buys is not a source. It is most of §6.** An API that publishes its own summary and its
+own ingestion timestamp *deletes* work rather than relocating it:
+
+- **§6.5's summarizer becomes unnecessary.** It exists because a crawled page yields a body and
+  nothing else; `summary` is the publisher's. Dropping it removes the entire archive-build LLM
+  spend — on this design's window roughly 2 800 calls, about four times a full calibration — along
+  with the `archive.toml` summarizer binding, its model id and prompt digest inside `archive_digest`
+  (§6.6), the `SUMMARIZED NEWS` banner, and the second contamination channel §6.5 was built to
+  close, in which a summarizer could colour a March headline with April's outcome. Two of §16.2's
+  five contamination tests go with it.
+- **§6.7's derivation becomes unnecessary.** `created_at` is the source's own ingestion moment,
+  precise to the second — the first rung §6.7 already prefers — so `observed_at` is *recorded*
+  rather than synthetic, and the `RECONSTRUCTED NEWS` banner does not apply.
+- **§6.4's crawl apparatus becomes unnecessary, and with it §6.2's argument.** That section exists
+  to reason the bot's "RSS and official APIs, never scraping" policy out of the way for a period no
+  feed covers. An official API needs no such carve-out: this is inside the policy as written.
+
+None of that deletes the **protocol**. `SitemapArchiveSource` stays declared and stays the fallback,
+and every simplification above is a property of the `api` backend alone — so a slice shipping only
+the API backend leaves §6.4's crawler and §6.5's summarizer *specified but unbuilt*, against the day
+the sitemap path is wanted. That path remains viable:
+`https://www.coindesk.com/sitemap/archive/2024` is live and paginated (5 706 articles across 12
+pages, reverse-chronological), and `robots.txt` disallows nothing touching `/sitemap/` or article
+pages.
+
+**Two things remain unmeasured, and a key settles both.** How much of Benzinga's ~130 articles a day
+carries a `BTCUSD` or `ETHUSD` tag in 2024 — thin crypto coverage would leave the shock-day news
+evidence sparse, which is a finding about the experiment rather than a defect, and one worth having
+*before* building on it. And whether Benzinga's storage and redistribution terms permit keeping what
+§6.4 keeps; the posture is the bot's existing one — title, canonical URL, timestamps and a short
+excerpt, never a body — but it is **unread, not cleared**.
 
 ### 6.4 What is kept, and what is never written
 
@@ -532,7 +586,53 @@ rather than restating it: `robots.txt` honoured per host with an unreachable fil
 the error taxonomy in which a robots denial raises `SourceDisallowedError` and we stop asking. The
 crawler is therefore robots-respecting **by construction**, not by promise.
 
+#### 6.4.1 The body is metered, and that settles §6.4 by circumstance
+
+Measured against the live site on 2026-09-16, with an instrumented crawl rather than inferred:
+**CoinDesk meters the article body at three articles per session — and one crawl is one session.**
+The first three requests return a ~1.71 MB page carrying the text; every request after returns a
+~1.62 MB page with the text removed. The page says so itself — `rw_remaining` counts `2 → 1 → 0`
+and `rw_allowed` flips `true → false` at exactly the request where the body disappears.
+
+The count is **flat, not a rate**: confirmed at 1 430 collected rows, where the only articles
+carrying a body were at fetch-order positions 0, 1 and 2. A full year yields three bodies out of
+~5 700, not a proportion of them. Any reading of this as "roughly N% arrive with a body" is wrong,
+and wrong in the direction that makes the archive sound richer than it is.
+
+So a full-text archive of this source **is not obtainable**, and the ways around a meter — cycling
+clients, clearing cookies per request, rotating identity — are paywall circumvention. They are out
+of scope here on the same grounds §6.2 uses to reason about ToS exposure, and no amount of care in
+the crawler makes them acceptable. If full text is ever needed it is a licensing question.
+
+**Everything else survives the meter.** The `ld+json` record is served in full on metered pages
+too, and a live one-day crawl found all of it present on 20 of 20 articles: title, canonical URL,
+`datePublished` precise to the millisecond, `dateModified`, author, section, `keywords`, and the
+publisher's own `abstract`. §6.4's list — title, canonical URL, `published_at` and a short
+summary — is therefore collectable in full, and its "the body is never written to disk" rule is now
+enforced by circumstance as well as by policy.
+
+The consequence for the crawler is one default: **a body retry is zero by default**. Past the third
+article a re-fetch cannot succeed, so retrying only triples the requests made to the publisher for
+nothing. The knob remains for a source that drops a body *transiently*; this one does not.
+
+**And the loss is far smaller than it sounds, because the panel never reads a body in production
+either.** The bot's live pipeline stores title, a short excerpt and a link — `news/normalize.py`
+states it as policy — and `NewsItem.view` renders that `excerpt` as the seat-visible `summary`,
+bounded by `DEFAULT_EXCERPT_CHARS = 280`. The abstracts collected here average ~129 characters.
+So an abstract-only archive is not a degraded replay of the live system; it is a **faithful** one.
+
+Full bodies would make it *unfaithful* in the direction this design most cares about: a 2024
+decision replayed against evidence richer than the live system could ever have shown it is a
+milder cousin of the look-ahead problem §2.2 exists to prevent. That reframes the meter from an
+obstacle into a constraint that happens to enforce the right thing.
+
 ### 6.5 The summarizer is a compressor, not an analyst
+
+> **Applies to the `sitemap` backend only.** §6.3.1 settled the `api` backend on a source that
+> publishes its own `summary`, which needs no compression — so on that path this whole section is
+> skipped and the banner it raises does not apply. It stays specified because the sitemap fallback
+> stays declared, and a crawled page yields a body and nothing else. Read what follows as the rule
+> *if* an excerpt has to be generated, never as a step every archive takes.
 
 Each article gets one LLM pass producing the `excerpt` the panel will read. This is the section's
 load-bearing rule, and it has a home in existing doctrine: `interfaces/news.py` already says
@@ -586,6 +686,17 @@ Neither backend gives us a moment *we* learned something, so one is derived:
 - Otherwise `observed_at = published_at + declared_lag`, with the lag stated in the header.
   Setting `observed_at = published_at` is **rejected**: it grants the panel the headline at the
   instant of publication, which is optimistic in the one direction that inflates a score.
+
+**A date-only `published_at` is a look-ahead hazard, not merely a coarse one.** The second rung
+assumes a publication *instant*. A backend reading its dates off an archive listing gets
+`2024-03-11`, not `2024-03-11T09:02:00Z`, and `midnight + lag` then grants every one of that day's
+headlines to the day's first cycle — including those filed at 23:00. On the 8h corpus of §5.5 that
+is up to twenty-four hours of intra-day look-ahead wearing a well-formed timestamp: the exact
+failure §2.2 exists to prevent, reached from inside the archive rather than from a live feed. A
+backend whose listing carries no time of day must therefore take the instant from the article page
+itself — which it is fetching regardless — and **refuse the row** if none is there. This binds any
+crawl-based backend, which is why it is stated here rather than in §6.3.1: it survives whichever
+source is chosen.
 
 Any archive whose `observed_at` is derived puts
 **`RECONSTRUCTED NEWS — observed_at is synthetic (lag = …)`** on every report that used it, and
