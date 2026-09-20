@@ -272,21 +272,56 @@ async def collect_site(
         extra={"source": profile.source_id, "year": year, "candidates": len(candidates)},
     )
 
+    # Two passes, because a chunk's *neighbours* decide whether it is walked and that cannot be
+    # known while streaming. Every chunk's sitemap is read first, then the selection is made, then
+    # the articles are fetched. 49 sitemap reads against several thousand article fetches.
+    scanned: list[tuple[str, tuple[tuple[str, str], ...]]] = []
     for chunk in candidates:
         document = await _fetch(fetcher, chunk, retries=transport_retries, backoff=backoff)
         if not document:
             continue
         entries = parse_sitemap(document)
-        if not entries:
-            continue
-        hits = sum(1 for _, mod in entries if mod[:4] == str(year))
-        # Integer arithmetic on purpose: the package admits no `float` (test_discipline.py).
-        if hits * 100 < len(entries) * MIN_YEAR_PERCENT:
-            logger.debug(
-                "archive chunk skipped",
-                extra={"chunk": chunk, "in_year": hits, "urls": len(entries)},
-            )
-            continue
+        if entries:
+            scanned.append((chunk, entries))
+
+    in_year = [sum(1 for _, mod in entries if mod[:4] == str(year)) for _, entries in scanned]
+    # Integer arithmetic on purpose: the package admits no `float` (test_discipline.py).
+    qualifying = {
+        index
+        for index, (_, entries) in enumerate(scanned)
+        if in_year[index] * 100 >= len(entries) * MIN_YEAR_PERCENT
+    }
+    # **A chunk beside the qualifying run is opened when it holds *any* of the target year.** A
+    # paginated sitemap is chronological, so the year's first articles sit in the tail of the
+    # previous chunk, and that chunk is mostly *last* year by construction — so the share test
+    # lands it only when the year happens to begin early in it, which is luck rather than a rule.
+    # Measured on Bitcoin.com's live index: `post-sitemap34.xml` held 46 URLs from 2025 against
+    # 954 from 2024 (4.6%), and skipping it cost 2025-01-01..03 and the whole of December 2024.
+    #
+    # Adjacency alone is not enough to open one, or a stale chunk of 2017 posts that happens to
+    # sit beside the run would be walked for nothing. Holding at least one URL in the year is what
+    # separates a boundary chunk from a neighbour: a boundary chunk contains the year, a stale one
+    # does not.
+    neighbours = {i - 1 for i in qualifying} | {i + 1 for i in qualifying}
+    boundary = {
+        index
+        for index in neighbours & set(range(len(scanned)))
+        if index not in qualifying and in_year[index]
+    }
+    selected = sorted(qualifying | boundary)
+    logger.info(
+        "archive chunks selected",
+        extra={
+            "source": profile.source_id,
+            "scanned": len(scanned),
+            "qualifying": len(qualifying),
+            "boundary": len(boundary),
+            "selected": len(selected),
+        },
+    )
+
+    for position in selected:
+        chunk, entries = scanned[position]
         urls = [loc for loc, _ in entries]
         report = report.added(pages=1, seen=len(urls))
         for url in urls:

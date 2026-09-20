@@ -185,3 +185,62 @@ async def test_a_stale_chunk_stamped_with_the_year_is_not_walked(tmp_path: Path)
 
     assert "https://cryptoslate.com/2017-story-0" not in fetcher.asked, "walked a stale chunk"
     assert "https://cryptoslate.com/2025-story-0" in fetcher.asked, "skipped a real 2025 chunk"
+
+
+BOUNDARY_EARLY = "https://cryptoslate.com/published-2025-01-02"
+BOUNDARY_OLD = "https://cryptoslate.com/published-2024-12-30"
+
+
+def boundary_pages() -> dict[str, str]:
+    """A chunk that is overwhelmingly last year, holding the target year's first articles.
+
+    Measured on Bitcoin.com's live index: `post-sitemap34.xml` carried 46 URLs from 2025 against
+    954 from 2024 — 4.6%, far under `MIN_YEAR_PERCENT` — and being skipped cost 2025-01-01..03
+    *and* all of December 2024. The threshold only lands a boundary chunk when the year happens
+    to begin early in it, which is luck rather than a rule.
+    """
+    return {
+        PROFILE.sitemap_index: index(
+            ("https://cryptoslate.com/post-sitemap34.xml", "2024-12-30"),
+            ("https://cryptoslate.com/post-sitemap35.xml", "2025-06-04"),
+        ),
+        # 1 of 5 URLs in the target year: 20% would pass, so make it plainly under.
+        "https://cryptoslate.com/post-sitemap34.xml": sitemap(
+            (BOUNDARY_OLD, "2024-12-30"),
+            ("https://cryptoslate.com/old-1", "2024-11-01"),
+            ("https://cryptoslate.com/old-2", "2024-11-02"),
+            ("https://cryptoslate.com/old-3", "2024-11-03"),
+            ("https://cryptoslate.com/old-4", "2024-11-04"),
+            ("https://cryptoslate.com/old-5", "2024-11-05"),
+            ("https://cryptoslate.com/old-6", "2024-11-06"),
+            ("https://cryptoslate.com/old-7", "2024-11-07"),
+            ("https://cryptoslate.com/old-8", "2024-11-08"),
+            (BOUNDARY_EARLY, "2025-01-02"),
+        ),
+        "https://cryptoslate.com/post-sitemap35.xml": sitemap((IN_YEAR, "2025-06-04")),
+        BOUNDARY_EARLY: article("2025-01-02T09:00:00+00:00"),
+        BOUNDARY_OLD: article("2024-12-30T09:00:00+00:00"),
+        IN_YEAR: article("2025-06-04T09:00:00+00:00"),
+        **{
+            f"https://cryptoslate.com/old-{n}": article(f"2024-11-0{n}T09:00:00+00:00")
+            for n in range(1, 9)
+        },
+    }
+
+
+async def test_the_chunk_before_the_first_kept_one_is_walked(tmp_path: Path) -> None:
+    """A year's first articles live in the tail of the previous chunk, under any threshold.
+
+    A paginated sitemap is chronological, so the boundary chunk is mostly *last* year by
+    construction. Judging it by its own share of the target year drops the first days of January
+    and the whole of the preceding December — which is under-collection, the one failure a
+    one-shot archive cannot repair later.
+    """
+    store = RawStore.open(tmp_path, source_id="cryptoslate")
+    fetcher = FakeFetcher(boundary_pages())
+
+    await collect(store, fetcher)
+
+    collected = {row.url for row in store.read_all()}
+    assert BOUNDARY_EARLY in collected, "2025-01-02 sat in a chunk that is 10% 2025"
+    assert BOUNDARY_OLD in collected, "December of the preceding year comes with it"
