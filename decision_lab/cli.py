@@ -41,14 +41,22 @@ from decision_lab import render as rd
 from decision_lab import scoring as sc
 from decision_lab import seats as st
 from decision_lab import sweep as sw
+from decision_lab.archive.auth import (
+    COOKIE_VARIABLE,
+    authenticated_fetcher,
+    cookie_from_environment,
+)
+from decision_lab.archive.backfill import backfill
+from decision_lab.archive.coindesk import parse_article
 from decision_lab.archive.collect import (
     DEFAULT_BODY_RETRIES,
     DEFAULT_PAUSE,
     collect,
     collect_site,
 )
-from decision_lab.archive.sites import PROFILES
-from decision_lab.archive.store import RAW_DIR, RawStore
+from decision_lab.archive.reshard import reshard
+from decision_lab.archive.sites import PROFILES, parse_site_article
+from decision_lab.archive.store import RAW_DIR, RawArticle, RawStore
 from decision_lab.dashboard import auth as lab_auth
 from decision_lab.dashboard import create_lab_dashboard
 from decision_lab.params import (
@@ -199,6 +207,56 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "the same URL with and without a body, varying per request",
     )
     archive_build_parser.add_argument("--verbose", action="store_true")
+
+    archive_backfill_parser = archive_actions.add_parser(
+        "backfill",
+        help="re-fetch the body of rows a metered crawl stored without one",
+    )
+    archive_backfill_parser.add_argument(
+        "--data", type=Path, required=True, help="dataset directory"
+    )
+    archive_backfill_parser.add_argument(
+        "--source",
+        default="coindesk",
+        choices=("coindesk", *sorted(PROFILES)),
+        help="which publisher's store to repair",
+    )
+    archive_backfill_parser.add_argument(
+        "--authenticated",
+        action="store_true",
+        help=f"present the session in {COOKIE_VARIABLE}, so a metered publisher serves the "
+        "article text. Refused if that variable is unset: an anonymous fallback would spend "
+        "thousands of requests to collect three bodies",
+    )
+    archive_backfill_parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="stop after this many re-fetches. The cheap probe: `--limit 5` answers whether a "
+        "session lifts the meter at all, for five requests rather than several thousand",
+    )
+    archive_backfill_parser.add_argument(
+        "--pause-ms",
+        type=int,
+        default=int(DEFAULT_PAUSE.total_seconds() * 1000),
+        help="gap between fetches, in integer milliseconds",
+    )
+    archive_backfill_parser.add_argument("--verbose", action="store_true")
+
+    archive_reshard_parser = archive_actions.add_parser(
+        "reshard",
+        help="split a flat raw store into one file per publication month",
+    )
+    archive_reshard_parser.add_argument(
+        "--data", type=Path, required=True, help="dataset directory"
+    )
+    archive_reshard_parser.add_argument(
+        "--source",
+        default="coindesk",
+        choices=("coindesk", *sorted(PROFILES)),
+        help="which publisher's store to migrate",
+    )
+    archive_reshard_parser.add_argument("--verbose", action="store_true")
 
     corpus = commands.add_parser("corpus", help="build the frozen decision contexts a sweep reads")
     corpus_actions = corpus.add_subparsers(dest="action", required=True)
@@ -1247,12 +1305,90 @@ async def archive_build(args: argparse.Namespace) -> int:
     return 0
 
 
+async def archive_backfill(args: argparse.Namespace) -> int:
+    """Re-fetch the body of rows a metered crawl stored without one (spec §6.3.1).
+
+    Not `archive build` with a flag. Build is keyed by canonical URL so an interrupted crawl
+    resumes, which means every row is `held` and a re-run collects nothing — the resume property
+    and the repair are in direct opposition, so they are different commands.
+
+    Absent from `LOCKED` for the same two reasons `build` is: it writes beside the dataset rather
+    than into the workspace, and it is long enough that holding the workspace lock would block
+    every sweep and report for its duration.
+    """
+    clock = SystemClock()
+    store = RawStore.open(args.data / RAW_DIR, source_id=args.source)
+
+    # Before the transport, deliberately. A pass that discovered the missing cookie on its first
+    # 401 would already have crawled, and the refusal is about the operator's environment rather
+    # than about the publisher.
+    cookie = cookie_from_environment() if args.authenticated else ""
+    fetcher = authenticated_fetcher(clock, cookie=cookie) if cookie else build_fetcher(clock)
+
+    def parse(page: str, url: str, at: datetime) -> RawArticle:
+        profile = PROFILES.get(args.source)
+        if profile is None:
+            return parse_article(page, url=url, fetched_at=at)
+        return parse_site_article(page, url=url, fetched_at=at, profile=profile)
+
+    try:
+        report = await backfill(
+            fetcher,
+            store,
+            clock,
+            limit=args.limit,
+            pause=timedelta(milliseconds=args.pause_ms),
+            parse=parse,
+        )
+    finally:
+        await fetcher.close()
+
+    logger.info(
+        "archive backfilled",
+        extra={
+            "source": args.source,
+            "authenticated": bool(cookie),
+            "rows": report.rows,
+            "bodyless": report.bodyless,
+            "refetched": report.refetched,
+            "gained": report.gained,
+            "still_bodyless": report.still_bodyless,
+            "refused": report.refused,
+            "missing": report.missing,
+            "store": str(store.path),
+        },
+    )
+    return 0
+
+
+async def archive_reshard(args: argparse.Namespace) -> int:
+    """Split a flat raw store into one file per publication month (spec §6.3.1).
+
+    Explicit rather than automatic on open: 71 MB of collected article text must not be
+    reorganised as a side effect of being read. The flat file is renamed `.premigration` and
+    never deleted — CoinDesk's cannot be recollected without a signed-in session.
+    """
+    report = reshard(args.data / RAW_DIR, source_id=args.source)
+    logger.info(
+        "archive reshard complete",
+        extra={
+            "source": args.source,
+            "migrated": report.migrated,
+            "shards": report.shards,
+            "kept": report.kept,
+        },
+    )
+    return 0
+
+
 #: Command → coroutine. Dispatch over a table rather than a chain of `if`s, per the repo's own
 #: convention (CLAUDE.md, "prefer dispatch over branching").
 COMMANDS: dict[tuple[str, str], Callable[[argparse.Namespace], Coroutine[Any, Any, int]]] = {
     ("dataset", "verify"): dataset_verify,
     ("dataset", "days"): dataset_days,
     ("archive", "build"): archive_build,
+    ("archive", "backfill"): archive_backfill,
+    ("archive", "reshard"): archive_reshard,
     ("corpus", "build"): corpus_build,
     # `sweep` and `report` have no sub-action, so `getattr(args, "action", "")` yields "".
     ("sweep", ""): sweep_command,

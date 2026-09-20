@@ -99,3 +99,66 @@ def test_archive_build_routes_a_sitemap_source_to_its_own_walk(
     assert len(stored) == 2, "both articles in the 2025 chunk should have been collected"
     assert all(row.source_id == "cryptoslate" for row in stored)
     assert PROFILES["cryptoslate"].sitemap_index in fetcher.asked
+
+
+def test_archive_backfill_fills_bodies_into_rows_collected_without_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The metered 2024 crawl's repair pass: 5 678 complete rows that lack only their text."""
+    from decision_lab.tests.test_archive_backfill import stored
+
+    store = RawStore.open(tmp_path / "news-raw", source_id="coindesk")
+    store.append(stored(url=INSIDE))
+    fetcher = FakeFetcher({INSIDE: article_page()})
+    monkeypatch.setattr(cli, "build_fetcher", lambda clock: fetcher)
+
+    code = cli.main(["archive", "backfill", "--data", str(tmp_path), "--pause-ms", "0"])
+
+    assert code == 0
+    (row,) = RawStore.open(tmp_path / "news-raw", source_id="coindesk").read_all()
+    assert "72 cents mid-morning Tuesday" in row.body
+
+
+def test_archive_backfill_limit_bounds_what_the_probe_costs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--limit 1` answers "does this session get bodies" for one request, not 5 678."""
+    from decision_lab.tests.test_archive_backfill import stored
+
+    store = RawStore.open(tmp_path / "news-raw", source_id="coindesk")
+    store.append(stored(url=INSIDE))
+    store.append(stored(url=OUTSIDE))
+    fetcher = FakeFetcher({INSIDE: article_page(), OUTSIDE: article_page()})
+    monkeypatch.setattr(cli, "build_fetcher", lambda clock: fetcher)
+
+    code = cli.main(
+        ["archive", "backfill", "--data", str(tmp_path), "--pause-ms", "0", "--limit", "1"]
+    )
+
+    assert code == 0
+    assert fetcher.asked == [INSIDE]
+
+
+def test_an_authenticated_backfill_without_a_cookie_refuses_before_any_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Falling back to anonymous would spend thousands of requests to gain three bodies.
+
+    The refusal must also come *before* the transport is built, which is what `asked == []`
+    pins: a pass that discovered the problem on its first 401 would already have crawled.
+    """
+    from decision_lab.archive.auth import COOKIE_VARIABLE
+    from decision_lab.tests.test_archive_backfill import stored
+
+    store = RawStore.open(tmp_path / "news-raw", source_id="coindesk")
+    store.append(stored(url=INSIDE))
+    fetcher = FakeFetcher({INSIDE: article_page()})
+    monkeypatch.setattr(cli, "build_fetcher", lambda clock: fetcher)
+    monkeypatch.delenv(COOKIE_VARIABLE, raising=False)
+
+    code = cli.main(
+        ["archive", "backfill", "--data", str(tmp_path), "--pause-ms", "0", "--authenticated"]
+    )
+
+    assert code == 3, "a refusal about the evidence we were pointed at"
+    assert fetcher.asked == []
