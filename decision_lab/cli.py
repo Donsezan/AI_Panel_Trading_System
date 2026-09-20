@@ -20,7 +20,7 @@ import asyncio
 import logging
 import sys
 from collections.abc import Callable, Coroutine
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -41,6 +41,22 @@ from decision_lab import render as rd
 from decision_lab import scoring as sc
 from decision_lab import seats as st
 from decision_lab import sweep as sw
+from decision_lab.archive.auth import (
+    COOKIE_VARIABLE,
+    authenticated_fetcher,
+    cookie_from_environment,
+)
+from decision_lab.archive.backfill import backfill
+from decision_lab.archive.coindesk import parse_article
+from decision_lab.archive.collect import (
+    DEFAULT_BODY_RETRIES,
+    DEFAULT_PAUSE,
+    collect,
+    collect_site,
+)
+from decision_lab.archive.reshard import reshard
+from decision_lab.archive.sites import PROFILES, parse_site_article
+from decision_lab.archive.store import RAW_DIR, RawArticle, RawStore
 from decision_lab.dashboard import auth as lab_auth
 from decision_lab.dashboard import create_lab_dashboard
 from decision_lab.params import (
@@ -62,6 +78,7 @@ from tradebot.core.schema import Money
 from tradebot.dashboard.auth import assert_bind_allowed
 from tradebot.interfaces.exchange import VenueTransport
 from tradebot.marketdata.recorder import MANIFEST, ReplayDataset
+from tradebot.news.http import build_fetcher
 
 logger = get_logger("decision_lab.cli")
 
@@ -151,6 +168,95 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="add a day by hand",
     )
     days.add_argument("--verbose", action="store_true")
+
+    archive = commands.add_parser("archive", help="collect recorded news beside the dataset (§6)")
+    archive_actions = archive.add_subparsers(dest="action", required=True)
+
+    archive_build_parser = archive_actions.add_parser(
+        "build", help="crawl one year of a publisher's archive into the raw store"
+    )
+    archive_build_parser.add_argument("--data", type=Path, required=True, help="dataset directory")
+    archive_build_parser.add_argument(
+        "--source",
+        default="coindesk",
+        choices=("coindesk", *sorted(PROFILES)),
+        help="which publisher. `coindesk` is addressed by a dated year listing and honours "
+        "--since/--until; the others are Yoast sitemaps and take the year whole",
+    )
+    archive_build_parser.add_argument(
+        "--year", type=int, required=True, help="the archive year to walk; listings are per year"
+    )
+    archive_build_parser.add_argument(
+        "--since", default=None, help="window start (YYYY-MM-DD); defaults to 1 January"
+    )
+    archive_build_parser.add_argument(
+        "--until", default=None, help="window end (YYYY-MM-DD); defaults to 31 December"
+    )
+    archive_build_parser.add_argument(
+        "--pause-ms",
+        type=int,
+        default=int(DEFAULT_PAUSE.total_seconds() * 1000),
+        help="gap between article fetches. Milliseconds rather than seconds because the package "
+        "admits no `float` (test_discipline.py), and this is a transport interval either way",
+    )
+    archive_build_parser.add_argument(
+        "--body-retries",
+        type=int,
+        default=DEFAULT_BODY_RETRIES,
+        help="re-fetches when a page arrives without its article text. The publisher serves "
+        "the same URL with and without a body, varying per request",
+    )
+    archive_build_parser.add_argument("--verbose", action="store_true")
+
+    archive_backfill_parser = archive_actions.add_parser(
+        "backfill",
+        help="re-fetch the body of rows a metered crawl stored without one",
+    )
+    archive_backfill_parser.add_argument(
+        "--data", type=Path, required=True, help="dataset directory"
+    )
+    archive_backfill_parser.add_argument(
+        "--source",
+        default="coindesk",
+        choices=("coindesk", *sorted(PROFILES)),
+        help="which publisher's store to repair",
+    )
+    archive_backfill_parser.add_argument(
+        "--authenticated",
+        action="store_true",
+        help=f"present the session in {COOKIE_VARIABLE}, so a metered publisher serves the "
+        "article text. Refused if that variable is unset: an anonymous fallback would spend "
+        "thousands of requests to collect three bodies",
+    )
+    archive_backfill_parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="stop after this many re-fetches. The cheap probe: `--limit 5` answers whether a "
+        "session lifts the meter at all, for five requests rather than several thousand",
+    )
+    archive_backfill_parser.add_argument(
+        "--pause-ms",
+        type=int,
+        default=int(DEFAULT_PAUSE.total_seconds() * 1000),
+        help="gap between fetches, in integer milliseconds",
+    )
+    archive_backfill_parser.add_argument("--verbose", action="store_true")
+
+    archive_reshard_parser = archive_actions.add_parser(
+        "reshard",
+        help="split a flat raw store into one file per publication month",
+    )
+    archive_reshard_parser.add_argument(
+        "--data", type=Path, required=True, help="dataset directory"
+    )
+    archive_reshard_parser.add_argument(
+        "--source",
+        default="coindesk",
+        choices=("coindesk", *sorted(PROFILES)),
+        help="which publisher's store to migrate",
+    )
+    archive_reshard_parser.add_argument("--verbose", action="store_true")
 
     corpus = commands.add_parser("corpus", help="build the frozen decision contexts a sweep reads")
     corpus_actions = corpus.add_subparsers(dest="action", required=True)
@@ -1136,11 +1242,153 @@ def _dayset_digest(data_dir: Path) -> str:
         return ""
 
 
+async def archive_build(args: argparse.Namespace) -> int:
+    """Crawl one year of a publisher's archive into the raw staging store (§6.3.1).
+
+    Resumable by construction: the store is keyed by canonical URL, so re-running after an
+    interruption asks the publisher only for what is missing. Deliberately not in `LOCKED` — it
+    writes beside the dataset, not into the workspace, and a multi-hour crawl must not hold the
+    lock against every sweep and report.
+    """
+    clock = SystemClock()
+    since = date.fromisoformat(args.since) if args.since else date(args.year, 1, 1)
+    until = date.fromisoformat(args.until) if args.until else date(args.year, 12, 31)
+    if since > until:
+        raise ConfigError(f"--since {since} is after --until {until}; the window is empty")
+
+    store = RawStore.open(args.data / RAW_DIR, source_id=args.source)
+    fetcher = build_fetcher(clock)
+    pause = timedelta(milliseconds=args.pause_ms)
+    try:
+        # The two source shapes are addressed differently, so they do not share a walk: a dated
+        # year listing and a Yoast sitemap index have nothing in common but the word "archive",
+        # and pointing one walk at the other's entry point finds nothing and calls it success.
+        if args.source in PROFILES:
+            report = await collect_site(
+                fetcher,
+                store,
+                clock,
+                profile=PROFILES[args.source],
+                year=args.year,
+                pause=pause,
+                body_retries=args.body_retries,
+            )
+        else:
+            report = await collect(
+                fetcher,
+                store,
+                clock,
+                year=args.year,
+                since=since,
+                until=until,
+                pause=pause,
+                body_retries=args.body_retries,
+            )
+    finally:
+        await fetcher.close()
+
+    logger.info(
+        "archive collected",
+        extra={
+            "source": args.source,
+            "window": f"{since}..{until}",
+            "pages": report.pages,
+            "listed": report.seen,
+            "collected": report.collected,
+            "already_held": report.already_held,
+            "refused": report.refused,
+            "bodyless": report.bodyless,
+            "missing": report.missing,
+            "store": str(store.path),
+        },
+    )
+    return 0
+
+
+async def archive_backfill(args: argparse.Namespace) -> int:
+    """Re-fetch the body of rows a metered crawl stored without one (spec §6.3.1).
+
+    Not `archive build` with a flag. Build is keyed by canonical URL so an interrupted crawl
+    resumes, which means every row is `held` and a re-run collects nothing — the resume property
+    and the repair are in direct opposition, so they are different commands.
+
+    Absent from `LOCKED` for the same two reasons `build` is: it writes beside the dataset rather
+    than into the workspace, and it is long enough that holding the workspace lock would block
+    every sweep and report for its duration.
+    """
+    clock = SystemClock()
+    store = RawStore.open(args.data / RAW_DIR, source_id=args.source)
+
+    # Before the transport, deliberately. A pass that discovered the missing cookie on its first
+    # 401 would already have crawled, and the refusal is about the operator's environment rather
+    # than about the publisher.
+    cookie = cookie_from_environment() if args.authenticated else ""
+    fetcher = authenticated_fetcher(clock, cookie=cookie) if cookie else build_fetcher(clock)
+
+    def parse(page: str, url: str, at: datetime) -> RawArticle:
+        profile = PROFILES.get(args.source)
+        if profile is None:
+            return parse_article(page, url=url, fetched_at=at)
+        return parse_site_article(page, url=url, fetched_at=at, profile=profile)
+
+    try:
+        report = await backfill(
+            fetcher,
+            store,
+            clock,
+            limit=args.limit,
+            pause=timedelta(milliseconds=args.pause_ms),
+            parse=parse,
+        )
+    finally:
+        await fetcher.close()
+
+    logger.info(
+        "archive backfilled",
+        extra={
+            "source": args.source,
+            "authenticated": bool(cookie),
+            "rows": report.rows,
+            "bodyless": report.bodyless,
+            "refetched": report.refetched,
+            "gained": report.gained,
+            "still_bodyless": report.still_bodyless,
+            "refused": report.refused,
+            "missing": report.missing,
+            "store": str(store.path),
+        },
+    )
+    return 0
+
+
+async def archive_reshard(args: argparse.Namespace) -> int:
+    """Split a flat raw store into one file per publication month (spec §6.3.1).
+
+    Explicit rather than automatic on open: 71 MB of collected article text must not be
+    reorganised as a side effect of being read. The flat file is renamed `.premigration` and
+    never deleted — CoinDesk's cannot be recollected without a signed-in session.
+    """
+    report = reshard(args.data / RAW_DIR, source_id=args.source)
+    logger.info(
+        "archive reshard complete",
+        extra={
+            "source": args.source,
+            "migrated": report.migrated,
+            "shards": report.shards,
+            "kept": report.kept,
+        },
+    )
+    return 0
+
+
 #: Command → coroutine. Dispatch over a table rather than a chain of `if`s, per the repo's own
 #: convention (CLAUDE.md, "prefer dispatch over branching").
 COMMANDS: dict[tuple[str, str], Callable[[argparse.Namespace], Coroutine[Any, Any, int]]] = {
     ("dataset", "verify"): dataset_verify,
     ("dataset", "days"): dataset_days,
+    ("archive", "build"): archive_build,
+    ("archive", "backfill"): archive_backfill,
+    ("archive", "reshard"): archive_reshard,
     ("corpus", "build"): corpus_build,
     # `sweep` and `report` have no sub-action, so `getattr(args, "action", "")` yields "".
     ("sweep", ""): sweep_command,
