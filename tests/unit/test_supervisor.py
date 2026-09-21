@@ -94,6 +94,34 @@ class ScriptedFactory:
         return self.calendar
 
 
+class SpyMonitor:
+    """An `ExecutionMonitor` stand-in that records every sweep that reached it."""
+
+    def __init__(self, trace: list[str] | None = None) -> None:
+        self.trace = [] if trace is None else trace
+        #: Raised by `poll`, standing in for a venue that is down mid-sweep.
+        self.error: Exception | None = None
+
+    @property
+    def polls(self) -> int:
+        return self.trace.count("poll")
+
+    async def poll(self) -> None:
+        self.trace.append("poll")
+        if self.error is not None:
+            raise self.error
+
+
+class SpyPortfolio:
+    """A `PortfolioWatch` stand-in, here only to record where in the sweep it ran."""
+
+    def __init__(self, trace: list[str]) -> None:
+        self.trace = trace
+
+    async def sweep(self) -> None:
+        self.trace.append("sweep")
+
+
 @pytest.fixture
 def states(store: EventStore, clock: ManualClock) -> RiskStateStore:
     return RiskStateStore(store.engine, store._writer, clock)
@@ -427,6 +455,121 @@ class TestSupervision:
         await supervisor.stop()
 
         await asyncio.wait_for(serving, timeout=5)
+
+
+class TestOrdersArePolledBetweenCycles:
+    """KNOWN_GAPS §5: something must advance working orders when no basket is trading.
+
+    A venue-held stop exists precisely because it fires *between* cycles (ADR 0004). Until this
+    sweep polled, the monitor's only production caller was `BasketRunner._settle` — which returns
+    before polling when the cycle placed no orders — so a stop that filled overnight stayed
+    unbooked until some basket happened to trade, and until then the ledger reported a holding
+    the venue had already sold.
+    """
+
+    def _supervisor(
+        self,
+        factory: ScriptedFactory,
+        configs: ConfigStore,
+        clock: ManualClock,
+        watchdog: Watchdog,
+        states: RiskStateStore,
+        *,
+        monitor: SpyMonitor,
+        portfolio: SpyPortfolio | None = None,
+    ) -> Supervisor:
+        return Supervisor(
+            factory,
+            configs,
+            Scheduler(clock),
+            watchdog,
+            states,
+            clock,
+            monitor=monitor,  # type: ignore[arg-type]
+            portfolio=portfolio,  # type: ignore[arg-type]
+        )
+
+    async def test_the_sweep_polls_working_orders_though_nothing_cycled(
+        self,
+        factory: ScriptedFactory,
+        configs: ConfigStore,
+        clock: ManualClock,
+        watchdog: Watchdog,
+        states: RiskStateStore,
+    ) -> None:
+        """No basket is even configured, so no cycle can be what reached the venue."""
+        monitor = SpyMonitor()
+        supervisor = self._supervisor(factory, configs, clock, watchdog, states, monitor=monitor)
+
+        serving = asyncio.create_task(supervisor.serve(resync_seconds=60.0))
+        await asyncio.sleep(0)
+        await supervisor.stop()
+        await asyncio.wait_for(serving, timeout=5)
+
+        assert monitor.polls >= 1
+        assert factory.built == [], "nothing cycled; the sweep itself polled"
+
+    async def test_the_poll_precedes_the_valuation_sweep(
+        self,
+        factory: ScriptedFactory,
+        configs: ConfigStore,
+        clock: ManualClock,
+        watchdog: Watchdog,
+        states: RiskStateStore,
+    ) -> None:
+        """Ordering is load-bearing: the poll books the fills, the sweep values what is left.
+
+        Swept first, the drawdown is measured against a holding this very tick is about to
+        discover the venue already sold — ADR 0027's own argument, arriving one door along.
+        """
+        trace: list[str] = []
+        supervisor = self._supervisor(
+            factory,
+            configs,
+            clock,
+            watchdog,
+            states,
+            monitor=SpyMonitor(trace),
+            portfolio=SpyPortfolio(trace),
+        )
+
+        serving = asyncio.create_task(supervisor.serve(resync_seconds=60.0))
+        await asyncio.sleep(0)
+        await supervisor.stop()
+        await asyncio.wait_for(serving, timeout=5)
+
+        assert trace[:2] == ["poll", "sweep"]
+
+    async def test_a_poll_that_raises_does_not_kill_the_loop(
+        self,
+        factory: ScriptedFactory,
+        configs: ConfigStore,
+        clock: ManualClock,
+        watchdog: Watchdog,
+        states: RiskStateStore,
+    ) -> None:
+        """A dead supervisor leaves working orders with nobody polling them — the whole point."""
+        trace: list[str] = []
+        monitor = SpyMonitor(trace)
+        monitor.error = FailClosedError("the venue is down")
+        supervisor = self._supervisor(
+            factory,
+            configs,
+            clock,
+            watchdog,
+            states,
+            monitor=monitor,
+            portfolio=SpyPortfolio(trace),
+        )
+
+        serving = asyncio.create_task(supervisor.serve(resync_seconds=60.0))
+        for _ in range(4):
+            await asyncio.sleep(0)
+        await supervisor.stop()
+        await asyncio.wait_for(serving, timeout=5)
+
+        assert monitor.polls >= 2, "the sweep came round again"
+        assert "sweep" in trace, "and the rest of the sweep still ran"
 
 
 class TestScheduledLoop:

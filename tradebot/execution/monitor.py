@@ -2,8 +2,31 @@
 
 Hummingbot's executor pattern, and for the same reason — an order that nobody owns is an order
 whose partial fill nobody books and whose TTL nobody enforces. The monitor is the only thing
-that polls the venue, and it does so **only while orders are actually open**, because a polling
-storm against a venue is a rate-limit ban waiting to happen (PLAN §3.1).
+that polls the venue, and it does so **only while orders are actually open**: `poll` over an
+empty tracked set reaches nothing, and `_sync` returns early for an order already terminal, so
+the venue cost is proportional to live work rather than to how often something asks. That is
+what lets the supervisor's sweep call it on every tick without a polling storm becoming a
+rate-limit ban (PLAN §3.1).
+
+**Who calls it.** Two callers in a running process, and both are needed (KNOWN_GAPS §5):
+
+* `BasketRunner._settle`, after a cycle that placed orders — one sweep to book what filled
+  immediately, so the cycle's own outcome is a determined fact rather than a race;
+* `Supervisor._poll_orders`, on the resync sweep, whether or not anything cycled. A venue-held
+  stop fires *between* cycles by construction (ADR 0004), so the cycle that placed an order can
+  never be the thing that notices. Without it, everything here advanced only when some basket
+  happened to trade — and in a real `sim.db`, 41 orders span 196 cycles.
+
+`ManualCloser` polls its own close for the same reason, one act rather than one loop: the
+close empties a holding whose protective legs are still resting at the venue.
+
+**The cadence belongs to the caller, not to this module.** It used to own a
+`DEFAULT_POLL_INTERVAL` of ten seconds, which only `settle()` ever read — and `settle()` had no
+production caller, so nothing in the process polled on that cadence or any other. Today the
+cadence is `Supervisor.DEFAULT_RESYNC_SECONDS`, thirty seconds, because the sweep is what calls
+`poll`. DESIGN §6.7 asks for "~10s while orders are open"; a sweep that ran three times as often
+would also run the drift check and the valuation sweep three times as often, so reconciling the
+two is a decision about *that* loop rather than a constant this module can hold.
 
 What it owns (DESIGN §6.7):
 
@@ -26,7 +49,6 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from datetime import timedelta
 from decimal import Decimal
 
 from tradebot.core.clock import Clock
@@ -41,10 +63,6 @@ from tradebot.interfaces.broker import BrokerAdapter
 from tradebot.persistence.store import EventStore
 
 logger = get_logger(__name__)
-
-#: Poll cadence while orders are open (DESIGN §6.7). Derived from the rate budget in Phase 3;
-#: until then it is a floor slow enough that a burst cannot approach any venue's limit.
-DEFAULT_POLL_INTERVAL = timedelta(seconds=10)
 
 #: Sign applied to a group's stop trigger when ranking, keyed on the side that *opened* the
 #: position. A long is opened BUY and its stops sit below the market, so the tightest — the one
@@ -108,14 +126,11 @@ class ExecutionMonitor:
         execution: ExecutionService,
         store: EventStore,
         clock: Clock,
-        *,
-        poll_interval: timedelta = DEFAULT_POLL_INTERVAL,
     ) -> None:
         self._broker = broker
         self._execution = execution
         self._store = store
         self._clock = clock
-        self._poll_interval = poll_interval
         self._tracked: dict[str, _Tracked] = {}
         #: One monitor serves every basket, because orders belong to the venue portfolio rather
         #: than to a basket. Two runners polling at once would each see an entry fill that is not
@@ -147,22 +162,6 @@ class ExecutionMonitor:
             group.legs[order.client_order_id] = order
         else:
             group.order = order
-
-    async def settle(self, *, deadline: timedelta | None = None) -> tuple[Order, ...]:
-        """Poll until every entry is terminal, or until `deadline` elapses.
-
-        `--once` and the scenario tests use this instead of a background task, so a cycle's
-        outcome is a determined fact rather than a race against a poller.
-        """
-        started = self._clock.now()
-        while True:
-            await self.poll()
-            if not any(t.order.state.is_open for t in self._tracked.values()):
-                break
-            if deadline is not None and self._clock.now() - started >= deadline:
-                break
-            await self._clock.sleep(self._poll_interval.total_seconds())
-        return tuple(t.order for t in self._tracked.values())
 
     async def poll(self) -> None:
         """One sweep: sync every working order, expire what is past its TTL, mind the groups."""

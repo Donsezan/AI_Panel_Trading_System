@@ -34,7 +34,14 @@ from tradebot.decision.providers.stub import StubLLMProvider
 #: leaves the ledger holding a position the panel then sizes a SELL against, and the build dies
 #: on `sell of … exceeds holding …`. Measured over seven seeds on these two fixtures, three
 #: failed that way: unseeded, this file would fail roughly two runs in five. 2024 completes both
-#: at 228/228 cycles. When §5 is closed, any seed will do and this note can go.
+#: at 228/228 cycles.
+#:
+#: §5's *between-cycle* half closed on 2026-09-21 — `Supervisor._poll_orders` polls on the resync
+#: sweep — and it does not help here: `BacktestHarness._replay` drives `worker.cycle()` directly
+#: and polls only after it, so a replay has no sweep between two cycles. The race is inside one:
+#: freezing the snapshot reads prices, which hands the bar to the simulated venue and can match a
+#: resting stop right then, and nothing polls between that and the panel sizing its SELL. The pin
+#: goes when a poll lands there, not before.
 STUB_SEED = 2024
 
 

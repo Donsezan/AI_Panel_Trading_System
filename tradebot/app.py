@@ -1019,6 +1019,7 @@ async def _assemble(
             clock,
             drift=drift,
             portfolio=portfolio_watch,
+            monitor=monitor,
         ),
         configs=configs,
         startup=StartupSequence(

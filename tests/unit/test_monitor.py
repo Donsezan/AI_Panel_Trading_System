@@ -6,7 +6,6 @@ half of an order's life that a cycle-based system does not watch by default.
 
 from __future__ import annotations
 
-from datetime import timedelta
 from decimal import Decimal
 
 import pytest
@@ -45,7 +44,6 @@ def monitor(
         ExecutionService(broker, store, ledger, clock),
         store,
         clock,
-        poll_interval=timedelta(seconds=1),
     )
 
 
@@ -387,40 +385,6 @@ class TestProtectiveGroups:
 
 
 class TestLifecycle:
-    async def test_settle_returns_once_every_entry_is_terminal(
-        self,
-        monitor: ExecutionMonitor,
-        broker: SimBroker,
-        store: EventStore,
-        ledger: Ledger,
-        clock: ManualClock,
-        instrument: Instrument,
-    ) -> None:
-        broker.observe(tick(instrument, clock, last="49000"))
-        await submit_entry(monitor, broker, store, ledger, clock, instrument, plan=None)
-
-        settled = await monitor.settle()
-
-        assert [order.state for order in settled] == [OrderState.FILLED]
-
-    async def test_settle_gives_up_at_its_deadline_rather_than_blocking_forever(
-        self,
-        monitor: ExecutionMonitor,
-        broker: SimBroker,
-        store: EventStore,
-        ledger: Ledger,
-        clock: ManualClock,
-        instrument: Instrument,
-    ) -> None:
-        broker.observe(tick(instrument, clock, last="51000"))
-        await submit_entry(
-            monitor, broker, store, ledger, clock, instrument, price="45000", ttl=None
-        )
-
-        settled = await monitor.settle(deadline=timedelta(seconds=5))
-
-        assert settled[0].state.is_open
-
     async def test_a_settled_group_stops_being_polled(
         self,
         monitor: ExecutionMonitor,
