@@ -555,8 +555,10 @@ the seats first" should say so on its face.
   their ranking as a plumbing check. Run the two files separately.
 - **Every report is `NEWS-BLIND`** until slice E. Shock blocks measure the reaction to a violent
   price move, not to the reporting of an event.
-- **Corpus `61721dba…` (4h) is a stale 67/1080-cycle pass** and is reused at its identity, never
-  rebuilt. Delete the directory to retry it.
+- **The two dead partial corpora are gone** (deleted 2026-09-21): `61721dba…` at 67/1080 cycles
+  and `d7c390c6…` at 118/1080, the latter still holding `-wal`/`-shm` from the pass that died. A
+  corpus is reused at its identity and never rebuilt, so a partial one persists until the
+  directory is removed — which is the only way to retry that configuration.
 - **`STUB_SEED = 2024` is pinned** in `test_slice_b_end_to_end.py` because a reference pass can die
   on [KNOWN_GAPS](../docs/KNOWN_GAPS.md) §5. Delete the pin when §5 closes.
 - **The gate is keyed on `(dataset_digest, matrix_digest, dayset_digest)`, deliberately not on
@@ -566,8 +568,9 @@ the seats first" should say so on its face.
   edited prompt mints a new `matrix_digest`, so it is a calibration again. That is nine days, and
   it is the price of the guarantee.
 - **Nothing has been calibrated against a real panel yet, and the workspace is emptier than this
-  file used to claim.** Checked 2026-09-16: `decision_lab/workspace/` holds the three corpus
-  directories and **nothing else** — no `registry.jsonl`, no `gates/`. No sweep has ever run outside
+  file used to claim.** Re-checked 2026-09-21: `decision_lab/workspace/` holds **one** corpus
+  directory — `8ac130d8…`, the complete 540/540 pass — and **nothing else**: no `registry.jsonl`,
+  no `gates/`. No sweep has ever run outside
   the test suite, so there is not even a stub gate record to disambiguate. A stub matrix could never
   satisfy a real matrix's gate in any case — the bindings feed `panel_digest` → `matrix_digest`,
   which is a third of the key — so the first real `sweep` needs its own `calibrate normal` and
@@ -674,14 +677,20 @@ interruption a nine-session run had.
 
 ### What comes next
 
-1. **Close [KNOWN_GAPS](../docs/KNOWN_GAPS.md) §5 — "the monitor polls only inside a cycle that
-   placed orders."** Recommended next, and the only one of these three needing no key at all. It is
-   a live-money defect on its own terms — a venue-held stop fires between cycles, nothing books the
-   fill, and `aggregate` then values a position that no longer exists — *and* it is why a reference
-   pass is a coin flip: three of seven seeds died on it. Every `corpus build` and every
-   `calibrate long` carries that risk today, and `calibrate long` has neither a budget nor a resume,
-   so a death mid-pass costs the whole run. Closing it also retires the `STUB_SEED = 2024` pin in
-   `test_slice_b_end_to_end.py`.
+1. **Finish [KNOWN_GAPS](../docs/KNOWN_GAPS.md) §5 — the half a replay actually hits.** The
+   *between-cycle* half closed on 2026-09-21: `Supervisor._poll_orders` polls on the resync sweep,
+   and `ManualCloser` polls its own close, so a venue-held stop that fires overnight is booked
+   within thirty seconds instead of waiting for some basket to trade. **That does nothing for this
+   tool**, and the distinction is worth keeping straight: `BacktestHarness._replay` drives
+   `worker.cycle()` directly and polls only *after* it, so a replay has no sweep between two
+   cycles. The race that kills a reference pass is inside one — freezing the snapshot reads
+   prices, which hands the bar to the simulated venue and can match a resting stop right then, and
+   nothing polls between that and the panel sizing its SELL against a ledger that has not booked
+   it. `sell of … exceeds holding …`, three seeds in seven. Closing it means a poll between the
+   snapshot and the decision, which changes the live money path's ordering and its per-cycle venue
+   cost — a decision of its own. Until it is taken, every `corpus build` and every `calibrate long`
+   still carries the risk, `calibrate long` still has neither a budget nor a resume, and the
+   `STUB_SEED = 2024` pin in `test_slice_b_end_to_end.py` stays.
 2. **Calibrate against a real panel and then sweep it**, once `OPENROUTER_API_KEY` exists. The cost
    projection on the calibration page is what tells you what the sweep after it will cost — the
    whole point of running the nine days first. **Verify the model ids first:** the three `:free`

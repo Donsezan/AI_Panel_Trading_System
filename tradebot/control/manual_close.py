@@ -228,12 +228,45 @@ class ManualCloser:
             "manual close submitted",
             extra={"actor": actor, "instrument": instrument.key, "qty": str(order.qty)},
         )
+        # After the record above, never before: the poll can fail, and that a human asked and the
+        # venue took it must survive that.
+        order = await self._settle(order)
         return CloseOutcome(
             instrument_key=instrument.key,
             correlation_id=correlation_id,
             order=order,
             checks=checks,
             held_qty=proposal.position.qty,
+        )
+
+    async def _settle(self, order: Order) -> Order:
+        """Poll the close just submitted, and report it as the poll found it.
+
+        KNOWN_GAPS §5: nothing else polls until a basket happens to place an order, so until this
+        the close's own fill went unbooked and — worse — the protective legs guarding the holding
+        it emptied went on resting at the venue. A resting SELL against a position that is gone is
+        an accidental short (R13), and `_maintain` is what releases it.
+
+        Reporting the settled order rather than the submitted one is the same fact one layer up:
+        having polled, it would be this method that made the page say "submitted" about an order
+        it had just watched fill.
+
+        Guarded. The order is at the venue and already recorded, so a venue error here is a wait —
+        the supervisor's own sweep polls it next — while raising would tell an operator mid-
+        incident that a close which actually happened had failed.
+        """
+        try:
+            await self._monitor.poll()
+        except Exception:
+            logger.exception("polling the manual close raised; the order stands and is tracked")
+            return order
+        return next(
+            (
+                tracked
+                for tracked in self._monitor.tracked
+                if tracked.client_order_id == order.client_order_id
+            ),
+            order,
         )
 
     async def _refused(

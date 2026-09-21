@@ -25,8 +25,15 @@ from tradebot.app import Application
 from tradebot.control.arming import LIVE_CONFIRMATION_PHRASE
 from tradebot.control.config_store import SINGLETON_ID
 from tradebot.control.supervision import SupervisionController
-from tradebot.core.enums import BasketStatus, ConfigKind, CycleOutcome, KillSwitchState
+from tradebot.core.enums import (
+    BasketStatus,
+    ConfigKind,
+    CycleOutcome,
+    KillSwitchState,
+    OrderRole,
+)
 from tradebot.core.events import EventType
+from tradebot.core.orders import Order
 from tradebot.dashboard.dock import KILL_PHRASE, QUARANTINE_CONFIRM
 from tradebot.dashboard.queries import Queries
 from tradebot.risk.rules import STOOD_ASIDE
@@ -50,6 +57,21 @@ def events_of(application: Application, event_type: EventType) -> list[Any]:
 
 def risk_events(application: Application, rule: str) -> list[Any]:
     return [e for e in events_of(application, EventType.RISK_EVENT) if e.payload["rule"] == rule]
+
+
+def resting_stops(application: Application, instrument_key: str) -> list[Order]:
+    """This instrument's protective legs that could still sell at the venue.
+
+    Scoped to one instrument deliberately: the demo basket holds two, and a sibling's stop
+    resting on is correct — closing BTC by hand must not release ETH's guard.
+    """
+    return [
+        order
+        for order in application.monitor.tracked
+        if order.role is OrderRole.STOP_LOSS
+        and order.state.is_open
+        and order.instrument_key == instrument_key
+    ]
 
 
 async def test_the_control_page_redirects_to_the_workspace(client: httpx.AsyncClient) -> None:
@@ -456,6 +478,25 @@ async def test_a_manual_close_goes_through_the_normal_path(
     ]
     assert len(checked) == 2
     assert all(event.payload["approved"] for event in checked)
+
+
+async def test_a_manual_close_releases_the_legs_it_leaves_behind(cycled: Application) -> None:
+    """KNOWN_GAPS §5, through the second door it names.
+
+    The close empties the holding, but the venue-held stop that guarded it goes on resting until
+    something polls — and a resting SELL against a position that is gone is an accidental short
+    (R13). Nothing polled it: `manual_close` submits and tracks, and the monitor's only other
+    caller is a cycle that placed an order, which an operator closing by hand has no reason to
+    wait for.
+    """
+    assert resting_stops(cycled, BTC), "the entry that ran is guarded"
+
+    outcome = await cycled.manual_close.close("demo", BTC, actor="test")
+
+    assert outcome.submitted
+    assert cycled.ledger.position(BTC).is_flat, "the close emptied the position"
+    assert not resting_stops(cycled, BTC), "and released the stop that guarded it"
+    assert resting_stops(cycled, "sim:ETH/USDT"), "the sibling it did not close is still guarded"
 
 
 async def test_the_cooldown_the_entry_created_does_not_trap_the_operator(

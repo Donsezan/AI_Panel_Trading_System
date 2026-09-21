@@ -323,6 +323,24 @@ class TestTheSimulatedVenue:
         finally:
             await application.shutdown()
 
+    async def test_the_supervision_sweep_is_wired_to_the_one_monitor(
+        self, clock: ManualClock
+    ) -> None:
+        """KNOWN_GAPS §5: the sweep polls whatever monitor it was handed — and it must be *the*
+        one, the same object the cycles, the startup recovery and the operator's close all track
+        orders on. A second monitor would poll an empty set for ever and look identical.
+
+        Structural on purpose, and it is the only half the behavioural tests cannot reach: that
+        `serve` polls `self._monitor` is asserted in `test_supervisor.py`, and what a poll does to
+        a stop the venue has already filled is asserted in `test_protective_resize.py`. What
+        neither can see is which object the composition root put there.
+        """
+        application = await build_sim(clock=clock, db_path=None)
+        try:
+            assert application.supervisor._monitor is application.monitor
+        finally:
+            await application.shutdown()
+
     async def test_an_instrument_added_after_wiring_can_be_cycled(self, clock: ManualClock) -> None:
         """A basket published from the dashboard is picked up by the resync sweep, so the venue
         has to price instruments nobody enumerated when the process was wired."""

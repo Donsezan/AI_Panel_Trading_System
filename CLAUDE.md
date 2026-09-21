@@ -307,7 +307,11 @@ Rules that are easy to get backwards:
   order, so a stop that matched during the gap leaves the ledger holding a position the panel then
   sizes a SELL against, and the build dies on `sell of … exceeds holding …`. Measured over seven
   seeds, three did. `test_slice_b_end_to_end.py` therefore pins `STUB_SEED = 2024` through the
-  `rng` seam `StubLLMProvider` documents; **delete that pin when §5 closes.**
+  `rng` seam `StubLLMProvider` documents. **The pin stays**: §5's *between-cycle* half closed on
+  2026-09-21 (the supervisor's sweep now polls), but a replay has no such sweep —
+  `BacktestHarness._replay` drives `worker.cycle()` directly and polls only after it, so the race
+  inside one cycle is untouched. Delete the pin when a poll lands between the snapshot and the
+  decision, not before.
 - **A pass also ends when the basket auto-pauses.** `max_consecutive_losses` is a legitimate
   Tier-1 rule and a replay has no human to clear it, so the harness stops and the report shows how
   much of the window went unused. `ran_cycles` well below `planned_cycles` is that, not a crash.
@@ -809,6 +813,10 @@ Six rules that are easy to get backwards:
   the whole portfolio and block every other basket. It reads `read_only_prices`, never `prices`:
   the sim stack's bridge would match resting orders, and a valuation sweep must never move the
   venue.
+- **The order poll precedes that valuation sweep, and the order is load-bearing.**
+  `Supervisor._poll_orders` books what the venue did between cycles; the valuation sweep then
+  values what is left. Swept first, the drawdown would be measured against a holding the same tick
+  is about to discover is gone — ADR 0027's own argument, one door along (KNOWN_GAPS §5).
 - **The valuation basis change is announced, never absorbed.** A high-water mark stored by an
   earlier version was recorded on cost basis. Startup records one `RISK_EVENT` naming both figures
   and changes nothing — an automatic re-baseline would silently forgive whatever unrealized loss

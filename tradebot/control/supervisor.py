@@ -43,6 +43,7 @@ from tradebot.core.config import Basket
 from tradebot.core.enums import ConfigKind, CycleOutcome
 from tradebot.core.errors import TradebotError
 from tradebot.core.logging import correlate, get_logger
+from tradebot.execution.monitor import ExecutionMonitor
 from tradebot.interfaces.broker import TradingCalendar
 from tradebot.risk.state import RiskStateStore
 from tradebot.risk.watchdog import Watchdog
@@ -322,6 +323,7 @@ class Supervisor:
         max_consecutive_failures: int = DEFAULT_MAX_CONSECUTIVE_FAILURES,
         drift: DriftWatch | None = None,
         portfolio: PortfolioWatch | None = None,
+        monitor: ExecutionMonitor | None = None,
     ) -> None:
         self._factory = factory
         self._configs = configs
@@ -341,6 +343,11 @@ class Supervisor:
         #: process that outlives every cycle, and a paused basket's position still has to be
         #: marked or the whole portfolio freezes (PHASE_12 D1).
         self._portfolio = portfolio
+        #: Advances every working order whether or not a basket cycled. On this loop for the same
+        #: reason the two watches above are, and for a third: a venue-held stop fires *between*
+        #: cycles by construction (ADR 0004), so the only caller that used to poll — the cycle
+        #: that placed an order — could not be the one to notice (KNOWN_GAPS §5).
+        self._monitor = monitor
         self._workers: dict[str, BasketWorker] = {}
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._serving = False
@@ -406,6 +413,7 @@ class Supervisor:
         try:
             while self._serving:
                 await self._check_drift()
+                await self._poll_orders()
                 await self._sweep_portfolio()
                 self.sync()
                 await self._clock.sleep(resync_seconds)
@@ -425,6 +433,31 @@ class Supervisor:
             await self._drift.check()
         except Exception:
             logger.exception("the instrument reference-data check raised; supervision continues")
+
+    async def _poll_orders(self) -> None:
+        """Advance every working order, whether or not a basket cycled. Never fatal.
+
+        KNOWN_GAPS §5: the monitor's only production caller was `BasketRunner._settle`, which
+        returns before polling when the cycle placed no orders. So everything the monitor owns —
+        booking a venue-held fill, enforcing the bot-side TTL, resizing the protective legs —
+        advanced only when some basket happened to trade. A stop that fired overnight left the
+        ledger reporting a position the venue had already sold, which `aggregate` then valued and
+        `_size_sell` then sized a reduce-only order from.
+
+        Before `_sweep_portfolio`, and the order is load-bearing: the poll books the fills, the
+        sweep values what is left. Swept first, the drawdown would be measured against a holding
+        this very tick is about to discover is gone.
+
+        Guarded like the two sweeps around it. A venue error here is transient by nature — the
+        order stays tracked and the next tick asks again — and the alternative is the failure the
+        module docstring names: a dead supervisor leaves working orders with nobody polling them.
+        """
+        if self._monitor is None:
+            return
+        try:
+            await self._monitor.poll()
+        except Exception:
+            logger.exception("the order poll raised; supervision continues")
 
     async def _sweep_portfolio(self) -> None:
         """Refresh every mark and measure the drawdown. Never fatal.

@@ -24,7 +24,8 @@ Five passes so far:
 - **§5–8, found while designing gap 4's fix** (2026-08-27). Not an audit either: four things
   the fix had to reason about and then leave alone. §5 and §6 are the parts of the same seam
   that monitor-side scope deliberately excludes; §7 and §8 are what an operator is actually
-  told when the discrepancy §6 can cause is the one that gets caught.
+  told when the discrepancy §6 can cause is the one that gets caught. **§5 has since been
+  fixed** — see *Closed* below, including the half of its seam the fix does not reach.
 - **§9, found while closing gap 4** (2026-08-28). Verifying the fix on the reference pass that
   found the original defect turned up the one class of group it cannot reach — not a new defect,
   the fix's own documented boundary, written up because it is the exact shape of the thing §4
@@ -35,7 +36,6 @@ Five passes so far:
 | 1 | The mismatch kill threshold compares quantities to money, and sizes itself from explained lines | live · paper | **fails open and closed** |
 | 2 | Retiring a basket that holds a position is unguarded | every mode | fails closed, and traps |
 | 3 | The one-quote-currency rule is enforced only at boot | live · paper | fails open |
-| 5 | The monitor polls only inside a cycle that placed orders | every mode | **fails open** |
 | 6 | Nothing releases protective legs before a discretionary exit | live · paper on a venue | fails closed, and traps |
 | 7 | The mismatch alert names no instrument and no quantity | live · paper | fires, but says too little |
 | 8 | The kill-switch reason carries the explained lines and no absolute figures | every mode | fires, but says too little |
@@ -209,52 +209,6 @@ Binance data, and it takes *Binance's* catalogue (ADR 0025) — and so does live
 **To close it.** One check in `store_basket`, beside the exclusivity refusal it already performs
 (ADR 0026): refuse a basket whose instruments do not all quote in the process's notional currency.
 `Application.quote_currency` is already the single answer to what that is.
-
----
-
-## 5. The monitor polls only inside a cycle that placed orders
-
-**Where** — the module docstring of [execution/monitor.py](../tradebot/execution/monitor.py),
-against [basket_runner.py:256](../tradebot/control/basket_runner.py#L256)
-
-The docstring says the monitor polls the venue "**only while orders are actually open**, because a
-polling storm against a venue is a rate-limit ban waiting to happen". That describes a loop which
-does not exist. `poll()` has exactly two production callers:
-
-- `BasketRunner._settle`, which returns *before* polling when the cycle placed no orders
-- `BacktestHarness.run`
-
-`settle()` — whose own docstring says "`--once` and the scenario tests use this instead of a
-background task" — has **no** production caller at all. `run --once` goes through
-`Supervisor.run_once` → `BasketWorker.cycle` → `BasketRunner._settle` like every other cycle, and
-the only two callers of `settle()` are in `tests/unit/test_monitor.py`. `manual_close` submits and
-tracks its order and never polls. `Supervisor.serve` runs `_check_drift` and `_sweep_portfolio` and
-never touches the monitor; `PortfolioWatch` refreshes *marks*, not orders; `reconcile()` runs at
-startup only (§1).
-
-So everything the monitor owns advances only when some basket places an order. In `data/sim.db`
-that is 41 orders across 196 cycles — the great majority of cycles poll nothing.
-
-**What it costs.** A venue-held stop exists precisely because it fires *between* cycles
-(ADR 0004). When it does, nothing books the fill until the next order-placing cycle, and until
-then `Ledger.position` reports a holding that is gone:
-
-- `risk.aggregate.aggregate` values a position that no longer exists, so equity and the drawdown
-  baseline are wrong in whichever direction the market moved — ADR 0027's own argument, arriving
-  through a different door.
-- `_size_sell` sizes reduce-only from it and `LongOnlyRule` caps against it, so a SELL can be
-  approved for quantity the venue no longer holds, and `Ledger._apply_sell` then refuses it as
-  ledger corruption. That is §4's failure reached from the other side.
-- TTL is bot-enforced, because Binance spot has no venue-side good-till-time. An order past its
-  deadline keeps resting until something polls.
-
-Gap 4's fix inherits this latency exactly: legs are resized at the next poll, so a manual close's
-reduction is corrected promptly only if a basket happens to trade soon afterwards.
-
-**To close it.** A monitor tick in `Supervisor.serve` beside `_check_drift` and `_sweep_portfolio`
-— the loop that already exists for this class of between-cycle work — and a poll after
-`manual_close` submits. Whether `settle()` is then deleted or wired is the same "the docstring or
-the code" decision §1 ends on.
 
 ---
 
@@ -516,12 +470,85 @@ neither reproduces this defect: in both, the surviving `orders` row shows the *o
 leg still `open`, and the quantity refused is that leg's full size, not a resized one. The leg had
 already matched at the venue on the same bar the panel's own reducing order was sized against, and
 the monitor's next poll — which runs after a cycle's own order, not before it — was what tried to
-book it, against a ledger that had moved on in between. That is §5's mechanism, not this one; §5 is
-open and out of scope here.
+book it, against a ledger that had moved on in between. That is §5's mechanism, not this one — and
+it is the half of §5 that the fix below does *not* reach, because it happens inside one cycle
+rather than between two.
 
 **What the fix does not reach.** A group adopted at startup carries no `ProtectivePlan` — the
 `orders` projection has no column for one — so the resize path above cannot see it. §9 records the
 boundary; the original defect survives a restart for exactly those groups.
+
+## Closed — the monitor polls between cycles (2026-09-21)
+
+**5 — everything the monitor owned advanced only when some basket placed an order.** `poll()` had
+exactly two production callers: `BasketRunner._settle`, which returns *before* polling when the
+cycle placed nothing, and `BacktestHarness.run`. `Supervisor.serve` ran `_check_drift` and
+`_sweep_portfolio` and never touched the monitor; `manual_close` submitted and tracked its order
+and never polled; `reconcile()` ran at startup only. In `data/sim.db` that is 41 orders across 196
+cycles, so the great majority of cycles polled nothing at all.
+
+A venue-held stop exists precisely because it fires *between* cycles (ADR 0004), which made the one
+caller that did poll the one that structurally could not notice. Until some basket happened to
+trade, `Ledger.position` reported a holding the venue had already sold: `risk.aggregate.aggregate`
+valued it, `_size_sell` sized reduce-only from it, and a bot-enforced TTL went unenforced on
+whatever was still resting.
+
+**The fix is the one the gap prescribed**, and it is two calls:
+
+* `Supervisor._poll_orders`, on the resync sweep beside `_check_drift` and `_sweep_portfolio` —
+  the loop that already exists for this class of between-cycle work. It sits **before**
+  `_sweep_portfolio`, and that order is load-bearing: the poll books the fills, the sweep values
+  what is left. Swept first, the drawdown would be measured against a holding the same tick is
+  about to discover is gone. Guarded like its two neighbours — a dead supervisor leaves working
+  orders with nobody polling them, which is the failure this whole entry is about.
+* `ManualCloser._settle`, after the close is submitted *and recorded*. The close empties a holding
+  whose protective legs are still resting at the venue, and a resting SELL against a position that
+  is gone is an accidental short (R13). The order is reported as the poll found it, because having
+  polled, anything else would be this method telling the page "submitted" about an order it had
+  just watched fill.
+
+Neither adds a polling storm: `poll` over an empty tracked set reaches nothing and `_sync` returns
+early for an order already terminal, so the venue cost stays proportional to live work rather than
+to how often something asks. That is what the monitor's module docstring always claimed, and it is
+now true of a loop that exists.
+
+**`settle()` was deleted, which is the other half of "the docstring or the code".** It had no
+production caller — `--once` goes through `BasketRunner._settle` like every other cycle — and
+blocking until an entry is terminal is the thing no caller wants, because it stalls every other
+basket behind one unfilled limit. Its two unit tests went with it; `poll` is the method.
+
+That deletion surfaced one thing worth stating rather than losing. `DEFAULT_POLL_INTERVAL`, ten
+seconds, was read **only** by `settle()` — so nothing in the process ever polled on that cadence,
+or on any other. It is gone with the method, and the cadence is now openly
+`Supervisor.DEFAULT_RESYNC_SECONDS`: thirty seconds, because the sweep is what calls `poll`.
+DESIGN §6.7 asks for "~10s while orders are open". Thirty is a strict improvement on never, but it
+is not ten, and closing the difference means running the drift check and the valuation sweep three
+times as often too — a decision about that loop, not a constant the monitor can hold. **Open.**
+
+**Re-verified four ways.** A rung-3 scenario
+([tests/scenario/test_protective_resize.py](../tests/scenario/test_protective_resize.py)) buys,
+lets the venue match the stop against a crash bar with *no basket cycling*, and then runs the real
+`Supervisor.serve` loop over a factory that raises if anything asks it for a runner — so the sweep
+is the only thing that can have reached the venue. Against the pre-fix supervisor the stop is never
+read and the ledger keeps the position. `tests/unit/test_supervisor.py` pins the composition: that
+the sweep polls at all, that it polls *before* the valuation sweep, and that a poll which raises
+leaves the loop running. `tests/unit/test_dashboard_control.py` pins the close releasing the legs it
+leaves behind — and the sibling instrument's legs staying exactly where they were. And because
+none of those three can see *which* monitor the composition root handed the supervisor — a second
+one would poll an empty set for ever and look identical — `tests/scenario/test_full_cycle.py`
+asserts it is the process's own.
+
+**What the fix does not reach**, and it is the half that costs `decision_lab` its reference passes.
+The hazard inside a *single* cycle is untouched: freezing the snapshot reads prices, which on the
+simulated stack hands the bar to the venue and can match a resting stop right then — and the panel
+then sizes a SELL against a ledger that has not booked it, which `Ledger._apply_sell` refuses as
+ledger corruption. Nothing between the freeze and the sizing polls. A running process is largely
+covered by the 30-second sweep having already been round, but `BacktestHarness._replay` drives
+`worker.cycle()` directly and polls only *after* it, so a replay has no such sweep and reaches the
+race on its own data read. Closing that means a poll between the snapshot and the decision, which
+changes the live money path's ordering and its per-cycle venue cost — a decision of its own, not a
+consequence of this one. Until it is taken, `STUB_SEED = 2024` stays pinned in
+`decision_lab/tests/test_slice_b_end_to_end.py`.
 
 ## What was checked and found sound
 
