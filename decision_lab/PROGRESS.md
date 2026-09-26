@@ -415,10 +415,29 @@ with a **117-day hole** between. Those were stopped processes, not sparse publis
 being that a background crawl looks identical to a finished one unless you check the last day it
 reached.
 
-**These two stores have no corpus yet.** `data\history` is **2024-01-01 → 06-30** and corpus
+**The 2025 dataset is now verified and its day set pinned** (2026-09-22). `dataset verify` found
+both 1h series **8 760/8 760 bars with zero holes**, so no `--repair` was needed, and `dataset days`
+drew the nine days off `binance:BTC/USDT` at the default seed `20260823`:
+
+```
+dataset_digest  09a89f7e1e36e441470fcb11ae603d23
+dayset_digest   cf2a3eabc5bc14f547e18f3afd4339f3
+  NORMAL        2025-06-09  2025-08-07  2025-08-13
+  SHOCK_DOWN    2025-01-09  2025-02-04  2025-11-04
+  SHOCK_UP      2025-03-04  2025-03-07  2025-12-09
+```
+
+Both files sit beside the CSVs as `decision_lab-coverage.json` and
+`decision_lab-calibration-days.json`, exactly as `data\history` carries them. Two of the three
+§10.6 gate key components have therefore changed, so **nothing calibrated against 2024 transfers**:
+2025 needs its own `calibrate normal` and `calibrate shock` over these nine days, from nothing.
+
+**These two stores still have no corpus.** `data\history` is **2024-01-01 → 06-30** and corpus
 `8ac130d8…` is exactly that window at 8h (540 cycles), so the year that has a corpus is 2024 while
-the news year is 2025. Building one over `data\history-2025` carries its own pinned day set, its
-own calibration and its own §10.6 gate cost, and it is the prerequisite for any scored news work.
+the news year is 2025. What remains is the reference pass itself — and at 8h over a full year that
+is **~1 095 cycles**, the same size as the two dead partial corpora, carrying the §5 intra-cycle
+race with no `--seed` to pin it (`corpus build` has none; only `dataset days` and `sweep` do). That
+is a decision, not a formality — see *What comes next*.
 
 Rules that are easy to get backwards, all of them learned the expensive way:
 
@@ -508,6 +527,8 @@ is the bot's existing one (title, URL, timestamps, short excerpt, never a body),
 ```powershell
 .venv\Scripts\python.exe -m decision_lab dataset verify --data data\history   # --repair re-asks the venue
 .venv\Scripts\python.exe -m decision_lab dataset days   --data data\history
+.venv\Scripts\python.exe -m decision_lab dataset verify --data data\history-2025   # clean, 2026-09-22
+.venv\Scripts\python.exe -m decision_lab dataset days   --data data\history-2025   # cf2a3eab…
 .venv\Scripts\python.exe -m decision_lab archive build  --data data\history --year 2024  # resumable
 .venv\Scripts\python.exe -m decision_lab archive build  --data data\history-2025 --source cryptoslate --year 2025
 .venv\Scripts\python.exe -m decision_lab archive build  --data data\history-2025 --source bitcoincom  --year 2025
@@ -701,8 +722,11 @@ interruption a nine-session run had.
 3. **Slice E's remaining half. Collection is done** — 20 171 articles, every one with a body, and
    2025 covered every day. What is left, in order:
    - **A corpus over `data\history-2025`**, because the news year is 2025 and corpus `8ac130d8…`
-     is 2024 H1. It needs `dataset verify`, then `dataset days` to pin a set, and it carries its
-     own §10.6 gate. This is the prerequisite for any scored news work and needs no key.
+     is 2024 H1. Its two prerequisites are **done** (2026-09-22): the dataset verified clean at
+     8 760/8 760 bars per series and the day set is pinned at `cf2a3eab…`. What is left is the
+     reference pass itself, which carries its own §10.6 gate and needs no key — but at 8h over a
+     full year it is **~1 095 cycles**, unseeded, and both prior passes of that size died short.
+     Weigh closing §5's intra-cycle half first.
    - **Then the `build_sim(news_feed=…)` seam and `ArchiveNewsFeed`.** The seam is the only part of
      this design that touches `tradebot` at all, and it lands with its §2.3 guard tests in one
      commit, never two. `RawStore.read_months(start, end)` is what it should read: sharding means

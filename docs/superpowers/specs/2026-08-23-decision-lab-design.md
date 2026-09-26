@@ -540,8 +540,12 @@ paid.
 **What this buys is not a source. It is most of §6.** An API that publishes its own summary and its
 own ingestion timestamp *deletes* work rather than relocating it:
 
-- **§6.5's summarizer becomes unnecessary.** It exists because a crawled page yields a body and
-  nothing else; `summary` is the publisher's. Dropping it removes the entire archive-build LLM
+- **§6.5's summarizer becomes unnecessary.** *(Superseded — this bullet describes the `api`
+  backend, which no longer exists. The sitemap path shipped, so the summarizer is live; and §6.5's
+  own premise — "a crawled page yields a body and nothing else" — was measured false in
+  2026-09-22, since both 2025 sources publish an abstract on 100% of rows. The summarizer survives
+  for the reasons §6.5 now gives, which are not these.)* It exists because a crawled page yields a
+  body and nothing else; `summary` is the publisher's. Dropping it removes the entire archive-build LLM
   spend — on this design's window roughly 2 800 calls, about four times a full calibration — along
   with the `archive.toml` summarizer binding, its model id and prompt digest inside `archive_digest`
   (§6.6), the `SUMMARIZED NEWS` banner, and the second contamination channel §6.5 was built to
@@ -628,21 +632,62 @@ obstacle into a constraint that happens to enforce the right thing.
 
 ### 6.5 The summarizer is a compressor, not an analyst
 
-> **Applies to the `sitemap` backend only.** §6.3.1 settled the `api` backend on a source that
-> publishes its own `summary`, which needs no compression — so on that path this whole section is
-> skipped and the banner it raises does not apply. It stays specified because the sitemap fallback
-> stays declared, and a crawled page yields a body and nothing else. Read what follows as the rule
-> *if* an excerpt has to be generated, never as a step every archive takes.
+> **Applies to the `sitemap` backend, which is the path this design took.** §6.3.1 first settled
+> the `api` backend on a source publishing its own `summary`, which needs no compression. That
+> backend is **gone** — CoinDesk retired its free tier on 21 May 2026 — and the sitemap path is no
+> longer a declared fallback but the one in service, over CryptoSlate and Bitcoin.com. So this
+> section is live, not contingent, and the banner it raises applies to every archive built here.
+> The premise underneath it changed too; see the revision note below.
+
+**Revised 2026-09-22, after measuring the archive that was actually collected.** The premise this
+section was written on — that a crawled page yields a body and nothing else — is **false** for the
+2025 stores. CryptoSlate and Bitcoin.com carry the publisher's abstract on **100%** of rows, median
+119 and 135 characters against `DEFAULT_EXCERPT_CHARS = 280`; only 2.3% exceed the slot. The
+summarizer survives that correction, but for different reasons than the ones first written down,
+and those reasons decide what the prompt must say:
+
+- **Bitcoin.com's abstract is the body's first sentence, verbatim.** A lede is not a summary; it is
+  whatever the writer opened with.
+- **CryptoSlate's is written, and it evaluates.** *"Securing EMI authorization **empowers** Kraken
+  to introduce **innovative** crypto-focused financial products."* That is the fourteenth seat this
+  section exists to prevent, arriving from the publisher instead of from our model — and it arrives
+  on **one source only**, so the two registers are not comparable and a seat could learn the
+  publisher rather than the news.
+
+So the job is **de-editorialising and genuine compression**, not merely fitting 280 characters.
 
 Each article gets one LLM pass producing the `excerpt` the panel will read. This is the section's
 load-bearing rule, and it has a home in existing doctrine: `interfaces/news.py` already says
 *"Scoring only ranks and filters. **Interpreting** the news is the panel's job — that is what the
 seats are for."*
 
+**What the summary carries** — facts stated in the article, and nothing else:
+
+| Carried | Why it is a fact and not a judgement |
+|---|---|
+| the event, as a classification | the event is the subject and the entity the target; events dominate news's impact on volatility. Classification rather than span extraction, because financial events are overlong and discontinuous |
+| named entities | who acted, and on whom |
+| the assets the text names — BTC / ETH / other / none | the text either names them or it does not; inferring an asset is the relevance filter's job, and it is the bot's |
+| magnitudes exactly as stated | *"$2.2B inflow"* is in the article; *"large inflow"* is a judgement about it |
+| **modality — confirmed, proposed, rumoured, denied, corrected** | *"SEC approves"* and *"SEC is expected to approve"* are different facts, both present in the text, and an editorial abstract flattens them. Load-bearing past the prompt: §6.8 reads it to refuse to collapse a correction behind the claim it corrects |
+
+**What it never carries:**
+
+- sentiment polarity — finBERT's entire output, and the panel's job by `interfaces/news.py`
+- price direction, market implication, or expected impact
+- anything about what happened after the article was published
+
+**The hindsight channel is measured, not hypothetical, and this archive is its worst case.** A
+pre-trained model's weights encode the outcomes it is being asked to summarise toward; the
+mitigations the literature settles on are to restrict the prompt to pre-cutoff content and to
+suppress memory activation, and the finding that binds us is that **memorisation is non-uniform
+across entities** — heavily-covered names leak far more than obscure ones. BTC and ETH over 2025
+are about the most-covered assets there are.
+
 A summarizer that offered market implications would have quietly become a fourteenth seat that
 every candidate shares — and worse, one trained on what happened next, able to colour a March 2024
 headline with April 2024's outcome. That is a second contamination channel, distinct from the
-`observed_at` one §6.7 guards, and it is closed three ways:
+`observed_at` one §6.7 guards, and it is closed four ways:
 
 - **By prompt.** Restate only what the text says. No outlook, no market implication, no price
   direction, no reference to anything after the article.
@@ -651,6 +696,11 @@ headline with April 2024's outcome. That is a second contamination channel, dist
 - **By binding.** The summarizer is a declared `(provider, model)` in `archive.toml`, reached
   through the same `decision.providers` adapters the seats use — so the stub provider serves it in
   tests and the suite stays offline and free.
+- **By traceability, which is the only one of the four that is *checkable*.** Every clause must
+  restate a span of the body. Asserted on a sample by n-gram overlap against the source body: a
+  summary asserting something the article does not say fails, and it fails identically whether the
+  claim came from hindsight, from the model's priors, or from invention. The other three close the
+  channel by construction and can only be reasoned about; this one produces a number.
 
 The summary lands in `NewsItem.excerpt`, which `NewsItem.view` already renders as the panel's
 `summary`. No new field, no second rendering path, and the delimiting that keeps news as data
@@ -674,9 +724,17 @@ alone.
 ```
 
 `archive_digest` covers the source, the capture mode, the `observed_at` policy, **the summarizer's
-model id and prompt digest**, and the row set. It feeds `corpus_id` (§5.4), so re-summarising with
-a different model yields a different corpus instead of silently mixing two experiments — the same
-rule ADR 0013 applies to a basket version, one level out.
+model id and prompt digest**, **the §6.8 news window**, and the row set. It feeds `corpus_id`
+(§5.4), so re-summarising with a different model yields a different corpus instead of silently
+mixing two experiments — the same rule ADR 0013 applies to a basket version, one level out.
+
+**The window rides here rather than in `corpus_identity`, and that is a constraint rather than a
+preference.** `corpus_identity` is exactly four components —
+`dataset_digest | reference_config_digest | cadence_seconds | archive_digest` — so a fifth would
+recompute the id of every corpus ever built, including the complete 540-cycle `8ac130d8…`.
+`archive_digest` is `""` on all of them, so folding the window into it renumbers nothing while
+still making two windows two corpora. It is also the consistent home: `observed_at_policy` is
+already in there, and is likewise a reading policy rather than file content.
 
 ### 6.7 `observed_at` is synthetic unless the source supplies it
 
@@ -710,6 +768,89 @@ A `NewsFeed` implementation that **never fetches**. It satisfies `snapshot_news(
 limit)` by selecting archive rows with `observed_at <= as_of` and scoring them through the bot's
 own `KeywordRelevanceFilter`, returning `NewsItemView`s and a `NewsCoverage`. Only the fetch half is
 replaced; relevance, selection, ordering and truncation stay the bot's.
+
+#### 6.8.1 The window is the bot's by default, and it is configurable
+
+`NewsStore.select` filters `observed_at <= as_of` **and** `>= as_of - lookback`, with
+`DEFAULT_LOOKBACK = 48h` and `DEFAULT_SNAPSHOT_ITEMS = 8`. The feed reads the archive rather than
+that store, so the window is its own choice and is stated here: **48 hours by default**, because a
+replay measuring a panel the bot does not run measures the wrong panel (ADR 0020's argument, one
+door along). It is **configurable**, and the value is part of `archive_digest` (§6.6), so two
+window lengths are two corpora and the axis can be measured rather than argued about.
+
+The numbers this operates on: ~33 articles a day across the two 2025 sources, so a 48h window
+offers roughly **65 candidates for 8 slots**. The cut is severe, and that is what §6.8.3 is about.
+
+#### 6.8.2 Clustering annotates; it never deletes
+
+Because the feed bypasses `NewsHub._ingest`, the bot's embedding dedup **does not run in a
+replay** — so without a clustering step a replay's eight slots can be filled by eight rewrites of
+one story where production's would hold eight distinct events. Clustering is therefore required
+for *fidelity*, not merely for tidiness. Four rules, and the last two exist because the obvious
+implementation loses the one item that mattered:
+
+- **No row is ever dropped.** A cluster elects one member to occupy a slot and the line carries the
+  count — `reports=12` — while every other member stays in the archive and is shown in the
+  decision drill-down. The bot's own dedup *drops* at ingest with a `logger.debug`
+  (`tradebot/news/hub.py`), which is unrecoverable and invisible; a replay whose evidence cannot be
+  reconstructed is not evidence. This is the same rule §9 already applies to scoring: unscorable is
+  a verdict with a reason, never a drop.
+- **The count is information the panel cannot otherwise have.** Twelve outlets reporting one event
+  currently render as twelve lines, and repetition reads as corroboration.
+- **A cluster is represented by its most recent member as of `as_of`, never its first.** Otherwise a
+  story's original claim outranks its own correction and the correction is invisible behind a
+  count.
+- **A member whose modality qualifies, corrects or denies its cluster is never collapsed at all**
+  and takes its own slot. This is what §6.5's `modality` field is *for*. The worked case: a 09:00
+  item reporting a public figure's enthusiasm for bitcoin and a 15:00 item walking it back are
+  textually near-identical and cluster together; collapsed to either single member, the panel reads
+  a claim without its retraction or a retraction without its claim.
+
+#### 6.8.2.1 The clustering signal is the extracted fields, not the bot's embedding
+
+**Measured 2026-09-22, against `tradebot.news.embedding` at its `DEFAULT_DUPLICATE_THRESHOLD` of
+0.85.** That embedding is a hashed bag of unigrams and bigrams, and its own docstring says it
+"captures lexical overlap, not meaning". The numbers say how little:
+
+| Pair | Similarity | At 0.85 |
+|---|---|---|
+| a claim and its later walk-back | **0.085** | kept |
+| one event, two publishers, different wording | **0.556** | kept |
+| near-verbatim syndication | 1.000 | dropped |
+
+Two consequences, and the second is the one that shapes this section. **A correction is in no
+danger of being dropped** — at 0.085 it is not remotely near the threshold, so the hazard §6.8.2
+guards against is not reachable through this embedding. And **a genuine duplicate in different
+words is not caught either**: 0.556 against a 0.85 threshold means only near-verbatim copies
+collapse, so a lexical clusterer would leave the eight slots open to eight rewordings of one story
+— the exact flooding this subsection exists to prevent.
+
+So **the cluster key is §6.5's extracted fields** — `(event_type, entities, assets)` — not a
+similarity score. Those are semantic by construction, they are computed once per article at
+archive-build time and cached, so clustering stays deterministic and costs nothing per cycle, and
+`modality` is already beside them to enforce the correction rule above. The field extraction earns
+its keep twice.
+
+**The known weakness, stated rather than discovered later:** two genuinely distinct events sharing
+a type and an entity — *"Kraken licensed in the UK"* and *"Kraken licensed in Germany"* — collide
+on that key. A lexical **floor** is the cheap guard (cluster only if the fields match *and*
+similarity clears a low bar), and the floor's value is a calibration question, not a constant to
+be guessed here. Until it is measured, the fail-closed reading applies: **when in doubt, do not
+cluster** — two slots spent on one event costs a slot, while one slot hiding two events costs the
+evidence.
+
+**Cluster counts are computed forward-only, over rows with `observed_at <= as_of`, and never
+precomputed across the archive.** A count taken over the whole year encodes how much coverage an
+event *eventually* attracted, which is information from after the cycle — §6.7's failure arriving
+through a new door, wearing a deterministic, model-free disguise. Forward-only it is also cheap,
+since the feed is already reading a month shard by date.
+
+#### 6.8.3 The cut is stated, because silence and absence are different
+
+`_render_news` already prints a coverage line, for a reason that generalises exactly: *"a seat told
+nothing happened will reason as though nothing happened."* A seat shown 8 of 65 must be told it is
+8 of 65. The existing `NewsCoverage` line carries it, so a truncation that is silent today becomes
+visible without a second rendering path — the same argument, one level up.
 
 ### 6.9 No archive
 
@@ -1493,6 +1634,10 @@ against the real failure, not merely against the wiring. In `decision_lab/tests/
 | an archive holding one item `observed_at` **before** the replay instant and one **after** it: the snapshot carries the first and not the second | the actual look-ahead guard, on the real `ContextBuilder` output |
 | the summarizer is called at archive-build time and **never** during a corpus, sweep or calibration run | §6.5's reuse promise, and that a sweep's spend is the panel's alone |
 | the summarizer's prompt is given no instrument, no market data and no sibling article | §6.5's hindsight closure, asserted on the call arguments rather than on the prompt text |
+| a sampled summary's clauses trace to n-grams of its own body | §6.5's traceability check — the only one of the four closures that produces a number rather than an argument |
+| a cluster holding a claim and its later correction yields **two** slots, not one | §6.8.2, on the worked 09:00/15:00 case. The collapse-to-first implementation passes every other test in this table |
+| cluster counts for a cycle at `as_of` ignore rows observed after it | §6.8.2's forward-only rule — a count over the whole archive is look-ahead with no model in it |
+| no archive row is absent from the drill-down for a cycle that collapsed it | §6.8.2's "annotates, never deletes", asserted on the reconstruction rather than on the renderer |
 
 The third is the one that matters most. It is the exact scenario §2.2 describes, run through the
 real snapshot path, and it fails if anyone ever reintroduces a fetch into the replay — including by
