@@ -55,6 +55,7 @@ from decision_lab.archive.collect import (
     collect_site,
 )
 from decision_lab.archive.config import DEFAULT_POLICY_FILE, load_policy
+from decision_lab.archive.publish import publish_archive
 from decision_lab.archive.reshard import reshard
 from decision_lab.archive.sites import PROFILES, parse_site_article
 from decision_lab.archive.store import RAW_DIR, RawArticle, RawStore
@@ -304,6 +305,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "confirms you meant it, because the shipped policy binds the stub",
     )
     archive_summarise_parser.add_argument("--verbose", action="store_true")
+
+    archive_publish_parser = archive_actions.add_parser(
+        "publish",
+        help="project the summarised staging store into the §6.6 archive a replay reads",
+    )
+    archive_publish_parser.add_argument(
+        "--data", type=Path, required=True, help="dataset directory"
+    )
+    archive_publish_parser.add_argument("--source", required=True, help="the source to publish")
+    archive_publish_parser.add_argument(
+        "--policy", type=Path, default=DEFAULT_POLICY_FILE, help="archive.toml (§6.6)"
+    )
+    archive_publish_parser.add_argument(
+        "--capture",
+        default="sitemap",
+        help="how the rows were collected; recorded in the header and inside archive_digest",
+    )
+    archive_publish_parser.add_argument("--verbose", action="store_true")
 
     corpus = commands.add_parser("corpus", help="build the frozen decision contexts a sweep reads")
     corpus_actions = corpus.add_subparsers(dest="action", required=True)
@@ -1508,6 +1527,29 @@ async def archive_summarise(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+async def archive_publish(args: argparse.Namespace) -> int:
+    """Project a summarised staging store into its travelling archive (§6.4, §6.6).
+
+    Absent from `LOCKED` for the same reasons every other `archive` action is: it writes beside
+    the dataset, not into the workspace. A refusal is an `EXIT_CANDIDATE` logged here, as
+    `archive_summarise` does, because `main` would report an escaping `ConfigError` as exit 3.
+    """
+    try:
+        policy = load_policy(args.policy)
+        store = RawStore.open(args.data / RAW_DIR, source_id=args.source)
+        report = publish_archive(
+            store, policy, SystemClock(), out_dir=args.data, capture=args.capture
+        )
+    except ConfigError as error:
+        logger.error("publish refused; nothing was written", extra={"reason": str(error)})
+        return EXIT_CANDIDATE
+    logger.info(
+        "archive publish complete",
+        extra=report.model_dump(mode="json") | {"source": args.source},
+    )
+    return EXIT_OK
+
+
 #: Command → coroutine. Dispatch over a table rather than a chain of `if`s, per the repo's own
 #: convention (CLAUDE.md, "prefer dispatch over branching").
 COMMANDS: dict[tuple[str, str], Callable[[argparse.Namespace], Coroutine[Any, Any, int]]] = {
@@ -1517,6 +1559,7 @@ COMMANDS: dict[tuple[str, str], Callable[[argparse.Namespace], Coroutine[Any, An
     ("archive", "backfill"): archive_backfill,
     ("archive", "reshard"): archive_reshard,
     ("archive", "summarise"): archive_summarise,
+    ("archive", "publish"): archive_publish,
     ("corpus", "build"): corpus_build,
     # `sweep` and `report` have no sub-action, so `getattr(args, "action", "")` yields "".
     ("sweep", ""): sweep_command,

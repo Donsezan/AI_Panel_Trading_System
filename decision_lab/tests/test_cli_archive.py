@@ -347,3 +347,51 @@ def test_dry_run_is_not_blocked_by_the_stub_refusal(tmp_path: Path) -> None:
 def test_summarise_is_absent_from_locked() -> None:
     assert ("archive", "summarise") not in cli.LOCKED
     assert ("archive", "publish") not in cli.LOCKED
+
+
+def _publishable(data: Path) -> None:
+    from decision_lab.archive.config import load_policy
+    from decision_lab.archive.fields import EventType, Modality
+    from decision_lab.archive.summarize import prompt_digest, system_for
+
+    policy = load_policy(DEFAULT_POLICY_FILE)
+    store = RawStore.open(data / RAW_DIR, source_id="cryptoslate")
+    store.append(
+        summarisable_row(1).model_copy(
+            update={
+                "summary": "Summary.",
+                "event_type": EventType.REGULATORY,
+                "modality": Modality.CONFIRMED,
+                "summary_provider": policy.provider_id,
+                "summary_model": policy.model,
+                "summary_prompt_digest": prompt_digest(system_for(policy)),
+            }
+        )
+    )
+
+
+def test_publish_writes_the_archive_and_exits_zero(tmp_path: Path) -> None:
+    data = tmp_path / "history"
+    _publishable(data)
+
+    code = cli.main(["archive", "publish", "--data", str(data), "--source", "cryptoslate"])
+
+    assert code == cli.EXIT_OK
+    assert (data / "news" / "cryptoslate" / "news.jsonl").exists()
+
+
+def test_publish_refuses_an_unsummarised_store_with_exit_candidate(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    data = tmp_path / "history"
+    RawStore.open(data / RAW_DIR, source_id="cryptoslate").append(summarisable_row(1))
+
+    parsed = cli.parse_args(["archive", "publish", "--data", str(data), "--source", "cryptoslate"])
+    with caplog.at_level(logging.ERROR, logger="decision_lab.cli"):
+        code = asyncio.run(cli.archive_publish(parsed))
+
+    assert code == cli.EXIT_CANDIDATE
+    assert "summarise" in " ".join(
+        r.getMessage() + str(getattr(r, "reason", "")) for r in caplog.records
+    )
+    assert not (data / "news").exists()
