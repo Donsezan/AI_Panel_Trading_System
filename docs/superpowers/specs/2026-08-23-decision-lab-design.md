@@ -831,6 +831,31 @@ archive-build time and cached, so clustering stays deterministic and costs nothi
 `modality` is already beside them to enforce the correction rule above. The field extraction earns
 its keep twice.
 
+**The floor is computed on the summary, never on the body — measured 2026-10-05.** The proposal
+that summarising would itself fix the dedup is half right, and the half that is wrong matters.
+Over 401 likely-duplicate pairs (cross- and same-source, title Jaccard ≥ 0.40) against 300 random
+controls from H1 2025:
+
+| Compared on | Same event | Unrelated | Separation | Best threshold → false merges |
+|---|---|---|---|---|
+| full bodies | 0.798 | 0.737 | 1.08× | 0.77 → **28%** |
+| short, normalised text | 0.308 | 0.177 | **1.74×** | 0.25 → **15%** |
+
+Normalising nearly **doubles the separation** and halves the false-merge rate, so a floor belongs
+on the summary. But similarity *falls* in absolute terms — a bag of n-grams over short text has
+fewer n-grams to share — so nothing crosses 0.85 after summarising; it moves further away. A
+threshold tuned on bodies is tuned against a 0.737 noise floor and is close to meaningless.
+
+**This also explains the live behaviour exactly.** `NewsHub` embeds `NewsItem.text` — title plus
+the 280-character excerpt, not the body — so the bot's dedup already operates on the bottom row:
+same-event pairs near 0.31 against a 0.85 threshold. It collapses near-verbatim syndication and
+essentially nothing else. That is the wrong instrument rather than a mistuned one, which is why
+this design keys on fields instead of raising or lowering a number.
+
+**And it is why a floor cannot be the key.** At its best operating point a lexical floor wrongly
+merges 15% of unrelated pairs — one distinct event in seven — and that figure is optimistic,
+because random controls are easy negatives. The hard case is below.
+
 **The known weakness, stated rather than discovered later:** two genuinely distinct events sharing
 a type and an entity — *"Kraken licensed in the UK"* and *"Kraken licensed in Germany"* — collide
 on that key. A lexical **floor** is the cheap guard (cluster only if the fields match *and*
