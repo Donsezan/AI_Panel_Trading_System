@@ -124,8 +124,8 @@ def _agreed_provenance(
         for a in ready
     )
     fix = (
-        "Re-summarise the store with the policy in force, "
-        "or restore the policy the rows were made under"
+        "Run `archive summarise --data <dir> --source <id> --resummarise-stale` to redo the rows "
+        "under the policy in force, or restore the policy the rows were made under"
     )
     if len(seen) > 1:
         ranked = seen.most_common()

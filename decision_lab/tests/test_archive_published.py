@@ -140,3 +140,39 @@ def test_a_file_whose_first_line_is_not_a_header_is_refused(tmp_path: Path) -> N
 
     with pytest.raises(ConfigError, match="header"):
         PublishedArchive.read(path)
+
+
+def test_an_edited_row_is_refused_by_the_digest(tmp_path: Path) -> None:
+    path = tmp_path / ARCHIVE_FILE
+    PublishedArchive.write(path, header(), (item(),))
+    text = path.read_text(encoding="utf-8").replace("Kraken gained", "Kraken lost")
+    path.write_text(text, encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="edited since it was published"):
+        PublishedArchive.read(path)
+
+
+def test_an_edited_digest_is_refused(tmp_path: Path) -> None:
+    path = tmp_path / ARCHIVE_FILE
+    PublishedArchive.write(path, header(), (item(),))
+    stamped = PublishedArchive.read(path).header.archive_digest
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(stamped, "0" * len(stamped)), encoding="utf-8"
+    )
+
+    with pytest.raises(ConfigError, match="edited since it was published"):
+        PublishedArchive.read(path)
+
+
+def test_an_empty_digest_is_refused_by_name(tmp_path: Path) -> None:
+    """An empty digest is the news-blind corpus identity, so it must not read as 'unchecked'."""
+    import json
+
+    path = tmp_path / ARCHIVE_FILE
+    PublishedArchive.write(path, header(), (item(),))
+    lines = path.read_text(encoding="utf-8").splitlines()
+    head = json.loads(lines[0]) | {"archive_digest": ""}
+    path.write_text("\n".join([json.dumps(head), *lines[1:]]) + "\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match=r"news\.jsonl carries no archive_digest"):
+        PublishedArchive.read(path)

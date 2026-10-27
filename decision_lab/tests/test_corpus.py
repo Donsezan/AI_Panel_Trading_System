@@ -224,7 +224,7 @@ def test_a_compacted_snapshot_refuses_by_name() -> None:
         cp.entry_from_payload(seq=1, cycle_id="c", basket_id="b", payload=payload)
 
 
-def _news_feed(*, provider: str = "stub") -> ArchiveNewsFeed:
+def _news_feed(*, provider: str = "stub", digest: str | None = None) -> ArchiveNewsFeed:
     when = NOW - timedelta(days=5)
     item = ArchiveItem(
         source_id="cryptoslate",
@@ -250,7 +250,7 @@ def _news_feed(*, provider: str = "stub") -> ArchiveNewsFeed:
         news_window_seconds=172_800,
         cluster_floor=Decimal("0.25"),
         rows=1,
-        archive_digest=f"digest-{provider}",
+        archive_digest=f"digest-{provider}" if digest is None else digest,
     )
     return ArchiveNewsFeed(
         (PublishedArchive(header=header, items=(item,)),),
@@ -342,3 +342,37 @@ async def test_a_meta_written_before_slice_e_still_loads_as_news_blind(
 
     assert loaded.news_blind is True
     assert loaded.news_archives == ()
+
+
+@pytest.mark.parametrize("digest", ["", "abc+"])
+async def test_a_feed_with_an_empty_digest_is_refused_before_it_takes_the_blind_id(
+    verified: Path, tmp_path: Path, digest: str
+) -> None:
+    stripped = _news_feed(digest=digest)
+    with pytest.raises(ConfigError, match="empty"):
+        await cp.build(
+            data_dir=verified,
+            workspace=tmp_path / "ws",
+            reference_panel="stub",
+            cadence_seconds=4 * 3600,
+            start_equity=Decimal(10_000),
+            news_feed=stripped,
+        )
+
+
+async def test_a_news_fed_build_never_takes_the_news_blind_corpus_id(
+    verified: Path, tmp_path: Path
+) -> None:
+    blind = await build(verified, tmp_path / "ws")
+    fed = await cp.build(
+        data_dir=verified,
+        workspace=tmp_path / "ws",
+        reference_panel="stub",
+        cadence_seconds=4 * 3600,
+        start_equity=Decimal(10_000),
+        news_feed=_news_feed(),
+        wall_clock=ManualClock(NOW),
+    )
+    assert fed.meta.corpus_id != blind.meta.corpus_id
+    assert fed.meta.news_blind is False
+    assert blind.meta.news_blind is True

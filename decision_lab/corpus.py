@@ -240,6 +240,13 @@ async def build(
                 "own digest and two values that must agree is one that can disagree"
             )
         archive_digest = news_feed.digest
+        # Empty is the news-blind identity; a feed that collapses onto it would reuse or
+        # contaminate a blind corpus (§6.6), so refuse before any identity is derived.
+        if not archive_digest or not all(archive_digest.split("+")):
+            raise ConfigError(
+                "the news feed's digest is empty or has an empty component; an unstamped archive "
+                "would take the news-blind corpus_id. Re-publish the archive"
+            )
     audit = require_verified(data_dir)
 
     # The clock is set by the harness before the first cycle; this initial value only has to be
@@ -302,7 +309,7 @@ async def build(
         reference_config_digest=config_digest(basket),
         cadence_seconds=cadence_seconds,
         archive_digest=archive_digest,
-        news_blind=not archive_digest,
+        news_blind=news_feed is None,
         news_archives=tuple(NewsArchive.of(h) for h in news_feed.headers) if news_feed else (),
         start_equity=start_equity,
         requested_start=report.requested_start,

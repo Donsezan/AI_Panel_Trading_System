@@ -194,7 +194,7 @@ def test_a_policy_that_disagrees_with_the_rows_is_refused(tmp_path: Path) -> Non
     edited = POLICY.model_copy(update={"model": "stub-summary-v2"})
     out = tmp_path / "out"
 
-    with pytest.raises(ConfigError, match=r"(?i)stub-summary-v2.*re-summarise"):
+    with pytest.raises(ConfigError, match=r"(?i)stub-summary-v2.*resummarise-stale"):
         publish_archive(store, edited, clock(), out_dir=out, capture="sitemap")
 
     assert not archive_path(out, "cryptoslate").exists()

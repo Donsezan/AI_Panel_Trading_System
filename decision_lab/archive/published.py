@@ -162,8 +162,16 @@ class PublishedArchive:
             items.append(_validate(path, number, ArchiveItem, body))
         rows = tuple(items)
 
+        # An absent digest is not "nothing to check": it feeds corpus_id, where empty means the
+        # news-blind identity, so a stripped field would pass a news-fed build off as blind.
+        if not header.archive_digest:
+            raise ConfigError(
+                f"{path} carries no archive_digest. It was not written by `archive publish`, or "
+                "the field was removed; re-publish it. An empty digest is the news-blind "
+                "corpus identity (§6.6)"
+            )
         recomputed = archive_digest(header, rows)
-        if header.archive_digest and header.archive_digest != recomputed:
+        if header.archive_digest != recomputed:
             raise ConfigError(
                 f"{path} declares archive_digest {header.archive_digest} but its rows hash to "
                 f"{recomputed}. The file has been edited since it was published; re-publish it "

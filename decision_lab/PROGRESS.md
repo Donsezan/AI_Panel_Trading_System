@@ -587,8 +587,9 @@ the seats first" should say so on its face.
   would both waive the missing-key refusal for the real candidates and stamp the page carrying
   their ranking as a plumbing check. Run the two files separately.
 - **Every real report is still `NEWS-BLIND`**, because no archive has been summarised for real.
-  The code to build a news-fed corpus exists, but over the stub-summarised archive it produces a
-  report stamped `PLUMBING CHECK`, not a measurement. Shock blocks measure the reaction to a
+  The code to build a news-fed corpus exists, but the shipped stub binding
+  summarises nothing (the unscripted stub refuses every row, and `publish` refuses an empty
+  store); plumbing over news is exercised only by the scripted-stub tests. Shock blocks measure the reaction to a
   violent price move until the real run lands.
 - **§6.8.3 is unimplemented, deliberately.** "8 of 65" cannot ride in `NewsCoverage` (two fields,
   `summary` counts sources) without a second `tradebot` change against a one-change licence.

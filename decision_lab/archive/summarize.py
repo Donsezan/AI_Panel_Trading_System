@@ -37,6 +37,7 @@ circular.
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Sequence
 from datetime import timedelta
 from decimal import Decimal
 from typing import Final
@@ -228,12 +229,35 @@ class Projection(DomainModel):
     bodyless: int = 0
     body_chars: int = 0
     prompt_tokens: int = 0
+    #: Summarised rows written under a different binding or prompt than the policy in force.
+    #: Reported always; requested only under `resummarise_stale`.
+    stale: int = 0
 
 
-def project(store: RawStore, policy: ArchivePolicy) -> Projection:
+def is_stale(article: RawArticle, policy: ArchivePolicy) -> bool:
+    """Summarised, but not by the (provider, model, prompt) the policy in force names.
+
+    `archive publish` refuses such rows, so without a way to redo them a model swap or a prompt
+    edit strands paid output."""
+    return article.is_summarised and (
+        article.summary_provider,
+        article.summary_model,
+        article.summary_prompt_digest,
+    ) != (policy.provider_id, policy.model, prompt_digest(system_for(policy)))
+
+
+def _pending(
+    rows: Sequence[RawArticle], policy: ArchivePolicy, resummarise_stale: bool
+) -> list[RawArticle]:
+    return [a for a in rows if not a.is_summarised or (resummarise_stale and is_stale(a, policy))]
+
+
+def project(
+    store: RawStore, policy: ArchivePolicy, *, resummarise_stale: bool = False
+) -> Projection:
     """What `summarize_store` would request. Reads the store and nothing else."""
     rows = store.read_all()
-    pending = [a for a in rows if not a.is_summarised]
+    pending = _pending(rows, policy, resummarise_stale)
     sendable = [a for a in pending if a.body.strip()]
     system = system_for(policy)
     # Four characters to a token: exact enough to tell a 3 000-call pass from a 30 000-call one,
@@ -245,6 +269,7 @@ def project(store: RawStore, policy: ArchivePolicy) -> Projection:
         bodyless=len(pending) - len(sendable),
         body_chars=sum(len(a.body) for a in sendable),
         prompt_tokens=chars // 4,
+        stale=sum(1 for a in rows if is_stale(a, policy)),
     )
 
 
@@ -256,6 +281,7 @@ async def summarize_store(
     *,
     limit: int | None = None,
     pause: timedelta = DEFAULT_PAUSE,
+    resummarise_stale: bool = False,
 ) -> SummaryReport:
     """Summarise every unsummarised row with a body. Resumable, batched, and never silent.
 
@@ -281,51 +307,58 @@ async def summarize_store(
     with StoreLock(store):
         rows = store.read_all()
         report = SummaryReport(rows=len(rows))
-        pending = [a for a in rows if not a.is_summarised]
+        pending = _pending(rows, policy, resummarise_stale)
         report = report.added(already=len(rows) - len(pending))
 
         updated: dict[str, RawArticle] = {}
-        asked = 0
-        for article in pending:
-            if limit is not None and asked >= limit:
-                break
-            if not article.body.strip():
-                # Review Focus 5: a model given nothing invents something, and the measured
-                # 418-character minimum in this archive is a measurement, not a guarantee.
-                report = report.added(bodyless=1)
-                continue
-            asked += 1
-            report = report.added(requested=1)
-            parsed, spent = await _summarise_one(provider, policy, system, article, clock, pause)
-            # Every billed call counts, whether it parsed, was repaired or was refused: the cost
-            # projection extrapolates from this figure, and counting only the winner understates
-            # spend by up to 2x on a model that answers in prose.
-            report = report.model_copy(update={"cost_usd": report.cost_usd + spent.cost_usd}).added(
-                prompt_tokens=spent.prompt_tokens, completion_tokens=spent.completion_tokens
-            )
-            if parsed is None:
-                report = report.added(refused=1)
-                continue
-            updated[article.url] = article.model_copy(
-                update={
-                    "summary": parsed.summary,
-                    "event_type": parsed.event_type,
-                    "entities": parsed.entities,
-                    "assets": parsed.assets,
-                    "magnitudes": parsed.magnitudes,
-                    "modality": parsed.modality,
-                    "summary_provider": policy.provider_id,
-                    "summary_model": policy.model,
-                    "summary_prompt_digest": digest,
-                }
-            )
-            report = report.added(summarised=1)
-
-        if updated:
-            # Only the six §6.5 fields and their provenance move. Every other field was accepted
-            # at collection, and rewriting one would silently change the archive's record of what
-            # was published - `backfill`'s rule, which this pass shares the store with.
-            store.rewrite(tuple(updated.get(a.url, a) for a in rows))
+        # Flushed in a `finally`: a KeyboardInterrupt, a cancellation or a FatalError at row N
+        # must not discard the N-1 rows already paid for. The same write path, then re-raise.
+        try:
+            asked = 0
+            for article in pending:
+                if limit is not None and asked >= limit:
+                    break
+                if not article.body.strip():
+                    # Review Focus 5: a model given nothing invents something, and the measured
+                    # 418-character minimum in this archive is a measurement, not a guarantee.
+                    report = report.added(bodyless=1)
+                    continue
+                asked += 1
+                report = report.added(requested=1)
+                parsed, spent = await _summarise_one(
+                    provider, policy, system, article, clock, pause
+                )
+                # Every billed call counts, whether it parsed, was repaired or was refused: the cost
+                # projection extrapolates from this figure, and counting only the winner understates
+                # spend by up to 2x on a model that answers in prose.
+                report = report.model_copy(
+                    update={"cost_usd": report.cost_usd + spent.cost_usd}
+                ).added(
+                    prompt_tokens=spent.prompt_tokens, completion_tokens=spent.completion_tokens
+                )
+                if parsed is None:
+                    report = report.added(refused=1)
+                    continue
+                updated[article.url] = article.model_copy(
+                    update={
+                        "summary": parsed.summary,
+                        "event_type": parsed.event_type,
+                        "entities": parsed.entities,
+                        "assets": parsed.assets,
+                        "magnitudes": parsed.magnitudes,
+                        "modality": parsed.modality,
+                        "summary_provider": policy.provider_id,
+                        "summary_model": policy.model,
+                        "summary_prompt_digest": digest,
+                    }
+                )
+                report = report.added(summarised=1)
+        finally:
+            if updated:
+                # Only the six §6.5 fields and their provenance move. Every other field was
+                # accepted at collection, and rewriting one would silently change the archive's
+                # record of what was published - `backfill`'s rule, shared with this pass.
+                store.rewrite(tuple(updated.get(a.url, a) for a in rows))
     logger.info("archive summarised", extra=report.model_dump(mode="json"))
     return report
 

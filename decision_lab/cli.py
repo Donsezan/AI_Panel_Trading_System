@@ -299,6 +299,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "provider call and quotes no dollars: the dollar figure comes from a measured batch",
     )
     archive_summarise_parser.add_argument(
+        "--resummarise-stale",
+        action="store_true",
+        help="also redo rows summarised under a different provider, model or prompt than the "
+        "policy in force. Re-pays for them, so it is opt-in; --dry-run reports how many there are",
+    )
+    archive_summarise_parser.add_argument(
         "--plumbing-check",
         action="store_true",
         help="acknowledge that the bound provider is the offline stub, which measures nothing. "
@@ -594,6 +600,14 @@ async def corpus_build(args: argparse.Namespace) -> int:
     """
     feed = None
     if args.news_sources:
+        if len(set(args.news_sources)) != len(args.news_sources):
+            # Loaded twice, every item meets its own copy at similarity 1.0 and reads
+            # `(reports=2)`: corroboration invented by a repeated flag.
+            logger.error(
+                "corpus build refused; nothing was built",
+                extra={"reason": f"--news-source repeats a source: {args.news_sources}"},
+            )
+            return EXIT_CANDIDATE
         try:
             feed = load_feed(args.data, tuple(args.news_sources), load_policy(args.policy))
         except ConfigError as error:
@@ -1495,7 +1509,7 @@ async def archive_summarise(args: argparse.Namespace) -> int:
     store = RawStore.open(args.data / RAW_DIR, source_id=args.source)
 
     if args.dry_run:
-        projection = project(store, policy)
+        projection = project(store, policy, resummarise_stale=args.resummarise_stale)
         logger.info(
             "archive summarise projection",
             extra=projection.model_dump(mode="json")
@@ -1540,6 +1554,7 @@ async def archive_summarise(args: argparse.Namespace) -> int:
         SystemClock(),
         limit=args.limit,
         pause=timedelta(milliseconds=args.pause_ms),
+        resummarise_stale=args.resummarise_stale,
     )
     logger.info(
         "archive summarised",

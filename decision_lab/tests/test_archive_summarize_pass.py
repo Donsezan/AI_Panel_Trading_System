@@ -298,3 +298,55 @@ async def test_a_refused_row_still_reports_both_calls_cost(tmp_path: Path) -> No
     assert report.refused == 1
     assert report.cost_usd == Decimal("0.0008")
     assert report.prompt_tokens > 0
+
+
+def _stale(article: RawArticle) -> RawArticle:
+    return article.model_copy(
+        update={
+            "summary": "Old summary.",
+            "event_type": EventType.REGULATORY,
+            "modality": Modality.CONFIRMED,
+            "summary_provider": "stub",
+            "summary_model": "retired-model",
+            "summary_prompt_digest": "0ld",
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_stale_rows_are_skipped_without_the_flag_and_redone_with_it(tmp_path: Path) -> None:
+    store = store_with(tmp_path, (_stale(row(1)), _stale(row(2))))
+
+    quiet = StubLLMProvider([GOOD])
+    report = await summarize_store(quiet, store, POLICY, clock(), pause=timedelta(0))
+    assert quiet.calls == [] and report.already == 2
+
+    loud = StubLLMProvider([GOOD])
+    report = await summarize_store(
+        loud, store, POLICY, clock(), pause=timedelta(0), resummarise_stale=True
+    )
+    assert (report.requested, report.summarised) == (2, 2)
+    assert {a.summary_model for a in store.read_all()} == {POLICY.model}
+
+
+class _Interrupts(StubLLMProvider):
+    def __init__(self, *, at: int) -> None:
+        super().__init__([GOOD])
+        self._at = at
+        self._n = 0
+
+    async def complete(self, request):  # type: ignore[no-untyped-def]
+        self._n += 1
+        if self._n == self._at:
+            raise KeyboardInterrupt
+        return await super().complete(request)
+
+
+@pytest.mark.asyncio
+async def test_an_interrupt_flushes_the_rows_already_summarised(tmp_path: Path) -> None:
+    store = store_with(tmp_path, (row(1), row(2), row(3), row(4)))
+
+    with pytest.raises(KeyboardInterrupt):
+        await summarize_store(_Interrupts(at=3), store, POLICY, clock(), pause=timedelta(0))
+
+    assert [a.is_summarised for a in store.read_all()] == [True, True, False, False]

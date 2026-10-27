@@ -127,3 +127,15 @@ def test_a_policy_built_directly_still_validates() -> None:
             cluster_floor=Decimal("0.25"),
             max_summary_chars=280,
         )
+
+
+def test_an_empty_model_is_refused_naming_the_key_and_file(tmp_path: Path) -> None:
+    path = write(tmp_path, '[summarizer]\nprovider = "stub"\nmodel = ""\n')
+    with pytest.raises(ConfigError, match=r"archive\.toml.*model|model.*archive\.toml"):
+        load_policy(path)
+
+
+def test_a_misspelt_summarizer_key_is_refused_not_read_as_an_empty_model(tmp_path: Path) -> None:
+    path = write(tmp_path, '[summarizer]\nprovider = "stub"\nmodle = "stub-summary"\n')
+    with pytest.raises(ConfigError, match="modle"):
+        load_policy(path)

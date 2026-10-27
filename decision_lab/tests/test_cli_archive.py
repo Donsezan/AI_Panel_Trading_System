@@ -395,3 +395,103 @@ def test_publish_refuses_an_unsummarised_store_with_exit_candidate(
         r.getMessage() + str(getattr(r, "reason", "")) for r in caplog.records
     )
     assert not (data / "news").exists()
+
+
+def _stale_store(data: Path) -> RawStore:
+    from decision_lab.archive.fields import EventType, Modality
+
+    store = RawStore.open(data / RAW_DIR, source_id="cryptoslate")
+    store.append(
+        summarisable_row(1).model_copy(
+            update={
+                "summary": "Old.",
+                "event_type": EventType.REGULATORY,
+                "modality": Modality.CONFIRMED,
+                "summary_provider": "stub",
+                "summary_model": "retired-model",
+                "summary_prompt_digest": "0ld",
+            }
+        )
+    )
+    return store
+
+
+def test_dry_run_reports_stale_rows_and_resummarise_counts_them_pending(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    data = tmp_path / "history"
+    _stale_store(data)
+    base = ["archive", "summarise", "--data", str(data), "--source", "cryptoslate", "--dry-run"]
+
+    def run(extra: list[str]) -> dict[str, object]:
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="decision_lab.cli"):
+            assert asyncio.run(cli.archive_summarise(cli.parse_args(base + extra))) == cli.EXIT_OK
+        (record,) = [r for r in caplog.records if r.getMessage() == "archive summarise projection"]
+        return {"stale": record.stale, "pending": record.pending}  # type: ignore[attr-defined]
+
+    assert run([]) == {"stale": 1, "pending": 0}
+    assert run(["--resummarise-stale"]) == {"stale": 1, "pending": 1}
+
+
+def test_summarise_with_the_flag_redoes_stale_rows_through_main(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import json
+    from types import SimpleNamespace
+
+    from tradebot.decision.providers.stub import StubLLMProvider
+
+    good = json.dumps(
+        {
+            "summary": "Kraken got a licence.",
+            "event_type": "REGULATORY",
+            "entities": ["Kraken"],
+            "assets": ["NONE"],
+            "magnitudes": [],
+            "modality": "CONFIRMED",
+        }
+    )
+    provider = StubLLMProvider([good])
+    monkeypatch.setattr(
+        cli, "build_providers", lambda *_a, **_k: SimpleNamespace(providers={"stub": provider})
+    )
+    data = tmp_path / "history"
+    store = _stale_store(data)
+    args = ["archive", "summarise", "--data", str(data), "--source", "cryptoslate"]
+    args += ["--pause-ms", "0", "--plumbing-check"]
+
+    assert cli.main(args) == cli.EXIT_OK
+    assert provider.calls == [] and store.read_all()[0].summary_model == "retired-model"
+
+    assert cli.main([*args, "--resummarise-stale"]) == cli.EXIT_OK
+    assert store.read_all()[0].summary_model == "stub-summary"
+
+
+def test_the_publish_refusal_names_the_resummarise_flag(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    data = tmp_path / "history"
+    _stale_store(data)
+    parsed = cli.parse_args(["archive", "publish", "--data", str(data), "--source", "cryptoslate"])
+    with caplog.at_level(logging.ERROR, logger="decision_lab.cli"):
+        assert asyncio.run(cli.archive_publish(parsed)) == cli.EXIT_CANDIDATE
+    assert "--resummarise-stale" in " ".join(
+        r.getMessage() + str(getattr(r, "reason", "")) for r in caplog.records
+    )
+
+
+def test_a_repeated_news_source_is_refused_before_anything_loads(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    parsed = cli.parse_args(
+        [
+            *["corpus", "build", "--data", str(tmp_path), "--every", "4h"],
+            *["--news-source", "cryptoslate", "--news-source", "cryptoslate"],
+        ]
+    )
+    with caplog.at_level(logging.ERROR, logger="decision_lab.cli"):
+        code = asyncio.run(cli.corpus_build(parsed))
+
+    assert code == cli.EXIT_CANDIDATE
+    assert "repeats a source" in " ".join(str(getattr(r, "reason", "")) for r in caplog.records)

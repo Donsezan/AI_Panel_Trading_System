@@ -50,6 +50,9 @@ DEFAULT_CLUSTER_FLOOR: Final = Decimal("0.25")
 DEFAULT_POLICY_FILE: Final = Path(__file__).parent.parent / "config" / "archive.toml"
 
 
+_SUMMARIZER_KEYS: Final = frozenset({"provider", "model"})
+
+
 class ArchivePolicy(DomainModel):
     """How one archive was summarised, and how a replay reads it."""
 
@@ -135,6 +138,16 @@ def load_policy(path: Path) -> ArchivePolicy:
         raise ConfigError(f"{path} is not valid TOML: {error}") from error
 
     binding = document.get("summarizer", {})
+    # A typo (`modle = ...`) must not quietly become `model = ""`: every row of a paid pass would
+    # then be refused for a reason only the log explains.
+    unknown = sorted(set(binding) - _SUMMARIZER_KEYS)
+    if unknown:
+        raise ConfigError(
+            f"{path} has unknown key(s) {unknown} in [summarizer]; "
+            f"the keys are {sorted(_SUMMARIZER_KEYS)}"
+        )
+    if not str(binding.get("model", "")).strip():
+        raise ConfigError(f"{path} gives [summarizer].model no value; name the model to bind")
     settings: dict[str, Any] = {
         "provider_id": str(binding.get("provider", "")),
         "model": str(binding.get("model", "")),
