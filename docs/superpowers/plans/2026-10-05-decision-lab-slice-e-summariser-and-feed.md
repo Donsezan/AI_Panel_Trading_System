@@ -4662,3 +4662,11 @@ to give.
   dataset's window rather than the news year. Everything in this plan works on it unchanged —
   `archive summarise --data data\history --source coindesk` — but 2024 has the corpus and 2025 has
   the news, and reconciling that is the sequencing decision above.
+- **`calibrate long` has no news wiring yet.** It was scoped out of slice E (D5); a six-month
+  profit run is still news-blind, whatever corpus its sibling commands read.
+- **Archive coverage is [first row, last row]**, because the header declares no captured-from/to
+  span. A span in the header would let trailing silence read as a quiet market rather than as "no
+  coverage".
+- **Per-row summariser provenance was added to `RawArticle`** (`summary_provider`, `summary_model`,
+  `summary_prompt_digest`), and `archive publish` refuses a store whose rows mix provenance
+  (ruling B10), so one archive digest never vouches for two prompts' output.
