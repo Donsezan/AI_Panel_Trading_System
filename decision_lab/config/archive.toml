@@ -1,0 +1,33 @@
+# The summarising pass's binding, and the three numbers a replay reads an archive by.
+#
+# Everything here rides in `archive_digest` (§6.6) and therefore in `corpus_id`: two archives
+# differing in any one of these are two experiments. Editing this file after an archive is
+# published does not change that archive — re-run `archive publish` to re-stamp it.
+#
+# The binding ships as the offline stub, so `pytest` and the demo cost nothing. Point it at a
+# real provider to run the pass for real; the provider's key is read from the environment by
+# name (`OPENROUTER_API_KEY` for openrouter) and is never written here.
+
+[summarizer]
+provider = "stub"
+model = "stub-summary"
+
+[archive]
+# §6.7: `observed_at = published_at + lag`. Zero is refused — it grants the panel the headline at
+# the instant of publication, which is optimistic in the one direction that inflates a score.
+observed_at_lag_seconds = 720
+
+# §6.8.1: 48 hours, matching the bot's own `NewsStore.DEFAULT_LOOKBACK`. A replay measuring a
+# panel the bot does not run measures the wrong panel.
+news_window_seconds = 172800
+
+# §6.8.2.1, measured 2026-10-05 over 401 likely-duplicate pairs against 300 controls: normalised
+# short text separates same-event pairs (0.308) from unrelated ones (0.177) by 1.74x, against
+# full bodies' 1.08x. This is the best lexical operating point and it still false-merges 15% of
+# unrelated pairs — which is why the cluster *key* is the extracted fields and this is only a
+# guard. Quoted, because a TOML float would be binary-rounded inside the digest.
+cluster_floor = "0.25"
+
+# `DEFAULT_EXCERPT_CHARS`. A summary longer than the panel's slot is our refusal, visible and
+# tallied, rather than the renderer's silent truncation.
+max_summary_chars = 280
