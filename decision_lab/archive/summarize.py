@@ -253,11 +253,16 @@ async def summarize_store(
                 continue
             asked += 1
             report = report.added(requested=1)
-            outcome = await _summarise_one(provider, policy, system, article, clock, pause)
-            if outcome is None:
+            parsed, spent = await _summarise_one(provider, policy, system, article, clock, pause)
+            # Every billed call counts, whether it parsed, was repaired or was refused: the cost
+            # projection extrapolates from this figure, and counting only the winner understates
+            # spend by up to 2x on a model that answers in prose.
+            report = report.model_copy(update={"cost_usd": report.cost_usd + spent.cost_usd}).added(
+                prompt_tokens=spent.prompt_tokens, completion_tokens=spent.completion_tokens
+            )
+            if parsed is None:
                 report = report.added(refused=1)
                 continue
-            parsed, spend = outcome
             updated[article.url] = article.model_copy(
                 update={
                     "summary": parsed.summary,
@@ -272,9 +277,6 @@ async def summarize_store(
                 }
             )
             report = report.added(summarised=1)
-            report = report.model_copy(
-                update={"cost_usd": report.cost_usd + (spend.cost_usd or ZERO)}
-            ).added(prompt_tokens=spend.prompt_tokens, completion_tokens=spend.completion_tokens)
 
         if updated:
             # Only the six §6.5 fields and their provenance move. Every other field was accepted
@@ -285,6 +287,21 @@ async def summarize_store(
     return report
 
 
+class _Spend(DomainModel):
+    """What one row's calls cost, summed over every attempt that returned a result."""
+
+    cost_usd: Money = ZERO
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+
+    def plus(self, result: CompletionResult) -> _Spend:
+        return _Spend(
+            cost_usd=self.cost_usd + (result.cost_usd or ZERO),
+            prompt_tokens=self.prompt_tokens + result.prompt_tokens,
+            completion_tokens=self.completion_tokens + result.completion_tokens,
+        )
+
+
 async def _summarise_one(
     provider: LLMProvider,
     policy: ArchivePolicy,
@@ -292,8 +309,12 @@ async def _summarise_one(
     article: RawArticle,
     clock: Clock,
     pause: timedelta,
-) -> tuple[SummaryResponse, CompletionResult] | None:
-    """One row, up to `DEFAULT_SUMMARY_RETRIES` attempts. `None` means refused and counted."""
+) -> tuple[SummaryResponse | None, _Spend]:
+    """One row, up to `DEFAULT_SUMMARY_RETRIES` attempts. `None` means refused and counted.
+
+    The spend is returned on both paths: a refused row was still billed for what came back.
+    """
+    spent = _Spend()
     user = summary_user(title=article.title, body=article.body)
     message = user
     for attempt in range(DEFAULT_SUMMARY_RETRIES):
@@ -307,11 +328,12 @@ async def _summarise_one(
             logger.warning("summariser call failed", extra={"url": article.url, "error": str(exc)})
             message = user
             continue
+        spent = spent.plus(result)
         try:
-            return parse_summary(result.text, max_chars=policy.max_summary_chars), result
+            return parse_summary(result.text, max_chars=policy.max_summary_chars), spent
         except SchemaViolationError as exc:
             logger.warning(
                 "summariser reply refused", extra={"url": article.url, "error": str(exc)}
             )
             message = f"{user}\n{REPAIR_INSTRUCTION.format(error=exc)}"
-    return None
+    return None, spent

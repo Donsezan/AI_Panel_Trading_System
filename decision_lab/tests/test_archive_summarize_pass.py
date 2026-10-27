@@ -259,3 +259,42 @@ async def test_each_summarised_row_records_the_binding_that_produced_it(tmp_path
         assert article.summary_model == "stub-summary"
         assert article.summary_prompt_digest == prompt_digest(system_for(POLICY))
     assert row(1).summary_provider is None
+
+
+@pytest.mark.asyncio
+async def test_a_repaired_row_reports_the_cost_of_both_calls(tmp_path: Path) -> None:
+    """The bad reply was billed too; the cost projection extrapolates from this figure."""
+    single = await summarize_store(
+        StubLLMProvider([GOOD], cost_usd=Decimal("0.0004")),
+        store_with(tmp_path / "a", (row(1),)),
+        POLICY,
+        clock(),
+        pause=timedelta(0),
+    )
+    repaired = await summarize_store(
+        StubLLMProvider(["not json at all", GOOD], cost_usd=Decimal("0.0004")),
+        store_with(tmp_path / "b", (row(1),)),
+        POLICY,
+        clock(),
+        pause=timedelta(0),
+    )
+
+    assert repaired.summarised == 1
+    assert repaired.cost_usd == single.cost_usd * 2 == Decimal("0.0008")
+    assert repaired.prompt_tokens > single.prompt_tokens
+    assert repaired.completion_tokens >= single.completion_tokens
+
+
+@pytest.mark.asyncio
+async def test_a_refused_row_still_reports_both_calls_cost(tmp_path: Path) -> None:
+    report = await summarize_store(
+        StubLLMProvider(["no.", "no."], cost_usd=Decimal("0.0004")),
+        store_with(tmp_path, (row(1),)),
+        POLICY,
+        clock(),
+        pause=timedelta(0),
+    )
+
+    assert report.refused == 1
+    assert report.cost_usd == Decimal("0.0008")
+    assert report.prompt_tokens > 0
