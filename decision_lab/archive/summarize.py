@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import hashlib
 from datetime import timedelta
+from decimal import Decimal
 from typing import Final
 
 from pydantic import field_validator
@@ -49,7 +50,7 @@ from decision_lab.archive.store import RawArticle, RawStore, StoreLock
 from tradebot.core.clock import Clock
 from tradebot.core.errors import ProviderError, SchemaViolationError
 from tradebot.core.logging import get_logger
-from tradebot.core.money import ZERO
+from tradebot.core.money import ZERO, divide
 from tradebot.core.schema import DomainModel, Money
 from tradebot.decision.seat import REPAIR_INSTRUCTION, _extract_object
 from tradebot.interfaces.llm import CompletionRequest, CompletionResult, LLMProvider
@@ -193,6 +194,14 @@ class SummaryReport(DomainModel):
     def added(self, **counts: int) -> SummaryReport:
         return self.model_copy(update={k: getattr(self, k) + v for k, v in counts.items()})
 
+    @property
+    def per_row_cost(self) -> Money:
+        """Measured, never projected. `ZERO` when nothing was summarised - a per-row cost over
+        zero rows is not a small number, it is no number."""
+        if not self.summarised:
+            return ZERO
+        return divide(self.cost_usd, Decimal(self.summarised))
+
 
 def system_for(policy: ArchivePolicy) -> str:
     """`SUMMARY_SYSTEM` with the policy's character limit substituted.
@@ -203,6 +212,40 @@ def system_for(policy: ArchivePolicy) -> str:
     the model was asked for.
     """
     return SUMMARY_SYSTEM.replace("{max_chars}", str(policy.max_summary_chars))
+
+
+class Projection(DomainModel):
+    """What a pass would ask for, measured without asking (§10.6's cost projection, one tool over).
+
+    No dollar figure, deliberately. This tool has no price table - every cost in it comes from a
+    provider's own response, which is why `total_cost` de-duplicates by `call_id` rather than
+    multiplying a rate. The dollars come from a measured batch: run `--limit 50` and read
+    `per_row_cost`. A projected rate would be a number with no provenance.
+    """
+
+    rows: int = 0
+    pending: int = 0
+    bodyless: int = 0
+    body_chars: int = 0
+    prompt_tokens: int = 0
+
+
+def project(store: RawStore, policy: ArchivePolicy) -> Projection:
+    """What `summarize_store` would request. Reads the store and nothing else."""
+    rows = store.read_all()
+    pending = [a for a in rows if not a.is_summarised]
+    sendable = [a for a in pending if a.body.strip()]
+    system = system_for(policy)
+    # Four characters to a token: exact enough to tell a 3 000-call pass from a 30 000-call one,
+    # which is the decision this number informs.
+    chars = sum(len(system) + len(summary_user(title=a.title, body=a.body)) for a in sendable)
+    return Projection(
+        rows=len(rows),
+        pending=len(sendable),
+        bodyless=len(pending) - len(sendable),
+        body_chars=sum(len(a.body) for a in sendable),
+        prompt_tokens=chars // 4,
+    )
 
 
 async def summarize_store(

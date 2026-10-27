@@ -11,12 +11,16 @@ what lets it assert the thing a crawl must never do — ask for a path `robots.t
 
 from __future__ import annotations
 
+import asyncio
+import logging
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
 from decision_lab import cli
-from decision_lab.archive.store import RawStore
+from decision_lab.archive.config import DEFAULT_POLICY_FILE
+from decision_lab.archive.store import RAW_DIR, RawArticle, RawStore
 from decision_lab.tests.test_archive_coindesk import LD_JSON, article_page
 from decision_lab.tests.test_archive_collect import FakeFetcher, listing, url_for
 
@@ -162,3 +166,184 @@ def test_an_authenticated_backfill_without_a_cookie_refuses_before_any_request(
 
     assert code == 3, "a refusal about the evidence we were pointed at"
     assert fetcher.asked == []
+
+
+def summarisable_row(
+    n: int, *, body: str = "The FCA granted Kraken an EMI licence today."
+) -> RawArticle:
+    return RawArticle(
+        source_id="cryptoslate",
+        url=f"https://x.test/{n}",
+        title=f"Story {n}",
+        body=body,
+        abstract="An abstract.",
+        published_at=datetime(2025, 3, 4, 9, n, tzinfo=UTC),
+        fetched_at=datetime(2025, 3, 4, 10, 0, tzinfo=UTC),
+    )
+
+
+def _refusal(args: list[str], caplog: pytest.LogCaptureFixture) -> tuple[int, str]:
+    # `main` reconfigures logging and detaches caplog's handler (see test_cli_calibrate), so the
+    # handler is driven directly, as the sweep tests do.
+    parsed = cli.parse_args(args)
+    with caplog.at_level(logging.ERROR, logger="decision_lab.cli"):
+        code = asyncio.run(cli.archive_summarise(parsed))
+    return code, " ".join(r.getMessage() + str(getattr(r, "reason", "")) for r in caplog.records)
+
+
+def test_summarise_runs_the_pass_and_exits_zero(tmp_path: Path) -> None:
+    data = tmp_path / "history"
+    store = RawStore.open(data / RAW_DIR, source_id="cryptoslate")
+    store.append(summarisable_row(1))
+
+    code = cli.main(
+        [
+            "archive",
+            "summarise",
+            "--data",
+            str(data),
+            "--source",
+            "cryptoslate",
+            "--policy",
+            str(DEFAULT_POLICY_FILE),
+            "--pause-ms",
+            "0",
+            "--plumbing-check",
+        ]
+    )
+
+    assert code == cli.EXIT_OK
+    # The stub answers an unscripted prompt with a trading decision, so every row is refused.
+    assert not store.read_all()[0].is_summarised
+
+
+def test_dry_run_makes_no_provider_calls_and_reports_what_is_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data = tmp_path / "history"
+    store = RawStore.open(data / RAW_DIR, source_id="cryptoslate")
+    store.append(summarisable_row(1))
+    store.append(summarisable_row(2, body="   "))
+
+    def explode(*_: object, **__: object) -> None:
+        raise AssertionError("a projection must not construct a provider")
+
+    monkeypatch.setattr(cli, "build_providers", explode)
+
+    code = cli.main(
+        ["archive", "summarise", "--data", str(data), "--source", "cryptoslate", "--dry-run"]
+    )
+
+    assert code == cli.EXIT_OK
+    assert not store.read_all()[0].is_summarised
+
+
+def test_project_counts_pending_bodyless_and_prompt_tokens(tmp_path: Path) -> None:
+    from decision_lab.archive.config import load_policy
+    from decision_lab.archive.summarize import project
+
+    store = RawStore.open(tmp_path / RAW_DIR, source_id="cryptoslate")
+    store.append(summarisable_row(1))
+    store.append(summarisable_row(2, body="   "))
+
+    projection = project(store, load_policy(DEFAULT_POLICY_FILE))
+
+    assert (projection.rows, projection.pending, projection.bodyless) == (2, 1, 1)
+    assert projection.prompt_tokens > 0
+
+
+def test_per_row_cost_is_zero_when_nothing_was_summarised() -> None:
+    from decimal import Decimal
+
+    from decision_lab.archive.summarize import SummaryReport
+
+    assert SummaryReport().per_row_cost == 0
+    report = SummaryReport(summarised=4, cost_usd=Decimal("0.10"))
+    assert report.per_row_cost == Decimal("0.025")
+
+
+def test_summarise_refuses_a_missing_policy_file(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    data = tmp_path / "history"
+    RawStore.open(data / RAW_DIR, source_id="cryptoslate")
+
+    code, text = _refusal(
+        [
+            "archive",
+            "summarise",
+            "--data",
+            str(data),
+            "--source",
+            "cryptoslate",
+            "--policy",
+            str(tmp_path / "absent.toml"),
+        ],
+        caplog,
+    )
+
+    assert code == cli.EXIT_CANDIDATE
+    assert "archive" in text and "absent.toml" in text
+
+
+def test_summarise_refuses_before_any_spend_when_the_key_is_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    data = tmp_path / "history"
+    store = RawStore.open(data / RAW_DIR, source_id="cryptoslate")
+    store.append(summarisable_row(1))
+    policy = tmp_path / "real.toml"
+    policy.write_text(
+        '[summarizer]\nprovider = "openrouter"\nmodel = "x/y:free"\n', encoding="utf-8"
+    )
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+
+    code, text = _refusal(
+        [
+            "archive",
+            "summarise",
+            "--data",
+            str(data),
+            "--source",
+            "cryptoslate",
+            "--policy",
+            str(policy),
+        ],
+        caplog,
+    )
+
+    assert code == cli.EXIT_CANDIDATE
+    assert "OPENROUTER_API_KEY" in text
+
+
+def test_a_stub_binding_refuses_without_the_acknowledgement(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    data = tmp_path / "history"
+    store = RawStore.open(data / RAW_DIR, source_id="cryptoslate")
+    store.append(summarisable_row(1))
+
+    code, text = _refusal(
+        ["archive", "summarise", "--data", str(data), "--source", "cryptoslate"], caplog
+    )
+
+    assert code == cli.EXIT_CANDIDATE
+    assert "--plumbing-check" in text
+    assert not store.read_all()[0].is_summarised
+
+
+def test_dry_run_is_not_blocked_by_the_stub_refusal(tmp_path: Path) -> None:
+    data = tmp_path / "history"
+    store = RawStore.open(data / RAW_DIR, source_id="cryptoslate")
+    store.append(summarisable_row(1))
+
+    code = cli.main(
+        ["archive", "summarise", "--data", str(data), "--source", "cryptoslate", "--dry-run"]
+    )
+
+    assert code == cli.EXIT_OK
+
+
+def test_summarise_is_absent_from_locked() -> None:
+    assert ("archive", "summarise") not in cli.LOCKED
+    assert ("archive", "publish") not in cli.LOCKED

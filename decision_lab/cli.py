@@ -54,9 +54,11 @@ from decision_lab.archive.collect import (
     collect,
     collect_site,
 )
+from decision_lab.archive.config import DEFAULT_POLICY_FILE, load_policy
 from decision_lab.archive.reshard import reshard
 from decision_lab.archive.sites import PROFILES, parse_site_article
 from decision_lab.archive.store import RAW_DIR, RawArticle, RawStore
+from decision_lab.archive.summarize import project, summarize_store
 from decision_lab.dashboard import auth as lab_auth
 from decision_lab.dashboard import create_lab_dashboard
 from decision_lab.params import (
@@ -76,6 +78,7 @@ from tradebot.core.logging import configure_logging, get_logger
 from tradebot.core.money import ZERO, to_decimal
 from tradebot.core.schema import Money
 from tradebot.dashboard.auth import assert_bind_allowed
+from tradebot.decision.providers.registry import build_providers, preset
 from tradebot.interfaces.exchange import VenueTransport
 from tradebot.marketdata.recorder import MANIFEST, ReplayDataset
 from tradebot.news.http import build_fetcher
@@ -257,6 +260,50 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="which publisher's store to migrate",
     )
     archive_reshard_parser.add_argument("--verbose", action="store_true")
+
+    archive_summarise_parser = archive_actions.add_parser(
+        "summarise",
+        help="fill the §6.5 summary and extracted fields from the stored bodies",
+    )
+    archive_summarise_parser.add_argument(
+        "--data", type=Path, required=True, help="dataset directory"
+    )
+    archive_summarise_parser.add_argument(
+        "--source", required=True, help="the source whose store to summarise"
+    )
+    archive_summarise_parser.add_argument(
+        "--policy",
+        type=Path,
+        default=DEFAULT_POLICY_FILE,
+        help="archive.toml: the summariser binding and the reading policy (§6.6)",
+    )
+    archive_summarise_parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="rows to request in this batch. A long pass risks everything it collected to one "
+        "late failure, so a large job is a sequence of batches, each of which commits",
+    )
+    archive_summarise_parser.add_argument(
+        "--pause-ms",
+        type=int,
+        default=0,
+        help="delay between retries, in integer milliseconds (no float, test_discipline.py)",
+    )
+    archive_summarise_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="report what would be requested and how many prompt tokens it is. Makes no "
+        "provider call and quotes no dollars: the dollar figure comes from a measured batch",
+    )
+    archive_summarise_parser.add_argument(
+        "--plumbing-check",
+        action="store_true",
+        help="acknowledge that the bound provider is the offline stub, which measures nothing. "
+        "Changes no behaviour - the binding decides what kind of run this is (§7.2); this only "
+        "confirms you meant it, because the shipped policy binds the stub",
+    )
+    archive_summarise_parser.add_argument("--verbose", action="store_true")
 
     corpus = commands.add_parser("corpus", help="build the frozen decision contexts a sweep reads")
     corpus_actions = corpus.add_subparsers(dest="action", required=True)
@@ -1381,6 +1428,86 @@ async def archive_reshard(args: argparse.Namespace) -> int:
     return 0
 
 
+async def archive_summarise(args: argparse.Namespace) -> int:
+    """Fill §6.5's summary and extracted fields from the bodies a crawl stored.
+
+    Deliberately absent from `LOCKED`, like every other `archive` action: it writes beside the
+    dataset rather than into the workspace, and a multi-hour pass holding the workspace lock
+    would block every sweep and report for its duration. `StoreLock` is the protection that
+    matters here and it is scoped to the one store this rewrites.
+
+    Every refusal is an `EXIT_CANDIDATE` logged here, as `sweep_command` does: `main` would turn
+    an escaping `ConfigError` into exit 3 (a dataset problem), which these are not. The
+    reachability refusal comes before any spend - a provider whose key is absent is left unwired
+    by ADR 0023, so without it every row would be refused for a reason only the log explains.
+    """
+    try:
+        policy = load_policy(args.policy)
+    except ConfigError as error:
+        logger.error("summarise refused; nothing was spent", extra={"reason": str(error)})
+        return EXIT_CANDIDATE
+    store = RawStore.open(args.data / RAW_DIR, source_id=args.source)
+
+    if args.dry_run:
+        projection = project(store, policy)
+        logger.info(
+            "archive summarise projection",
+            extra=projection.model_dump(mode="json")
+            | {
+                "source": args.source,
+                "model": f"{policy.provider_id}:{policy.model}",
+                "note": "no provider call was made; measure dollars with a --limit batch",
+            },
+        )
+        return EXIT_OK
+
+    if policy.is_stub and not args.plumbing_check:
+        logger.error(
+            "summarise refused; nothing was spent",
+            extra={
+                "reason": f"{args.policy} binds the summarizer to the offline stub, which "
+                "measures nothing: it answers an unscripted prompt with a trading decision, so "
+                "every row would be refused and nothing written. Point --policy at a real "
+                "binding, or pass --plumbing-check if a plumbing run is what you meant"
+            },
+        )
+        return EXIT_CANDIDATE
+
+    settings = preset(policy.provider_id)
+    pool = build_providers((settings,), SystemClock())
+    provider = pool.providers.get(policy.provider_id)
+    if provider is None:
+        logger.error(
+            "summarise refused; nothing was spent",
+            extra={
+                "reason": f"{policy.provider_id} is unreachable: {settings.secret_ref} is not "
+                "set. Set it and re-run - a pass against an unwired provider refuses every row "
+                "for a reason only the log explains"
+            },
+        )
+        return EXIT_CANDIDATE
+
+    report = await summarize_store(
+        provider,
+        store,
+        policy,
+        SystemClock(),
+        limit=args.limit,
+        pause=timedelta(milliseconds=args.pause_ms),
+    )
+    logger.info(
+        "archive summarised",
+        extra=report.model_dump(mode="json")
+        | {
+            "source": args.source,
+            "model": f"{policy.provider_id}:{policy.model}",
+            "per_row_cost": str(report.per_row_cost),
+            "store": str(store.path),
+        },
+    )
+    return EXIT_OK
+
+
 #: Command → coroutine. Dispatch over a table rather than a chain of `if`s, per the repo's own
 #: convention (CLAUDE.md, "prefer dispatch over branching").
 COMMANDS: dict[tuple[str, str], Callable[[argparse.Namespace], Coroutine[Any, Any, int]]] = {
@@ -1389,6 +1516,7 @@ COMMANDS: dict[tuple[str, str], Callable[[argparse.Namespace], Coroutine[Any, An
     ("archive", "build"): archive_build,
     ("archive", "backfill"): archive_backfill,
     ("archive", "reshard"): archive_reshard,
+    ("archive", "summarise"): archive_summarise,
     ("corpus", "build"): corpus_build,
     # `sweep` and `report` have no sub-action, so `getattr(args, "action", "")` yields "".
     ("sweep", ""): sweep_command,
