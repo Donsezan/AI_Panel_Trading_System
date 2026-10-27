@@ -43,6 +43,7 @@ from pathlib import Path
 from decision_lab.archive.config import ArchivePolicy
 from decision_lab.archive.publish import archive_path
 from decision_lab.archive.published import ArchiveItem, PublishedArchive
+from decision_lab.clustering import annotate, fold
 from tradebot.core.instrument import Instrument
 from tradebot.core.logging import get_logger
 from tradebot.core.schema import Money
@@ -98,11 +99,13 @@ class ArchiveNewsFeed:
         relevance: RelevanceFilter,
         *,
         window: timedelta,
+        floor: Money,
         min_relevance: Money = DEFAULT_MIN_RELEVANCE,
     ) -> None:
         self._archives = tuple(_Indexed.of(a) for a in archives)
         self._relevance = relevance
         self._window = window
+        self._floor = floor
         self._min_relevance = min_relevance
 
     @property
@@ -129,8 +132,11 @@ class ArchiveNewsFeed:
     ) -> tuple[tuple[NewsItemView, ...], NewsCoverage]:
         """What was knowable at `as_of`, ranked and cut by the bot's own rules."""
         candidates = self.in_window(as_of)
+        # Forward-only and never precomputed (§6.8.2): `candidates` is already cut at `as_of`, so
+        # a count cannot encode coverage the event attracted afterwards.
+        elected = tuple(annotate(c) for c in fold(candidates, floor=self._floor))
         scored = [
-            (self._relevance.relevance(_as_news_item(row), instruments), row) for row in candidates
+            (self._relevance.relevance(_as_news_item(row), instruments), row) for row in elected
         ]
         keep = [pair for pair in scored if pair[0] >= self._min_relevance]
         # `NewsHub.select`'s exact key, reversed. Imported behaviour would be better still; this
@@ -147,6 +153,7 @@ class ArchiveNewsFeed:
             extra={
                 "as_of": as_of.isoformat(),
                 "in_window": len(candidates),
+                "clusters": len(elected),
                 "relevant": len(keep),
                 "served": len(views),
             },
@@ -181,4 +188,6 @@ def load_feed(data_dir: Path, sources: tuple[str, ...], policy: ArchivePolicy) -
     published. Task 10 refuses a mismatch rather than picking one.
     """
     archives = tuple(PublishedArchive.read(archive_path(data_dir, source)) for source in sources)
-    return ArchiveNewsFeed(archives, KeywordRelevanceFilter(), window=policy.window)
+    return ArchiveNewsFeed(
+        archives, KeywordRelevanceFilter(), window=policy.window, floor=policy.cluster_floor
+    )

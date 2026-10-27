@@ -20,6 +20,7 @@ from tradebot.core.enums import AssetClass
 from tradebot.core.instrument import Instrument
 from tradebot.news.relevance import KeywordRelevanceFilter
 
+FLOOR = Decimal("0.25")
 BTC = Instrument(
     symbol="BTC/USDT",
     venue="binance",
@@ -31,7 +32,14 @@ BTC = Instrument(
 )
 
 
-def item(*, at: datetime, title: str, summary: str, url: str | None = None) -> ArchiveItem:
+def item(
+    *,
+    at: datetime,
+    title: str,
+    summary: str,
+    url: str | None = None,
+    entities: tuple[str, ...] = ("Kraken",),
+) -> ArchiveItem:
     link = url or f"https://x.test/{abs(hash(title)) % 10_000}"
     return ArchiveItem(
         source_id="cryptoslate",
@@ -40,7 +48,7 @@ def item(*, at: datetime, title: str, summary: str, url: str | None = None) -> A
         title=title,
         summary=summary,
         event_type=EventType.REGULATORY,
-        entities=("Kraken",),
+        entities=entities,
         assets=("BTC",),
         magnitudes=(),
         modality=Modality.CONFIRMED,
@@ -66,7 +74,7 @@ def archive(*items: ArchiveItem) -> PublishedArchive:
 
 
 def feed(*items: ArchiveItem, window: timedelta = timedelta(hours=48)) -> ArchiveNewsFeed:
-    return ArchiveNewsFeed((archive(*items),), KeywordRelevanceFilter(), window=window)
+    return ArchiveNewsFeed((archive(*items),), KeywordRelevanceFilter(), window=window, floor=FLOOR)
 
 
 @pytest.mark.asyncio
@@ -154,6 +162,21 @@ async def test_an_instant_outside_the_archives_span_reports_no_coverage() -> Non
 
 
 @pytest.mark.asyncio
+async def test_an_instant_after_the_archives_last_row_reports_no_coverage() -> None:
+    """Deliberate, and pinned so it is not "fixed" by accident: the header declares no span, so
+    coverage is [first row, last row] and an instant past the last row was never measured. A seat
+    told a source is silent after its archive ended would reason as though nothing happened."""
+    only = item(
+        at=datetime(2025, 3, 4, tzinfo=UTC), title="Kraken licensed", summary="Kraken was licensed."
+    )
+
+    _, coverage = await feed(only).snapshot_news((BTC,), datetime(2025, 3, 5, tzinfo=UTC), 8)
+
+    assert coverage.sources_failed == ("cryptoslate",)
+    assert coverage.sources_ok == ()
+
+
+@pytest.mark.asyncio
 async def test_an_irrelevant_item_is_filtered_by_the_bots_own_floor() -> None:
     """Relevance is the bot's and is imported, never restated. An item naming no instrument and
     no macro term scores below `DEFAULT_MIN_RELEVANCE` and spends no tokens diluting evidence."""
@@ -182,6 +205,8 @@ async def test_the_limit_truncates_most_relevant_first() -> None:
             at=datetime(2025, 3, 4, 9, n, tzinfo=UTC),
             title=f"Bitcoin story {n}",
             summary=f"Bitcoin news {n}.",
+            # Distinct events: one shared key would fold all twelve into a single slot.
+            entities=(f"Outlet{n}",),
         )
         for n in range(12)
     )
@@ -219,7 +244,10 @@ async def test_two_sources_both_appear_in_coverage() -> None:
         items=(other,),
     )
     multi = ArchiveNewsFeed(
-        (archive(btc_item), second), KeywordRelevanceFilter(), window=timedelta(hours=48)
+        (archive(btc_item), second),
+        KeywordRelevanceFilter(),
+        window=timedelta(hours=48),
+        floor=FLOOR,
     )
 
     # At the rows' own instant: an instant past an archive's last row is outside its span.
