@@ -29,9 +29,36 @@ from decision_lab import seats as st
 from decision_lab import sweep as sw
 from decision_lab.candidates import Matrix
 from decision_lab.records import CycleRecord
-from decision_lab.render import CandidateSeats, NotMeasured
+from decision_lab.render import CandidateSeats, NewsProvenance, NotMeasured
 from tradebot.core.clock import Clock
 from tradebot.marketdata.recorder import ReplayDataset
+
+
+def news_provenance(meta: cp.CorpusMeta) -> NewsProvenance | None:
+    """§6.7's provenance for `LabReport.news_archive`, from the meta alone - `None` if blind.
+
+    The one place the report path learns about the archive, called from every `LabReport`
+    construction in the CLI so a news-fed corpus cannot render without its banners. Several
+    archives are read through one window and floor (`load_feed` refuses otherwise), so those are
+    taken from the first; models, prompts and policies are listed, de-duplicated. A stub archive
+    anywhere makes the run a plumbing check.
+    """
+    if meta.news_blind or not meta.news_archives:
+        return None
+    archives = meta.news_archives
+
+    def unique(values: Sequence[str]) -> str:
+        return ", ".join(dict.fromkeys(values))
+
+    return NewsProvenance(
+        sources=tuple(a.source for a in archives),
+        summarizer_model=unique([a.summarizer_model for a in archives]),
+        prompt_digest=unique([a.prompt_digest for a in archives]),
+        observed_at_policy=unique([a.observed_at_policy for a in archives]),
+        window_seconds=archives[0].news_window_seconds,
+        cluster_floor=archives[0].cluster_floor,
+        is_stub=any(a.is_stub for a in archives),
+    )
 
 
 @dataclass(frozen=True, slots=True)

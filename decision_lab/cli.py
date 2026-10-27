@@ -62,6 +62,7 @@ from decision_lab.archive.store import RAW_DIR, RawArticle, RawStore
 from decision_lab.archive.summarize import project, summarize_store
 from decision_lab.dashboard import auth as lab_auth
 from decision_lab.dashboard import create_lab_dashboard
+from decision_lab.newsfeed import load_feed
 from decision_lab.params import (
     CADENCE_SECONDS,
     DAYSET_FILE,
@@ -352,6 +353,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     corpus_build_parser.add_argument(
         "--until", default=None, help="window end; defaults to the data's"
     )
+    corpus_build_parser.add_argument(
+        "--news-source",
+        action="append",
+        default=[],
+        dest="news_sources",
+        metavar="SOURCE",
+        help="a published archive to read, repeatable. Omitted, the pass is NEWS-BLIND (§6.9) "
+        "and the report says so",
+    )
+    corpus_build_parser.add_argument(
+        "--policy", type=Path, default=DEFAULT_POLICY_FILE, help="archive.toml (§6.6)"
+    )
     corpus_build_parser.add_argument("--verbose", action="store_true")
 
     sweep_ = commands.add_parser(
@@ -574,7 +587,18 @@ def _days_fields(days: cday.CalibrationDays) -> dict[str, Any]:
 
 
 async def corpus_build(args: argparse.Namespace) -> int:
-    """Build the corpus. Refuses an unverified dataset before doing any work."""
+    """Build the corpus. Refuses an unverified dataset before doing any work.
+
+    A policy or archive problem is an `EXIT_CANDIDATE` logged here, as `archive_publish` does:
+    `main` would report an escaping `ConfigError` as exit 3 (a dataset problem), which it is not.
+    """
+    feed = None
+    if args.news_sources:
+        try:
+            feed = load_feed(args.data, tuple(args.news_sources), load_policy(args.policy))
+        except ConfigError as error:
+            logger.error("corpus build refused; nothing was built", extra={"reason": str(error)})
+            return EXIT_CANDIDATE
     built = await cp.build(
         data_dir=args.data,
         reference_panel=args.reference_panel,
@@ -582,6 +606,7 @@ async def corpus_build(args: argparse.Namespace) -> int:
         start_equity=args.start_equity,
         since=_moment(args.since),
         until=_moment(args.until),
+        news_feed=feed,
     )
     logger.info(
         "corpus ready",
@@ -854,6 +879,7 @@ async def calibrate_snapshot(args: argparse.Namespace) -> int:
         named_windows=tuple(w.name for w in regime_index.windows),
         start_equity=corpus.meta.start_equity,
         news_blind=corpus.meta.news_blind,
+        news_archive=an.news_provenance(corpus.meta),
         panel_models=tuple(
             dict.fromkeys(
                 f"{s.provider_id}:{s.model}"
@@ -1234,6 +1260,7 @@ async def report(args: argparse.Namespace) -> int:
         named_windows=tuple(w.name for w in regime_index.windows),
         start_equity=meta.start_equity,
         news_blind=meta.news_blind,
+        news_archive=an.news_provenance(meta),
         panel_models=tuple(dict.fromkeys(f"{s.provider_id}:{s.model}" for s in panel.seats)),
         cycles=len(cycles),
         regimes=sc.by_regime(scored),

@@ -10,13 +10,17 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 
+from decision_lab.archive.config import ArchivePolicy
 from decision_lab.archive.fields import EventType, Modality
+from decision_lab.archive.publish import archive_path
 from decision_lab.archive.published import ArchiveHeader, ArchiveItem, PublishedArchive
-from decision_lab.newsfeed import ArchiveNewsFeed
+from decision_lab.newsfeed import ArchiveNewsFeed, load_feed
 from tradebot.core.enums import AssetClass
+from tradebot.core.errors import ConfigError
 from tradebot.core.instrument import Instrument
 from tradebot.news.relevance import KeywordRelevanceFilter
 
@@ -264,3 +268,31 @@ def test_the_feed_holds_no_fetcher_and_no_http_client() -> None:
     )
     names = {type(v).__name__.lower() for v in vars(built).values()}
     assert not any("client" in n or "fetcher" in n or "transport" in n for n in names)
+
+
+def _published(tmp_path: Path, *, window_seconds: int = 172_800) -> Path:
+    """Write one archive under `tmp_path` the way `archive publish` does."""
+    one = archive(item(at=datetime(2026, 9, 1, tzinfo=UTC), title="Kraken settles", summary="s"))
+    header = one.header.model_copy(update={"news_window_seconds": window_seconds})
+    PublishedArchive.write(archive_path(tmp_path, "cryptoslate"), header, one.items)
+    return tmp_path
+
+
+def _policy() -> ArchivePolicy:
+    return ArchivePolicy(provider_id="stub", model="stub-summary", cluster_floor=FLOOR)
+
+
+def test_load_feed_reads_an_archive_published_under_the_policy_in_force(tmp_path: Path) -> None:
+    loaded = load_feed(_published(tmp_path), ("cryptoslate",), _policy())
+
+    assert loaded.digest
+    assert [h.source for h in loaded.headers] == ["cryptoslate"]
+
+
+def test_load_feed_refuses_an_archive_published_under_another_window(tmp_path: Path) -> None:
+    """The window is inside `archive_digest`: reading through another one yields a corpus id
+    describing evidence nobody selected."""
+    data = _published(tmp_path, window_seconds=3_600)
+
+    with pytest.raises(ConfigError, match="different window or floor"):
+        load_feed(data, ("cryptoslate",), _policy())

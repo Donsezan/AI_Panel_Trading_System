@@ -57,9 +57,10 @@ NEWS_BLIND = (
 #: reader must meet it before they meet a number.
 PLUMBING_CHECK: Final = (
     "**PLUMBING CHECK — NOT AN EVALUATION.** At least one candidate in this run binds the "
-    "offline stub, whose votes are drawn from a fixed catalogue. Every table below exercises the "
-    "sweep, the scoring and this page; none of it measures any model's judgement. Re-run with a "
-    "matrix bound to real providers to learn something."
+    "offline stub, whose votes are drawn from a fixed catalogue, **or the news archive it read "
+    "was summarised by that stub.** Every table below exercises the sweep, the scoring and this "
+    "page; none of it measures any model's judgement. Re-run with a matrix bound to real "
+    "providers, over an archive summarised by one, to learn something."
 )
 
 #: §10.6. `--skip-gate` was used, so nobody proved every seat answered on its own model before
@@ -72,6 +73,51 @@ GATE_SKIPPED: Final = (
     "all. A seat that abstained silently would leave exactly these tables, and they would look "
     "no different."
 )
+
+
+class NewsProvenance(DomainModel):
+    """How a news-fed run's evidence was produced. Rendered as §6.7's two banners.
+
+    A model rather than six parameters because `analysis.py` is the one read assembly and carries
+    it to the CLI, the dashboard and the notebook alike.
+    """
+
+    sources: tuple[str, ...]
+    summarizer_model: str
+    prompt_digest: str
+    observed_at_policy: str
+    window_seconds: int
+    cluster_floor: Money
+    #: §7.2's whole-run label, one layer out: a stub-summarised archive carries a real-looking
+    #: `archive_digest` over canned text. Derived from the header, never passed.
+    is_stub: bool = False
+
+
+def summarized_news(provenance: NewsProvenance) -> str:
+    """§6.7. The excerpts the panel read were written by a model, not by a publisher.
+
+    A pre-trained model's weights encode the outcomes it is being asked to summarise toward, and
+    memorisation is non-uniform across entities - heavily-covered names leak far more.
+    """
+    return (
+        f"**SUMMARIZED NEWS** — the excerpts in every snapshot are model-generated "
+        f"(model=`{provenance.summarizer_model}`, prompt=`{provenance.prompt_digest}`), not the "
+        "publishers' own text. §6.5 closes the hindsight channel by prompt, by what the model was "
+        "not given, by binding and by a traceability check — but only the last of those produces "
+        "a number, and none of them is a guarantee."
+    )
+
+
+def reconstructed_news(provenance: NewsProvenance) -> str:
+    """§6.7. `observed_at` was derived, so "what was knowable" is a policy, not a record."""
+    return (
+        f"**RECONSTRUCTED NEWS** — `observed_at` is synthetic "
+        f"(policy=`{provenance.observed_at_policy}`). No source here publishes the moment *we* "
+        f"learned something, so it is derived from the publication instant. Read through a "
+        f"{provenance.window_seconds // 3600}h window over "
+        f"{', '.join(provenance.sources)}, clustering on the §6.5 fields above a "
+        f"{provenance.cluster_floor} similarity floor."
+    )
 
 
 class CandidateSeats(DomainModel):
@@ -141,6 +187,10 @@ class LabReport(DomainModel):
     named_windows: tuple[str, ...] = ()
     start_equity: Money
     news_blind: bool = True
+    #: §6.7's provenance, present exactly when a news archive was wired. `news_blind` is its
+    #: inverse and both are kept: a reader scanning for one banner must not infer the other's
+    #: absence.
+    news_archive: NewsProvenance | None = None
     panel_models: tuple[str, ...] = ()
     cycles: int = 0
     regimes: tuple[RegimeMetrics, ...] = ()
@@ -190,10 +240,17 @@ def report_markdown(report: LabReport) -> str:
         "",
         DISCLAIMER,
     ]
-    if report.plumbing_check:
+    if report.plumbing_check or (report.news_archive is not None and report.news_archive.is_stub):
         sections += ["", PLUMBING_CHECK]
     if report.news_blind:
         sections += ["", NEWS_BLIND]
+    elif report.news_archive is not None:
+        sections += [
+            "",
+            summarized_news(report.news_archive),
+            "",
+            reconstructed_news(report.news_archive),
+        ]
     if report.gate_skipped:
         sections += ["", GATE_SKIPPED]
     sections += ["", _identity(report)]

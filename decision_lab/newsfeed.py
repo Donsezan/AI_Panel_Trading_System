@@ -42,8 +42,9 @@ from pathlib import Path
 
 from decision_lab.archive.config import ArchivePolicy
 from decision_lab.archive.publish import archive_path
-from decision_lab.archive.published import ArchiveItem, PublishedArchive
+from decision_lab.archive.published import ArchiveHeader, ArchiveItem, PublishedArchive
 from decision_lab.clustering import annotate, fold
+from tradebot.core.errors import ConfigError
 from tradebot.core.instrument import Instrument
 from tradebot.core.logging import get_logger
 from tradebot.core.schema import Money
@@ -103,10 +104,17 @@ class ArchiveNewsFeed:
         min_relevance: Money = DEFAULT_MIN_RELEVANCE,
     ) -> None:
         self._archives = tuple(_Indexed.of(a) for a in archives)
+        self._headers = tuple(a.header for a in archives)
         self._relevance = relevance
         self._window = window
         self._floor = floor
         self._min_relevance = min_relevance
+
+    @property
+    def headers(self) -> tuple[ArchiveHeader, ...]:
+        """Each archive's provenance line, in the order given. A corpus copies these into its
+        meta so `report` - a separate process that reads only that file - can state them."""
+        return self._headers
 
     @property
     def digest(self) -> str:
@@ -188,6 +196,20 @@ def load_feed(data_dir: Path, sources: tuple[str, ...], policy: ArchivePolicy) -
     published. Task 10 refuses a mismatch rather than picking one.
     """
     archives = tuple(PublishedArchive.read(archive_path(data_dir, source)) for source in sources)
+    mismatched = [
+        a.header.source
+        for a in archives
+        if a.header.news_window_seconds != policy.news_window_seconds
+        or a.header.cluster_floor != policy.cluster_floor
+    ]
+    if mismatched:
+        raise ConfigError(
+            f"{mismatched} were published under a different window or floor than the policy "
+            "in force declares. Re-publish them, or point --policy at the archive.toml they "
+            "were published with: the window and the floor are inside archive_digest, so "
+            "reading an archive through a policy it was not published for yields a corpus id "
+            "describing evidence nobody selected"
+        )
     return ArchiveNewsFeed(
         archives, KeywordRelevanceFilter(), window=policy.window, floor=policy.cluster_floor
     )
