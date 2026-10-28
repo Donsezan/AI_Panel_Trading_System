@@ -15,6 +15,7 @@ A bare `except: pass` is a defect: it converts a classified error into an unclas
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
 
 
 class TradebotError(Exception):
@@ -64,6 +65,29 @@ class SourceDisallowedError(FailClosedError):
 
 class ReconciliationMismatchError(FailClosedError):
     """Ledger and venue disagree beyond tolerance. Halt; above tolerance, kill switch."""
+
+
+class UnbookableFillError(ReconciliationMismatchError):
+    """A fill the venue reports that the ledger refuses to book: a sell larger than the holding.
+
+    Fail closed, and narrower than its parent so the execution monitor can contain it to the one
+    group that carries the fill instead of letting it wedge every other group (ADR 0030).
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        client_order_id: str,
+        instrument_key: str,
+        qty: Decimal,
+        held: Decimal,
+    ) -> None:
+        super().__init__(message)
+        self.client_order_id = client_order_id
+        self.instrument_key = instrument_key
+        self.qty = qty
+        self.held = held
 
 
 class SubmitUnknownError(FailClosedError):

@@ -33,10 +33,11 @@ from tradebot.core.enums import (
     KillSwitchState,
     OrderRole,
     OrderState,
+    Side,
 )
-from tradebot.core.errors import ConfigError
+from tradebot.core.errors import ConfigError, UnbookableFillError
 from tradebot.core.events import EventType
-from tradebot.core.orders import Order
+from tradebot.core.orders import Fill, Order
 from tradebot.dashboard.dock import KILL_PHRASE, QUARANTINE_CONFIRM
 from tradebot.dashboard.queries import Queries
 from tradebot.execution.brokers.sim import Tick
@@ -788,3 +789,31 @@ async def test_a_sim_process_has_nothing_to_arm(
 
 async def test_the_arming_form_is_absent_outside_live(client: httpx.AsyncClient) -> None:
     assert "Live arming" not in (await client.get("/")).text
+
+
+async def test_a_close_over_an_unbookable_fill_is_refused_and_sends_nothing(
+    cycled: Application, clock: ManualClock
+) -> None:
+    """Fail closed for the operator too: the close would size against a ledger known to be wrong."""
+    held = cycled.ledger.position(BTC).qty
+    cycled.ledger.apply_fill(
+        Fill(
+            fill_id="external",
+            client_order_id="elsewhere",
+            instrument_key=BTC,
+            side=Side.SELL,
+            qty=held / 2,
+            price=Decimal("50000"),
+            filled_at=clock.now(),
+        ),
+        base_currency="BTC",
+        quote_currency="USDT",
+    )
+    cross_the_stop(cycled, BTC, clock)
+    sent = len(events_of(cycled, EventType.ORDER_SUBMITTED))
+
+    with pytest.raises(UnbookableFillError, match="exceeds holding"):
+        await cycled.manual_close.close("demo", BTC, actor="test")
+
+    assert len(events_of(cycled, EventType.ORDER_SUBMITTED)) == sent
+    assert risk_events(cycled, "unbookable_fill")

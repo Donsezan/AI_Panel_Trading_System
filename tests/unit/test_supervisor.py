@@ -14,8 +14,10 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from datetime import timedelta
+from decimal import Decimal
 
 import pytest
+from tests.unit.test_monitor import poisoned_pair
 
 from tradebot.control.basket_runner import CycleResult
 from tradebot.control.config_store import ConfigRecord, ConfigStore
@@ -25,7 +27,12 @@ from tradebot.core.clock import ManualClock
 from tradebot.core.config import Basket, GlobalRiskPolicy, Schedule
 from tradebot.core.enums import BasketStatus, ConfigKind, CycleOutcome
 from tradebot.core.errors import ConfigError, FailClosedError
+from tradebot.core.instrument import Instrument
 from tradebot.execution.brokers.calendars import ContinuousCalendar
+from tradebot.execution.brokers.sim import SimBroker
+from tradebot.execution.monitor import ExecutionMonitor
+from tradebot.execution.service import ExecutionService
+from tradebot.ledger.portfolio import Ledger
 from tradebot.persistence.store import EventStore
 from tradebot.risk.state import RiskStateStore
 from tradebot.risk.watchdog import Watchdog
@@ -508,6 +515,41 @@ class TestOrdersArePolledBetweenCycles:
 
         assert monitor.polls >= 1
         assert factory.built == [], "nothing cycled; the sweep itself polled"
+
+    async def test_a_poisoned_group_does_not_stop_the_sweep_booking_a_sibling(
+        self,
+        factory: ScriptedFactory,
+        configs: ConfigStore,
+        clock: ManualClock,
+        watchdog: Watchdog,
+        states: RiskStateStore,
+        store: EventStore,
+        ledger: Ledger,
+        instrument: Instrument,
+        second_instrument: Instrument,
+    ) -> None:
+        """Before ADR 0030 one unbookable fill stopped the sweep at that group, every 30s, for
+        every basket. The sweep is unscoped, so it neither raises nor stops."""
+        broker = SimBroker(clock, balances={"USDT": Decimal(100_000)})
+        monitor = ExecutionMonitor(
+            broker, ExecutionService(broker, store, ledger, clock), store, clock
+        )
+        await poisoned_pair(monitor, broker, store, ledger, clock, instrument, second_instrument)
+        supervisor = self._supervisor(
+            factory,
+            configs,
+            clock,
+            watchdog,
+            states,
+            monitor=monitor,  # type: ignore[arg-type]
+        )
+
+        serving = asyncio.create_task(supervisor.serve(resync_seconds=60.0))
+        await asyncio.sleep(0)
+        await supervisor.stop()
+        await asyncio.wait_for(serving, timeout=5)
+
+        assert ledger.position(second_instrument.key).qty == Decimal("1")
 
     async def test_the_poll_precedes_the_valuation_sweep(
         self,

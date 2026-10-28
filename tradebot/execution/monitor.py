@@ -40,7 +40,13 @@ What it owns (DESIGN §6.7):
   stop that filled cannot leave a take-profit resting against a position that is gone.
 
 Failure semantics: a venue error during a poll propagates to the caller's retry budget and the
-order stays tracked — dropping it would orphan a live order. An entry that fills but whose
+order stays tracked — dropping it would orphan a live order. Groups fail independently: every
+group is attempted, every failure is logged, and the most severe class is re-raised after the
+others have been synced and maintained (a fail-closed error is never masked by a retryable one).
+A fill the ledger refuses (`UnbookableFillError`) poisons only its own group: one `RISK_EVENT`, the
+group stays tracked with the fill unbooked, and the error is raised only to a caller whose scope
+contains that group — it sizes against that ledger. An unscoped sweep records it and halts
+nothing; the owning basket halts at its next scoped poll (ADR 0030). An entry that fills but whose
 protective legs cannot be placed emits a `RISK_EVENT` and leaves the position flagged
 unprotected; it is never silently left unguarded.
 """
@@ -53,6 +59,7 @@ from decimal import Decimal
 
 from tradebot.core.clock import Clock
 from tradebot.core.enums import OrderRole, OrderState, RiskTier, Side
+from tradebot.core.errors import FailClosedError, FatalError, UnbookableFillError
 from tradebot.core.instrument import Instrument
 from tradebot.core.logging import get_logger
 from tradebot.core.money import ZERO, multiply
@@ -75,6 +82,15 @@ logger = get_logger(__name__)
 #: assuming. Age was the first proposal and is a proxy that inverts in a falling market — an entry
 #: at 100 stopped at 95 and a later one at 90 stopped at 85, newest-first keeps the 85.
 _RANK_SIGN: dict[Side, Decimal] = {Side.BUY: Decimal(-1), Side.SELL: Decimal(1)}
+
+UNBOOKABLE_FILL_RULE = "unbookable_fill"
+
+
+def _severity(error: Exception) -> int:
+    """Lower is more severe: a later fail-closed error must not hide behind an earlier retryable."""
+    if isinstance(error, FatalError):
+        return 0
+    return 1 if isinstance(error, FailClosedError) else 2
 
 
 @dataclass(slots=True)
@@ -101,6 +117,9 @@ class _Tracked:
     #: target refuses identically next poll, so a retry buys nothing. A *venue* failure never sets
     #: it, because that one must be retried (review C1).
     unprotected_at: Decimal | None = None
+    #: Set when the ledger refused to book this group's fill. The group stays tracked and the fill
+    #: stays unbooked until the holding allows it, so nothing pretends it never happened.
+    poisoned: UnbookableFillError | None = None
 
     @property
     def resting_qty(self) -> Decimal:
@@ -172,17 +191,51 @@ class ExecutionMonitor:
         is every group, which is what the supervisor's sweep and a replay want.
         """
         async with self._polling:
-            for group in self._in_scope(instrument_keys):
-                group.order = await self._sync(group, group.order)
-                for client_order_id, leg in list(group.legs.items()):
-                    group.legs[client_order_id] = await self._sync(group, leg)
+            in_scope = self._in_scope(instrument_keys)
+            failures: list[tuple[_Tracked, Exception]] = []
+            synced: list[_Tracked] = []
+            for group in in_scope:
+                try:
+                    await self._sync_group(group)
+                except UnbookableFillError as error:
+                    # Contained to this group (ADR 0030): the fill stays unbooked and tracked, and
+                    # its siblings go on syncing, booking and being maintained.
+                    await self._poison(group, error)
+                except Exception as error:
+                    # Collected, not swallowed: every one is logged and the most severe is
+                    # re-raised below, so the error's class still governs the caller's handling.
+                    failures.append((group, error))
+                else:
+                    group.poisoned = None  # booked: the holding now allows it
+                    synced.append(group)
             # After the sync loop, never inside it: `_sync` books fills as it reads them, so a stop
             # that filled this sweep has already reduced the position. Computing per group inside
             # the loop would size some groups against a pre-fill holding and others against a
             # post-fill one (design §2.4).
             targets = self._targets()
-            for group in self._in_scope(instrument_keys):
-                await self._maintain(group, targets.get(group.order.group_id))
+            for group in synced:
+                try:
+                    await self._maintain(group, targets.get(group.order.group_id))
+                except Exception as error:
+                    # Same contract as above: collected, logged, re-raised by severity.
+                    failures.append((group, error))
+            for failed, problem in failures:
+                logger.error(
+                    "a group failed to poll",
+                    extra={
+                        "group_id": failed.order.group_id,
+                        "client_order_id": failed.order.client_order_id,
+                        "error": f"{type(problem).__name__}: {problem}",
+                    },
+                )
+            raising = [problem for _, problem in failures]
+            if instrument_keys is not None:
+                # A caller scoped to a poisoned group sizes against this ledger, so it must be
+                # told; an unscoped sweep sizes nothing and is not (the basket halts at its own
+                # next scoped poll).
+                raising.extend(g.poisoned for g in in_scope if g.poisoned is not None)
+            if raising:
+                raise min(raising, key=_severity)
 
     def _in_scope(self, instrument_keys: frozenset[str] | None) -> list[_Tracked]:
         # Re-evaluated per pass, as the unscoped loops always were: a group adopted while a venue
@@ -192,6 +245,39 @@ class ExecutionMonitor:
             for group in self._tracked.values()
             if instrument_keys is None or group.order.instrument_key in instrument_keys
         ]
+
+    async def _sync_group(self, group: _Tracked) -> None:
+        """Entry first, then each leg, assigning as it goes so a later failure loses nothing."""
+        group.order = await self._sync(group, group.order)
+        for client_order_id, leg in list(group.legs.items()):
+            group.legs[client_order_id] = await self._sync(group, leg)
+
+    async def _poison(self, group: _Tracked, error: UnbookableFillError) -> None:
+        """Record, once, that a group carries a fill the ledger refuses; keep it tracked."""
+        if group.poisoned is None:
+            events = self._execution.events_for(group.order)
+            detail = (
+                f"{error.client_order_id}: a fill of {error.qty} exceeds the holding of "
+                f"{error.held}; left unbooked and still tracked"
+            )
+            await self._store.append(
+                events.risk_event(
+                    tier=RiskTier.EXECUTION,
+                    rule=UNBOOKABLE_FILL_RULE,
+                    scope=error.instrument_key,
+                    action="group_poisoned",
+                    detail=detail,
+                )
+            )
+            logger.error(
+                "fill cannot be booked; group poisoned",
+                extra={
+                    "client_order_id": error.client_order_id,
+                    "instrument_key": error.instrument_key,
+                    "detail": detail,
+                },
+            )
+        group.poisoned = error
 
     async def _sync(self, group: _Tracked, order: Order) -> Order:
         if not order.state.is_open:

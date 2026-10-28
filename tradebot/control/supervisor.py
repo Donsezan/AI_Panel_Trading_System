@@ -451,6 +451,9 @@ class Supervisor:
         Guarded like the two sweeps around it. A venue error here is transient by nature — the
         order stays tracked and the next tick asks again — and the alternative is the failure the
         module docstring names: a dead supervisor leaves working orders with nobody polling them.
+
+        An unscoped poll never raises for a poisoned group (ADR 0030), so this guard now catches
+        only transient errors; the poisoned group's own basket halts at its next scoped poll.
         """
         if self._monitor is None:
             return

@@ -34,7 +34,7 @@ from decimal import Decimal
 
 from tradebot.core.clock import Clock
 from tradebot.core.enums import Side
-from tradebot.core.errors import ReconciliationMismatchError
+from tradebot.core.errors import ReconciliationMismatchError, UnbookableFillError
 from tradebot.core.events import Event, EventType
 from tradebot.core.money import ZERO, divide, multiply, to_decimal
 from tradebot.core.orders import Fill
@@ -143,9 +143,13 @@ class Ledger:
     def _apply_sell(self, fill: Fill) -> Position:
         current = self.position(fill.instrument_key)
         if fill.qty > current.qty:
-            raise ReconciliationMismatchError(
+            raise UnbookableFillError(
                 f"sell of {fill.qty} exceeds holding {current.qty} on {fill.instrument_key}; "
-                "v1 is long-only, so this is ledger corruption rather than a short"
+                "v1 is long-only, so this is ledger corruption rather than a short",
+                client_order_id=fill.client_order_id,
+                instrument_key=fill.instrument_key,
+                qty=fill.qty,
+                held=current.qty,
             )
         realized = multiply(fill.qty, fill.price - current.avg_entry)
         remaining = current.qty - fill.qty
