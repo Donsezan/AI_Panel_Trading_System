@@ -8,17 +8,17 @@ the venue cost is proportional to live work rather than to how often something a
 what lets the supervisor's sweep call it on every tick without a polling storm becoming a
 rate-limit ban (PLAN §3.1).
 
-**Who calls it.** Two callers in a running process, and both are needed (KNOWN_GAPS §5):
+**Who calls it.** Three kinds of caller in a running process, and all are needed (KNOWN_GAPS §5):
 
-* `BasketRunner._settle`, after a cycle that placed orders — one sweep to book what filled
-  immediately, so the cycle's own outcome is a determined fact rather than a race;
-* `Supervisor._poll_orders`, on the resync sweep, whether or not anything cycled. A venue-held
-  stop fires *between* cycles by construction (ADR 0004), so the cycle that placed an order can
-  never be the thing that notices. Without it, everything here advanced only when some basket
-  happened to trade — and in a real `sim.db`, 41 orders span 196 cycles.
-
-`ManualCloser` polls its own close for the same reason, one act rather than one loop: the
-close empties a holding whose protective legs are still resting at the venue.
+* the snapshot's settle hook and `BasketRunner._settle`, both scoped to the basket's instruments
+  (ADR 0030). The hook books what the venue did while the snapshot read its candles, before the
+  position is read; `_settle` books what the cycle's own orders did, so the outcome is a
+  determined fact rather than a race;
+* `ManualCloser`, scoped, for the same reason: a close empties a holding whose protective legs
+  are still resting at the venue;
+* `Supervisor._poll_orders`, unscoped, on the resync sweep, whether or not anything cycled. A
+  venue-held stop fires *between* cycles by construction (ADR 0004), so the cycle that placed an
+  order can never be the thing that notices. In a real `sim.db`, 41 orders span 196 cycles.
 
 **The cadence belongs to the caller, not to this module.** It used to own a
 `DEFAULT_POLL_INTERVAL` of ten seconds, which only `settle()` ever read — and `settle()` had no

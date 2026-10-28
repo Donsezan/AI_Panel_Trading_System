@@ -101,6 +101,31 @@ class TestDataAndPanelRows:
 
 
 class TestExecutionRows:
+    async def test_a_venue_error_while_settling_the_snapshot_places_no_order(
+        self, basket: Basket, clock: ManualClock, market_data: ReplayMarketData
+    ) -> None:
+        """ADR 0030: the in-snapshot poll failing is the worker's failure path — no trade."""
+        harness = await make_harness(basket, clock, market_data, [DEFAULT_RESPONSE])
+        try:
+            await harness.runner.run_once()  # buys; legs rest, so the next snapshot must poll
+            frozen = len(
+                [e for e in harness.store.read_all() if e.type is EventType.SNAPSHOT_FROZEN]
+            )
+            sent = len([e for e in harness.store.read_all() if e.type is EventType.ORDER_SUBMITTED])
+
+            async def down(_ref: object) -> None:
+                raise VenueError("503 from the venue")
+
+            harness.broker.fetch_order = down  # type: ignore[method-assign]
+            with pytest.raises(VenueError):
+                await harness.runner.run_once()
+
+            after = harness.store.read_all()
+            assert len([e for e in after if e.type is EventType.SNAPSHOT_FROZEN]) == frozen
+            assert len([e for e in after if e.type is EventType.ORDER_SUBMITTED]) == sent
+        finally:
+            harness.close()
+
     async def test_an_ambiguous_submit_queries_rather_than_resubmitting(
         self, basket: Basket, clock: ManualClock, market_data: ReplayMarketData
     ) -> None:

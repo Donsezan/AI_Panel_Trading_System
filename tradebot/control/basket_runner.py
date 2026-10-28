@@ -16,9 +16,11 @@ Failure semantics — every one of these ends the cycle with no order and a reco
 * degraded panel / no consensus         → `PANEL_DEGRADED` or `NO_ACTION`
 * any Tier-1 or Tier-2 veto             → `RISK_VETOED`
 * a fail-closed error mid-cycle         → `FAILED`, and the basket is halted for review
+* a venue error while settling the snapshot → raised to the worker; no snapshot, no order (ADR 0030)
 * a shadow panel failing                → nothing; it is recorded and the outcome is unchanged
 
-The cycle never raises past `run_once`; it records what happened and returns.
+The cycle never raises past `run_once`, except a `RetryableError`, which is the worker's to back
+off; it records what happened and returns.
 """
 
 from __future__ import annotations
@@ -193,7 +195,7 @@ class BasketRunner:
         return ""
 
     async def _run(self, cycle_id: str, events: EventFactory) -> CycleResult:
-        snapshot = await self._context.build(self._basket)
+        snapshot = await self._context.build(self._basket, settle=self._settle_positions)
         await self._store.append(events.snapshot_frozen(snapshot))
         # Every basket writes the marks every basket is valued against, from quotes this cycle has
         # already paid for. That is what makes portfolio equity one number rather than one per
@@ -243,6 +245,19 @@ class BasketRunner:
             cost=panel.cost_usd,
         )
 
+    def _scope(self) -> frozenset[str]:
+        """The instruments this basket trades. ADR 0026 means no other basket's group sits on them,
+        so a scoped poll can never fail this cycle on a sibling's fill (ADR 0030)."""
+        return frozenset(instrument.key for instrument in self._basket.instruments)
+
+    async def _settle_positions(self) -> None:
+        """The snapshot's settle hook: book what the venue did before the position is read.
+
+        On a `SimBroker` stack the snapshot's own candle read can match a resting stop, and the
+        ledger would otherwise be read before it booked the fill (KNOWN_GAPS §5, ADR 0030).
+        """
+        await self._monitor.poll(self._scope())
+
     async def _settle(self, orders: list[Order]) -> tuple[Order, ...]:
         """One sweep to book whatever filled immediately, then hand the rest to the monitor.
 
@@ -253,7 +268,7 @@ class BasketRunner:
         """
         if not orders:
             return ()
-        await self._monitor.poll()
+        await self._monitor.poll(self._scope())
         settled = {order.client_order_id: order for order in self._monitor.tracked}
         self._monitor.prune(*{order.group_id for order in orders})
         return tuple(settled.get(order.client_order_id, order) for order in orders)
