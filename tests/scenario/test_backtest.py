@@ -54,6 +54,10 @@ FULL_SELL = """{
   "action": "SELL", "conviction": 5, "size_hint": "full",
   "thesis": "Take the position off.", "key_risks": [], "invalidation": "n/a"
 }"""
+HOLD = """{
+  "action": "HOLD", "conviction": 3, "size_hint": "none",
+  "thesis": "Nothing to do.", "key_risks": [], "invalidation": "n/a"
+}"""
 
 #: The dataset is sized so that, after the indicators' warm-up has eaten the front of it, what
 #: is left is long enough for the loss streak, the daily cap and TTL expiry to each get a turn.
@@ -190,6 +194,67 @@ async def crash_dataset(
         directory=tmp_path / "crash",
         clock=replay_clock,
         source="crash fixture",
+    )
+
+
+@pytest.fixture
+async def reentry_dataset(
+    tmp_path: Path, history_instrument: Instrument, replay_clock: ManualClock
+) -> ReplayDataset:
+    """RCA 2026-10-28 §1: rising to the first cycle (the entry), flat for the exit, a fall well
+    below the first entry's stop before the re-entry, then a rally through both of its levels."""
+    rising_hours = (first_cycle_at() - HISTORY_START) // timedelta(hours=1)
+    before = synthetic_candles(
+        start=HISTORY_START,
+        timeframe="1h",
+        count=rising_hours,
+        open_price=Decimal("50000"),
+        step=Decimal("25"),
+    )
+    top = before[-1].close
+    # Close of each hour from the first cycle on: flat (the exit), down 6000 over two hours,
+    # flat (the re-entry at the low), then 9000 back up over three hours and flat after.
+    closes = [top, top - 3000, top - 6000, top - 6000, top - 3000, top, top + 3000]
+    closes += [top + 3000] * (BARS - rising_hours - len(closes))
+    bars: list[Candle] = []
+    opened = before[-1].close_time
+    previous = top
+    for close in closes:
+        bars.append(
+            Candle(
+                open_time=opened,
+                close_time=opened + timedelta(hours=1),
+                open=previous,
+                high=max(previous, close) + 20,
+                low=min(previous, close) - 20,
+                close=close,
+                volume=Decimal(1),
+            )
+        )
+        opened += timedelta(hours=1)
+        previous = close
+    source = ReplayMarketData(
+        {
+            (history_instrument.key, "1h"): (*before, *bars),
+            (history_instrument.key, "4h"): synthetic_candles(
+                start=HISTORY_START,
+                timeframe="4h",
+                count=BARS,
+                open_price=Decimal("50000"),
+                step=Decimal("25"),
+            ),
+        },
+        replay_clock,
+    )
+    return await record(
+        source,
+        (history_instrument,),
+        TIMEFRAMES,
+        start=HISTORY_START,
+        end=HISTORY_START + timedelta(hours=BARS),
+        directory=tmp_path / "reentry",
+        clock=replay_clock,
+        source="re-entry fixture",
     )
 
 
@@ -442,6 +507,96 @@ class TestBacktest:
         ]
         assert booked, "the stop's fill never reached the ledger"
         assert all(Decimal(e.payload["position"]["qty"]) == 0 for e in booked)
+
+    async def test_a_re_entry_is_guarded_by_its_own_stop_not_the_exited_entrys(
+        self,
+        reentry_dataset: ReplayDataset,
+        history_instrument: Instrument,
+        tmp_path: Path,
+        replay_clock: ManualClock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """RCA 2026-10-28 §1 and §4 item 2: buy, a full panel exit, re-entry lower, then a rally
+        through the exited entry's old levels. The exited group used to keep its entitlement,
+        claim the re-entry's shares on its tighter stale stop, and re-place its old legs — a stop
+        above the market, which in the sim armed and rested as a second take-profit."""
+        script = [DEFAULT_RESPONSE, FULL_SELL, HOLD, HOLD, DEFAULT_RESPONSE] + [HOLD] * 4
+        monkeypatch.setattr(registry, "StubLLMProvider", functools.partial(StubLLMProvider, script))
+        basket = dataset_basket(reentry_dataset, STUB_PANEL)
+        basket = basket.model_copy(
+            update={"risk_policy": basket.risk_policy.model_copy(update={"cooldown_cycles": 0})}
+        )
+        application = await build_sim(
+            clock=replay_clock,
+            db_path=backtest_database_path(tmp_path / "reentry-run"),
+            baskets=(basket,),
+            market_data=reentry_dataset.market_data,
+        )
+        try:
+            start = reentry_dataset.coverage[0]
+            report = await BacktestHarness(
+                application, replay_clock, start=start, end=first_cycle_at() + timedelta(hours=8)
+            ).run()
+            events = application.store.read_all()
+        finally:
+            await application.shutdown()
+
+        assert report.ran_cycles == report.planned_cycles
+        assert CycleOutcome.FAILED.value not in report.evidence.outcomes
+        assert not report.evidence.incidents, "no halt"
+        assert not [
+            e
+            for e in events
+            if e.type is EventType.RISK_EVENT and e.payload["rule"] == "unbookable_fill"
+        ]
+
+        entries = [
+            e.payload["order"]
+            for e in events
+            if e.type is EventType.ORDER_SUBMITTED
+            and e.payload["order"]["side"] == Side.BUY.value
+            and e.payload["order"]["role"] == OrderRole.ENTRY.value
+        ]
+        assert len(entries) == 2, "the first entry and the re-entry"
+        first, again = entries
+        assert Decimal(again["protective"]["stop_price"]) < Decimal(first["limit_price"])
+        # The rally closes 3000 above the first entry: through both of its old levels.
+        assert (
+            Decimal(first["protective"]["take_profit_price"]) < Decimal(first["limit_price"]) + 3000
+        )
+
+        (retired,) = [
+            e
+            for e in events
+            if e.type is EventType.RISK_EVENT and e.payload["action_taken"] == "group_retired"
+        ]
+        assert first["client_order_id"] in retired.payload["detail"]
+
+        exited_at = next(
+            e.seq
+            for e in events
+            if e.type is EventType.FILL_RECEIVED and e.payload["fill"]["side"] == Side.SELL.value
+        )
+        armed_after_exit = [
+            e
+            for e in events
+            if e.type is EventType.PROTECTIVE_PLACED
+            and e.payload["protected"]
+            and e.seq is not None
+            and e.seq > exited_at
+        ]
+        assert armed_after_exit, "the re-entry was never guarded"
+        for placed in armed_after_exit:
+            assert placed.payload["group_id"] == again["group_id"]
+            stops = [
+                Decimal(leg["stop_price"])
+                for leg in placed.payload["legs"]
+                if leg["role"] == OrderRole.STOP_LOSS.value
+            ]
+            # Within one tick: the leg's trigger is the plan's stop quantized to the venue grid.
+            planned = Decimal(again["protective"]["stop_price"])
+            assert len(stops) == 1
+            assert abs(stops[0] - planned) < history_instrument.tick_size
 
 
 def _projection_rows(application: Application) -> dict[str, list[tuple[object, ...]]]:

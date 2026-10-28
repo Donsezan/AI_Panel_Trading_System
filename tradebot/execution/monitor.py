@@ -38,6 +38,9 @@ What it owns (DESIGN §6.7):
   because no venue lets a resting order's quantity be edited in place.
 * **Group closure.** A leg reaching a terminal state takes its working siblings with it, so a
   stop that filled cannot leave a take-profit resting against a position that is gone.
+* **Group retirement.** A group whose share of the holding has been sold away by some other path
+  is closed and forgotten, so the next entry is guarded by its own plan and never by a dead
+  group's stale legs (RCA 2026-10-28 §4 item 2).
 
 Failure semantics: a venue error during a poll propagates to the caller's retry budget and the
 order stays tracked — dropping it would orphan a live order. Groups fail independently: every
@@ -84,6 +87,9 @@ logger = get_logger(__name__)
 _RANK_SIGN: dict[Side, Decimal] = {Side.BUY: Decimal(-1), Side.SELL: Decimal(1)}
 
 UNBOOKABLE_FILL_RULE = "unbookable_fill"
+#: Not a flag: a retired group guards nothing and risks nothing. A `RISK_EVENT` because that is
+#: the monitor's record of acting on a group by itself, as `group_poisoned` is.
+PROTECTIVE_GROUP_RULE = "protective_group"
 
 
 def _severity(error: Exception) -> int:
@@ -121,6 +127,20 @@ class _Tracked:
     #: Set when the ledger refused to book this group's fill. The group stays tracked and the fill
     #: stays unbooked until the holding allows it, so nothing pretends it never happened.
     poisoned: UnbookableFillError | None = None
+    #: How much of the instrument's holding this group may guard, as of the last allocation. It
+    #: grows only with this entry's own fills and never grows back after a reduction took it away:
+    #: a later entry's shares are that entry's, not a ladder for an older group to climb back up
+    #: (RCA 2026-10-28 §4 item 2). See `ExecutionMonitor._entitle`.
+    entitled: Decimal = ZERO
+    #: The `net_filled` that `entitled` already accounts for, so each poll sees only the change.
+    credited: Decimal = ZERO
+
+    @property
+    def net_filled(self) -> Decimal:
+        """What this group's own orders put into the holding: the entry's fills less its legs'."""
+        return self.order.filled_qty - sum(
+            (leg.filled_qty for leg in self.legs.values()), start=ZERO
+        )
 
     @property
     def resting_qty(self) -> Decimal:
@@ -354,6 +374,11 @@ class ExecutionMonitor:
             # the legs of every group adopted at startup, because the `orders` projection does not
             # persist `protective` and `_persisted_open_orders` rebuilds the entry without it.
             return
+        if self._spent(group):
+            # Ahead of the minimums suppression: a spent group is retired whatever was last
+            # refused for it, or it would linger with its entitlement at zero for ever.
+            await self._retire(group)
+            return
         if target == group.unprotected_at:
             # A deterministic refusal that has already been reported, and already acted on — the
             # legs were cancelled when it was found. `plan_legs` is a pure function of the target
@@ -447,6 +472,49 @@ class ExecutionMonitor:
         events = self._execution.events_for(entry)
         await self._store.append(events.protective_placed(entry, tuple(placed)))
 
+    @staticmethod
+    def _spent(group: _Tracked) -> bool:
+        """The entry is done filling, did fill, and none of what it bought is left to guard.
+
+        `filled_qty > 0` keeps an entry that expired unfilled out of it: that one never guarded
+        anything, so there is nothing to retire and the runner's own `prune` forgets it.
+        """
+        return (
+            group.entitled <= ZERO
+            and not group.order.state.is_open
+            and group.order.filled_qty > ZERO
+        )
+
+    async def _retire(self, group: _Tracked) -> None:
+        """Close a group whose holding is gone, record it, and forget it.
+
+        RCA 2026-10-28 §4 item 2: a group only released to zero stayed tracked with its stop and
+        take-profit in hand, and the next entry's shares were handed to it first. Forgotten only
+        after the cancel and the record have both succeeded, so a venue error leaves it tracked
+        and the next poll retries the whole retirement.
+        """
+        await self._cancel_legs(group, reason="released_to_position")
+        entry = group.order
+        events = self._execution.events_for(entry)
+        detail = (
+            f"{entry.client_order_id}: none of the {entry.filled_qty} it bought is left in the "
+            "holding; its legs are cancelled and a later entry is guarded by its own plan"
+        )
+        await self._store.append(
+            events.risk_event(
+                tier=RiskTier.EXECUTION,
+                rule=PROTECTIVE_GROUP_RULE,
+                scope=entry.instrument_key,
+                action="group_retired",
+                detail=detail,
+            )
+        )
+        logger.info(
+            "protective group retired",
+            extra={"group_id": entry.group_id, "detail": detail},
+        )
+        self.forget(entry.group_id)
+
     async def _record_unprotected(self, group: _Tracked, reason: str) -> None:
         """Say that this position is bare, whichever way it got there.
 
@@ -483,14 +551,49 @@ class ExecutionMonitor:
         targets: dict[str, Decimal] = {}
         for instrument_key in {group.order.instrument_key for group in self._tracked.values()}:
             groups = self._protectable(instrument_key)
+            self._entitle(instrument_key, groups)
             budget = max(
                 ZERO, self._execution.held(instrument_key) - self._committed(instrument_key)
             )
             for group in groups:
-                target = min(group.order.filled_qty, budget)
+                target = min(group.entitled, budget)
                 targets[group.order.group_id] = target
                 budget -= target
         return targets
+
+    def _entitle(self, instrument_key: str, groups: list[_Tracked]) -> None:
+        """Move each group's entitlement by what happened since the last allocation.
+
+        RCA 2026-10-28 §4 item 2. Entitling every group to its `filled_qty` let one whose holding a
+        discretionary SELL had emptied claim the *next* entry's shares, tightest stop first, and
+        re-place its months-old legs. So an entitlement only ever grows by the group's own entry
+        fills and only ever shrinks otherwise — by its own legs' fills, or by a reduction from some
+        other path. It is *held* that is shared out here, not `held - committed`: a resting SELL
+        sells nothing until it fills, so one that expires lets the group re-arm to what it had.
+
+        New fills are shared out first, then what each group already had, both tightest stop
+        first. A shortfall therefore lands on the older entitlements: the shares an entry has just
+        bought are that entry's, and what is missing is what was sold — including when the exit and
+        the re-entry both land between the same two polls. With nothing new it is exactly the old
+        tightest-first allocation, so the tighter stop still keeps its cover.
+        """
+        budget = max(ZERO, self._execution.held(instrument_key))
+        moved = [group.net_filled - group.credited for group in groups]
+        new = [max(change, ZERO) for change in moved]
+        # A group's own exits come off its own entitlement before anything is shared out.
+        kept = [
+            max(ZERO, group.entitled + min(change, ZERO))
+            for group, change in zip(groups, moved, strict=True)
+        ]
+        granted = [ZERO] * len(groups)
+        for claims in (new, kept):
+            for index, claim in enumerate(claims):
+                take = min(claim, budget)
+                granted[index] += take
+                budget -= take
+        for group, entitled in zip(groups, granted, strict=True):
+            group.entitled = entitled
+            group.credited = group.net_filled
 
     def _protectable(self, instrument_key: str) -> list[_Tracked]:
         """This instrument's groups that can hold legs at all, tightest stop first.

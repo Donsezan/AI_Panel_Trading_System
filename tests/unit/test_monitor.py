@@ -567,7 +567,10 @@ class TestLegsTrackThePosition:
 
         assert not [leg for leg in monitor.tracked if leg.role.is_protective and leg.state.is_open]
         risk = [e for e in store.read_all() if e.type is EventType.RISK_EVENT]
-        assert not risk, "nothing is at risk, so nothing is flagged"
+        # The group is retired and says so (RCA 2026-10-28 §4 item 2) — a record, not a flag.
+        assert [(e.payload["rule"], e.payload["action_taken"]) for e in risk] == [
+            ("protective_group", "group_retired")
+        ], "nothing is at risk, so nothing is flagged"
 
     @pytest.mark.parametrize("tight_first", [True, False])
     async def test_the_tighter_stop_keeps_its_cover_whichever_was_opened_first(
@@ -837,36 +840,226 @@ class TestLegsTrackThePosition:
         monitor.track(order, instrument)
         await monitor.poll()
 
-        # Down to dust: 0.0001 at 49 000 is 4.90, under the instrument's min_notional of 10.
-        book(ledger, external_sell(instrument, clock, qty="0.4999"), instrument)
-        clock.advance(30)
-        await monitor.poll()
+        async def rest_an_exit(coid: str) -> None:
+            # Down to dust: 0.0001 at 49 000 is 4.90, under the instrument's min_notional of 10.
+            # A *resting* exit rather than a booked one: a group's entitlement never grows back
+            # after a filled reduction (RCA 2026-10-28 §4 item 2), so the only way back up to
+            # guardable is a commitment that lapses.
+            exit_order = await service.submit(
+                entry_intent(
+                    instrument,
+                    clock,
+                    coid=coid,
+                    qty="0.4999",
+                    price="60000",
+                    side=Side.SELL,
+                    plan=None,
+                    ttl=60,
+                ),
+                instrument,
+            )
+            monitor.track(exit_order, instrument)
+            clock.advance(30)
+            await monitor.poll()
 
-        # Back up, guardable again, then down to the same dust a second time.
-        book(
-            ledger,
-            Fill(
-                fill_id="refill",
-                client_order_id="sim-ELSEWHERE",
-                instrument_key=instrument.key,
-                side=Side.BUY,
-                qty=Decimal("0.4999"),
-                price=Decimal("49000"),
-                filled_at=clock.now(),
-            ),
-            instrument,
-        )
-        clock.advance(30)
+        await rest_an_exit("sim-EXIT-1")
+        # The exit lapses: guardable again at the full size, then down to the same dust again.
+        clock.advance(60)
         await monitor.poll()
-        book(ledger, external_sell(instrument, clock, qty="0.4999"), instrument)
-        clock.advance(30)
-        await monitor.poll()
+        assert monitor._tracked["sim-ENTRY"].resting_qty == Decimal("0.5")
+        await rest_an_exit("sim-EXIT-2")
 
         risk = [e for e in store.read_all() if e.type is EventType.RISK_EVENT]
         assert [e.payload["rule"] for e in risk] == [
             "unprotected_position",
             "unprotected_position",
         ], "the second time it becomes unguardable is a second fact, not a repeat"
+
+
+LATER_PLAN = ProtectivePlan(stop_price=Decimal("38000"), take_profit_price=Decimal("44000"))
+
+
+def _guarded(monitor: ExecutionMonitor) -> dict[str, Decimal]:
+    """Each group's resting stop, by group: what the venue is guarding, and for whom."""
+    return {
+        leg.group_id: leg.qty
+        for leg in monitor.tracked
+        if leg.role is OrderRole.STOP_LOSS and leg.state.is_open
+    }
+
+
+def _retired(store: EventStore) -> list[Event]:
+    return [
+        e
+        for e in store.read_all()
+        if e.type is EventType.RISK_EVENT and e.payload["action_taken"] == "group_retired"
+    ]
+
+
+class TestAGroupWhoseHoldingIsGoneDoesNotComeBack:
+    """RCA 2026-10-28 §4 item 2. A group released by a discretionary SELL kept its `filled_qty`
+    entitlement, ranked first on its stale, tighter stop, and took the next entry's shares —
+    re-placing March's legs against May's position. In live the venue rejects those prices and the
+    new position is left with no venue-held stop at all."""
+
+    async def _entry_a(
+        self,
+        monitor: ExecutionMonitor,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+    ) -> None:
+        broker.observe(tick(instrument, clock, last="49000"))
+        await submit_entry(
+            monitor, broker, store, ledger, clock, instrument, coid="sim-A", ttl=None
+        )
+        await monitor.poll()
+        assert _guarded(monitor) == {"sim-A": Decimal("0.5")}
+
+    async def _entry_b(
+        self,
+        monitor: ExecutionMonitor,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+        *,
+        qty: str,
+    ) -> None:
+        clock.advance(30)
+        broker.observe(tick(instrument, clock, last="40000"))
+        await submit_entry(
+            monitor,
+            broker,
+            store,
+            ledger,
+            clock,
+            instrument,
+            coid="sim-B",
+            price="40000",
+            qty=qty,
+            plan=LATER_PLAN,
+            ttl=None,
+        )
+
+    async def test_a_new_entry_is_guarded_by_its_own_plan_not_a_released_group(
+        self,
+        monitor: ExecutionMonitor,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+    ) -> None:
+        await self._entry_a(monitor, broker, store, ledger, clock, instrument)
+        book(ledger, external_sell(instrument, clock, qty="0.5"), instrument)
+        clock.advance(30)
+        broker.observe(tick(instrument, clock, last="49000"))
+        await monitor.poll()
+
+        await self._entry_b(monitor, broker, store, ledger, clock, instrument, qty="0.3")
+        await monitor.poll()
+
+        assert _guarded(monitor) == {"sim-B": Decimal("0.3")}
+        stops = {
+            leg.stop_price
+            for leg in monitor.working
+            if leg.role is OrderRole.STOP_LOSS and leg.group_id == "sim-B"
+        }
+        assert stops == {LATER_PLAN.stop_price}, "B is guarded at B's own stop"
+        assert _armed(store)[-1].aggregate_id == "sim-B"
+        assert "sim-A" not in monitor._tracked, "A's holding is gone, so A is forgotten"
+        (retired,) = _retired(store)
+        assert retired.payload["scope"] == instrument.key
+        assert "sim-A" in retired.payload["detail"]
+        flagged = [
+            e
+            for e in store.read_all()
+            if e.type is EventType.RISK_EVENT and e.payload["rule"] == "unprotected_position"
+        ]
+        assert not flagged
+
+    async def test_a_partial_sell_then_a_new_entry_does_not_grow_the_old_group_back(
+        self,
+        monitor: ExecutionMonitor,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+    ) -> None:
+        await self._entry_a(monitor, broker, store, ledger, clock, instrument)
+        book(ledger, external_sell(instrument, clock, qty="0.2"), instrument)
+        clock.advance(30)
+        broker.observe(tick(instrument, clock, last="49000"))
+        await monitor.poll()
+        assert _guarded(monitor) == {"sim-A": Decimal("0.3")}
+
+        await self._entry_b(monitor, broker, store, ledger, clock, instrument, qty="0.4")
+        await monitor.poll()
+
+        assert _guarded(monitor) == {"sim-A": Decimal("0.3"), "sim-B": Decimal("0.4")}
+        assert not _retired(store), "A still holds 0.3, so it is still live"
+
+    async def test_a_sell_and_a_new_entry_between_the_same_two_polls(
+        self,
+        monitor: ExecutionMonitor,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+    ) -> None:
+        """No poll separates the exit from the re-entry: a resting exit that fills just before the
+        next cycle's entry does. The shares just bought belong to the entry that bought them; what
+        is missing is what the older group lost."""
+        await self._entry_a(monitor, broker, store, ledger, clock, instrument)
+        book(ledger, external_sell(instrument, clock, qty="0.5"), instrument)
+        await self._entry_b(monitor, broker, store, ledger, clock, instrument, qty="0.3")
+        await monitor.poll()
+
+        assert _guarded(monitor) == {"sim-B": Decimal("0.3")}
+        assert "sim-A" not in monitor._tracked
+
+    async def test_a_resting_sell_that_expires_lets_the_group_re_arm_to_its_capacity(
+        self,
+        monitor: ExecutionMonitor,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+    ) -> None:
+        """A resting exit commits the base asset but sells none of it: the group's legs shrink
+        while it rests and grow back when it expires, because nothing was ever taken away."""
+        await self._entry_a(monitor, broker, store, ledger, clock, instrument)
+        service = ExecutionService(broker, store, ledger, clock)
+        exit_order = await service.submit(
+            entry_intent(
+                instrument,
+                clock,
+                coid="sim-EXIT",
+                qty="0.2",
+                price="60000",
+                side=Side.SELL,
+                plan=None,
+                ttl=60,
+            ),
+            instrument,
+        )
+        monitor.track(exit_order, instrument)
+        clock.advance(30)
+        await monitor.poll()
+        assert _guarded(monitor) == {"sim-A": Decimal("0.3")}
+
+        clock.advance(60)
+        await monitor.poll()
+
+        assert _guarded(monitor) == {"sim-A": Decimal("0.5")}
+        assert not _retired(store)
 
 
 def _armed(store: EventStore) -> list[Event]:
