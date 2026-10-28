@@ -169,15 +169,17 @@ async def test_a_partial_exit_resizes_the_legs_before_the_stop_fires(
         assert result.outcome is CycleOutcome.NO_ACTION, "HOLD decides nothing this cycle"
 
         # The cycle above revealed the crash bar to the venue through its own snapshot, and that
-        # snapshot's settle poll booked the stop's fill (ADR 0030). This explicit poll is now a
-        # no-op confirmation, kept because it is what a background poller would do next anyway.
-        await harness.monitor.poll()
-
+        # snapshot's settle poll booked the stop's fill (ADR 0030) and released the closed group.
+        # Read before the next poll: a released group stays visible only until then.
         filled = [
             order
             for order in harness.monitor.tracked
             if order.role is OrderRole.STOP_LOSS and order.state is OrderState.FILLED
         ]
+        # A no-op confirmation, kept because it is what a background poller would do next anyway.
+        await harness.monitor.poll()
+        assert not harness.monitor.working, "the closed group left nothing working"
+
         assert filled, "the crash bar crossed the trigger"
         assert filled[0].filled_qty <= reduced, "no exit sells more than was held"
         assert harness.ledger.position(key).is_flat

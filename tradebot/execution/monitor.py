@@ -87,9 +87,11 @@ logger = get_logger(__name__)
 _RANK_SIGN: dict[Side, Decimal] = {Side.BUY: Decimal(-1), Side.SELL: Decimal(1)}
 
 UNBOOKABLE_FILL_RULE = "unbookable_fill"
-#: Not a flag: a retired group guards nothing and risks nothing. A `RISK_EVENT` because that is
-#: the monitor's record of acting on a group by itself, as `group_poisoned` is.
-PROTECTIVE_GROUP_RULE = "protective_group"
+#: The monitor's record of releasing a group it will no longer track: retired (its holding is
+#: gone), closed (its own leg filled) or lapsed (the entry ended with nothing filled). Not a flag
+#: — none of them leaves anything at risk. A `RISK_EVENT` because that is how the monitor records
+#: acting on a group by itself, as `group_poisoned` is; a group never disappears unrecorded.
+TRACKED_GROUP_RULE = "tracked_group"
 
 
 def _severity(error: Exception) -> int:
@@ -172,6 +174,14 @@ class ExecutionMonitor:
         self._store = store
         self._clock = clock
         self._tracked: dict[str, _Tracked] = {}
+        #: Groups the most recent poll settled and released. Kept visible through `tracked` until
+        #: the next poll begins, because `BasketRunner._settle` and `ManualCloser` read `tracked`
+        #: straight after their own poll to report how their orders settled: a release inside that
+        #: poll must change nothing they report, let alone an order.
+        self._released: dict[str, _Tracked] = {}
+        #: The last surplus of `held` over the instrument's entitlements that was logged, so the
+        #: warning fires when the figure changes rather than on every sweep.
+        self._surplus_logged: dict[str, Decimal] = {}
         #: One monitor serves every basket, because orders belong to the venue portfolio rather
         #: than to a basket. Two runners polling at once would each see an entry fill that is not
         #: yet protected and each place a protective group for it — twice the exit quantity
@@ -180,10 +190,14 @@ class ExecutionMonitor:
 
     @property
     def tracked(self) -> tuple[Order, ...]:
-        """Every order this monitor owns — entries and legs, working or just settled."""
+        """Every order this monitor owns — entries and legs, working or just settled.
+
+        Includes the groups the most recent poll released (see `_released`); all of those are
+        terminal, so `working` is unaffected.
+        """
         return tuple(
             order
-            for group in self._tracked.values()
+            for group in (*self._tracked.values(), *self._released.values())
             for order in (group.order, *group.legs.values())
         )
 
@@ -194,6 +208,7 @@ class ExecutionMonitor:
 
     def track(self, order: Order, instrument: Instrument) -> None:
         """Adopt an order. Used by execution and by the startup recovery sequence alike."""
+        self._released.pop(order.group_id, None)
         group = self._tracked.get(order.group_id)
         if group is None:
             self._tracked[order.group_id] = _Tracked(order=order, instrument=instrument)
@@ -212,6 +227,8 @@ class ExecutionMonitor:
         is every group, which is what the supervisor's sweep and a replay want.
         """
         async with self._polling:
+            # The previous poll's callers have read what it released; this poll reports its own.
+            self._released.clear()
             in_scope = self._in_scope(instrument_keys)
             failures: list[tuple[_Tracked, Exception]] = []
             synced: list[_Tracked] = []
@@ -364,8 +381,29 @@ class ExecutionMonitor:
         # `resting_qty` read live, a filled leg and its cancelled OCO sibling both leave `is_open`,
         # so a replace check ahead of this one arms a fresh group against a position that has
         # already gone flat and then cancels it.
-        if any(leg.state is OrderState.FILLED for leg in group.legs.values()):
+        filled = [leg for leg in group.legs.values() if leg.state is OrderState.FILLED]
+        if filled:
             await self._close_group(group)
+            # Released here rather than by the runner's prune: a stop fills *between* cycles, after
+            # the cycle that placed it has already pruned what it named, so nothing else would.
+            await self._release(
+                group,
+                action="group_closed",
+                detail=(
+                    f"{group.order.client_order_id}: its {filled[0].role.value} leg "
+                    f"{filled[0].client_order_id} filled; the group is closed"
+                ),
+            )
+            return
+        if self._lapsed(group):
+            await self._release(
+                group,
+                action="group_lapsed",
+                detail=(
+                    f"{group.order.client_order_id}: ended {group.order.state.value} "
+                    "with nothing filled"
+                ),
+            )
             return
         if target is None:
             # Outside the allocation, which is not the same fact as a target of zero. Zero means
@@ -485,35 +523,61 @@ class ExecutionMonitor:
             and group.order.filled_qty > ZERO
         )
 
+    @staticmethod
+    def _lapsed(group: _Tracked) -> bool:
+        """An entry that ended — expired, cancelled, rejected — having filled nothing and placed no
+        legs. Typically one whose TTL ran out on the supervisor's sweep, after its own cycle's
+        `prune` had already run, so nothing else would ever forget it."""
+        return (
+            group.order.role is OrderRole.ENTRY
+            and not group.order.state.is_open
+            and group.order.filled_qty <= ZERO
+            and not group.legs
+        )
+
     async def _retire(self, group: _Tracked) -> None:
-        """Close a group whose holding is gone, record it, and forget it.
+        """Close a group whose holding is gone, record it, and release it.
 
         RCA 2026-10-28 §4 item 2: a group only released to zero stayed tracked with its stop and
-        take-profit in hand, and the next entry's shares were handed to it first. Forgotten only
-        after the cancel and the record have both succeeded, so a venue error leaves it tracked
-        and the next poll retries the whole retirement.
+        take-profit in hand, and the next entry's shares were handed to it first. Released only
+        after the cancel and the record have both succeeded, so a venue or store error leaves it
+        tracked and the next poll retries the whole retirement.
         """
         await self._cancel_legs(group, reason="released_to_position")
         entry = group.order
-        events = self._execution.events_for(entry)
-        detail = (
-            f"{entry.client_order_id}: none of the {entry.filled_qty} it bought is left in the "
-            "holding; its legs are cancelled and a later entry is guarded by its own plan"
+        await self._release(
+            group,
+            action="group_retired",
+            detail=(
+                f"{entry.client_order_id}: none of the {entry.filled_qty} it bought is left in the "
+                "holding; its legs are cancelled and a later entry is guarded by its own plan"
+            ),
         )
+
+    async def _release(self, group: _Tracked, *, action: str, detail: str) -> None:
+        """Record that this group is no longer tracked, then stop tracking it.
+
+        The record comes first: a store failure leaves the group tracked, and the next poll
+        records and releases it again. Moved to `_released`, not dropped, so a caller reading
+        `tracked` straight after this poll still sees each order exactly as it settled.
+        """
+        entry = group.order
+        events = self._execution.events_for(entry)
         await self._store.append(
             events.risk_event(
                 tier=RiskTier.EXECUTION,
-                rule=PROTECTIVE_GROUP_RULE,
+                rule=TRACKED_GROUP_RULE,
                 scope=entry.instrument_key,
-                action="group_retired",
+                action=action,
                 detail=detail,
             )
         )
         logger.info(
-            "protective group retired",
-            extra={"group_id": entry.group_id, "detail": detail},
+            "group released", extra={"group_id": entry.group_id, "action": action, "detail": detail}
         )
-        self.forget(entry.group_id)
+        released = self._tracked.pop(entry.group_id, None)
+        if released is not None:
+            self._released[entry.group_id] = released
 
     async def _record_unprotected(self, group: _Tracked, reason: str) -> None:
         """Say that this position is bare, whichever way it got there.
@@ -594,6 +658,27 @@ class ExecutionMonitor:
         for group, entitled in zip(groups, granted, strict=True):
             group.entitled = entitled
             group.credited = group.net_filled
+        self._report_surplus(instrument_key, budget if groups else ZERO)
+
+    def _report_surplus(self, instrument_key: str, surplus: Decimal) -> None:
+        """Say so when more is held than the live groups are entitled to guard.
+
+        Two causes, and from here they cannot be told apart. A deposit, or a position adopted at a
+        restart, is unguarded by design and is no `unprotected_position`. But the ratchet never
+        grows back, so a ledger that under-read for a poll — a fill booked whose order update was
+        then lost — leaves a group under-guarded for good, and this line is the only trace of it.
+        Logged when the figure changes, not on every sweep.
+        """
+        if surplus <= ZERO:
+            self._surplus_logged.pop(instrument_key, None)
+            return
+        if self._surplus_logged.get(instrument_key) == surplus:
+            return
+        self._surplus_logged[instrument_key] = surplus
+        logger.warning(
+            "more is held than the protective groups are entitled to guard",
+            extra={"instrument_key": instrument_key, "unguarded": str(surplus)},
+        )
 
     def _protectable(self, instrument_key: str) -> list[_Tracked]:
         """This instrument's groups that can hold legs at all, tightest stop first.
@@ -667,6 +752,7 @@ class ExecutionMonitor:
     def forget(self, group_id: str) -> None:
         """Stop tracking a finished group, so the poll loop stays proportional to live work."""
         self._tracked.pop(group_id, None)
+        self._released.pop(group_id, None)
 
     def prune(self, *group_ids: str) -> None:
         """Forget settled groups. Named groups only, or all of them when none are named.
@@ -675,8 +761,9 @@ class ExecutionMonitor:
         another basket's cycle is still reading, and the second would then report the order as it
         was before the poll rather than as it settled.
         """
-        wanted = set(group_ids) or set(self._tracked)
-        for group_id, group in list(self._tracked.items()):
+        everything = {**self._tracked, **self._released}
+        wanted = set(group_ids) or set(everything)
+        for group_id, group in everything.items():
             settled = not group.order.state.is_open and all(
                 not leg.state.is_open for leg in group.legs.values()
             )

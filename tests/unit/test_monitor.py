@@ -569,7 +569,7 @@ class TestLegsTrackThePosition:
         risk = [e for e in store.read_all() if e.type is EventType.RISK_EVENT]
         # The group is retired and says so (RCA 2026-10-28 §4 item 2) — a record, not a flag.
         assert [(e.payload["rule"], e.payload["action_taken"]) for e in risk] == [
-            ("protective_group", "group_retired")
+            ("tracked_group", "group_retired")
         ], "nothing is at risk, so nothing is flagged"
 
     @pytest.mark.parametrize("tight_first", [True, False])
@@ -869,7 +869,12 @@ class TestLegsTrackThePosition:
         assert monitor._tracked["sim-ENTRY"].resting_qty == Decimal("0.5")
         await rest_an_exit("sim-EXIT-2")
 
-        risk = [e for e in store.read_all() if e.type is EventType.RISK_EVENT]
+        # The lapsed exit is released with its own `tracked_group` record; only the flags count.
+        risk = [
+            e
+            for e in store.read_all()
+            if e.type is EventType.RISK_EVENT and e.payload["rule"] != "tracked_group"
+        ]
         assert [e.payload["rule"] for e in risk] == [
             "unprotected_position",
             "unprotected_position",
@@ -1060,6 +1065,331 @@ class TestAGroupWhoseHoldingIsGoneDoesNotComeBack:
 
         assert _guarded(monitor) == {"sim-A": Decimal("0.5")}
         assert not _retired(store)
+
+
+def _released(store: EventStore, action: str) -> list[Event]:
+    return [
+        e
+        for e in store.read_all()
+        if e.type is EventType.RISK_EVENT
+        and e.payload["rule"] == "tracked_group"
+        and e.payload["action_taken"] == action
+    ]
+
+
+def _submitted(store: EventStore) -> int:
+    return sum(1 for e in store.read_all() if e.type is EventType.ORDER_SUBMITTED)
+
+
+class TestSettledGroupsAreReleasedWhateverCycleMadeThem:
+    """Task 7b review: the runner prunes only the groups its own cycle named, so a group that
+    settled later — on the supervisor's sweep — was never forgotten. Each is now released by the
+    poll that settles it, with a record, and stays visible through `tracked` until the next poll
+    so a caller reading straight after its own poll reports the order as it settled."""
+
+    async def test_a_group_closed_by_its_own_stop_is_released_and_recorded(
+        self,
+        monitor: ExecutionMonitor,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+    ) -> None:
+        broker.observe(tick(instrument, clock, last="49000"))
+        await submit_entry(monitor, broker, store, ledger, clock, instrument, ttl=None)
+        await monitor.poll()
+        orders_before = _submitted(store)
+
+        clock.advance(60)
+        broker.observe(tick(instrument, clock, last="46500", high="49000", low="46000"))
+        await monitor.poll()
+
+        assert "sim-ENTRY" not in monitor._tracked
+        (closed,) = _released(store, "group_closed")
+        assert "sim-ENTRY" in closed.payload["detail"]
+        # What a caller reading straight after this poll sees: the orders as they settled.
+        settled = {order.client_order_id: order for order in monitor.tracked}
+        assert any(
+            o.role is OrderRole.STOP_LOSS and o.state is OrderState.FILLED for o in settled.values()
+        )
+        assert _submitted(store) == orders_before, "releasing a group places nothing"
+
+        await monitor.poll()
+        assert monitor.tracked == ()
+        assert len(_released(store, "group_closed")) == 1, "recorded once"
+
+    async def test_an_entry_that_lapses_unfilled_on_a_later_sweep_is_released(
+        self,
+        monitor: ExecutionMonitor,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+    ) -> None:
+        broker.observe(tick(instrument, clock, last="51000"))
+        await submit_entry(monitor, broker, store, ledger, clock, instrument, price="45000")
+        await monitor.poll()
+        monitor.prune("sim-ENTRY")  # the cycle's own prune: still working, so it is kept
+        assert monitor.working
+
+        clock.advance(61)
+        await monitor.poll()
+
+        assert "sim-ENTRY" not in monitor._tracked
+        (lapsed,) = _released(store, "group_lapsed")
+        assert "expired" in lapsed.payload["detail"]
+        # `BasketRunner._settle` builds exactly this map after its poll and falls back to the
+        # pre-poll order for anything missing: the release must not change what it reports.
+        settled = {order.client_order_id: order for order in monitor.tracked}
+        assert settled["sim-ENTRY"].state is OrderState.EXPIRED
+        assert not monitor.working
+
+        await monitor.poll()
+        assert monitor.tracked == ()
+
+    async def test_the_runners_prune_still_forgets_a_released_group(
+        self,
+        monitor: ExecutionMonitor,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+    ) -> None:
+        broker.observe(tick(instrument, clock, last="51000"))
+        await submit_entry(monitor, broker, store, ledger, clock, instrument, price="45000")
+        clock.advance(61)
+        await monitor.poll()
+
+        monitor.prune("sim-ENTRY")
+
+        assert monitor.tracked == ()
+
+
+class TestRetirementRetries:
+    """`_retire` releases only after the cancel and the record have both succeeded."""
+
+    async def _flat_group(
+        self,
+        monitor: ExecutionMonitor,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+    ) -> None:
+        broker.observe(tick(instrument, clock, last="49000"))
+        await submit_entry(monitor, broker, store, ledger, clock, instrument, ttl=None)
+        await monitor.poll()
+        book(ledger, external_sell(instrument, clock, qty="0.5"), instrument)
+        clock.advance(30)
+
+    async def test_a_venue_failure_on_the_cancel_leaves_it_tracked_and_the_next_poll_retires(
+        self,
+        monitor: ExecutionMonitor,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        await self._flat_group(monitor, broker, store, ledger, clock, instrument)
+        real_cancel = broker.cancel
+        failures = iter([VenueError("503 on cancel")])
+
+        async def flaky_cancel(ref: OrderRef):  # type: ignore[no-untyped-def]
+            failure = next(failures, None)
+            if failure is not None:
+                raise failure
+            return await real_cancel(ref)
+
+        monkeypatch.setattr(broker, "cancel", flaky_cancel)
+
+        with pytest.raises(VenueError):
+            await monitor.poll()
+        assert "sim-ENTRY" in monitor._tracked
+        assert not _released(store, "group_retired")
+
+        await monitor.poll()
+
+        assert "sim-ENTRY" not in monitor._tracked
+        assert len(_released(store, "group_retired")) == 1
+        assert not monitor.working, "every leg is cancelled"
+
+    async def test_a_store_failure_on_the_record_leaves_it_tracked_and_the_next_poll_retires(
+        self,
+        monitor: ExecutionMonitor,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        await self._flat_group(monitor, broker, store, ledger, clock, instrument)
+        real_append = store.append
+        failed: list[bool] = []
+
+        async def flaky_append(*events: Event) -> None:
+            if not failed and any(e.payload.get("action_taken") == "group_retired" for e in events):
+                failed.append(True)
+                raise OSError("disk full")
+            await real_append(*events)
+
+        monkeypatch.setattr(store, "append", flaky_append)
+
+        with pytest.raises(OSError):
+            await monitor.poll()
+        assert "sim-ENTRY" in monitor._tracked, "no record, so not released"
+
+        await monitor.poll()
+
+        assert "sim-ENTRY" not in monitor._tracked
+        assert len(_released(store, "group_retired")) == 1
+
+
+def _monitor_and_ledger(
+    broker: SimBroker,
+    store: EventStore,
+    clock: ManualClock,
+    instrument: Instrument,
+    holding: str,
+) -> tuple[ExecutionMonitor, Ledger]:
+    ledger = Ledger(clock, venue="sim", balances={"USDT": Decimal(100_000)})
+    ledger.adopt_position(Position(instrument_key=instrument.key, qty=Decimal(holding)))
+    service = ExecutionService(broker, store, ledger, clock)
+    return ExecutionMonitor(broker, service, store, clock), ledger
+
+
+def _hold(ledger: Ledger, instrument: Instrument, qty: str) -> None:
+    ledger.adopt_position(Position(instrument_key=instrument.key, qty=Decimal(qty)))
+
+
+def _stop_leg(instrument: Instrument, clock: ManualClock, *, group: str, filled: str) -> Order:
+    intent = OrderIntent(
+        client_order_id=f"{group}-SL",
+        basket_id="b1",
+        cycle_id="c1",
+        instrument_key=instrument.key,
+        side=Side.SELL,
+        qty=Decimal("0.3"),
+        order_type=OrderType.LIMIT,
+        limit_price=Decimal("47000"),
+        stop_price=Decimal("47000"),
+        role=OrderRole.STOP_LOSS,
+        group_id=group,
+        created_at=clock.now(),
+    )
+    leg = Order.from_intent(intent).transition_to(OrderState.SUBMITTED, at=clock.now())
+    return leg.with_fill(
+        Fill(
+            fill_id=f"{group}-SL-1",
+            client_order_id=leg.client_order_id,
+            instrument_key=instrument.key,
+            side=Side.SELL,
+            qty=Decimal(filled),
+            price=Decimal("47000"),
+            filled_at=clock.now(),
+        )
+    )
+
+
+class TestEntitlementAccounting:
+    """The `_entitle` bookkeeping, driven through `_targets` with the ledger set by hand."""
+
+    def test_an_own_leg_partly_filling_comes_off_its_own_group(
+        self,
+        broker: SimBroker,
+        store: EventStore,
+        clock: ManualClock,
+        instrument: Instrument,
+    ) -> None:
+        """The tight group's own stop sold 0.1. Shared out tightest-first, the shortfall would
+        land on the *wide* group; it is the tight group's own exit and comes off the tight one."""
+        monitor, ledger = _monitor_and_ledger(broker, store, clock, instrument, "0.6")
+        for coid, stop in (("TIGHT", "48000"), ("WIDE", "45000")):
+            monitor.track(
+                _filled_entry(
+                    instrument, clock, coid=coid, filled=Decimal("0.3"), stop=Decimal(stop)
+                ),
+                instrument,
+            )
+        assert monitor._targets() == {"TIGHT": Decimal("0.3"), "WIDE": Decimal("0.3")}
+
+        monitor.track(_stop_leg(instrument, clock, group="TIGHT", filled="0.1"), instrument)
+        _hold(ledger, instrument, "0.5")
+
+        assert monitor._targets() == {"TIGHT": Decimal("0.2"), "WIDE": Decimal("0.3")}
+
+    def test_an_entry_filling_across_polls_grows_by_its_own_fills_only(
+        self,
+        broker: SimBroker,
+        store: EventStore,
+        clock: ManualClock,
+        instrument: Instrument,
+    ) -> None:
+        """A partly filled entry, a reduction that takes all of it, then the rest of the entry
+        fills: the group is entitled to the new fill and nothing of what was sold."""
+        monitor, ledger = _monitor_and_ledger(broker, store, clock, instrument, "0.2")
+        entry = _filled_entry(instrument, clock, coid="E", filled=Decimal("0.2"), stop=Decimal("1"))
+        entry = entry.model_copy(
+            update={"qty": Decimal("0.5"), "state": OrderState.PARTIALLY_FILLED}
+        )
+        monitor.track(entry, instrument)
+        assert monitor._targets() == {"E": Decimal("0.2")}
+
+        _hold(ledger, instrument, "0")
+        assert monitor._targets() == {"E": ZERO}
+        assert "E" in monitor._tracked and monitor._tracked["E"].order.state.is_open
+
+        more = entry.with_fill(
+            Fill(
+                fill_id="E-2",
+                client_order_id="E",
+                instrument_key=instrument.key,
+                side=Side.BUY,
+                qty=Decimal("0.3"),
+                price=Decimal("50000"),
+                filled_at=clock.now(),
+            )
+        )
+        monitor.track(more, instrument)
+        _hold(ledger, instrument, "0.3")
+
+        assert monitor._targets() == {"E": Decimal("0.3")}
+
+    def test_more_held_than_entitled_is_logged_once_per_figure(
+        self,
+        broker: SimBroker,
+        store: EventStore,
+        clock: ManualClock,
+        instrument: Instrument,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Review minor 1: the ratchet never grows back, so a shortfall it leaves is said out
+        loud. Logged, not flagged — a deposit is unguarded by design and the two look alike."""
+        monitor, ledger = _monitor_and_ledger(broker, store, clock, instrument, "0.3")
+        monitor.track(
+            _filled_entry(instrument, clock, coid="E", filled=Decimal("0.3"), stop=Decimal("1")),
+            instrument,
+        )
+        monitor._targets()
+        _hold(ledger, instrument, "0.2")
+        monitor._targets()
+        _hold(ledger, instrument, "0.3")
+
+        with caplog.at_level("WARNING"):
+            monitor._targets()
+            monitor._targets()
+
+        warned = [r for r in caplog.records if "entitled to guard" in r.getMessage()]
+        assert len(warned) == 1
+        assert monitor._targets() == {"E": Decimal("0.2")}, "the ratchet does not grow back"
+        risk = [e for e in store.read_all() if e.type is EventType.RISK_EVENT]
+        assert not risk
 
 
 def _armed(store: EventStore) -> list[Event]:
