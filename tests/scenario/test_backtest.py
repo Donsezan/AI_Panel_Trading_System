@@ -20,8 +20,16 @@ from sqlalchemy import select
 from tradebot.app import Application, backtest_database_path, build_sim, dataset_basket
 from tradebot.core.clock import ManualClock
 from tradebot.core.config import PanelConfig, ProviderSettings, SeatConfig
-from tradebot.core.enums import AssetClass, CycleOutcome, ProviderKind
+from tradebot.core.enums import (
+    AssetClass,
+    CycleOutcome,
+    OrderRole,
+    ProviderKind,
+    RiskDecision,
+    Side,
+)
 from tradebot.core.errors import ConfigError
+from tradebot.core.events import EventType
 from tradebot.core.instrument import Instrument
 from tradebot.core.market import Candle, timeframe_interval
 from tradebot.decision.presets import FREE_PANEL, STUB_PANEL
@@ -343,6 +351,7 @@ class TestBacktest:
     async def test_a_stop_crossed_by_the_snapshot_does_not_end_the_replay(
         self,
         crash_dataset: ReplayDataset,
+        history_instrument: Instrument,
         tmp_path: Path,
         replay_clock: ManualClock,
         monkeypatch: pytest.MonkeyPatch,
@@ -370,12 +379,69 @@ class TestBacktest:
             report = await BacktestHarness(
                 application, replay_clock, start=start, end=first_cycle_at() + timedelta(hours=4)
             ).run()
+            events = application.store.read_all()
         finally:
             await application.shutdown()
 
         assert report.ran_cycles == report.planned_cycles == 5
         assert CycleOutcome.FAILED.value not in report.evidence.outcomes
         assert report.evidence.fills > 0
+
+        crash_at = first_cycle_at() + timedelta(hours=1)
+        orders = {
+            e.payload["order"]["client_order_id"]: e.payload["order"]
+            for e in events
+            if e.type is EventType.ORDER_SUBMITTED
+        }
+
+        # (a) The stop crossed on the crash cycle: a SELL fill at that instant, on the protective
+        # stop of the first BUY's group. Scoped to that instant because later cycles legitimately
+        # place reduce-only SELLs of their own, which an unscoped check would also match.
+        entry = next(o for o in orders.values() if o["side"] == Side.BUY.value)
+        stop_fills = [
+            e
+            for e in events
+            if e.type is EventType.FILL_RECEIVED
+            and e.ts == crash_at
+            and e.payload["fill"]["side"] == Side.SELL.value
+        ]
+        assert stop_fills, "no SELL fill on the crash cycle: the stop never crossed"
+        for fill in stop_fills:
+            stop = orders[fill.payload["fill"]["client_order_id"]]
+            assert stop["role"] == OrderRole.STOP_LOSS.value
+            assert stop["group_id"] == entry["group_id"]
+
+        # (b) The cycle-2 SELL decision was refused as a flat SELL, and placed no order of its own.
+        vetoes = [
+            e
+            for e in events
+            if e.type is EventType.RISK_CHECKED
+            and any(
+                check["rule"] == "sizing"
+                and check["decision"] == RiskDecision.VETO.value
+                and check["detail"].startswith("SELL while flat")
+                for check in e.payload["checks"]
+            )
+        ]
+        assert len(vetoes) == 1
+        veto_cycle = vetoes[0].cycle_id
+        started = {e.cycle_id: e.ts for e in events if e.type is EventType.CYCLE_STARTED}
+        assert started[veto_cycle] == crash_at
+        assert not [
+            e for e in events if e.type is EventType.ORDER_SUBMITTED and e.cycle_id == veto_cycle
+        ]
+
+        # (c) The stop closed the position at the crash instant, so the veto saw a flat ledger.
+        # Not asserted at the end of the run: the scripted panel buys again afterwards.
+        booked = [
+            e
+            for e in events
+            if e.type is EventType.POSITION_UPDATED
+            and e.ts == crash_at
+            and e.aggregate_id == history_instrument.key
+        ]
+        assert booked, "the stop's fill never reached the ledger"
+        assert all(Decimal(e.payload["position"]["qty"]) == 0 for e in booked)
 
 
 def _projection_rows(application: Application) -> dict[str, list[tuple[object, ...]]]:
