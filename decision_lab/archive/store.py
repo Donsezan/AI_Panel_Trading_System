@@ -23,6 +23,7 @@ import tempfile
 from pathlib import Path
 from typing import IO, Any, Final, Self
 
+from decision_lab.archive.fields import EventType, Modality
 from decision_lab.jobs import Busy, _drop, _take
 from tradebot.core.errors import ConfigError
 from tradebot.core.schema import DomainModel, UtcDatetime
@@ -62,6 +63,32 @@ class RawArticle(DomainModel):
     modified_at: UtcDatetime | None = None
     fetched_at: UtcDatetime
     summary: str = ""
+    #: §6.5's extracted fields, written by the same pass that writes `summary`. They are not
+    #: decoration: `event_type`, `entities` and `assets` are the §6.8.2.1 cluster key, and
+    #: `modality` is what stops a correction being collapsed behind the claim it corrects.
+    #:
+    #: Defaulted and nullable because 14 484 rows are already on disk, written before these
+    #: fields existed - a non-defaulted addition would refuse the whole store on its first read.
+    #: Nullable rather than carrying a sentinel member, because `EventType.OTHER` means
+    #: *classified as other* while `None` means *never summarised*: one is a measurement and the
+    #: other is its absence. `is_summarised` is the predicate that keeps them apart.
+    event_type: EventType | None = None
+    entities: tuple[str, ...] = ()
+    assets: tuple[str, ...] = ()
+    magnitudes: tuple[str, ...] = ()
+    modality: Modality | None = None
+    #: Which binding produced this row's summary. A publish step refuses a store whose summarised
+    #: rows disagree with each other or with the policy, so two prompts' output is never mixed
+    #: under one archive digest.
+    summary_provider: str | None = None
+    summary_model: str | None = None
+    summary_prompt_digest: str | None = None
+
+    @property
+    def is_summarised(self) -> bool:
+        """True once §6.5's pass has written this row. Both halves, because a row carrying a
+        summary but no classification cannot be clustered and must be re-asked."""
+        return bool(self.summary) and self.event_type is not None and self.modality is not None
 
 
 class RawStore:

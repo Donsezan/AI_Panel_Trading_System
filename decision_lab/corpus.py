@@ -39,7 +39,9 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from decision_lab.archive.published import ArchiveHeader
 from decision_lab.dataset import require_verified
+from decision_lab.newsfeed import ArchiveNewsFeed
 from decision_lab.params import CORPUS_META, workspace_root
 from tradebot.app import build_sim, dataset_basket, dataset_catalogue, select_panel
 from tradebot.core.clock import Clock, ManualClock, SystemClock
@@ -63,6 +65,38 @@ COMPACTION_MARKER = "compacted"
 CORPUS_DB = "corpus.db"
 
 
+class NewsArchive(DomainModel):
+    """One archive's provenance, copied from its header into the corpus meta (§6.7).
+
+    `report` is a separate process that reads only `corpus.json`, so a banner that names the
+    summariser can only be rendered if the meta carried it. `is_stub` is derived here, from the
+    header's provider, never passed: one value that must agree with the header is one that can
+    disagree with it.
+    """
+
+    source: str
+    summarizer_provider: str
+    summarizer_model: str
+    prompt_digest: str
+    observed_at_policy: str
+    news_window_seconds: int
+    cluster_floor: Money
+    is_stub: bool
+
+    @classmethod
+    def of(cls, header: ArchiveHeader) -> NewsArchive:
+        return cls(
+            source=header.source,
+            summarizer_provider=header.summarizer_provider,
+            summarizer_model=header.summarizer_model,
+            prompt_digest=header.prompt_digest,
+            observed_at_policy=header.observed_at_policy,
+            news_window_seconds=header.news_window_seconds,
+            cluster_floor=header.cluster_floor,
+            is_stub=header.summarizer_provider == "stub",
+        )
+
+
 class CorpusMeta(DomainModel):
     """Everything needed to explain, reproduce and identify one corpus."""
 
@@ -80,6 +114,8 @@ class CorpusMeta(DomainModel):
     #: model yields a different corpus rather than silently mixing two experiments (§6.6).
     archive_digest: str = ""
     news_blind: bool = True
+    #: Defaulted so every `corpus.json` written before slice E still loads, as news-blind.
+    news_archives: tuple[NewsArchive, ...] = ()
     start_equity: Money
     #: What was asked for, and where cycling actually began once the indicators had the history
     #: they need. Both, like `BacktestReport`: a corpus whose window silently differs from the
@@ -186,6 +222,7 @@ async def build(
     since: datetime | None = None,
     until: datetime | None = None,
     archive_digest: str = "",
+    news_feed: ArchiveNewsFeed | None = None,
     wall_clock: Clock | None = None,
 ) -> Corpus:
     """One reference pass through the unmodified `BacktestHarness`, into a workspace database.
@@ -194,6 +231,22 @@ async def build(
     `ManualClock` sitting in 2024 by the end of the pass, and a corpus built today carrying a
     2024 provenance date is a provenance date that says nothing.
     """
+    # §6.6: the archive's digest *is* the news component of `corpus_id`, so it is read off the
+    # feed rather than passed beside it - two arguments that must agree is one that can disagree.
+    if news_feed is not None:
+        if archive_digest:
+            raise ConfigError(
+                "pass either a news feed or an archive_digest, never both: the feed carries its "
+                "own digest and two values that must agree is one that can disagree"
+            )
+        archive_digest = news_feed.digest
+        # Empty is the news-blind identity; a feed that collapses onto it would reuse or
+        # contaminate a blind corpus (§6.6), so refuse before any identity is derived.
+        if not archive_digest or not all(archive_digest.split("+")):
+            raise ConfigError(
+                "the news feed's digest is empty or has an empty component; an unstamped archive "
+                "would take the news-blind corpus_id. Re-publish the archive"
+            )
     audit = require_verified(data_dir)
 
     # The clock is set by the harness before the first cycle; this initial value only has to be
@@ -229,9 +282,10 @@ async def build(
         start_equity=start_equity,
         market_data=dataset.market_data,
         catalogue=dataset_catalogue(dataset),
-        # News stays off until slice E. §6.9: the snapshot records "no sources configured" rather
-        # than leaving the panel to read an empty list as a quiet market.
+        # §6.9 when there is no feed: the snapshot records "no sources configured" rather than
+        # leaving the panel to read an empty list as a quiet market.
         news_sources=(),
+        news_feed=news_feed,
     )
     try:
         report = await BacktestHarness(
@@ -255,7 +309,8 @@ async def build(
         reference_config_digest=config_digest(basket),
         cadence_seconds=cadence_seconds,
         archive_digest=archive_digest,
-        news_blind=not archive_digest,
+        news_blind=news_feed is None,
+        news_archives=tuple(NewsArchive.of(h) for h in news_feed.headers) if news_feed else (),
         start_equity=start_equity,
         requested_start=report.requested_start,
         window_start=report.window_start,

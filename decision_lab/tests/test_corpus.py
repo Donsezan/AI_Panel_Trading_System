@@ -11,7 +11,8 @@ space goes unmeasured.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+import inspect
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -19,11 +20,15 @@ import pytest
 
 from decision_lab import corpus as cp
 from decision_lab import dataset as ds
+from decision_lab.archive.fields import EventType, Modality
+from decision_lab.archive.published import ArchiveHeader, ArchiveItem, PublishedArchive
+from decision_lab.newsfeed import ArchiveNewsFeed
 from decision_lab.params import CORPUS_META
 from decision_lab.tests import factories as f
 from tradebot.core.clock import ManualClock
 from tradebot.core.errors import ConfigError
 from tradebot.marketdata.recorder import ReplayDataset
+from tradebot.news.relevance import KeywordRelevanceFilter
 
 NOW = datetime(2026, 8, 23, tzinfo=UTC)
 
@@ -217,3 +222,157 @@ def test_a_compacted_snapshot_refuses_by_name() -> None:
 
     with pytest.raises(ConfigError, match="compacted"):
         cp.entry_from_payload(seq=1, cycle_id="c", basket_id="b", payload=payload)
+
+
+def _news_feed(*, provider: str = "stub", digest: str | None = None) -> ArchiveNewsFeed:
+    when = NOW - timedelta(days=5)
+    item = ArchiveItem(
+        source_id="cryptoslate",
+        url="https://x.test/a",
+        url_hash="h1",
+        title="Kraken settles",
+        summary="Kraken settled with the regulator.",
+        event_type=EventType.REGULATORY,
+        entities=("Kraken",),
+        assets=("BTC",),
+        modality=Modality.CONFIRMED,
+        published_at=when - timedelta(minutes=12),
+        observed_at=when,
+    )
+    header = ArchiveHeader(
+        source="cryptoslate",
+        capture="sitemap",
+        captured_at=NOW,
+        observed_at_policy="published_at+00:12:00",
+        summarizer_provider=provider,
+        summarizer_model="stub-summary" if provider == "stub" else "real-model",
+        prompt_digest="abc",
+        news_window_seconds=172_800,
+        cluster_floor=Decimal("0.25"),
+        rows=1,
+        archive_digest=f"digest-{provider}" if digest is None else digest,
+    )
+    return ArchiveNewsFeed(
+        (PublishedArchive(header=header, items=(item,)),),
+        KeywordRelevanceFilter(),
+        window=timedelta(hours=48),
+        floor=Decimal("0.25"),
+    )
+
+
+def test_a_news_fed_corpus_has_a_different_id_from_a_news_blind_one() -> None:
+    """`archive_digest` feeds `corpus_identity`, so the two are two experiments. Nothing existing
+    is renumbered: every corpus built so far has `archive_digest = ""`."""
+    blind = cp.corpus_identity(
+        dataset_digest="d", reference_config_digest="c", cadence_seconds=28_800, archive_digest=""
+    )
+    fed = cp.corpus_identity(
+        dataset_digest="d", reference_config_digest="c", cadence_seconds=28_800, archive_digest="a1"
+    )
+    assert blind != fed
+
+
+def test_corpus_identity_still_takes_exactly_four_components() -> None:
+    """§5.4. A fifth would recompute the id of every corpus ever built."""
+    assert set(inspect.signature(cp.corpus_identity).parameters) == {
+        "dataset_digest",
+        "reference_config_digest",
+        "cadence_seconds",
+        "archive_digest",
+    }
+
+
+async def test_build_with_a_feed_records_the_digest_and_is_not_news_blind(
+    verified: Path, tmp_path: Path
+) -> None:
+    feed = _news_feed()
+    built = await cp.build(
+        data_dir=verified,
+        workspace=tmp_path / "ws",
+        reference_panel="stub",
+        cadence_seconds=4 * 3600,
+        start_equity=Decimal(10_000),
+        news_feed=feed,
+        wall_clock=ManualClock(NOW),
+    )
+
+    assert built.meta.archive_digest == feed.digest
+    assert built.meta.news_blind is False
+    (archive,) = built.meta.news_archives
+    assert archive.source == "cryptoslate"
+    assert archive.summarizer_model == "stub-summary"
+    assert archive.is_stub is True
+    assert cp.load(built.meta.corpus_id, workspace=tmp_path / "ws").meta == built.meta
+
+
+async def test_build_without_a_feed_stays_news_blind(verified: Path, tmp_path: Path) -> None:
+    built = await build(verified, tmp_path / "ws")
+
+    assert built.meta.archive_digest == ""
+    assert built.meta.news_blind is True
+    assert built.meta.news_archives == ()
+
+
+async def test_a_feed_and_an_archive_digest_together_are_refused(
+    verified: Path, tmp_path: Path
+) -> None:
+    with pytest.raises(ConfigError, match="never both"):
+        await cp.build(
+            data_dir=verified,
+            workspace=tmp_path / "ws",
+            reference_panel="stub",
+            cadence_seconds=4 * 3600,
+            start_equity=Decimal(10_000),
+            archive_digest="x",
+            news_feed=_news_feed(),
+        )
+
+
+async def test_a_meta_written_before_slice_e_still_loads_as_news_blind(
+    verified: Path, tmp_path: Path
+) -> None:
+    """The field is defaulted, so no existing `corpus.json` is rejected."""
+    import json
+
+    built = await build(verified, tmp_path / "ws")
+    old = json.loads(built.meta.model_dump_json())
+    del old["news_archives"]
+
+    loaded = cp.CorpusMeta.model_validate(old)
+
+    assert loaded.news_blind is True
+    assert loaded.news_archives == ()
+
+
+@pytest.mark.parametrize("digest", ["", "abc+"])
+async def test_a_feed_with_an_empty_digest_is_refused_before_it_takes_the_blind_id(
+    verified: Path, tmp_path: Path, digest: str
+) -> None:
+    stripped = _news_feed(digest=digest)
+    with pytest.raises(ConfigError, match="empty"):
+        await cp.build(
+            data_dir=verified,
+            workspace=tmp_path / "ws",
+            reference_panel="stub",
+            cadence_seconds=4 * 3600,
+            start_equity=Decimal(10_000),
+            news_feed=stripped,
+        )
+
+
+async def test_a_news_fed_build_never_takes_the_news_blind_corpus_id(
+    verified: Path, tmp_path: Path
+) -> None:
+    blind = await build(verified, tmp_path / "ws")
+    fed = await cp.build(
+        data_dir=verified,
+        workspace=tmp_path / "ws",
+        reference_panel="stub",
+        cadence_seconds=4 * 3600,
+        start_equity=Decimal(10_000),
+        news_feed=_news_feed(),
+        wall_clock=ManualClock(NOW),
+    )
+    assert fed.meta.corpus_id != blind.meta.corpus_id
+    assert fed.meta.news_blind is False
+    assert blind.meta.news_blind is True

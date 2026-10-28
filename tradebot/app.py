@@ -892,13 +892,28 @@ async def _assemble(
     feed: PriceFeed,
     news_sources: tuple[str, ...],
     panel_id: str,
+    news_feed: NewsFeed | None = None,
 ) -> Application:
     """Wire one mode. Everything above the venue is identical for all of them (DESIGN §5).
 
     Wiring live no longer asserts the arming preconditions: they are evaluated when supervision is
     asked to start, so an unarmed live process comes up able to *show* what is missing instead of
     refusing before there is anything to show it with (ADR 0021).
+
+    `news_feed` defaults to `None` so `build_paper` and `build_live` need not name it; only
+    `build_sim` passes one, and any other mode refuses it before building anything.
     """
+    # Belt and braces on purpose. The structural closure is that no other builder takes this
+    # parameter; this refusal survives a future refactor that adds one. Paper is refused beside
+    # live: a paper soak is the evidence `report promotion` reads (ADR 0016, ADR 0020), and a soak
+    # deciding on archived news is not a soak of the system that would trade. First statement, so
+    # a refused build creates no database, venue stack or transport and needs no credentials.
+    if news_feed is not None and mode is not Mode.SIM:
+        raise ConfigError(
+            f"a substituted news feed is simulation-only; {mode.value} must read live sources. "
+            "An archived feed decides on news that is not current, and in paper it would "
+            "contaminate the evidence report promotion reads."
+        )
     engine = create_database(db_path)
     writer = SingleWriter(engine)
     store = EventStore(engine, writer)
@@ -944,9 +959,15 @@ async def _assemble(
         balances={} if broker_choice.is_venue else {quote_currency: start_equity},
     )
 
-    news_feed, news_closers = build_news_hub(
-        engine, writer, clock, news_sources or _news_sources_of(configured)
-    )
+    # A substituted feed replaces the fetch half entirely: `build_news_hub` is not called, so
+    # nothing in this process can reach a publisher. There is nothing to close, because the
+    # injected object owns no transport — the property that makes it safe here at all.
+    if news_feed is None:
+        news_feed, news_closers = build_news_hub(
+            engine, writer, clock, news_sources or _news_sources_of(configured)
+        )
+    else:
+        news_closers = ()
 
     alert_sinks, alert_closers = build_sinks()
     history = HistoryReader(engine, clock)
@@ -1213,6 +1234,12 @@ async def build_sim(
     news_sources: tuple[str, ...] = (),
     panel_id: str = DEFAULT_PANEL_ID,
     broker: BrokerChoice = BrokerChoice.SIM,
+    #: A substituted news feed, for a replay. Simulation only — `_assemble` refuses it in any
+    #: other mode, and `build_paper`/`build_live` do not accept it at all. A replay must decide
+    #: on what was knowable at the replayed instant, and `NewsHub.snapshot_news` refreshes on
+    #: every call: wired into one, it would stamp today's headlines with the replayed `observed_at`
+    #: and serve them into a past decision (DESIGN [L12]).
+    news_feed: NewsFeed | None = None,
 ) -> Application:
     """Wire the simulation stack: replayed data, a panel, and `SimBroker`.
 
@@ -1242,6 +1269,7 @@ async def build_sim(
         feed=PriceFeed(market_data, catalogue),
         news_sources=news_sources,
         panel_id=panel_id,
+        news_feed=news_feed,
     )
 
 

@@ -319,3 +319,68 @@ def test_no_calibration_report_has_a_doubled_blank_line() -> None:
     text = rd.report_markdown(report)
 
     assert "\n\n\n" not in text
+
+
+def _news(*, is_stub: bool = False) -> rd.NewsProvenance:
+    return rd.NewsProvenance(
+        sources=("cryptoslate",),
+        summarizer_model="stub-summary" if is_stub else "real-model",
+        prompt_digest="abc",
+        observed_at_policy="published_at+00:12:00",
+        window_seconds=172_800,
+        cluster_floor=Decimal("0.25"),
+        is_stub=is_stub,
+    )
+
+
+def _with_news(*, is_stub: bool = False) -> rd.LabReport:
+    return _minimal_report().model_copy(
+        update={"news_blind": False, "news_archive": _news(is_stub=is_stub)}
+    )
+
+
+def test_a_news_fed_report_carries_both_provenance_banners() -> None:
+    page = rd.report_markdown(_with_news())
+
+    assert "SUMMARIZED NEWS" in page
+    assert "RECONSTRUCTED NEWS" in page
+    assert "NEWS-BLIND RUN" not in page
+
+
+def test_both_banners_name_what_a_reader_needs_to_distrust_the_number() -> None:
+    page = rd.report_markdown(_with_news(is_stub=True))
+
+    assert "stub-summary" in page
+    assert "published_at+00:12:00" in page
+    assert "0.25" in page
+    assert "48h" in page
+
+
+def test_the_banners_precede_the_identity_block() -> None:
+    page = rd.report_markdown(_with_news())
+
+    assert (
+        page.index("SUMMARIZED NEWS")
+        < page.index("RECONSTRUCTED NEWS")
+        < page.index("## Experiment")
+    )
+
+
+def test_a_news_blind_report_carries_neither() -> None:
+    page = rd.report_markdown(_minimal_report())
+
+    assert "SUMMARIZED NEWS" not in page
+    assert "RECONSTRUCTED NEWS" not in page
+    assert "NEWS-BLIND RUN" in page
+
+
+def test_a_stub_summarised_archive_stamps_the_plumbing_check_banner() -> None:
+    page = rd.report_markdown(_with_news(is_stub=True))
+
+    assert "PLUMBING CHECK" in page
+    assert "SUMMARIZED NEWS" in page
+    assert "RECONSTRUCTED NEWS" in page
+
+
+def test_a_real_summarised_archive_does_not_stamp_it() -> None:
+    assert "PLUMBING CHECK" not in rd.report_markdown(_with_news(is_stub=False))

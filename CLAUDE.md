@@ -243,8 +243,11 @@ scores decisions against what the market did next, over recorded history, per re
 Specced in [docs/superpowers/specs/2026-08-23-decision-lab-design.md](docs/superpowers/specs/2026-08-23-decision-lab-design.md);
 five slices, of which **A (integrity, day set, corpus), B (regimes, scoring, per-seat, report),
 C (the sweep) and D — both pass 1 (calibration and the gate) and pass 2 (the tuning dashboard and
-the notebook) — have shipped**. E (news) is not built, and it is the only slice that touches
-`tradebot` at all. Pass 2 is **not** the read-only surface §12 first specified — that was reversed
+the notebook) — have shipped**. E (news): **the code has shipped** — the `build_sim(news_feed=…)`
+seam (the only slice that touches `tradebot` at all), the summarising pass, `archive publish`,
+`ArchiveNewsFeed`, clustering and the provenance banners — but **the real summarising run and the
+news-fed corpus built over it are pending**, so every report is still `NEWS-BLIND` or stamped
+`PLUMBING CHECK`. Pass 2 is **not** the read-only surface §12 first specified — that was reversed
 deliberately, and §12.1 records why: a loop that means editing TOML in one window, running a
 command in a second and reading Markdown in a third is a loop nobody closes. What the reversal did
 not license is unchanged — no authority over the bot, no promotion authority, no automatic search.
@@ -266,6 +269,14 @@ dataset.py             audit recorded history, repair holes, refuse an unverifie
       gate.py          the §10.6 record alone: its key, its file, and `require_satisfied`
         calibration.py scenarios 1 and 2 — the pinned days through `sweep.run`, then four conditions
         longrun.py     scenario 3 — one candidate's own six months, its own ledger, its own profit
+archive/               raw store and crawl (staging, with bodies) -> summarise -> publish (travels, none)
+  fields.py            §6.5's two closed vocabularies: EventType, Modality
+  published.py         ArchiveItem (no body field), ArchiveHeader, archive_digest, PublishedArchive
+  config.py            archive.toml: the summariser binding and the window/floor/lag it is read by
+  summarize.py         the prompt, parse_summary, the resumable pass, per_row_cost, project
+  publish.py           staging -> news.jsonl; refuses a store that mixes summariser provenance
+newsfeed.py            ArchiveNewsFeed: a NewsFeed that never fetches; load_feed
+  clustering.py        fold annotates, never deletes; a correction is never collapsed
 ```
 
 Rules that are easy to get backwards:
@@ -410,6 +421,17 @@ Rules that are easy to get backwards:
   (`forms.py`), and it is safe only because `matrices.dumps` refuses a float outright, naming the
   path — so no document the store can serve ever holds one, and the failure is a refusal rather
   than a silent deletion.
+- **The travelling archive carries no body, and a refusal is tallied, never filled.** `ArchiveItem`
+  has no `body` field, so there is nowhere to write one. A row the model refuses is counted and left
+  unsummarised — never back-filled from the publisher's abstract, which is the baseline the pass is
+  measured against and carries the evaluative register it exists to strip.
+- **`archive publish` refuses a store whose rows mix summariser provenance**, or disagree with the
+  policy in force: `archive_digest` feeds `corpus_id`, so a digest vouching for two prompts' output
+  would key a corpus on evidence nobody can name.
+- **"No coverage" is not a quiet market.** A cycle outside the archive's span (first row to last
+  row) reports that source *failed*, and the prompt says so; a cycle inside it with an empty window
+  was genuinely quiet and reports ok. Collapsing the two teaches the panel to discount real calm or
+  to read silence as calm.
 - **`analysis.py` is the one read assembly**, shared by the CLI, the dashboard and the notebook.
   A second one would be §14's rejected second `report` command arriving through another door.
 - **The derivation cache keys on the rows files' size and mtime**, so a running job invalidates

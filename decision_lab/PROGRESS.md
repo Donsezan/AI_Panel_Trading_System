@@ -17,7 +17,7 @@ Slice order and rationale: §18.
 | **B** — regimes, scoring, per-seat, report | *how did this panel do, and which seat carried it* | ✅ shipped |
 | **C** — the sweep | *is a **different** panel right more often* — the stated goal | ✅ shipped |
 | **D** — calibration + dashboard | normal day / shock day / six-month profit run | ✅ shipped |
-| **E** — news archive | shock days measure the *news*, not just the price move | ◨ collection complete, full bodies; feed and summarising pending |
+| **E** — news archive | shock days measure the *news*, not just the price move | ◨ code shipped (seam, summariser, publish, feed, clustering); the real summarising run and a news-fed 2025 corpus pending |
 
 **Four slices of five.** Comparing configurations — the thing the tool was built for — now runs:
 N candidates over one frozen corpus, ranked, with a pairwise agreement matrix and a per-candidate
@@ -46,7 +46,11 @@ The consequence to plan for: the corpus that news work is scored against must be
 `data\history-2025`, which carries its own pinned day set, its own calibration and its own §10.6
 gate. Corpus `8ac130d8…` is 2024 H1 and stays `NEWS-BLIND`.
 
-What is still owed is the `tradebot` seam, `ArchiveNewsFeed`, and the summarising pass.
+**Slice E's code has landed** - the `build_sim(news_feed=...)` seam, the summarising pass, `archive
+publish`, `ArchiveNewsFeed`, clustering and the two provenance banners - and is green on the stub.
+What is still owed is not code and every piece of it is a spend decision: the **real summarising
+run** (a key, a verified model id, ~14 484 rows), **publishing** its output, **a 2025 corpus** built
+over it, and **that corpus's calibration**. Nothing the stub produces is a measurement.
 
 **The archive keeps full raw text, and that is now a stated requirement rather than an
 implementation detail.** Decided 2026-09-17: `RawArticle` stores the publisher's whole title and
@@ -152,9 +156,9 @@ Three rules this pass added that are easy to get backwards:
   `tradebot_session` on `127.0.0.1` would overwrite the bot dashboard's cookie on another port and
   log the operator out of the surface holding the kill switch.
 
-## Slice E — news archive ◨ collection shipped
+## Slice E — news archive ◨ code shipped, summarising run pending
 
-**Collection is built and green; the feed and the summarising pass are not.** The order was chosen
+**Collection, the seam, the summariser, publish, the feed and clustering are built and green on the stub; the real summarising run is not.** The order was chosen
 deliberately on 2026-09-16: collecting is the only half that can be done with no key at all, and an
 archive nobody has collected yet is the thing every later half waits on.
 
@@ -211,11 +215,14 @@ reach here and the archive takes its own, scoped to the one store it rewrites. R
 `jobs.Busy` → **exit 7**, the same code a second writer gets anywhere else in this tool.
 
 - [x] Finish the two 2025 crawls — **done 2026-09-20**, both walked to 2025-12-31
-- [ ] The `build_sim(news_feed=…)` seam — **the only `tradebot` change in the whole design**
-- [ ] Its §2.3 guard tests and §16.2 contamination tests, in the *same commit* as the seam
-- [ ] `ArchiveNewsFeed`, reading the archive point-in-time
-- [ ] The summarising pass, which fills `RawArticle.summary` and needs the key — run as a
-      separate process over the stored bodies, not inline with a crawl
+- [x] The `build_sim(news_feed=…)` seam — **the only `tradebot` change in the whole design**
+- [x] Its §2.3 guard tests, in the *same commit* as the seam (spec §2.3 requires only those of the
+      seam's commit); the §16.2 contamination tests landed with the slice's exit criterion, in
+      `test_contamination.py` and `test_slice_e_end_to_end.py`
+- [x] `ArchiveNewsFeed`, reading the archive point-in-time
+- [x] The summarising pass's *code* - `archive summarise` / `archive publish`, which fill
+      `RawArticle.summary` and publish the body-less archive. **Running it for real needs the key**
+      and is still pending, as a separate process over the stored bodies, not inline with a crawl
 
 ### What collection looks like
 
@@ -536,7 +543,12 @@ $env:DECISION_LAB_COINDESK_COOKIE = "<the whole Cookie: header from a signed-in 
 .venv\Scripts\python.exe -m decision_lab archive backfill --data data\history --authenticated --limit 5
 .venv\Scripts\python.exe -m decision_lab archive backfill --data data\history --authenticated --limit 1000
 .venv\Scripts\python.exe -m decision_lab archive reshard  --data data\history --source coindesk
+.venv\Scripts\python.exe -m decision_lab archive summarise --data data\history-2025 --source cryptoslate --dry-run
+.venv\Scripts\python.exe -m decision_lab archive summarise --data data\history-2025 --source cryptoslate --limit 50  # needs a real binding in archive.toml
+.venv\Scripts\python.exe -m decision_lab archive publish   --data data\history-2025 --source cryptoslate
 .venv\Scripts\python.exe -m decision_lab corpus build --data data\history --every 8h --reference-panel sim
+.venv\Scripts\python.exe -m decision_lab corpus build --data data\history-2025 --every 8h --reference-panel sim `
+    --news-source cryptoslate --news-source bitcoincom   # NEWS-FED; needs both archives published
 .venv\Scripts\python.exe -m decision_lab report --corpus 8ac130d8f2ed5650dff0dcb9f969d07e
 .venv\Scripts\python.exe -m decision_lab calibrate normal --corpus <id> `
     --configs decision_lab\config\sweep-stub.toml --budget 1
@@ -574,8 +586,25 @@ the seats first" should say so on its face.
   cannot be added to `sweep.toml` as a baseline: that label is whole-run, and one stub binding
   would both waive the missing-key refusal for the real candidates and stamp the page carrying
   their ranking as a plumbing check. Run the two files separately.
-- **Every report is `NEWS-BLIND`** until slice E. Shock blocks measure the reaction to a violent
-  price move, not to the reporting of an event.
+- **Every real report is still `NEWS-BLIND`**, because no archive has been summarised for real.
+  The code to build a news-fed corpus exists, but the shipped stub binding
+  summarises nothing (the unscripted stub refuses every row, and `publish` refuses an empty
+  store); plumbing over news is exercised only by the scripted-stub tests. Shock blocks measure the reaction to a
+  violent price move until the real run lands.
+- **§6.8.3 is unimplemented, deliberately.** "8 of 65" cannot ride in `NewsCoverage` (two fields,
+  `summary` counts sources) without a second `tradebot` change against a one-change licence.
+  `(reports=N)` carries the clustering half. Closing it is a `NewsCoverage` field or a spec
+  correction - the operator's call. The spec records the cut at §6.8.3 rather than editing the
+  claim away.
+- **`calibrate long` has no news wiring** - scoped out of slice E (D5); the six-month run is
+  news-blind whatever corpus its sibling commands read.
+- **Archive coverage is [first row, last row]**, because the header declares no span. A
+  captured-from/to span in the header would let trailing silence read as quiet rather than as "no
+  coverage".
+- **Per-row summariser provenance** (`summary_provider`, `summary_model`, `summary_prompt_digest`)
+  lives on `RawArticle`, and `archive publish` refuses a store whose rows mix it (ruling B10).
+- **The shipped `ArchiveHeader` flattens spec §6.6's nested `summarizer` object** and adds
+  `news_window_seconds`, `cluster_floor` and `rows`; recorded in the spec.
 - **The two dead partial corpora are gone** (deleted 2026-09-21): `61721dba…` at 67/1080 cycles
   and `d7c390c6…` at 118/1080, the latter still holding `-wal`/`-shm` from the pass that died. A
   corpus is reused at its identity and never rebuilt, so a partial one persists until the
@@ -719,20 +748,24 @@ interruption a nine-session run had.
    `on_fallback = "halt"` and the gemini/lmstudio fallbacks equally unreachable, a retired slot
    becomes an abstention — and a seat that never answered on its primary **fails the §10.6 gate**.
    That would burn the nine days for a reason having nothing to do with the panel's judgement.
-3. **Slice E's remaining half. Collection is done** — 20 171 articles, every one with a body, and
-   2025 covered every day. What is left, in order:
+3. **Slice E's remaining half. Collection and the code are done** — 20 171 articles, every one with
+   a body, 2025 covered every day, and the seam, summariser, publish, feed and clustering are
+   shipped and green on the stub. What is left is spend decisions, in order:
    - **A corpus over `data\history-2025`**, because the news year is 2025 and corpus `8ac130d8…`
      is 2024 H1. Its two prerequisites are **done** (2026-09-22): the dataset verified clean at
      8 760/8 760 bars per series and the day set is pinned at `cf2a3eab…`. What is left is the
      reference pass itself, which carries its own §10.6 gate and needs no key — but at 8h over a
      full year it is **~1 095 cycles**, unseeded, and both prior passes of that size died short.
      Weigh closing §5's intra-cycle half first.
-   - **Then the `build_sim(news_feed=…)` seam and `ArchiveNewsFeed`.** The seam is the only part of
-     this design that touches `tradebot` at all, and it lands with its §2.3 guard tests in one
-     commit, never two. `RawStore.read_months(start, end)` is what it should read: sharding means
-     a cycle deciding on 2025-03-15 parses one ~1.5 MB file rather than the whole year.
-   - **The summarising pass is the operator's own separate process** over the stored bodies, and is
-     the only piece wanting an LLM key.
+   - **The real summarising run** - the operator's own separate process over the stored bodies,
+     the only piece wanting an LLM key. Verify the model id, price it with `--dry-run` and a
+     `--limit 50` batch, then run `--limit 1000` batches; the plan's *When the real key arrives*
+     is the whole procedure.
+   - **Publish both archives, build the news-fed 2025 corpus, calibrate it.** Each of these also
+     mints a new identity, by design: a real binding changes `archive_digest`, so any corpus built
+     over a stub-summarised archive is a different corpus and stays one.
+   - Not scheduled, but owed: `calibrate long` news wiring (D5), a header-declared coverage span,
+     and the §6.8.3 decision above.
 
 Pass 1 was written across two sessions and **carries no independent task review for tasks 4–9** —
 the reviewing agents in session 1 stalled, and session 2 was executed directly. Its ledger is

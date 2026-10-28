@@ -736,6 +736,18 @@ recompute the id of every corpus ever built, including the complete 540-cycle `8
 still making two windows two corpora. It is also the consistent home: `observed_at_policy` is
 already in there, and is likewise a reading policy rather than file content.
 
+**As shipped (slice E), and where it departs from the example above.** `ArchiveHeader` flattens
+the nested `"summarizer": {provider, model, prompt_digest}` into `summarizer_provider`,
+`summarizer_model` and `prompt_digest`, and adds three fields the example does not show:
+`news_window_seconds` and `cluster_floor` (both inside `archive_digest`, as the paragraphs above
+require of the window) and `rows`. The example is left as the design's first statement of the
+shape; the code is authoritative for the field names.
+
+**The single `news.jsonl` per source is kept deliberately, against month shards.** The *staging*
+store shards by publication month because it carries full bodies (22–28 MB a source). The
+travelling archive carries none (§6.4), is read once at feed construction and indexed in memory,
+and so gains nothing from a layout whose point is parsing one month of many.
+
 ### 6.7 `observed_at` is synthetic unless the source supplies it
 
 Neither backend gives us a moment *we* learned something, so one is derived:
@@ -876,6 +888,13 @@ since the feed is already reading a month shard by date.
 nothing happened will reason as though nothing happened."* A seat shown 8 of 65 must be told it is
 8 of 65. The existing `NewsCoverage` line carries it, so a truncation that is silent today becomes
 visible without a second rendering path — the same argument, one level up.
+
+**Status — not implemented in slice E (recorded 2026-10-27; the claim above is left standing).**
+`NewsCoverage` has two fields and its `summary` counts *sources*, not items, so "8 of 65" has
+nowhere to ride, and adding a field is a second `tradebot` change against §2.2's licence of exactly
+one. What does reach the seat is the clustering half: an elected member's summary carries
+`(reports=N)`. Closing the rest is either a `NewsCoverage` field, with its own guard tests, or a
+correction to this section. That is a decision about the bot and is the operator's.
 
 ### 6.9 No archive
 
