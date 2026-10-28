@@ -220,6 +220,78 @@ class TestBooking:
         assert len(fills) == 1
 
 
+class TestScopedPoll:
+    """ADR 0030: a cycle settles its own basket's instruments, and nothing else's."""
+
+    async def test_a_scoped_poll_touches_only_the_named_instruments(
+        self,
+        monitor: ExecutionMonitor,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+        second_instrument: Instrument,
+    ) -> None:
+        # Both entries rest below the market, then both markets trade through them.
+        broker.observe(tick(instrument, clock, last="51000"))
+        broker.observe(tick(second_instrument, clock, last="3000"))
+        await submit_entry(
+            monitor, broker, store, ledger, clock, instrument, price="50000", ttl=None, plan=None
+        )
+        await submit_entry(
+            monitor,
+            broker,
+            store,
+            ledger,
+            clock,
+            second_instrument,
+            price="2900",
+            qty="1",
+            ttl=None,
+            plan=None,
+            coid="sim-ETH",
+        )
+        clock.advance(60)
+        broker.observe(tick(instrument, clock, last="49000"))
+        broker.observe(tick(second_instrument, clock, last="2800"))
+
+        await monitor.poll(frozenset({second_instrument.key}))
+
+        assert ledger.position(second_instrument.key).qty == Decimal("1")
+        assert ledger.position(instrument.key).is_flat, "outside the scope: not synced"
+
+        await monitor.poll()
+        assert ledger.position(instrument.key).qty == Decimal("0.5")
+
+    async def test_a_scope_holding_no_group_reaches_no_venue(
+        self,
+        monitor: ExecutionMonitor,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+        second_instrument: Instrument,
+    ) -> None:
+        """The live-cost claim in ADR 0030: a basket holding nothing pays nothing."""
+        broker.observe(tick(instrument, clock, last="51000"))
+        await submit_entry(
+            monitor, broker, store, ledger, clock, instrument, price="50000", plan=None, ttl=None
+        )
+        calls: list[str] = []
+        real = broker.fetch_order
+
+        async def counted(ref: OrderRef) -> object:
+            calls.append(ref.client_order_id)
+            return await real(ref)
+
+        broker.fetch_order = counted  # type: ignore[method-assign, assignment]
+        await monitor.poll(frozenset({second_instrument.key}))
+
+        assert calls == []
+
+
 class TestProtectiveGroups:
     async def test_a_filled_entry_gets_its_venue_held_legs(
         self,

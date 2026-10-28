@@ -163,10 +163,16 @@ class ExecutionMonitor:
         else:
             group.order = order
 
-    async def poll(self) -> None:
-        """One sweep: sync every working order, expire what is past its TTL, mind the groups."""
+    async def poll(self, instrument_keys: frozenset[str] | None = None) -> None:
+        """One sweep: sync every working order, expire what is past its TTL, mind the groups.
+
+        `instrument_keys` scopes the sweep to the groups on those instruments (ADR 0030): a cycle
+        settles its own basket's holdings before reading them, and must not pay venue calls for,
+        or fail on, a sibling basket's orders. A scope holding no group reaches no venue. `None`
+        is every group, which is what the supervisor's sweep and a replay want.
+        """
         async with self._polling:
-            for group in list(self._tracked.values()):
+            for group in self._in_scope(instrument_keys):
                 group.order = await self._sync(group, group.order)
                 for client_order_id, leg in list(group.legs.items()):
                     group.legs[client_order_id] = await self._sync(group, leg)
@@ -175,8 +181,17 @@ class ExecutionMonitor:
             # the loop would size some groups against a pre-fill holding and others against a
             # post-fill one (design §2.4).
             targets = self._targets()
-            for group in list(self._tracked.values()):
+            for group in self._in_scope(instrument_keys):
                 await self._maintain(group, targets.get(group.order.group_id))
+
+    def _in_scope(self, instrument_keys: frozenset[str] | None) -> list[_Tracked]:
+        # Re-evaluated per pass, as the unscoped loops always were: a group adopted while a venue
+        # call was awaited is still minded in the same sweep.
+        return [
+            group
+            for group in self._tracked.values()
+            if instrument_keys is None or group.order.instrument_key in instrument_keys
+        ]
 
     async def _sync(self, group: _Tracked, order: Order) -> Order:
         if not order.state.is_open:
