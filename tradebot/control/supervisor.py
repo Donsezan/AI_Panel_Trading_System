@@ -452,8 +452,9 @@ class Supervisor:
         order stays tracked and the next tick asks again — and the alternative is the failure the
         module docstring names: a dead supervisor leaves working orders with nobody polling them.
 
-        An unscoped poll never raises for a poisoned group (ADR 0030), so this guard now catches
-        only transient errors; the poisoned group's own basket halts at its next scoped poll.
+        An unscoped poll never raises for a poisoned group (ADR 0030), so this guard catches
+        everything *except* the poison; the poisoned group's own basket halts at its next scoped
+        poll.
         """
         if self._monitor is None:
             return

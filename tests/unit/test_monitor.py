@@ -23,7 +23,7 @@ from tradebot.core.portfolio import Position
 from tradebot.execution.brokers.sim import SimBroker, Tick
 from tradebot.execution.monitor import ExecutionMonitor
 from tradebot.execution.service import ExecutionService
-from tradebot.interfaces.broker import OrderRef
+from tradebot.interfaces.broker import OrderRef, OrderStatus
 from tradebot.ledger.portfolio import Ledger
 from tradebot.persistence.store import EventStore
 
@@ -1346,3 +1346,181 @@ class TestAnUnbookableFillIsContained:
         assert not isinstance(raised.value, RetryableError)
         text = " ".join(r.getMessage() + str(r.__dict__) for r in caplog.records)
         assert "sim-ENTRY" in text and "sim-ETH" in text, "every failure is logged"
+
+
+class TestContainmentFollowUps:
+    """Review round: a poisoned retry is idempotent, and every path out of it is recorded."""
+
+    async def test_a_poisoned_retry_does_not_rebook_the_fills_it_already_booked(
+        self,
+        monitor: ExecutionMonitor,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+        second_instrument: Instrument,
+    ) -> None:
+        """The stop filled in two trades; only the second exceeds the holding. Trade 1 must be
+        booked once, not on every 30s retry."""
+        await poisoned_pair(monitor, broker, store, ledger, clock, instrument, second_instrument)
+        real = broker.fetch_order
+
+        async def two_trades(ref: OrderRef) -> OrderStatus:
+            status = await real(ref)
+            if len(status.fills) == 1 and status.fills[0].qty == Decimal("0.5"):
+                whole = status.fills[0]
+                first = whole.model_copy(update={"fill_id": "trade-1", "qty": Decimal("0.1")})
+                second = whole.model_copy(update={"fill_id": "trade-2", "qty": Decimal("0.4")})
+                return status.model_copy(update={"fills": (first, second)})
+            return status
+
+        broker.fetch_order = two_trades  # type: ignore[method-assign]
+
+        def received() -> int:
+            return len([e for e in store.read_all() if e.type is EventType.FILL_RECEIVED])
+
+        await monitor.poll()
+        held, count = ledger.position(instrument.key).qty, received()
+        assert held == Decimal("0.1"), "trade 1 booked once"
+        for _ in range(3):
+            await monitor.poll()
+            await monitor.poll(frozenset({second_instrument.key}))
+
+        assert ledger.position(instrument.key).qty == held
+        assert received() == count
+
+    async def test_a_failure_to_record_the_poison_does_not_skip_the_siblings(
+        self,
+        monitor: ExecutionMonitor,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+        second_instrument: Instrument,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        await poisoned_pair(
+            monitor, broker, store, ledger, clock, instrument, second_instrument,
+            eth_plan=ETH_PLAN,
+        )  # fmt: skip
+        real_append = store.append
+        failing = {"on": True}
+
+        async def append(*events: Event) -> object:
+            if failing["on"] and any(e.type is EventType.RISK_EVENT for e in events):
+                raise RuntimeError("disk full")
+            return await real_append(*events)
+
+        store.append = append  # type: ignore[method-assign]
+        with caplog.at_level("ERROR"), pytest.raises(RuntimeError, match="disk full"):
+            await monitor.poll()
+
+        assert ledger.position(second_instrument.key).qty == Decimal("1")
+        assert open_stops(monitor, second_instrument), "the sibling was still maintained"
+        assert "disk full" in " ".join(str(r.__dict__) for r in caplog.records)
+        assert unbookable_events(store) == []
+
+        failing["on"] = False
+        await monitor.poll()  # the record is retried because the group was left unpoisoned
+        assert len(unbookable_events(store)) == 1
+
+    async def test_clearing_a_poison_is_recorded(
+        self,
+        monitor: ExecutionMonitor,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+        second_instrument: Instrument,
+    ) -> None:
+        await poisoned_pair(monitor, broker, store, ledger, clock, instrument, second_instrument)
+        await monitor.poll()
+        book(
+            ledger,
+            Fill(
+                fill_id="restored",
+                client_order_id="sim-ELSEWHERE",
+                instrument_key=instrument.key,
+                side=Side.BUY,
+                qty=Decimal("0.3"),
+                price=Decimal("49000"),
+                filled_at=clock.now(),
+            ),
+            instrument,
+        )
+
+        await monitor.poll()
+        await monitor.poll()
+
+        actions = [e.payload["action_taken"] for e in unbookable_events(store)]
+        assert actions == ["group_poisoned", "group_unpoisoned"]
+
+    async def test_an_unclassified_error_outranks_a_retryable_one(
+        self,
+        monitor: ExecutionMonitor,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+        second_instrument: Instrument,
+    ) -> None:
+        broker.observe(tick(instrument, clock, last="49000"))
+        await submit_entry(
+            monitor, broker, store, ledger, clock, instrument, price="40000", ttl=None
+        )
+        await submit_entry(
+            monitor, broker, store, ledger, clock, second_instrument,
+            price="2900", qty="1", ttl=None, plan=ETH_PLAN, coid="sim-ETH",
+        )  # fmt: skip
+
+        async def down(ref: OrderRef) -> object:
+            if ref.instrument_key == instrument.key:
+                raise VenueError("503 from the venue")
+            raise RuntimeError("a bug, not a venue answer")
+
+        broker.fetch_order = down  # type: ignore[method-assign]
+        with pytest.raises(RuntimeError, match="a bug"):
+            await monitor.poll()
+
+    async def test_a_group_adopted_during_the_sync_is_maintained_in_that_sweep(
+        self,
+        monitor: ExecutionMonitor,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+        second_instrument: Instrument,
+    ) -> None:
+        broker.observe(tick(instrument, clock, last="49000"))
+        await submit_entry(
+            monitor, broker, store, ledger, clock, instrument, price="40000", ttl=None
+        )
+        service = ExecutionService(broker, store, ledger, clock)
+        eth = await service.submit(
+            entry_intent(
+                second_instrument, clock, price="2900", qty="1", ttl=None, plan=ETH_PLAN,
+                coid="sim-ETH",
+            ),
+            second_instrument,
+        )  # fmt: skip
+        broker.observe(tick(second_instrument, clock, last="2800"))
+        filled = await service.sync(eth, second_instrument)
+        real = broker.fetch_order
+        adopted = {"done": False}
+
+        async def adopt_midway(ref: OrderRef) -> OrderStatus:
+            if not adopted["done"]:
+                adopted["done"] = True
+                monitor.track(filled, second_instrument)
+            return await real(ref)
+
+        broker.fetch_order = adopt_midway  # type: ignore[method-assign]
+
+        await monitor.poll()
+
+        assert open_stops(monitor, second_instrument), "armed in the sweep that adopted it"

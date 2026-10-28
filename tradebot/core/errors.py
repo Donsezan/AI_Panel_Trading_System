@@ -16,6 +16,10 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from tradebot.core.orders import Order
 
 
 class TradebotError(Exception):
@@ -88,6 +92,9 @@ class UnbookableFillError(ReconciliationMismatchError):
         self.instrument_key = instrument_key
         self.qty = qty
         self.held = held
+        #: The order with every fill booked *before* the refused one folded in, set by whoever was
+        #: booking, so a retry does not book those again.
+        self.partial_order: Order | None = None
 
 
 class SubmitUnknownError(FailClosedError):

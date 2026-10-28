@@ -59,7 +59,7 @@ from decimal import Decimal
 
 from tradebot.core.clock import Clock
 from tradebot.core.enums import OrderRole, OrderState, RiskTier, Side
-from tradebot.core.errors import FailClosedError, FatalError, UnbookableFillError
+from tradebot.core.errors import FatalError, RetryableError, UnbookableFillError
 from tradebot.core.instrument import Instrument
 from tradebot.core.logging import get_logger
 from tradebot.core.money import ZERO, multiply
@@ -90,7 +90,8 @@ def _severity(error: Exception) -> int:
     """Lower is more severe: a later fail-closed error must not hide behind an earlier retryable."""
     if isinstance(error, FatalError):
         return 0
-    return 1 if isinstance(error, FailClosedError) else 2
+    # An unclassified exception is not known to be transient, so it is never ranked as retryable.
+    return 2 if isinstance(error, RetryableError) else 1
 
 
 @dataclass(slots=True)
@@ -200,20 +201,32 @@ class ExecutionMonitor:
                 except UnbookableFillError as error:
                     # Contained to this group (ADR 0030): the fill stays unbooked and tracked, and
                     # its siblings go on syncing, booking and being maintained.
-                    await self._poison(group, error)
+                    try:
+                        await self._poison(group, error)
+                    except Exception as failure:
+                        # The record itself failed: collected like any other, and the group stays
+                        # unpoisoned so the next poll tries to record it again.
+                        failures.append((group, failure))
                 except Exception as error:
                     # Collected, not swallowed: every one is logged and the most severe is
                     # re-raised below, so the error's class still governs the caller's handling.
                     failures.append((group, error))
                 else:
-                    group.poisoned = None  # booked: the holding now allows it
-                    synced.append(group)
+                    try:
+                        await self._unpoison(group)
+                    except Exception as failure:
+                        # Still poisoned, so the next poll records the clearing again.
+                        failures.append((group, failure))
+                    else:
+                        synced.append(group)
             # After the sync loop, never inside it: `_sync` books fills as it reads them, so a stop
             # that filled this sweep has already reduced the position. Computing per group inside
             # the loop would size some groups against a pre-fill holding and others against a
             # post-fill one (design §2.4).
             targets = self._targets()
-            for group in synced:
+            # A group adopted while a sync awaited the venue is minded in this sweep too.
+            adopted = [g for g in self._in_scope(instrument_keys) if g not in in_scope]
+            for group in (*synced, *adopted):
                 try:
                     await self._maintain(group, targets.get(group.order.group_id))
                 except Exception as error:
@@ -238,8 +251,8 @@ class ExecutionMonitor:
                 raise min(raising, key=_severity)
 
     def _in_scope(self, instrument_keys: frozenset[str] | None) -> list[_Tracked]:
-        # Re-evaluated per pass, as the unscoped loops always were: a group adopted while a venue
-        # call was awaited is still minded in the same sweep.
+        # Evaluated twice per poll: once to sync, once more so a group adopted while a venue call
+        # was awaited is still maintained in the same sweep.
         return [
             group
             for group in self._tracked.values()
@@ -248,9 +261,40 @@ class ExecutionMonitor:
 
     async def _sync_group(self, group: _Tracked) -> None:
         """Entry first, then each leg, assigning as it goes so a later failure loses nothing."""
-        group.order = await self._sync(group, group.order)
+        try:
+            group.order = await self._sync(group, group.order)
+        except UnbookableFillError as error:
+            group.order = error.partial_order or group.order
+            raise
         for client_order_id, leg in list(group.legs.items()):
-            group.legs[client_order_id] = await self._sync(group, leg)
+            try:
+                group.legs[client_order_id] = await self._sync(group, leg)
+            except UnbookableFillError as error:
+                # Fills booked before the refused one are kept on the order. Without this the next
+                # poll re-books them (`new_fills` dedupes against the order) and drains the ledger.
+                group.legs[client_order_id] = error.partial_order or leg
+                raise
+
+    async def _unpoison(self, group: _Tracked) -> None:
+        """A sync that no longer raises ends the poison; say so, so the window is in the log."""
+        poison = group.poisoned
+        if poison is None:
+            return
+        events = self._execution.events_for(group.order)
+        await self._store.append(
+            events.risk_event(
+                tier=RiskTier.EXECUTION,
+                rule=UNBOOKABLE_FILL_RULE,
+                scope=poison.instrument_key,
+                action="group_unpoisoned",
+                detail=(
+                    f"{poison.client_order_id}: synced without error "
+                    f"(entry {group.order.state.value}, filled {group.order.filled_qty}); "
+                    "the ledger was known to be wrong until now"
+                ),
+            )
+        )
+        group.poisoned = None
 
     async def _poison(self, group: _Tracked, error: UnbookableFillError) -> None:
         """Record, once, that a group carries a fill the ledger refuses; keep it tracked."""
