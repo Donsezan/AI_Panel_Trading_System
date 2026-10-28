@@ -25,17 +25,21 @@ from tradebot.app import Application
 from tradebot.control.arming import LIVE_CONFIRMATION_PHRASE
 from tradebot.control.config_store import SINGLETON_ID
 from tradebot.control.supervision import SupervisionController
+from tradebot.core.clock import ManualClock
 from tradebot.core.enums import (
     BasketStatus,
     ConfigKind,
     CycleOutcome,
     KillSwitchState,
     OrderRole,
+    OrderState,
 )
+from tradebot.core.errors import ConfigError
 from tradebot.core.events import EventType
 from tradebot.core.orders import Order
 from tradebot.dashboard.dock import KILL_PHRASE, QUARANTINE_CONFIRM
 from tradebot.dashboard.queries import Queries
+from tradebot.execution.brokers.sim import Tick
 from tradebot.risk.rules import STOOD_ASIDE
 from tradebot.risk.state import REARM_PHRASE
 
@@ -478,6 +482,52 @@ async def test_a_manual_close_goes_through_the_normal_path(
     ]
     assert len(checked) == 2
     assert all(event.payload["approved"] for event in checked)
+
+
+def cross_the_stop(application: Application, instrument_key: str, clock: ManualClock) -> None:
+    """The venue trades through every resting stop on this instrument, and nobody has looked.
+
+    Exactly the state a sim-stack quote read leaves behind when its bar crosses the stop.
+    """
+    one = Decimal(1)
+    application.monitor._broker.observe(  # type: ignore[attr-defined]
+        Tick(
+            instrument_key=instrument_key,
+            bid=one,
+            ask=one,
+            last=one,
+            high=one,
+            low=one,
+            covers_since=clock.now(),
+            observed_at=clock.now(),
+        )
+    )
+
+
+async def test_a_close_after_the_stop_sold_it_sells_nothing(
+    cycled: Application, clock: ManualClock
+) -> None:
+    """ADR 0030 through the operator's door: quote, settle, *then* read the holding.
+
+    Before: the close read the stale holding, sold all of it on top of the stop's sale, and its
+    guarded `_settle` swallowed the "exceeds holding" the stop's fill then raised.
+    """
+    assert resting_stops(cycled, BTC)
+    cross_the_stop(cycled, BTC, clock)
+
+    with pytest.raises(ConfigError, match="nothing to close"):
+        await cycled.manual_close.close("demo", BTC, actor="test")
+
+    assert cycled.ledger.position(BTC).is_flat
+    assert [
+        o
+        for o in cycled.monitor.tracked
+        if o.role is OrderRole.STOP_LOSS
+        and o.instrument_key == BTC
+        and o.state is OrderState.FILLED
+    ]
+    actions = [e.payload["action_taken"] for e in risk_events(cycled, "manual_close")]
+    assert "order_submitted" not in actions
 
 
 async def test_a_manual_close_releases_the_legs_it_leaves_behind(cycled: Application) -> None:

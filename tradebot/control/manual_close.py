@@ -32,7 +32,8 @@ completed cycles, and letting an operator's close advance every basket's cooldow
 risk limit depend on how often a human intervened.
 
 Failure semantics: an unknown basket, an instrument the basket does not hold, a flat position, a
-stale quote, or a missing Tier-2 policy each refuse before anything is sent. A veto from either
+stale quote, a venue that cannot be polled for what it has already done, or a missing Tier-2
+policy each refuse before anything is sent. A veto from either
 tier refuses and is recorded with full provenance. Only a fully approved intent reaches the venue.
 """
 
@@ -185,7 +186,8 @@ class ManualCloser:
     ) -> CloseOutcome:
         basket = self._basket(basket_id)
         instrument = _instrument_of(basket, instrument_key)
-        proposal = await self._proposal(basket, instrument, actor)
+        scope = _scope_of(basket)
+        proposal = await self._proposal(basket, instrument, actor, scope)
 
         outcome = Tier1RiskEngine(self._clock).approve(
             proposal,
@@ -230,7 +232,7 @@ class ManualCloser:
         )
         # After the record above, never before: the poll can fail, and that a human asked and the
         # venue took it must survive that.
-        order = await self._settle(order)
+        order = await self._settle(order, scope)
         return CloseOutcome(
             instrument_key=instrument.key,
             correlation_id=correlation_id,
@@ -239,7 +241,7 @@ class ManualCloser:
             held_qty=proposal.position.qty,
         )
 
-    async def _settle(self, order: Order) -> Order:
+    async def _settle(self, order: Order, scope: frozenset[str]) -> Order:
         """Poll the close just submitted, and report it as the poll found it.
 
         KNOWN_GAPS §5: nothing else polls until a basket happens to place an order, so until this
@@ -256,7 +258,7 @@ class ManualCloser:
         incident that a close which actually happened had failed.
         """
         try:
-            await self._monitor.poll()
+            await self._monitor.poll(scope)
         except Exception:
             logger.exception("polling the manual close raised; the order stands and is tracked")
             return order
@@ -294,12 +296,25 @@ class ManualCloser:
             reason=reason,
         )
 
-    async def _proposal(self, basket: Basket, instrument: Instrument, actor: str) -> RiskProposal:
-        position = self._ledger.position(instrument.key)
-        if position.is_flat:
+    async def _proposal(
+        self, basket: Basket, instrument: Instrument, actor: str, scope: frozenset[str]
+    ) -> RiskProposal:
+        # A cheap pre-check that answers "nothing to close" without a venue call. It is not the
+        # authority: the holding is read again below, once the venue has been asked.
+        if self._ledger.position(instrument.key).is_flat:
             raise ConfigError(f"nothing to close: no position is held in {instrument.key}")
 
         quote = self._fresh_quote(await self._prices.get_quote(instrument))
+        # Reading the quote can itself move the venue (a sim-stack read feeds the tick to the
+        # broker, which trips any stop the bar crossed), so book what the venue did before
+        # reading the holding the close will be sized from. Sized from the stale holding, a close
+        # sells what a stop already sold (ADR 0030, KNOWN_GAPS section 5). Not guarded, unlike
+        # the poll after submission: no order exists yet, so a poll that fails refuses the
+        # close, and a close is never sized from a holding that could not be confirmed.
+        await self._monitor.poll(scope)
+        position = self._ledger.position(instrument.key)
+        if position.is_flat:
+            raise ConfigError(f"nothing to close: no position is held in {instrument.key}")
         # Into the shared cache before valuing: this is the freshest mark in the system for this
         # instrument, and an exit should never be the one act that lets it go stale.
         self._marks.observe_quote(quote)
@@ -366,6 +381,11 @@ class ManualCloser:
             raise ConfigError("no Tier-2 policy is published; refusing to send any order")
         policy: GlobalRiskPolicy = record.document
         return policy
+
+
+def _scope_of(basket: Basket) -> frozenset[str]:
+    """The instruments a close polls: the basket's, which is where its protective legs live."""
+    return frozenset(i.key for i in basket.instruments)
 
 
 def _instrument_of(basket: Basket, instrument_key: str) -> Instrument:
