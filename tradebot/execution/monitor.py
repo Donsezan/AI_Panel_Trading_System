@@ -297,12 +297,20 @@ class ExecutionMonitor:
         ]
 
     async def _sync_group(self, group: _Tracked) -> None:
-        """Entry first, then each leg, assigning as it goes so a later failure loses nothing."""
+        """Entry first, then each leg, assigning as it goes so a later failure loses nothing.
+
+        The synced order is assigned *before* its TTL cancel is attempted, never after: the sync
+        has already booked its fills into the ledger and the log, and a cancel that then fails (a
+        single 5xx is enough) must not leave the group holding the pre-sync order — the next
+        poll's `new_fills` would see the same fills as new and book them a second time (final
+        review I3, KNOWN_GAPS §13).
+        """
         try:
             group.order = await self._sync(group, group.order)
         except UnbookableFillError as error:
             group.order = error.partial_order or group.order
             raise
+        group.order = await self._expire(group.order)
         for client_order_id, leg in list(group.legs.items()):
             try:
                 group.legs[client_order_id] = await self._sync(group, leg)
@@ -311,6 +319,7 @@ class ExecutionMonitor:
                 # poll re-books them (`new_fills` dedupes against the order) and drains the ledger.
                 group.legs[client_order_id] = error.partial_order or leg
                 raise
+            group.legs[client_order_id] = await self._expire(group.legs[client_order_id])
 
     async def _unpoison(self, group: _Tracked) -> None:
         """A sync that no longer raises ends the poison; say so, so the window is in the log."""
@@ -361,14 +370,16 @@ class ExecutionMonitor:
         group.poisoned = error
 
     async def _sync(self, group: _Tracked, order: Order) -> Order:
+        """Fold the venue's truth into one order. Books fills; never cancels (see `_expire`)."""
         if not order.state.is_open:
             return order
-        order = await self._execution.sync(order, group.instrument)
-        if order.is_expired(self._clock.now()):
-            order = await self._execution.cancel(
-                order, reason="ttl_expired", state=OrderState.EXPIRED
-            )
-        return order
+        return await self._execution.sync(order, group.instrument)
+
+    async def _expire(self, order: Order) -> Order:
+        """Cancel the remainder of an order past its bot-enforced TTL; anything else is as is."""
+        if not order.is_expired(self._clock.now()):
+            return order
+        return await self._execution.cancel(order, reason="ttl_expired", state=OrderState.EXPIRED)
 
     async def _maintain(self, group: _Tracked, target: Decimal | None) -> None:
         """Keep the protective legs matched to the *position*, not to this entry's fills.

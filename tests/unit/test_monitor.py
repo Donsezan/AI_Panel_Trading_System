@@ -197,6 +197,52 @@ class TestTtl:
         assert settled.filled_qty == Decimal("0.2")
         assert ledger.position(instrument.key).qty == Decimal("0.2")
 
+    async def test_a_fill_booked_before_a_failed_ttl_cancel_is_not_booked_again(
+        self,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Final review I3: the sync books the fill, then the cancel fails transiently.
+
+        Before the fix the synced order was only assigned once the cancel returned, so the group
+        kept the pre-sync order and the next poll saw the same fill as new and booked it again —
+        a holding inflated by every retry, which a later reduce-only SELL is sized from.
+        """
+        broker = SimBroker(clock, balances={"USDT": Decimal(100_000)}, fill_ratio=Decimal("0.4"))
+        service = ExecutionService(broker, store, ledger, clock)
+        monitor = ExecutionMonitor(broker, service, store, clock)
+        broker.observe(tick(instrument, clock, last="51000"))
+        order = await service.submit(
+            entry_intent(instrument, clock, price="45000", plan=None), instrument
+        )
+        monitor.track(order, instrument)
+        clock.advance(61)
+        broker.observe(tick(instrument, clock, last="45000", low="44000"))
+
+        real_cancel = broker.cancel
+        failures = [VenueError("503 on cancel")]
+
+        async def flaky_cancel(order_ref: OrderRef) -> object:
+            if failures:
+                raise failures.pop()
+            return await real_cancel(order_ref)
+
+        monkeypatch.setattr(broker, "cancel", flaky_cancel)
+
+        with pytest.raises(VenueError):
+            await monitor.poll()
+        assert ledger.position(instrument.key).qty == Decimal("0.2")
+
+        await monitor.poll()
+
+        assert ledger.position(instrument.key).qty == Decimal("0.2"), "booked once, not twice"
+        settled = monitor.tracked[0]
+        assert settled.state is OrderState.EXPIRED
+        assert settled.filled_qty == Decimal("0.2")
+
 
 class TestBooking:
     async def test_polling_twice_does_not_book_a_fill_twice(
