@@ -442,8 +442,9 @@ Both files sit beside the CSVs as `decision_lab-coverage.json` and
 **These two stores still have no corpus.** `data\history` is **2024-01-01 → 06-30** and corpus
 `8ac130d8…` is exactly that window at 8h (540 cycles), so the year that has a corpus is 2024 while
 the news year is 2025. What remains is the reference pass itself — and at 8h over a full year that
-is **~1 095 cycles**, the same size as the two dead partial corpora, carrying the §5 intra-cycle
-race with no `--seed` to pin it (`corpus build` has none; only `dataset days` and `sweep` do). That
+is **~1 095 cycles**, the same size as the two dead partial corpora, no longer threatened by §5's
+intra-cycle race (closed 2026-10-29, ADR 0030), but with no `--seed` to pin it (`corpus build` has
+none; only `dataset days` and `sweep` do) and so free to auto-pause before the calibration days. That
 is a decision, not a formality — see *What comes next*.
 
 Rules that are easy to get backwards, all of them learned the expensive way:
@@ -609,8 +610,11 @@ the seats first" should say so on its face.
   and `d7c390c6…` at 118/1080, the latter still holding `-wal`/`-shm` from the pass that died. A
   corpus is reused at its identity and never rebuilt, so a partial one persists until the
   directory is removed — which is the only way to retry that configuration.
-- **`STUB_SEED = 2024` is pinned** in `test_slice_b_end_to_end.py` because a reference pass can die
-  on [KNOWN_GAPS](../docs/KNOWN_GAPS.md) §5. Delete the pin when §5 closes.
+- **`STUB_SEED = 2024` is still pinned** in `test_slice_b_end_to_end.py`, but no longer because of
+  [KNOWN_GAPS](../docs/KNOWN_GAPS.md) §5, which closed 2026-10-29 (ADR 0030; unpinned over seeds
+  0-6 and 2024 nothing reached `exceeds holding`). Seeds 0, 2, 3 and 6 fail six calibrate/sweep
+  tests with exit 6, because the unseeded reference pass auto-pauses on `max_consecutive_losses`
+  before the calibration days. Delete the pin when `corpus build` gains `--seed`.
 - **The gate is keyed on `(dataset_digest, matrix_digest, dayset_digest)`, deliberately not on
   `corpus_id`.** Every condition it checks is a property of the candidates, the seats and the
   days, so keying on the corpus would force a re-calibration each time the long run varied
@@ -727,20 +731,12 @@ interruption a nine-session run had.
 
 ### What comes next
 
-1. **Finish [KNOWN_GAPS](../docs/KNOWN_GAPS.md) §5 — the half a replay actually hits.** The
-   *between-cycle* half closed on 2026-09-21: `Supervisor._poll_orders` polls on the resync sweep,
-   and `ManualCloser` polls its own close, so a venue-held stop that fires overnight is booked
-   within thirty seconds instead of waiting for some basket to trade. **That does nothing for this
-   tool**, and the distinction is worth keeping straight: `BacktestHarness._replay` drives
-   `worker.cycle()` directly and polls only *after* it, so a replay has no sweep between two
-   cycles. The race that kills a reference pass is inside one — freezing the snapshot reads
-   prices, which hands the bar to the simulated venue and can match a resting stop right then, and
-   nothing polls between that and the panel sizing its SELL against a ledger that has not booked
-   it. `sell of … exceeds holding …`, three seeds in seven. Closing it means a poll between the
-   snapshot and the decision, which changes the live money path's ordering and its per-cycle venue
-   cost — a decision of its own. Until it is taken, every `corpus build` and every `calibrate long`
-   still carries the risk, `calibrate long` still has neither a budget nor a resume, and the
-   `STUB_SEED = 2024` pin in `test_slice_b_end_to_end.py` stays.
+1. **KNOWN_GAPS §5 is closed, both halves** ([ADR 0030](../docs/adr/0030-a-reconciling-poll-precedes-the-position-read.md)).
+   A snapshot now books what its own reads made the simulated venue do before it reads a holding,
+   so `corpus build` and `calibrate long` no longer die on `exceeds holding`. Any other unbookable
+   fill halts the basket and ends the pass short rather than crashing it. `calibrate long` still
+   has neither a budget nor a resume, and a reference pass can still auto-pause early, which is why
+   the `STUB_SEED = 2024` pin stays.
 2. **Calibrate against a real panel and then sweep it**, once `OPENROUTER_API_KEY` exists. The cost
    projection on the calibration page is what tells you what the sweep after it will cost — the
    whole point of running the nine days first. **Verify the model ids first:** the three `:free`
@@ -756,7 +752,7 @@ interruption a nine-session run had.
      8 760/8 760 bars per series and the day set is pinned at `cf2a3eab…`. What is left is the
      reference pass itself, which carries its own §10.6 gate and needs no key — but at 8h over a
      full year it is **~1 095 cycles**, unseeded, and both prior passes of that size died short.
-     Weigh closing §5's intra-cycle half first.
+     §5 no longer threatens it.
    - **The real summarising run** - the operator's own separate process over the stored bodies,
      the only piece wanting an LLM key. Verify the model id, price it with `--dry-run` and a
      `--limit 50` batch, then run `--limit 1000` batches; the plan's *When the real key arrives*

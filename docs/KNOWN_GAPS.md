@@ -9,7 +9,7 @@ The house rule applies to reading this file too: **fail-closed is not the same a
 these resolve in the fail-closed direction and are still on this list, because a system that stops
 doing something for a reason nobody can name is an incident.
 
-Five passes so far:
+Six passes so far:
 
 - **§1–3, the instrument-universe seam** (2026-08-19). None is caused by the two fixes that shipped
   alongside them ([marketdata/synthetic.py](../tradebot/marketdata/synthetic.py), the live
@@ -25,11 +25,16 @@ Five passes so far:
   the fix had to reason about and then leave alone. §5 and §6 are the parts of the same seam
   that monitor-side scope deliberately excludes; §7 and §8 are what an operator is actually
   told when the discrepancy §6 can cause is the one that gets caught. **§5 has since been
-  fixed** — see *Closed* below, including the half of its seam the fix does not reach.
+  fixed, both halves** — see *Closed* below.
 - **§9, found while closing gap 4** (2026-08-28). Verifying the fix on the reference pass that
   found the original defect turned up the one class of group it cannot reach — not a new defect,
   the fix's own documented boundary, written up because it is the exact shape of the thing §4
   closed and now waits on a migration instead.
+- **§10–17, found while closing §5's intra-cycle half** (2026-10-29). Recorded, not fixed: the
+  neighbours the fix had to reason about and leave alone, listed in
+  [ADR 0030](adr/0030-a-reconciling-poll-precedes-the-position-read.md)'s follow-ups. Two defects
+  found on the way — the simulated venue filling both legs of one OCO, and the monitor handing a
+  new entry's shares to a finished group — were fixed in the same branch and are in *Closed*.
 
 | # | Gap | Reaches | Direction |
 |---|---|---|---|
@@ -40,6 +45,14 @@ Five passes so far:
 | 7 | The mismatch alert names no instrument and no quantity | live · paper | fires, but says too little |
 | 8 | The kill-switch reason carries the explained lines and no absolute figures | every mode | fires, but says too little |
 | 9 | A group adopted at startup carries no protective plan, so the position-tracking fix cannot resize or cancel its legs | live · paper · sim | fails closed, at the venue |
+| 10 | A cancel the venue refused is recorded as terminal | live · paper on a venue | fails open: a fill is lost to the monitor |
+| 11 | `SimBroker` accepts a SELL beyond free base | sim · paper (primary venue) | fails open: evidence the venue would have refused |
+| 12 | The sim does not model Binance's stop and OCO price-ordering rejections | sim · paper (primary venue) | fails open: evidence the venue would have refused |
+| 13 | A poisoned retry of a multi-fill order can re-book earlier fills | every mode | fails open: a holding that is wrong |
+| 14 | `run --once` no longer polls sibling baskets' groups | every mode | fails closed: books late |
+| 15 | Settled plan-less filled groups stay in the monitor's tracked set | every mode | leaks, harmlessly so far |
+| 16 | A ratchet shortfall is a warning log and nothing else | live · paper · sim | fires, but says too little |
+| 17 | Poison is alerted late, and a poisoned group blocks a manual close | every mode | fails closed, and traps |
 
 ---
 
@@ -232,14 +245,23 @@ stand aside for.
 insufficient free funds: `submit` rejects exactly one thing, a duplicate `client_order_id`, and
 free balance is allowed to go negative. So the simulated venue cannot express this, and paper's
 primary venue **is** `SimBroker` (ADR 0020). Derived from the venue's documented semantics rather
-than observed — live has never run.
+than observed — live has never run. Consequently every discretionary partial exit in soak evidence
+and in `decision_lab` corpora so far was made against reserved coins, which live Binance would have
+refused; whether that evidence still counts is the operator's call. Making `SimBroker` refuse it
+(the memo's Option E, §11 below) must ship with this section's fix ([ADR 0030](adr/0030-a-reconciling-poll-precedes-the-position-read.md)).
 
 **Reach.** Live, and paper only when `--broker binance` puts orders at the testnet. Not sim.
 
 **To close it.** Cancel the instrument's resting protective legs before submitting a discretionary
 exit, then let the monitor re-arm whatever remains. The unprotected window between the two is real
 and has to be argued for rather than discovered — though it is the same window `_replace_legs`
-already opens on every resize, which is a precedent rather than an excuse.
+already opens on every resize, which is a precedent rather than an excuse. It also widens §10's
+window — a cancel the venue refuses is still recorded as terminal — so that fix has to land first
+or with this one.
+
+*Seen again, 2026-10-29.* The reference-pass RCA found a panel SELL submitted while the group's legs
+still locked the whole holding (seq 7723; the legs were cancelled afterwards, 7726-7727), which
+Binance would have refused for insufficient balance. It is this entry, not a new one.
 
 ---
 
@@ -383,6 +405,122 @@ branch that closed the entry below. See it for the fix this sits beside.
 
 ---
 
+## 10. A cancel the venue refused is recorded as terminal
+
+**Where** — [service.py `cancel`](../tradebot/execution/service.py) ignores `ack.cancelled=False`
+and advances the order to `CANCELLED`, a terminal state; `ExecutionMonitor._sync` never re-reads a
+terminal order. A stop that fills between a poll's sync and `_replace_legs`'s cancel therefore loses
+its fill — `BinanceSpotBroker.cancel`'s promise that "the monitor's next sweep books the fill"
+cannot hold — and only the reconciler finds it later, as a `MISMATCH`.
+
+**To close it.** On `cancelled=False`, re-sync the order instead of advancing it. Any fix to §6
+(cancel legs before an exit) widens this window and must land with it.
+
+---
+
+## 11. `SimBroker` accepts a SELL beyond free base
+
+**Where** — [sim.py `_reserve`](../tradebot/execution/brokers/sim.py) lets free base go negative;
+`submit` rejects only a duplicate `client_order_id`. Binance rejects the same order for
+insufficient balance.
+
+The sim's only guard is at *settle* time (`_fill` raises `FailClosedError` rather than drive the
+venue's base negative, added with the OCO fix). That is defence in depth, not the venue's
+behaviour, and it is reachable from a MARKET submit: the order is registered before it settles, so
+a refusal leaves an orphan OPEN order with locked base. It needs the ledger and the sim to have
+diverged first, which is why nothing has met it.
+
+**To close it** (the memo's Option E). Reject at submit when free base is short. It must ship with
+§6's fix or it refuses every exit while protective legs rest, and it **re-baselines every soak and
+corpus**, which is a decision for the operator rather than a change to make quietly.
+
+---
+
+## 12. The sim does not model Binance's stop and OCO price-ordering rejections
+
+**Where** — [sim.py](../tradebot/execution/brokers/sim.py) accepts a SELL stop at or above the
+touch and an OCO whose prices are not `take-profit limit > last > stop`. Binance refuses both
+("would immediately trigger"; -2010).
+
+Seen in the reference-pass RCA: a resurrected group's SELL stop, placed above the market, was
+accepted by the sim, armed on the next bar and rested as a second take-profit. The resurrection is
+fixed; the sim would still accept the next stale price a plan produced, where live would reject it.
+
+**To close it.** Reject both at submit, with the venue's error class, and add them to the contract
+suite so the wire fakes agree.
+
+---
+
+## 13. A poisoned retry of a multi-fill order can re-book earlier fills
+
+**Where** — [monitor.py](../tradebot/execution/monitor.py) retries a poisoned group every poll and
+re-reads its order's fills; the [ledger](../tradebot/ledger/) books a fill without a dedupe by fill id.
+
+If one fill of a multi-fill order was booked and a later one refused, the retry presents both
+again. ADR 0030 does not claim fills "book exactly once", and neither should anything downstream.
+Pre-existing in the ledger; the poison path is simply the first thing to retry on purpose.
+
+**To close it.** Dedupe by `(order, fill id)` in the ledger, or advance the group past fills it has
+booked.
+
+---
+
+## 14. `run --once` no longer polls sibling baskets' groups
+
+**Where** — [basket_runner.py](../tradebot/control/basket_runner.py). A basket's post-order poll was
+unscoped, so under `run --once` it incidentally settled every other basket's groups. The poll is
+now scoped to the basket's instruments (ADR 0026 gives them to no one else).
+
+A supervised process has the resync sweep. A `--once` run does not, and relies on startup to
+resolve what a sibling's groups did. Fails closed — fills book late, never wrongly.
+
+**To close it.** Only if `--once` is ever used across baskets for more than a smoke run.
+
+---
+
+## 15. Settled plan-less filled groups stay in the monitor's tracked set
+
+**Where** — [monitor.py](../tradebot/execution/monitor.py) `_tracked`. A group released by the
+poll that settles it is forgotten with a record (`group_retired`, `group_closed`, `group_lapsed`).
+A filled group *without* a protective plan — a panel SELL that rested to a later sweep, a manual
+close (`ManualCloser` never prunes) — has no leg to close it and no cycle to prune it.
+
+Each costs a dictionary entry and an empty scoped poll. Nothing reads them wrongly, because an
+entitlement of zero claims no shares. Recorded so that a long-lived process's growth is explained.
+
+**To close it.** Forget a terminal, plan-less group in the poll that observes it terminal.
+
+---
+
+## 16. A ratchet shortfall is a warning log and nothing else
+
+**Where** — [monitor.py `_entitle`](../tradebot/execution/monitor.py). When the instrument's holding
+exceeds the groups' summed entitlements, the surplus is unguarded and is logged once per figure at
+`WARNING`. No `RISK_EVENT` is written, so the event log alone cannot say the position was partly
+bare, which breaks the convention that the log reconstructs state.
+
+**To close it.** Record it as `unprotected_position` does, deduplicated the same way.
+
+---
+
+## 17. A poisoned group is alerted late, and blocks a manual close
+
+**Where** — [monitor.py](../tradebot/execution/monitor.py), [manual_close.py](../tradebot/control/manual_close.py).
+
+* The poison is raised only to a caller scoped to it. The supervisor's unscoped sweep records one
+  `RISK_EVENT` (`unbookable_fill`) and halts nothing; the owning basket halts at its next scoped
+  poll. A **paused** basket never re-polls scoped, so the halt — and the alert it carries — waits
+  until it cycles.
+* A manual close of that instrument raises the poison, **deliberately**: the ledger is known wrong
+  about the holding it would size from. The operator's route out is the reconciler or the venue.
+  The cost is that the one act reserved for a human is refused in the situation most likely to
+  need it.
+
+**To close it.** A halt (or alert) from the sweep itself, and a stated operator path for a
+poisoned group that does not wait on a cycle.
+
+---
+
 ## Closed — the maintenance audit's four (2026-08-23)
 
 All four were in `tradebot/maintenance/`, which never touches the money path; none could cause or
@@ -478,7 +616,7 @@ rather than between two.
 `orders` projection has no column for one — so the resize path above cannot see it. §9 records the
 boundary; the original defect survives a restart for exactly those groups.
 
-## Closed — the monitor polls between cycles (2026-09-21)
+## Closed — the monitor polls between cycles (2026-09-21), and inside them (2026-10-29)
 
 **5 — everything the monitor owned advanced only when some basket placed an order.** `poll()` had
 exactly two production callers: `BasketRunner._settle`, which returns *before* polling when the
@@ -538,17 +676,56 @@ none of those three can see *which* monitor the composition root handed the supe
 one would poll an empty set for ever and look identical — `tests/scenario/test_full_cycle.py`
 asserts it is the process's own.
 
-**What the fix does not reach**, and it is the half that costs `decision_lab` its reference passes.
-The hazard inside a *single* cycle is untouched: freezing the snapshot reads prices, which on the
-simulated stack hands the bar to the venue and can match a resting stop right then — and the panel
-then sizes a SELL against a ledger that has not booked it, which `Ledger._apply_sell` refuses as
-ledger corruption. Nothing between the freeze and the sizing polls. A running process is largely
-covered by the 30-second sweep having already been round, but `BacktestHarness._replay` drives
-`worker.cycle()` directly and polls only *after* it, so a replay has no such sweep and reaches the
-race on its own data read. Closing that means a poll between the snapshot and the decision, which
-changes the live money path's ordering and its per-cycle venue cost — a decision of its own, not a
-consequence of this one. Until it is taken, `STUB_SEED = 2024` stays pinned in
-`decision_lab/tests/test_slice_b_end_to_end.py`.
+**The intra-cycle half closed on 2026-10-29** ([ADR 0030](adr/0030-a-reconciling-poll-precedes-the-position-read.md)).
+The paragraph that stood here said a running process was "largely covered by the 30-second sweep
+having already been round". **That was wrong on a `SimBroker` stack** — sim, a replay, and paper,
+whose primary venue is `SimBroker`. That venue matches resting orders only when `stack.prices` is
+read, which only a snapshot and a manual close do; the sweep reads `read_only_prices`, so it can
+only book what a cycle's own read has already matched, after that cycle has sized. A paper soak
+was exactly as exposed as a replay.
+
+`ContextBuilder.build` now reads every instrument's market data, polls the process's monitor
+scoped to the basket's instruments, and only then reads positions; `ManualCloser` does the same
+(quote, poll, position). One unbookable fill no longer wedges the monitor: it poisons its own
+group, is recorded once (`RISK_EVENT`, `unbookable_fill`), stays tracked, and raises only to a
+caller scoped to it. Tests: the third scenario in `test_protective_resize.py`, `TestSettleHook`,
+`TestScopedPoll`, `TestAnUnbookableFillIsContained`, the replay in `test_backtest.py`, and
+`TestUnbookableFill` in `test_chaos.py`. In live a stop can still fill during deliberation; the
+resting leg reserves the coins there, so the SELL is refused rather than overselling (ADR 0030).
+
+**Two more defects surfaced on the reference pass that tried the fix, and were closed with it**
+(RCA: [2026-10-28-oco-double-fill-and-group-resurrection-rca.md](superpowers/specs/2026-10-28-oco-double-fill-and-group-resurrection-rca.md)).
+Neither is the §5 race, and the pass halted on one of them at cycle 377.
+
+* **`SimBroker` filled both legs of one OCO.** `observe` matched a snapshot of the working orders
+  taken before any of them filled, so a bar reaching both legs filled the stop, cancelled and
+  unlocked the take-profit, and then filled the take-profit anyway: the venue ended short and the
+  ledger refused the second fill. Sim-only (Binance expires the sibling atomically), but severe
+  there — it corrupts what a paper soak reports. `observe` now re-checks `is_open` at each order's
+  turn, and settling a SELL beyond the base the sim holds raises `FailClosedError`.
+* **The monitor gave a finished group the next entry's shares.** A group emptied by a discretionary
+  SELL kept its `filled_qty` as its entitlement, ranked first on its months-old (tighter) stop,
+  and re-placed old legs at old prices against the new position. **Live-relevant**: on Binance
+  those prices are refused (-2010) and the new position stays bare while the dead group exists.
+  Entitlement now ratchets: it grows only with the group's own entry fills and never grows back,
+  shares are allocated from `held` alone (a resting SELL that expires lets its group re-arm), and a
+  spent group is retired — legs cancelled, one `RISK_EVENT`, forgotten. A group closed by its own
+  leg, or an entry that lapsed unfilled, after its creating cycle had pruned is released by the
+  poll that settles it. Each of the three exits records a `RISK_EVENT` (`protective_group` /
+  `group_retired`; `tracked_group` / `group_closed` or `group_lapsed`); a released group stays
+  visible through `tracked` until the next poll so the cycle reading straight after it sees it
+  settled.
+
+**Soak and corpus evidence gathered before this landed is suspect twice over.** The race could kill
+a pass or leave a basket sizing against a ledger the venue had already moved past, and the sim
+could hold a short its ledger refused. Whether those cycles still count is the operator's call.
+
+**`STUB_SEED = 2024` stays pinned in `decision_lab/tests/test_slice_b_end_to_end.py`, for a new
+reason.** Unpinned over seeds 0-6 and 2024, no pass reached `exceeds holding` or a poisoned group —
+§5 no longer threatens it. But seeds 0, 2, 3 and 6 fail six calibrate/sweep tests with exit 6: an
+unseeded `varied-*` reference pass legitimately auto-pauses on `max_consecutive_losses` before the
+calibration days, so no rows exist (4 of 8 measured seeds). The pin buys a pass that reaches those
+days; it goes when `corpus build` gains `--seed`, or the fixture stops depending on that.
 
 ## What was checked and found sound
 

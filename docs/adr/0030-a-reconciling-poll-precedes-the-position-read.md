@@ -47,8 +47,18 @@ that cycle has sized.
   tracked and is retried every poll, and the poison is raised only to a caller whose scope contains
   that group. An unscoped poll — the supervisor's sweep, the backtest harness — never raises for it.
   The fill is never dropped; it books on the first poll after the holding allows it. The ledger has
-  no dedupe, so a multi-fill order whose poll is retried can re-book fills it had already booked;
-  that is pre-existing behaviour, not one this ADR introduces.
+  no dedupe by fill id, so a multi-fill order whose poll is retried can re-book fills it had already
+  booked (KNOWN_GAPS §13); that is pre-existing behaviour, not one this ADR introduces, and nothing
+  here claims fills "book exactly once".
+- **Two defects the first reference pass through the fix exposed are closed with it** (RCA
+  2026-10-28). `SimBroker.observe` re-checks that an order is still open at its turn, so a venue
+  OCO's cancelled sibling cannot fill in the same observation, and the sim refuses to settle a SELL
+  beyond the base it holds (`FailClosedError`). And `ExecutionMonitor` gives each group an
+  *entitlement* that grows only with its own entry fills and never grows back, allocated from
+  `held` alone: a group whose holding was sold away is retired (legs cancelled, `RISK_EVENT`
+  `protective_group` / `group_retired`) instead of claiming the next entry's shares at its
+  months-old prices. A group closed by its own leg, or an entry that lapsed unfilled, is likewise
+  released by the poll that settles it (`tracked_group` / `group_closed`, `group_lapsed`).
 
 ## Consequences
 
@@ -67,9 +77,16 @@ that cycle has sized.
   SELL is *rejected* rather than overselling, and the stop's fill then books cleanly (from venue
   documentation; live has never run). A poll placed immediately before sizing (the memo's Option
   B) could be added on top if that window ever matters.
-- A pass of `decision_lab` that would have died on `exceeds holding` no longer reaches that state;
-  if some other unbookable fill appears, it ends the pass short (basket halted) rather than
-  crashing it.
+- A pass of `decision_lab` that died on `exceeds holding` no longer does: measured unpinned over
+  eight seeds (0-6 and 2024), none reached that error, an `UnbookableFillError` or a poisoned group.
+  If some other unbookable fill appears, it ends the pass short (basket halted) rather than
+  crashing it. That is *not* the same as a reference pass being reliable — an unseeded `varied-*`
+  pass still auto-pauses on `max_consecutive_losses` about half the time (4 of those 8 seeds), which
+  is why `STUB_SEED` stays pinned, for that reason and no longer for this one.
+- **The settle guard is a spot-venue argument.** "A SELL never settles beyond the holding" holds on
+  Binance spot and on an Alpaca cash account. A margin or short-capable Alpaca account could
+  legitimately hold a negative base; if one is ever wired, the ledger refusal and the sim's settle
+  guard both need revisiting, because they would turn a legal short into a poisoned group.
 
 ## Follow-ups, deliberately not done here
 
