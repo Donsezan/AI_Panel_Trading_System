@@ -456,9 +456,19 @@ suite so the wire fakes agree.
 **Where** — [monitor.py](../tradebot/execution/monitor.py) retries a poisoned group every poll and
 re-reads its order's fills; the [ledger](../tradebot/ledger/) books a fill without a dedupe by fill id.
 
-If one fill of a multi-fill order was booked and a later one refused, the retry presents both
-again. ADR 0030 does not claim fills "book exactly once", and neither should anything downstream.
-Pre-existing in the ledger; the poison path is simply the first thing to retry on purpose.
+What protects against a double booking is the order the monitor keeps: `new_fills` dedupes against
+the fills already on it, so any path that books a fill and then loses the order carrying it re-books
+that fill on the next poll. Two such paths are closed. A refused fill keeps the fills booked before
+it (`UnbookableFillError.partial_order`), and the TTL-cancel path is closed: a sync that booked
+fills and was then followed by a cancel that failed — a single 5xx was enough — used to leave the
+group holding the pre-sync order. `_sync_group` now keeps the synced order before attempting the
+cancel (final review I3, 2026-10-29).
+
+What remains is the poisoned-retry case, plus any other failure *inside* `ExecutionService.apply`
+after a fill was booked (for example the store append in `_adopt_state`): those raise without an
+order to keep, so the retry presents the booked fills again. ADR 0030 does not claim fills "book
+exactly once", and neither should anything downstream. Pre-existing in the ledger; the poison path
+is simply the first thing to retry on purpose.
 
 **To close it.** Dedupe by `(order, fill id)` in the ledger, or advance the group past fills it has
 booked.
@@ -511,10 +521,12 @@ bare, which breaks the convention that the log reconstructs state.
   `RISK_EVENT` (`unbookable_fill`) and halts nothing; the owning basket halts at its next scoped
   poll. A **paused** basket never re-polls scoped, so the halt — and the alert it carries — waits
   until it cycles.
-* A manual close of that instrument raises the poison, **deliberately**: the ledger is known wrong
-  about the holding it would size from. The operator's route out is the reconciler or the venue.
-  The cost is that the one act reserved for a human is refused in the situation most likely to
-  need it.
+* A manual close of that instrument is refused, **deliberately** — fail-closed, and recorded as a
+  `manual_close` `refused` `RISK_EVENT` naming the poison: the ledger is known wrong about the
+  holding it would size from. Only that instrument: the close polls the one instrument it sizes
+  from, so a sibling's poison does not refuse it (final review I1). The operator's route out is
+  the reconciler or the venue. The cost is that the one act reserved for a human is refused in the
+  situation most likely to need it.
 
 **To close it.** A halt (or alert) from the sweep itself, and a stated operator path for a
 poisoned group that does not wait on a cycle.
@@ -609,8 +621,8 @@ leg still `open`, and the quantity refused is that leg's full size, not a resize
 already matched at the venue on the same bar the panel's own reducing order was sized against, and
 the monitor's next poll — which runs after a cycle's own order, not before it — was what tried to
 book it, against a ledger that had moved on in between. That is §5's mechanism, not this one — and
-it is the half of §5 that the fix below does *not* reach, because it happens inside one cycle
-rather than between two.
+it is the half of §5 this fix did not reach (closed since, ADR 0030), because it happens inside
+one cycle rather than between two.
 
 **What the fix does not reach.** A group adopted at startup carries no `ProtectivePlan` — the
 `orders` projection has no column for one — so the resize path above cannot see it. §9 records the
@@ -711,8 +723,8 @@ Neither is the §5 race, and the pass halted on one of them at cycle 377.
   shares are allocated from `held` alone (a resting SELL that expires lets its group re-arm), and a
   spent group is retired — legs cancelled, one `RISK_EVENT`, forgotten. A group closed by its own
   leg, or an entry that lapsed unfilled, after its creating cycle had pruned is released by the
-  poll that settles it. Each of the three exits records a `RISK_EVENT` (`protective_group` /
-  `group_retired`; `tracked_group` / `group_closed` or `group_lapsed`); a released group stays
+  poll that settles it. Each of the three exits records a `RISK_EVENT` under rule `tracked_group`
+  (`group_retired`, `group_closed` or `group_lapsed`); a released group stays
   visible through `tracked` until the next poll so the cycle reading straight after it sees it
   settled.
 

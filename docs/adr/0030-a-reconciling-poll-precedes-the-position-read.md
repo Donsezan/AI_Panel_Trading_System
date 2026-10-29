@@ -34,14 +34,24 @@ that cycle has sized.
   hook, then reads every position.** The runner supplies the hook: a poll of the process's one
   `ExecutionMonitor`, scoped to the basket's instrument keys (ADR 0026 means no other basket's
   group sits on them). The frozen snapshot is then truthful about what is held.
-- **`ManualCloser._proposal` does the same:** quote → scoped poll → position.
+- **`ManualCloser._proposal` does the same:** quote → scoped poll → position. Its scope is the one
+  instrument being closed, not the basket: that is the only holding the close sizes from, so a
+  poisoned group or a venue error on a sibling instrument does not refuse it. Any failure of that
+  poll, classified or not, is a fail-closed refusal naming the instrument and recorded as a
+  `manual_close` `refused` `RISK_EVENT`.
 - **The same code runs in every mode, live included** (ADR 0020). A separate replay-only fix
   would mean a replay no longer exercises the thing a soak runs.
 - **A poll failure is the worker's existing failure path.** A `RetryableError` propagates out of
   `run_once` to the worker's backoff, exactly as a failed submit does; a `FailClosedError` ends the
-  cycle `FAILED` and halts the basket. Either way: no snapshot, no decision, no order.
+  cycle `FAILED` and halts the basket. Either way, a failure of the settle hook — which runs
+  *before* the position read — means no snapshot, no decision, no order. The same scoped poll runs
+  again in `BasketRunner._settle`, *after* the cycle's orders were submitted, and fails the same
+  way — a poison or a fail-closed error ends the cycle `FAILED` and halts the basket, a retryable
+  one goes to the backoff — but the orders are already at the venue (tracked, and polled on). A `FAILED` cycle is therefore not evidence
+  that nothing was placed; its `ORDER_SUBMITTED` events are.
 - **`ExecutionMonitor.poll` isolates failures per group.** It syncs every group in scope, collects
-  errors, still maintains the healthy groups, and re-raises the first error afterwards.
+  errors, still maintains the healthy groups, and afterwards re-raises the most severe one, so a
+  fail-closed error is never masked by a retryable one.
 - **A group whose fill the ledger refuses is poisoned.** One `RISK_EVENT`
   (`rule: unbookable_fill`, naming the order, the quantity and the holding), the group stays
   tracked and is retried every poll, and the poison is raised only to a caller whose scope contains
@@ -49,14 +59,20 @@ that cycle has sized.
   The fill is never dropped; it books on the first poll after the holding allows it. The ledger has
   no dedupe by fill id, so a multi-fill order whose poll is retried can re-book fills it had already
   booked (KNOWN_GAPS §13); that is pre-existing behaviour, not one this ADR introduces, and nothing
-  here claims fills "book exactly once".
+  here claims fills "book exactly once". The ordinary trigger of the same re-booking — a sync that
+  booked fills, followed by a TTL cancel that failed — is closed: the synced order is kept before
+  the cancel is attempted.
+- **Startup contains it too.** An open order whose fill the ledger refuses during recovery is
+  tracked poisoned through `ExecutionMonitor.adopt_poisoned` (one `group_poisoned` `RISK_EVENT`)
+  and the recovery continues with the rest. The owning basket halts at its first scoped poll; the
+  process stays startable, and every other instrument stays closable.
 - **Two defects the first reference pass through the fix exposed are closed with it** (RCA
   2026-10-28). `SimBroker.observe` re-checks that an order is still open at its turn, so a venue
   OCO's cancelled sibling cannot fill in the same observation, and the sim refuses to settle a SELL
   beyond the base it holds (`FailClosedError`). And `ExecutionMonitor` gives each group an
   *entitlement* that grows only with its own entry fills and never grows back, allocated from
   `held` alone: a group whose holding was sold away is retired (legs cancelled, `RISK_EVENT`
-  `protective_group` / `group_retired`) instead of claiming the next entry's shares at its
+  `tracked_group` / `group_retired`) instead of claiming the next entry's shares at its
   months-old prices. A group closed by its own leg, or an entry that lapsed unfilled, is likewise
   released by the poll that settles it (`tracked_group` / `group_closed`, `group_lapsed`).
 
