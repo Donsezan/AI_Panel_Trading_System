@@ -35,7 +35,7 @@ from tradebot.core.enums import (
     OrderState,
     Side,
 )
-from tradebot.core.errors import ConfigError, UnbookableFillError
+from tradebot.core.errors import ConfigError, FailClosedError, UnbookableFillError, VenueError
 from tradebot.core.events import EventType
 from tradebot.core.orders import Fill, Order
 from tradebot.dashboard.dock import KILL_PHRASE, QUARANTINE_CONFIRM
@@ -812,8 +812,117 @@ async def test_a_close_over_an_unbookable_fill_is_refused_and_sends_nothing(
     cross_the_stop(cycled, BTC, clock)
     sent = len(events_of(cycled, EventType.ORDER_SUBMITTED))
 
-    with pytest.raises(UnbookableFillError, match="exceeds holding"):
+    with pytest.raises(FailClosedError, match="could not confirm the holding") as refused:
         await cycled.manual_close.close("demo", BTC, actor="test")
 
+    assert "exceeds holding" in str(refused.value), "the reason names the unbookable fill"
     assert len(events_of(cycled, EventType.ORDER_SUBMITTED)) == sent
     assert risk_events(cycled, "unbookable_fill")
+    assert risk_events(cycled, "manual_close")[-1].payload["action_taken"] == "refused"
+
+
+def poison_by_stop(application: Application, instrument_key: str, clock: ManualClock) -> None:
+    """Half the holding sold elsewhere, then the stop fills its full size: unbookable."""
+    base = instrument_key.split(":")[1].split("/")[0]
+    held = application.ledger.position(instrument_key).qty
+    application.ledger.apply_fill(
+        Fill(
+            fill_id=f"external-{base}",
+            client_order_id="elsewhere",
+            instrument_key=instrument_key,
+            side=Side.SELL,
+            qty=held / 2,
+            price=Decimal("50000"),
+            filled_at=clock.now(),
+        ),
+        base_currency=base,
+        quote_currency="USDT",
+    )
+    cross_the_stop(application, instrument_key, clock)
+    # The trough armed the stop; a rebound through its limit fills it — at its full size.
+    high = Decimal(10_000_000)
+    application.monitor._broker.observe(  # type: ignore[attr-defined]
+        Tick(
+            instrument_key=instrument_key,
+            bid=high,
+            ask=high,
+            last=high,
+            high=high,
+            low=high,
+            covers_since=clock.now(),
+            observed_at=clock.now(),
+        )
+    )
+
+
+async def test_a_poisoned_sibling_does_not_refuse_the_close_of_another_instrument(
+    cycled: Application, clock: ManualClock
+) -> None:
+    """Final review I1: the close sizes from one holding, so it polls that one instrument.
+
+    Scoped to the basket, ETH's unbookable stop fill refused the operator's close of BTC — the
+    one act reserved for a human, refused for a reason that had nothing to do with it.
+    """
+    eth = "sim:ETH/USDT"
+    poison_by_stop(cycled, eth, clock)
+    with pytest.raises(UnbookableFillError):
+        await cycled.monitor.poll(frozenset({eth}))
+
+    outcome = await cycled.manual_close.close("demo", BTC, actor="test")
+
+    assert outcome.submitted
+    sent = len(events_of(cycled, EventType.ORDER_SUBMITTED))
+    with pytest.raises(FailClosedError, match=f"could not confirm the holding in {eth}"):
+        await cycled.manual_close.close("demo", eth, actor="test")
+    assert len(events_of(cycled, EventType.ORDER_SUBMITTED)) == sent, "ETH still refuses"
+
+
+@pytest.mark.parametrize(
+    ("problem", "cause"),
+    [
+        (VenueError("503 from the venue"), "503 from the venue"),
+        (RuntimeError("disk I/O error"), "RuntimeError: disk I/O error"),
+    ],
+)
+async def test_a_failed_pre_close_poll_is_a_recorded_refusal(
+    cycled: Application,
+    monkeypatch: pytest.MonkeyPatch,
+    problem: Exception,
+    cause: str,
+) -> None:
+    """Final review Q(c): classified or not, it refuses fail-closed and says so in the log."""
+
+    async def failing_poll(instrument_keys: frozenset[str] | None = None) -> None:
+        raise problem
+
+    monkeypatch.setattr(cycled.monitor, "poll", failing_poll)
+    sent = len(events_of(cycled, EventType.ORDER_SUBMITTED))
+
+    with pytest.raises(FailClosedError) as refused:
+        await cycled.manual_close.close("demo", BTC, actor="test")
+
+    reason = f"close refused: could not confirm the holding in {BTC} with the venue ({cause})"
+    assert str(refused.value) == reason
+    assert len(events_of(cycled, EventType.ORDER_SUBMITTED)) == sent
+    recorded = risk_events(cycled, "manual_close")
+    assert [e.payload["action_taken"] for e in recorded][-2:] == ["requested", "refused"]
+    assert recorded[-1].payload["detail"] == reason
+
+
+async def test_an_unclassified_poll_failure_re_renders_the_workspace_not_a_500(
+    cycled: Application, client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def failing_poll(instrument_keys: frozenset[str] | None = None) -> None:
+        raise RuntimeError("disk I/O error")
+
+    monkeypatch.setattr(cycled.monitor, "poll", failing_poll)
+
+    response = await client.post(
+        "/control/close",
+        data={"basket_id": "demo", "instrument_key": BTC, "scope": "basket:demo"},
+    )
+
+    assert response.status_code == 200
+    assert "Not done" in response.text
+    assert f"could not confirm the holding in {BTC} with the venue" in response.text
+    assert "RuntimeError: disk I/O error" in response.text
