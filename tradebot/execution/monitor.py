@@ -218,6 +218,21 @@ class ExecutionMonitor:
         else:
             group.order = order
 
+    async def adopt_poisoned(
+        self, order: Order, instrument: Instrument, error: UnbookableFillError
+    ) -> None:
+        """Adopt an order whose fill the ledger refused before any poll reached it.
+
+        The startup recovery sequence's entry point (final review I2): `recover` books fills as
+        `sync` does, so the same refusal can surface there, before the monitor has ever seen the
+        order. It is contained exactly as a poll contains it — tracked, the fill left unbooked,
+        one `group_poisoned` `RISK_EVENT` — so the owning basket halts at its first scoped poll
+        and nothing else does. `order` is the one carrying every fill booked before the refusal.
+        """
+        async with self._polling:
+            self.track(order, instrument)
+            await self._poison(self._tracked[order.group_id], error)
+
     async def poll(self, instrument_keys: frozenset[str] | None = None) -> None:
         """One sweep: sync every working order, expire what is past its TTL, mind the groups.
 
