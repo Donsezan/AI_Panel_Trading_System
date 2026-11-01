@@ -203,6 +203,8 @@ async def test_an_unexpected_exception_is_written_and_raised(
     assert "injected escape" in meta.ending_reason
     # February never reached its month end, so the last good point is January.
     assert [m.label for m in meta.months] == ["2024-01"]
+    # February cycled and has no row, so it reads as not run: it is redone on a Continue.
+    assert pd.not_run_months(meta) == ("2024-02", "2024-03")
 
 
 async def test_a_rule_ended_run_is_reused_at_its_identity(
@@ -211,6 +213,7 @@ async def test_a_rule_ended_run_is_reused_at_its_identity(
     first = await execute(
         flat_data, tmp_path / "w", "2024-Q1", {}, before_cycle=trip_on(utc(1, 25))
     )
+    assert first.meta.ending is pd.RunEnding.RULE_ENDED
 
     async def refuse(**_: object) -> None:
         raise AssertionError("a finished run was wired again")

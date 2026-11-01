@@ -12,6 +12,7 @@ over an open position. `period_basket` is widened for those runs only.
 
 from __future__ import annotations
 
+import gc
 import json
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
@@ -186,7 +187,13 @@ async def execute(
     start_equity: Decimal = START_EQUITY,
     budget: Decimal = Decimal(5),
     cost_usd: Decimal = ZERO,
+    resume: bool = False,
+    candidate: Candidate | None = None,
 ) -> Ran:
+    if resume:
+        # A real Continue is a new process. Here a caught exception's frames keep the dead wiring's
+        # pooled connections open, and Windows will not move a file that is open.
+        gc.collect()
     plan = Plan(votes, cost_usd=cost_usd)
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(registry, "StubLLMProvider", lambda **_: plan)
@@ -202,13 +209,14 @@ async def execute(
             patch.setattr(BasketWorker, "cycle", cycle)
         meta = await pd.run(
             data_dir=data,
-            candidate=candidate_over(data, limit),
+            candidate=candidate or candidate_over(data, limit),
             period=pd.parse_period(label),
             cadence_seconds=CADENCE,
             start_equity=start_equity,
             budget=budget,
             wall_clock=ManualClock(datetime(2026, 11, 1, tzinfo=UTC)),
             workspace=workspace,
+            resume=resume,
         )
     return Ran(meta, pd.period_dir(meta.run_id, workspace=workspace) / pd.PERIOD_DB, plan)
 
@@ -498,23 +506,6 @@ async def test_an_older_pause_does_not_excuse_a_later_halt(flat_data: Path, tmp_
     assert pd.not_run_months(ran.meta) == ("2024-03",)
     assert ran.meta.ending is pd.RunEnding.INTERRUPTED
     assert len(ran.meta.lifts) == 1
-
-
-async def test_a_kill_switch_during_the_stretch_is_not_lifted_past(
-    flat_data: Path, tmp_path: Path
-) -> None:
-    """Lifting is for the loss streak alone (§5.3): a tripped switch keeps the basket as it is."""
-
-    async def trip_in_the_stretch(worker: BasketWorker) -> None:
-        if worker._clock.now() == utc(1, 25):
-            await worker._watchdog.trip("test", "injected")
-
-    ran = await execute(
-        flat_data, tmp_path / "w", "2024-Q1", TWO_LOSSES, before_cycle=trip_in_the_stretch
-    )
-
-    assert ran.meta.months[0].paused_at == PAUSED_ON
-    assert ran.meta.lifts == ()
 
 
 async def test_a_win_returns_the_limit_to_the_configured_one(

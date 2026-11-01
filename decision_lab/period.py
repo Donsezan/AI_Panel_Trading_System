@@ -29,11 +29,20 @@ boundary (with a month still to run), or an unexpected exception is `INTERRUPTED
 says nothing about the model. The exception is written and re-raised for the CLI's exit code. Months
 after an ending were not run, and `not_run_months` is how a reader knows: an absent month is never a
 quiet one.
+
+An interrupted run continues from its last month end (§5.7). A checkpoint that cannot be written
+raises `BackupError` and interrupts the run: going on would leave more to redo than the page
+promises. Continue never overwrites anything: the database it abandons stays beside the restored
+one as `period.db.abandoned-<stamp>`, and what that work spent still counts against the budget. A
+Continue whose budget is already spent refuses with `BudgetReached` before moving anything, and with
+no checkpoint at all it starts the period again.
 """
 
 from __future__ import annotations
 
+import json
 import re
+import shutil
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -41,11 +50,13 @@ from enum import Enum, StrEnum
 from pathlib import Path
 from typing import Final
 
+from sqlalchemy import inspect
+
 from decision_lab import registry
 from decision_lab.candidates import Candidate
 from decision_lab.corpus import config_digest
 from decision_lab.dataset import require_verified
-from decision_lab.longrun import Profit, VetoRow, profit_of, veto_breakdown
+from decision_lab.longrun import Profit, ProfitEvidence, VetoRow, profit_of, veto_breakdown
 from decision_lab.newsfeed import ArchiveNewsFeed
 from decision_lab.params import workspace_root
 from tradebot.app import Application, build_sim, dataset_catalogue
@@ -58,7 +69,10 @@ from tradebot.core.events import EventFactory, EventType
 from tradebot.core.logging import get_logger
 from tradebot.core.money import ZERO, to_decimal
 from tradebot.core.schema import DomainModel, Money, UtcDatetime
+from tradebot.execution.monitor import TRACKED_GROUP_RULE
+from tradebot.maintenance.backup import take_backup
 from tradebot.marketdata.recorder import ReplayDataset
+from tradebot.persistence.database import SingleWriter, open_database
 from tradebot.persistence.store import EventStore
 from tradebot.risk.aggregate import PortfolioAggregate
 from tradebot.risk.rules import AUTO_PAUSE_RULE
@@ -72,11 +86,28 @@ _BAR: Final = timedelta(hours=1)
 PERIOD_SYMBOL: Final = "BTC/USDT"
 PERIOD_DB: Final = "period.db"
 PERIOD_META: Final = "period.json"
+#: Beside a checkpoint's copy: the one piece of venue state the log does not record (§5.7).
+CHECKPOINT_ARMED: Final = "armed.json"
+CHECKPOINT_DIR: Final = "checkpoints"
+_CHECKPOINT_SCRATCH: Final = ".writing-"
 #: Who published a pause's two configuration versions, so the audit trail names this tool.
 ACTOR: Final = "decision_lab.period"
 #: The `RISK_EVENT` a lift appends. Namespaced because no rule of the bot's ever did this.
 PAUSE_LIFTED_RULE: Final = "decision_lab.pause_lifted"
 _BASKET_PAUSED: Final = "basket_paused"
+#: `RISK_EVENT`s that are never a refusal on any run, by rule and by the actions each may take. A
+#: new action under either rule stays on the table until someone says what it is.
+#:
+#: `valuation_basis` announces at a restart how equity compares with the high-water mark, and
+#: changes nothing: nothing was proposed, so nothing was refused. `tracked_group` is the monitor
+#: releasing a group it has finished with: retired, closed or lapsed, and no order is involved.
+#: Both are also what a Continue changes: a restart announces the one, and recovery adopts a group
+#: without its entry, so its release records none of the other (KNOWN_GAPS §18). A veto table
+#: holding either would differ between a continued run and an unbroken one for no decision's sake.
+_NOT_REFUSALS: Final[dict[str, frozenset[str]]] = {
+    "valuation_basis": frozenset({"recorded"}),
+    TRACKED_GROUP_RULE: frozenset({"group_retired", "group_closed", "group_lapsed"}),
+}
 
 logger = get_logger("decision_lab.period")
 
@@ -222,6 +253,9 @@ class PeriodMeta(DomainModel):
     cadence_seconds: int
     start_equity: Money
     budget: Money
+    #: What work thrown away by a Continue spent. Its cycles left this run's log, but the money left
+    #: the account, so budget checks and `profit.net` both count it (§5.7).
+    abandoned_cost_usd: Money = ZERO
     #: Later than the period's start when the history cannot warm the indicators first (§5.2).
     first_cycle_at: UtcDatetime
     months: tuple[MonthResult, ...] = ()
@@ -237,7 +271,10 @@ class PeriodMeta(DomainModel):
 
 
 def not_run_months(meta: PeriodMeta) -> tuple[str, ...]:
-    """The period's months no cycle was attempted for, derived so it cannot disagree with `months`.
+    """The period's months with no row on the meta, derived so it cannot disagree with `months`.
+
+    Not quite "no cycle was attempted": a month an exception cut short has cycled and has no row,
+    because only a month's end writes one, and a Continue redoes that work.
 
     A row per month carrying `not run` was the alternative, and would give a reader a zero-cycle
     row to add up as though it were a measurement (§5.3).
@@ -550,11 +587,189 @@ def _month_result(
     )
 
 
+def _vetoes(evidence: ProfitEvidence) -> tuple[VetoRow, ...]:
+    return tuple(
+        row
+        for row in veto_breakdown(evidence)
+        if row.action_taken not in _NOT_REFUSALS.get(row.rule, frozenset())
+    )
+
+
 def _write_meta(path: Path, meta: PeriodMeta) -> None:
     """Atomically, because a truncated meta would make the run unreadable rather than resumable."""
     scratch = path.with_suffix(".tmp")
     scratch.write_text(meta.model_dump_json(indent=2), encoding="utf-8")
     scratch.replace(path)
+
+
+def _sidecars(database: Path) -> tuple[Path, ...]:
+    return tuple(database.with_name(database.name + suffix) for suffix in ("-wal", "-shm"))
+
+
+def write_checkpoint(
+    directory: Path, month_label: str, *, clock: Clock, armed: frozenset[str] = frozenset()
+) -> Path:
+    """Copy the run's database and its meta to `checkpoints/<month_label>/`, atomically (§5.7).
+
+    Through a second engine while the first stays open: nothing is shut down, and `VACUUM INTO` has
+    what the WAL holds. The directory appears whole or not at all, because `restore_latest` trusts
+    whatever it finds under a month's name. Reads the meta from disk, so write that first.
+    """
+    root = directory / CHECKPOINT_DIR
+    scratch = root / f"{_CHECKPOINT_SCRATCH}{month_label}"
+    if scratch.exists():
+        shutil.rmtree(scratch)
+    engine = open_database(directory / PERIOD_DB)
+    try:
+        backup = take_backup(engine, scratch, mode="period", clock=clock)
+    finally:
+        engine.dispose()
+    backup.path.replace(scratch / PERIOD_DB)
+    shutil.copyfile(directory / PERIOD_META, scratch / PERIOD_META)
+    (scratch / CHECKPOINT_ARMED).write_text(json.dumps(sorted(armed)), encoding="utf-8")
+    target = root / month_label
+    scratch.replace(target)
+    return target
+
+
+def _latest_checkpoint(directory: Path) -> Path | None:
+    """The newest whole checkpoint. `YYYY-MM` sorts by time; a scratch directory is passed over."""
+    root = directory / CHECKPOINT_DIR
+    if not root.is_dir():
+        return None
+    written = (one for one in root.iterdir() if not one.name.startswith(_CHECKPOINT_SCRATCH))
+    return max(written, key=lambda one: one.name, default=None)
+
+
+def _armed_in_checkpoint(directory: Path) -> frozenset[str]:
+    """The stops armed at the newest checkpoint: `SimBroker.restore` cannot derive them (§5.7).
+
+    An armed stop sells on the next bar reaching its limit, and an un-armed one waits for a second
+    crossing, so without this a Continue can leave open a position the unbroken run sold.
+    """
+    checkpoint = _latest_checkpoint(directory)
+    if checkpoint is None:
+        return frozenset()
+    return frozenset(json.loads((checkpoint / CHECKPOINT_ARMED).read_text(encoding="utf-8")))
+
+
+def restore_latest(directory: Path) -> PeriodMeta | None:
+    """Put the newest checkpoint's database in place and return its meta; `None` if there is none.
+
+    Refuses over a live database rather than replacing it: that file is the record of what the
+    interrupted work did, so it has to have been moved aside first (`_abandon`).
+    """
+    checkpoint = _latest_checkpoint(directory)
+    if checkpoint is None:
+        return None
+    database = directory / PERIOD_DB
+    if database.exists():
+        raise FailClosedError(f"{database} is still in place; refusing to restore over it")
+    scratch = database.with_name(f"{PERIOD_DB}.restoring")
+    shutil.copyfile(checkpoint / PERIOD_DB, scratch)
+    scratch.replace(database)
+    return PeriodMeta.model_validate_json((checkpoint / PERIOD_META).read_text(encoding="utf-8"))
+
+
+def _spent_in(database: Path) -> Decimal:
+    """What a database says deliberation cost. One killed before its schema spent nothing."""
+    engine = open_database(database)
+    writer = SingleWriter(engine)
+    try:
+        if not inspect(engine).has_table("events"):
+            return ZERO
+        return Evidence.gather(EventStore(engine, writer)).cost_usd
+    finally:
+        writer.close()
+        engine.dispose()
+
+
+def _abandon(database: Path, clock: Clock) -> None:
+    """Move the interrupted database aside, kept, with its sidecars (§5.7).
+
+    The sidecars move with it: a process that died leaves a `-wal` holding committed rows, and left
+    behind it would be read as belonging to the restored file.
+    """
+    if not database.exists():
+        return
+    stem = f"{database.name}.abandoned-{clock.now().strftime('%Y%m%dT%H%M%SZ')}"
+    target = database.with_name(stem)
+    attempt = 1
+    # A second Continue within one second must not overwrite the first's record.
+    while target.exists():
+        attempt += 1
+        target = database.with_name(f"{stem}-{attempt}")
+    sidecars = _sidecars(database)
+    database.replace(target)
+    for sidecar, moved in zip(sidecars, _sidecars(target), strict=True):
+        if sidecar.exists():
+            sidecar.replace(moved)
+
+
+def _continue_from(
+    directory: Path,
+    *,
+    fresh: PeriodMeta,
+    found: PeriodMeta | None,
+    budget: Decimal,
+    clock: Clock,
+) -> PeriodMeta:
+    """Set the directory up to carry on, and return the meta to carry on with (§5.7).
+
+    The checkpoint's meta, or `fresh` when there is no checkpoint and the period starts again.
+    Whatever the interrupted work spent beyond the checkpoint joins what earlier Continues
+    abandoned, and is written down *before* the database moves: a crash between the two counts that
+    work twice, which errs towards stopping, where the other order would forget it.
+    """
+    database = directory / PERIOD_DB
+    checkpoint = _latest_checkpoint(directory)
+    kept = _spent_in(checkpoint / PERIOD_DB) if checkpoint is not None else ZERO
+    beyond = _spent_in(database) - kept if database.exists() else ZERO
+    abandoned = (found.abandoned_cost_usd if found is not None else ZERO) + beyond
+    labels = [month.label for month in fresh.period.months]
+    months_left = checkpoint is None or checkpoint.name != labels[-1]
+    if months_left and kept + abandoned > budget:
+        raise BudgetReached(
+            f"this run has spent {kept + abandoned}, past the budget of {budget}: continuing it "
+            "needs a larger budget"
+        )
+    _write_meta(
+        directory / PERIOD_META,
+        (found or fresh).model_copy(update={"abandoned_cost_usd": abandoned}),
+    )
+    _abandon(database, clock)
+    logger.warning(
+        "continuing an interrupted period run",
+        extra={
+            "run_id": fresh.run_id,
+            "checkpoint": checkpoint.name if checkpoint is not None else "",
+            "abandoned_cost_usd": str(abandoned),
+        },
+    )
+    start = restore_latest(directory) or fresh
+    return start.model_copy(
+        update={
+            "budget": budget,
+            "abandoned_cost_usd": abandoned,
+            "ending": RunEnding.RUNNING,
+            "ending_reason": "",
+            # A stamp once earned stays: part of this run's money was made without the gate.
+            "gate_skipped": start.gate_skipped or fresh.gate_skipped,
+        }
+    )
+
+
+def _profit(valuation: PortfolioAggregate, evidence: Evidence, *, meta: PeriodMeta) -> Profit:
+    """`profit_of`, plus what abandoned work cost. A frozen portfolio still has no figure at all."""
+    profit = profit_of(valuation, evidence, start_equity=meta.start_equity)
+    if profit.unvaluable:
+        return profit
+    return profit.model_copy(
+        update={
+            "cost_usd": profit.cost_usd + meta.abandoned_cost_usd,
+            "net": profit.net - meta.abandoned_cost_usd,
+        }
+    )
 
 
 async def run(
@@ -571,6 +786,7 @@ async def run(
     gate_skipped: bool = False,
     plumbing_check: bool = False,
     workspace: Path | None = None,
+    resume: bool = False,
 ) -> PeriodMeta:
     """One candidate's path through one period, in its own database, month after month.
 
@@ -580,6 +796,12 @@ async def run(
     every call and retires a stopped basket for good, so it cannot express a month boundary (§5.4).
 
     An unexpected exception out of the month loop writes `INTERRUPTED` and is raised again.
+
+    `resume` is Continue (§5.7): an unfinished run carries on from its last month end, under this
+    `budget` rather than the stored one, since a budget stop is exactly what needs a larger one. A
+    finished run is reused as ever, except that a rule's verdict refuses, because being asked to
+    continue one means someone read it as an error. Identity is unchanged, so seats changed since
+    the run began are a different directory and a new run, and the old one is not touched.
     """
     # §6.6's rule, as in `corpus.build`: two arguments that must agree is one that can disagree.
     if news_feed is not None:
@@ -611,20 +833,27 @@ async def run(
     directory = period_dir(identity, workspace=workspace)
     meta_path = directory / PERIOD_META
     database = directory / PERIOD_DB
+    found: PeriodMeta | None = None
     why = ""
     if meta_path.is_file():
         found = PeriodMeta.model_validate_json(meta_path.read_text(encoding="utf-8"))
+        if resume and found.ending is RunEnding.RULE_ENDED:
+            raise ConfigError(
+                "this run was ended by a rule, which is its result and has nothing to continue: "
+                f"{found.ending_reason}"
+            )
         # The meta is written after every month, so RUNNING is part of a period, not a result.
         if found.ending.is_final:
             return found
         why = f" ({found.ending_reason})" if found.ending_reason else ""
-    # INTERRUPTED falls through to this refusal too, until Task 5's Continue resumes it from its
-    # checkpoint (§5.7). Appending a second pass to this log would double every entry in it.
-    if database.is_file():
+    # An unfinished run is never run over: a second pass appended to this log would double every
+    # entry in it. A meta with no database is a Continue that died between its two moves.
+    unfinished = found is not None or database.is_file()
+    if unfinished and not resume:
         raise ConfigError(
-            f"{database} already exists but its run never finished, so a previous pass was "
-            f"interrupted{why}. Its event log is the record of why that pass failed — read it "
-            "before you discard it. Remove the directory once you are done with it to run again"
+            f"{directory} holds a run that never finished, so a previous pass was "
+            f"interrupted{why}. Continue it to carry on from its last month end. Its event log is "
+            "the record of why that pass failed — read it before you discard it"
         )
 
     # §5.2: the bars before the period are read for indicators only, so a period whose history can
@@ -658,12 +887,23 @@ async def run(
         plumbing_check=plumbing_check,
         news_blind=not archive_digest,
     )
-    # Before the wiring and recovery: the baselines are established as of the replayed period.
-    clock.set(first)
+    if unfinished:
+        meta = _continue_from(directory, fresh=meta, found=found, budget=budget, clock=wall_clock)
+        _write_meta(meta_path, meta)
+    done = len(meta.months)
+    # Before the wiring and recovery: the baselines are established as of the replayed period. A
+    # restored run stands where the unbroken run's clock stood at that month end, on its last tick.
+    last_month_end = period.months[done - 1].end if done else period.start
+    clock.set(max((moment for moment in ticks if moment < last_month_end), default=first))
+    # Past a checkpoint the database holds the configuration a pause or lift left in force, and
+    # publishing `basket` over it would put the candidate's limit back mid-streak. `None` is "what
+    # is stored".
+    restored = database.is_file()
     application = await build_sim(
         clock=clock,
         db_path=database,
-        baskets=(basket,),
+        baskets=None if restored else (basket,),
+        armed_orders=_armed_in_checkpoint(directory) if restored else frozenset(),
         start_equity=start_equity,
         market_data=dataset.market_data,
         catalogue=dataset_catalogue(dataset),
@@ -677,10 +917,16 @@ async def run(
                 f"startup recovery halted before the period began: {recovery.state.reason}; "
                 f"failures: {', '.join(recovery.failures) or 'none recorded'}"
             )
+        last = meta.months[-1] if meta.months else None
         carried: Decimal | None = start_equity
-        needs_lift = False
+        if last is not None:
+            carried = None if last.unvaluable else last.end_equity
+        # Read off the row, so a Continue across this boundary lifts as the unbroken run would.
+        needs_lift = last is not None and last.paused_at is not None
         try:
             for index, month in enumerate(period.months):
+                if index < done:
+                    continue
                 due = tuple(moment for moment in ticks if month.start <= moment < month.end)
                 planned = sum(1 for moment in grid if month.start <= moment < month.end)
                 # Only a stretch that reached its month's end leaves this set, and `_drive` read
@@ -713,8 +959,8 @@ async def run(
                 meta = meta.model_copy(
                     update={
                         "months": (*meta.months, result),
-                        "profit": profit_of(valuation, evidence, start_equity=start_equity),
-                        "vetoes": veto_breakdown(evidence),
+                        "profit": _profit(valuation, evidence, meta=meta),
+                        "vetoes": _vetoes(evidence),
                         "incidents": len(evidence.incidents),
                     }
                 )
@@ -726,17 +972,24 @@ async def run(
                             "ending_reason": driven.stop.reason,
                         }
                     )
+                    # Now, not after the shutdown below: a verdict must survive one that raises.
+                    # And no checkpoint, because a month cut short is no last good point.
+                    _write_meta(meta_path, meta)
                     break
+                write_checkpoint(
+                    directory, month.label, clock=wall_clock, armed=application.armed_orders()
+                )
                 # After the last month nothing is left to refuse, and so nothing to continue (§5.5).
-                if index + 1 < len(period.months) and evidence.cost_usd > budget:
+                spent = evidence.cost_usd + meta.abandoned_cost_usd
+                if index + 1 < len(period.months) and spent > budget:
                     raise BudgetReached(
-                        f"budget of {budget} passed at the end of {month.label}: "
-                        f"{evidence.cost_usd} spent"
+                        f"budget of {budget} passed at the end of {month.label}: {spent} spent"
                     )
         except BudgetReached as exc:
             meta = meta.model_copy(
                 update={"ending": RunEnding.INTERRUPTED, "ending_reason": str(exc)}
             )
+            _write_meta(meta_path, meta)
         except Exception as exc:
             _write_meta(
                 meta_path,

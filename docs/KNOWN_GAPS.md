@@ -35,6 +35,8 @@ Six passes so far:
   [ADR 0030](adr/0030-a-reconciling-poll-precedes-the-position-read.md)'s follow-ups. Two defects
   found on the way — the simulated venue filling both legs of one OCO, and the monitor handing a
   new entry's shares to a finished group — were fixed in the same branch and are in *Closed*.
+- **§18, found while building a resumable replay** (2026-11-01). Comparing a continued run against
+  an unbroken one over the same bars is what surfaced both halves. Recorded, not fixed.
 
 | # | Gap | Reaches | Direction |
 |---|---|---|---|
@@ -53,6 +55,7 @@ Six passes so far:
 | 15 | Settled plan-less filled groups stay in the monitor's tracked set | every mode | leaks, harmlessly so far |
 | 16 | A ratchet shortfall is a warning log and nothing else | live · paper · sim | fires, but says too little |
 | 17 | Poison is alerted late, and a poisoned group blocks a manual close | every mode | fails closed, and traps |
+| 18 | A restart forgets a triggered stop, and adopts a group with its leg in the entry's place | sim · paper (primary venue); the second half every mode | fails open: a position held that the venue would have sold |
 
 ---
 
@@ -530,6 +533,41 @@ bare, which breaks the convention that the log reconstructs state.
 
 **To close it.** A halt (or alert) from the sweep itself, and a stated operator path for a
 poisoned group that does not wait on a cycle.
+
+---
+
+## 18. A restart forgets a triggered stop, and adopts a group with its leg in the entry's place
+
+**Where** — [sim.py](../tradebot/execution/brokers/sim.py) `SimBroker.restore`, and
+[startup.py](../tradebot/control/startup.py) `_resolve_open_orders` with
+[monitor.py](../tradebot/execution/monitor.py) `track`.
+
+**First half: arming.** A stop whose trigger was crossed by a bar wholly below its limit is armed
+and unfilled. Arming lives only in the broker's memory, and `restore` re-derives it from whether the
+order has fills, so after a restart that stop waits for a second crossing. `build_sim` now takes
+`armed_orders` and `Application.armed_orders` reads them, so a caller can carry the set across, but
+**no bot restart passes one**: `run` and `serve` in sim and paper still lose arming, and the paper
+soak's primary venue is `SimBroker`.
+
+**Second half: the group.** Recovery re-tracks open orders only. With the entry already filled, the
+first leg recovered becomes the group's `order`, which §9 names as a recovery shape. So when the stop
+later fills, `_maintain` finds no filled *leg*, and no `group_closed` is recorded.
+
+**Verified**, by replaying one recorded dataset with and without a restart at a month boundary:
+- Without the set, the stop's sale (2.48607 at 99.07 on the next bar) did not happen after the
+  restart, and the position stayed open to the end of the bars.
+- With the set, fills, round trips, cycles and months match the unbroken run.
+- After a restart, a stop filled with its sibling cancelled and no `group_closed` event was written,
+  where the unbroken run wrote one. Fills matched, including one re-entry after that stop.
+
+**Inferred from reading the code, not observed:** that such a group stays in `_tracked` for good (the
+§15 shape), and that it claims no shares later, because the poll that first sees its stop's fill also
+sees nothing held. Replacing legs after a restart was not exercised: `_Tracked.revision` is not
+restored, and it feeds their deterministic ids. How often the first half occurs on real history was
+not measured.
+
+**To close it.** Decisions rather than fixes: record arming in the log so `restore` can derive it,
+and rebuild a recovered group from the persisted entry, which meets §9's migration.
 
 ---
 
