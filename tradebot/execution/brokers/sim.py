@@ -181,10 +181,6 @@ class SimBroker:
         slippage_pct: Decimal = Decimal("0.05"),
         fill_ratio: Decimal = Decimal(1),
         default_quote_currency: str = "USDT",
-        #: Which protective orders had already triggered, as `armed_orders` read them before the
-        #: process that held them ended. Arming is memory, not a fact the log records, so `restore`
-        #: cannot derive it; a caller replaying a path that must match an unbroken one states it.
-        armed_on_restore: frozenset[str] = frozenset(),
     ) -> None:
         self.venue_id = venue_id
         self._clock = clock
@@ -201,7 +197,6 @@ class SimBroker:
         self._cost: dict[str, Decimal] = {}
         self._orders: dict[str, _Resting] = {}
         self._ticks: dict[str, Tick] = {}
-        self._armed_on_restore = armed_on_restore
         #: Set by a test or chaos scenario to simulate an ambiguous submit.
         self.fail_next_submit = False
 
@@ -517,25 +512,11 @@ class SimBroker:
                 venue_order_id=order.venue_order_id or f"{self.venue_id}-restored",
                 state=order.state,
                 fills=list(order.fills),
-                armed=order.role.is_protective
-                and (bool(order.fills) or order.client_order_id in self._armed_on_restore),
+                armed=order.role.is_protective and bool(order.fills),
             )
             for order in orders
             if order.state.is_open
         }
-
-    def armed_orders(self) -> frozenset[str]:
-        """The open protective orders whose trigger has been crossed and which have not filled.
-
-        An armed stop fills on the next bar that reaches its limit, whether or not that bar crosses
-        the trigger again. Lost at a restart, the same stop waits for a second crossing, and a
-        position the venue would have sold stays open.
-        """
-        return frozenset(
-            client_order_id
-            for client_order_id, resting in self._orders.items()
-            if resting.intent.role.is_protective and resting.armed and resting.state.is_open
-        )
 
     # ------------------------------------------------------------------ test seams
 
