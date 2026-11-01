@@ -217,16 +217,25 @@ the checkpoint; if the same defect recurs, it stops at the same place and says s
 Work since the last checkpoint is redone on Continue, so an interruption can repeat up to one month
 of model spend. Previously spent budget still counts against the ceiling.
 
-**Corrected while planning: no `tradebot` change is expected.** The operator approved a sim-only seam
-on the belief that venue state could not be restored from outside. It can: `recover()` already replays
-the ledger from the log and calls `SimBroker.restore` with balances, positions and open orders
-(`control/startup.py:205`, `execution/brokers/sim.py:498`). Continue is therefore `build_sim(db_path=
-<restored copy>, baskets=None, start_equity=<the same>)` followed by `recover()`.
+**Corrected during Task 5: Continue re-executes rather than restores.** Restoring through `recover()`
+was tried and tests proved it unfaithful. `SimBroker.restore` loses a stop's armed state, which an
+extra seam fixed, but recovery also rebuilds a held position's group with no protective plan
+(KNOWN_GAPS §9): the panel's sale of a carried position then leaves its stop resting over a flat
+position, and the run diverges and halts. Closing §9 is a bot-wide money-path change, out of scope.
 
-`restore` loses two things: a protective order triggered but not yet filled comes back un-armed, and
-the last ticks. The next tick re-feeds the second. The test comparing a continued run to an
-uninterrupted one decides whether the first matters. **Only if it does** is the approved seam used,
-under the slice E rules: sim only, naming no `decision_lab`, seam and guard tests as one change.
+So Continue starts a **fresh database from the period's start** and re-drives the same loop, with the
+panel's answers **replayed from the previous run's log** up to the last checkpointed month end, and
+live model calls after that. Every piece of in-memory state is then rebuilt by the code that built it
+the first time. Replayed cycles cost nothing new, and their recorded cost is carried unchanged.
+
+**A replay checks itself.** Each replayed cycle compares its snapshot's market content to the recorded
+one. Any difference refuses, naming the first cycle that differs, because answers applied to a
+different market would be evidence nobody could name.
+
+**The `tradebot` seam, approved by the operator on 2026-11-01 as one small sim-only change:**
+`build_sim(deliberate=…)`, an optional callable replacing `DecisionEngine.deliberate`, refused outside
+sim. Rules as for slice E: nothing names `decision_lab`, and seam and guard tests are one change. The
+earlier `armed_orders` seam is reverted, since re-execution makes it unnecessary.
 
 ## 6. Changing a seat set
 
