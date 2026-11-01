@@ -25,13 +25,13 @@ off; it records what happened and returns.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from decimal import Decimal
 
 from tradebot.control.context_builder import ContextBuilder
 from tradebot.core.clock import Clock
 from tradebot.core.config import Basket, ConfigRef, GlobalRiskPolicy
-from tradebot.core.decision import Decision
+from tradebot.core.decision import Decision, PanelOutcome
 from tradebot.core.enums import BasketStatus, CycleOutcome, Mode, OrderState, RiskTier, Side
 from tradebot.core.errors import DataStaleError, FailClosedError
 from tradebot.core.events import EventFactory
@@ -59,6 +59,9 @@ from tradebot.risk.tier2 import Tier2RiskEngine
 from tradebot.risk.watchdog import Watchdog
 
 logger = get_logger(__name__)
+
+#: What answers for the panel in one cycle. `DecisionEngine.deliberate` has this shape.
+Deliberate = Callable[[ContextSnapshot, Basket], Awaitable[PanelOutcome]]
 
 #: The touch each side must cross, and the direction it crosses in.
 _TOUCH: dict[Side, Callable[[Quote], Decimal]] = {
@@ -124,6 +127,7 @@ class BasketRunner:
         quote_currency: str = "USDT",
         risk_timeframe: str = "1h",
         shadow: ShadowEvaluator | None = None,
+        deliberate: Deliberate | None = None,
     ) -> None:
         self._basket = basket
         self._mode = mode
@@ -157,6 +161,8 @@ class BasketRunner:
         #: The challenger, evaluated on this cycle's snapshot after the champion has acted.
         #: `None` whenever the basket declares no `shadow_panel` — which is the default.
         self._shadow = shadow
+        #: Answers instead of the engine when set, which `_assemble` allows in simulation alone.
+        self._deliberate = deliberate
 
     @property
     def basket(self) -> Basket:
@@ -209,7 +215,8 @@ class BasketRunner:
 
         # One call covers the whole basket, so the panel's cost ceiling and its decision mode
         # are the engine's to enforce; the runner only sees decisions (DESIGN §6.5).
-        panel = await self._decisions.deliberate(snapshot, self._basket)
+        deliberate = self._deliberate or self._decisions.deliberate
+        panel = await deliberate(snapshot, self._basket)
         await self._store.append(*(events.seat_responded(r) for r in panel.responses))
 
         decisions: list[Decision] = []
