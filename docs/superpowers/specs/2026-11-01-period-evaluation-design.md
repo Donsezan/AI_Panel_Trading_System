@@ -101,8 +101,8 @@ In a multi-candidate matrix, editing candidate A leaves candidate B's result val
 the gate's current state beside it. The gate is consulted before spend, never before reuse.
 [builder's call]
 
-A finished run is reused at its identity, and that includes one that ended early on the kill switch,
-a halt or budget, since those are its result. Results are kept and never deleted.
+A finished run is reused at its identity, and that includes one that a rule ended early, since that
+is its result; an interrupted run is continued instead (§5.7). Results are kept and never deleted.
 **Retrying:** see §5.7.
 
 ### 5.2 Warm-up
@@ -201,7 +201,8 @@ result.**
 | **Ended by a rule** | Out of money, kill switch | Final and reused at its identity; no Continue | *Model failed: <rule> on <date>. Needs tuning.* Later months read *not run* |
 | **Paused on losses** | `max_consecutive_losses` | Not an ending: §5.3 and §5.4 | ⚠ on the month |
 
-**Out of money** is new: at a cycle, the run holds no position and its free cash is below the
+**Out of money** is new: at a cycle, the run holds no position and its total cash, free plus locked
+in a resting entry, is below the
 instrument's `min_notional`, so no order can ever exist again. [builder's call: this definition,
 since exactly $0 is unreachable once fees and minimums apply]
 
