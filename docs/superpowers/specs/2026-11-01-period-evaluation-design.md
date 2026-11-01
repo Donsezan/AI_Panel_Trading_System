@@ -209,10 +209,9 @@ since exactly $0 is unreachable once fees and minimums apply]
 Continuing past a budget stop needs a larger budget. Continuing after a `FAILED` cycle retries from
 the checkpoint; if the same defect recurs, it stops at the same place and says so.
 
-**A checkpoint is written at each month end** [builder's call], atomically, in the run's directory:
-
-- a verified copy of the database, through `maintenance.backup.take_backup`;
-- the run's own meta so far.
+**A checkpoint is written at each month end** [builder's call], atomically and durably, in the run's
+directory: the run's own meta so far, which marks how far a replay may trust the log. There is no copy
+of the database, since nothing is restored from one and a year would hold twelve growing copies.
 
 Work since the last checkpoint is redone on Continue, so an interruption can repeat up to one month
 of model spend. Previously spent budget still counts against the ceiling.

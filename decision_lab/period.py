@@ -30,19 +30,25 @@ says nothing about the model. The exception is written and re-raised for the CLI
 after an ending were not run, and `not_run_months` is how a reader knows: an absent month is never a
 quiet one.
 
-An interrupted run continues from its last month end (§5.7). A checkpoint that cannot be written
-raises `BackupError` and interrupts the run: going on would leave more to redo than the page
-promises. Continue never overwrites anything: the database it abandons stays beside the restored
-one as `period.db.abandoned-<stamp>`, and what that work spent still counts against the budget. A
-Continue whose budget is already spent refuses with `BudgetReached` before moving anything, and with
-no checkpoint at all it starts the period again.
+An interrupted run continues from its last month end (§5.7), by re-executing rather than restoring:
+a fresh database from the period's start, the panel's answers replayed from the previous log up to
+that month end (`replay.py`), and live calls after it. A checkpoint is only the month's meta,
+durable on disk, marking how far those answers can be trusted. One that cannot be written raises
+`OSError` and interrupts the run: going on would leave more to redo than the page promises. Continue
+never overwrites anything: the database it abandons stays as `period.db.abandoned-<stamp>`, and what
+that work spent past the month end still counts against the budget. A Continue whose budget is
+already spent refuses with `BudgetReached` before moving anything; with no checkpoint it starts the
+period again; with a checkpoint whose log no longer exists it refuses with `ConfigError`. A replay
+that differs from what it replays raises `ConfigError` and interrupts the run, every earlier
+database intact.
 """
 
 from __future__ import annotations
 
-import json
+import os
 import re
-import shutil
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -59,10 +65,13 @@ from decision_lab.dataset import require_verified
 from decision_lab.longrun import Profit, ProfitEvidence, VetoRow, profit_of, veto_breakdown
 from decision_lab.newsfeed import ArchiveNewsFeed
 from decision_lab.params import workspace_root
+from decision_lab.records import CycleRecord
+from decision_lab.replay import Replayer, recorded_before
 from tradebot.app import Application, build_sim, dataset_catalogue
 from tradebot.control.supervisor import BasketWorker
 from tradebot.core.clock import Clock, ManualClock
 from tradebot.core.config import Basket, Schedule
+from tradebot.core.decision import SeatResponse, total_cost
 from tradebot.core.enums import BasketStatus, ConfigKind, RiskTier
 from tradebot.core.errors import ConfigError, FailClosedError
 from tradebot.core.events import EventFactory, EventType
@@ -70,7 +79,6 @@ from tradebot.core.logging import get_logger
 from tradebot.core.money import ZERO, to_decimal
 from tradebot.core.schema import DomainModel, Money, UtcDatetime
 from tradebot.execution.monitor import TRACKED_GROUP_RULE
-from tradebot.maintenance.backup import take_backup
 from tradebot.marketdata.recorder import ReplayDataset
 from tradebot.persistence.database import SingleWriter, open_database
 from tradebot.persistence.store import EventStore
@@ -86,10 +94,10 @@ _BAR: Final = timedelta(hours=1)
 PERIOD_SYMBOL: Final = "BTC/USDT"
 PERIOD_DB: Final = "period.db"
 PERIOD_META: Final = "period.json"
-#: Beside a checkpoint's copy: the one piece of venue state the log does not record (§5.7).
-CHECKPOINT_ARMED: Final = "armed.json"
 CHECKPOINT_DIR: Final = "checkpoints"
-_CHECKPOINT_SCRATCH: Final = ".writing-"
+_ABANDONED: Final = re.compile(
+    rf"^{re.escape(PERIOD_DB)}\.abandoned-(\d{{8}}T\d{{6}}Z)(?:-(\d+))?$"
+)
 #: Who published a pause's two configuration versions, so the audit trail names this tool.
 ACTOR: Final = "decision_lab.period"
 #: The `RISK_EVENT` a lift appends. Namespaced because no rule of the bot's ever did this.
@@ -101,9 +109,6 @@ _BASKET_PAUSED: Final = "basket_paused"
 #: `valuation_basis` announces at a restart how equity compares with the high-water mark, and
 #: changes nothing: nothing was proposed, so nothing was refused. `tracked_group` is the monitor
 #: releasing a group it has finished with: retired, closed or lapsed, and no order is involved.
-#: Both are also what a Continue changes: a restart announces the one, and recovery adopts a group
-#: without its entry, so its release records none of the other (KNOWN_GAPS §18). A veto table
-#: holding either would differ between a continued run and an unbroken one for no decision's sake.
 _NOT_REFUSALS: Final[dict[str, frozenset[str]]] = {
     "valuation_basis": frozenset({"recorded"}),
     TRACKED_GROUP_RULE: frozenset({"group_retired", "group_closed", "group_lapsed"}),
@@ -274,7 +279,8 @@ def not_run_months(meta: PeriodMeta) -> tuple[str, ...]:
     """The period's months with no row on the meta, derived so it cannot disagree with `months`.
 
     Not quite "no cycle was attempted": a month an exception cut short has cycled and has no row,
-    because only a month's end writes one, and a Continue redoes that work.
+    because only a month's end writes one. A Continue interrupted while replaying likewise shows
+    fewer rows than its checkpoint, until the replay reaches them again.
 
     A row per month carrying `not run` was the alternative, and would give a reader a zero-cycle
     row to add up as though it were a measurement (§5.3).
@@ -299,6 +305,9 @@ def period_basket(candidate: Candidate, dataset: ReplayDataset, cadence_seconds:
             "instruments": instruments,
             "timeframes": dataset.timeframes,
             "schedule": Schedule(every_seconds=cadence_seconds),
+            # As `candidates._basket_for` does, and here for one more reason: a challenger's
+            # answers are not replayed, so a Continue would pay for them all again, unread.
+            "shadow_panel": None,
         }
     )
 
@@ -525,7 +534,12 @@ class _Driven:
 
 
 async def _drive(
-    application: Application, clock: ManualClock, basket: Basket, ticks: tuple[datetime, ...]
+    application: Application,
+    clock: ManualClock,
+    basket: Basket,
+    ticks: tuple[datetime, ...],
+    *,
+    after_cycle: Callable[[], None] = lambda: None,
 ) -> _Driven:
     """Cycle each tick in order, through a pause, until the ticks end or something ends the run.
 
@@ -535,12 +549,15 @@ async def _drive(
     The pause is asked of the database after each cycle, not of `worker.stopped`: a worker only
     learns of a halt at its *next* `_runnable`, so a pause on a month's last tick would otherwise
     surface in the following month, with no month boundary left to lift it at.
+
+    `after_cycle` may raise, ending the run: `BasketWorker` absorbs what a cycle itself raises.
     """
     paused_at: datetime | None = None
     for moment in ticks:
         clock.set(moment)
         worker = application.supervisor.worker_for(basket.basket_id)
         await worker.cycle()
+        after_cycle()
         await application.monitor.poll()
         if paused_at is None and await stopped_on_loss_streak(application, basket.basket_id):
             logger.warning(
@@ -606,82 +623,116 @@ def _sidecars(database: Path) -> tuple[Path, ...]:
     return tuple(database.with_name(database.name + suffix) for suffix in ("-wal", "-shm"))
 
 
-def write_checkpoint(
-    directory: Path, month_label: str, *, clock: Clock, armed: frozenset[str] = frozenset()
-) -> Path:
-    """Copy the run's database and its meta to `checkpoints/<month_label>/`, atomically (§5.7).
+def write_checkpoint(directory: Path, month_label: str, *, meta: PeriodMeta) -> Path:
+    """Put the month's meta on disk, atomically and durably: it marks the replay boundary (§5.7).
 
-    Through a second engine while the first stays open: nothing is shut down, and `VACUUM INTO` has
-    what the WAL holds. The directory appears whole or not at all, because `restore_latest` trusts
-    whatever it finds under a month's name. Reads the meta from disk, so write that first.
+    No copy of the database. Re-execution replays the log and restores nothing from a copy, and a
+    year of them would be twelve growing files. The log it vouches for is durable already, because
+    the schema commits with `synchronous=FULL`, so the fsync here is what makes the two agree.
     """
     root = directory / CHECKPOINT_DIR
-    scratch = root / f"{_CHECKPOINT_SCRATCH}{month_label}"
-    if scratch.exists():
-        shutil.rmtree(scratch)
-    engine = open_database(directory / PERIOD_DB)
-    try:
-        backup = take_backup(engine, scratch, mode="period", clock=clock)
-    finally:
-        engine.dispose()
-    backup.path.replace(scratch / PERIOD_DB)
-    shutil.copyfile(directory / PERIOD_META, scratch / PERIOD_META)
-    (scratch / CHECKPOINT_ARMED).write_text(json.dumps(sorted(armed)), encoding="utf-8")
-    target = root / month_label
+    root.mkdir(exist_ok=True)
+    target = root / f"{month_label}.json"
+    scratch = target.with_suffix(".tmp")
+    with scratch.open("w", encoding="utf-8") as out:
+        out.write(meta.model_dump_json(indent=2))
+        out.flush()
+        os.fsync(out.fileno())
     scratch.replace(target)
     return target
 
 
-def _latest_checkpoint(directory: Path) -> Path | None:
-    """The newest whole checkpoint. `YYYY-MM` sorts by time; a scratch directory is passed over."""
-    root = directory / CHECKPOINT_DIR
-    if not root.is_dir():
+def _latest_checkpoint(directory: Path) -> PeriodMeta | None:
+    """The newest whole checkpoint. `YYYY-MM` sorts by time; a `.tmp` is passed over."""
+    written = sorted((directory / CHECKPOINT_DIR).glob("*.json"), key=lambda one: one.name)
+    if not written:
         return None
-    written = (one for one in root.iterdir() if not one.name.startswith(_CHECKPOINT_SCRATCH))
-    return max(written, key=lambda one: one.name, default=None)
+    return PeriodMeta.model_validate_json(written[-1].read_text(encoding="utf-8"))
 
 
-def _armed_in_checkpoint(directory: Path) -> frozenset[str]:
-    """The stops armed at the newest checkpoint: `SimBroker.restore` cannot derive them (§5.7).
-
-    An armed stop sells on the next bar reaching its limit, and an un-armed one waits for a second
-    crossing, so without this a Continue can leave open a position the unbroken run sold.
-    """
-    checkpoint = _latest_checkpoint(directory)
-    if checkpoint is None:
-        return frozenset()
-    return frozenset(json.loads((checkpoint / CHECKPOINT_ARMED).read_text(encoding="utf-8")))
-
-
-def restore_latest(directory: Path) -> PeriodMeta | None:
-    """Put the newest checkpoint's database in place and return its meta; `None` if there is none.
-
-    Refuses over a live database rather than replacing it: that file is the record of what the
-    interrupted work did, so it has to have been moved aside first (`_abandon`).
-    """
-    checkpoint = _latest_checkpoint(directory)
-    if checkpoint is None:
-        return None
-    database = directory / PERIOD_DB
-    if database.exists():
-        raise FailClosedError(f"{database} is still in place; refusing to restore over it")
-    scratch = database.with_name(f"{PERIOD_DB}.restoring")
-    shutil.copyfile(checkpoint / PERIOD_DB, scratch)
-    scratch.replace(database)
-    return PeriodMeta.model_validate_json((checkpoint / PERIOD_META).read_text(encoding="utf-8"))
-
-
-def _spent_in(database: Path) -> Decimal:
-    """What a database says deliberation cost. One killed before its schema spent nothing."""
+@contextmanager
+def _log_of(database: Path) -> Iterator[EventStore | None]:
+    """A database's log, or `None` for one killed before its schema existed."""
     engine = open_database(database)
     writer = SingleWriter(engine)
     try:
-        if not inspect(engine).has_table("events"):
-            return ZERO
-        return Evidence.gather(EventStore(engine, writer)).cost_usd
+        yield EventStore(engine, writer) if inspect(engine).has_table("events") else None
     finally:
         writer.close()
         engine.dispose()
+
+
+def _spend_around(database: Path, boundary: datetime | None) -> tuple[Decimal, Decimal]:
+    """What a database's log spent before `boundary`, and from it on.
+
+    Off the responses rather than `Evidence.cost_usd`: a cycle that failed, or died part way,
+    records no cost of its own, and the provider was still paid.
+    """
+    if not database.exists():
+        return ZERO, ZERO
+    with _log_of(database) as store:
+        if store is None:
+            return ZERO, ZERO
+        events = store.read_types(EventType.SEAT_RESPONDED)
+    responses = [(e.ts, SeatResponse.model_validate(e.payload["response"])) for e in events]
+    before = [one for at, one in responses if boundary is not None and at < boundary]
+    after = [one for at, one in responses if boundary is None or at >= boundary]
+    return total_cost(before), total_cost(after)
+
+
+def _abandoned_newest_first(directory: Path) -> list[Path]:
+    """Ordered by what the name says, numerically: `-10` follows `-9`. Sidecars do not match."""
+    found = []
+    for path in directory.iterdir():
+        match = _ABANDONED.match(path.name)
+        if match is not None:
+            found.append(((match.group(1), int(match.group(2) or 1)), path))
+    return [path for _, path in sorted(found, key=lambda one: one[0], reverse=True)]
+
+
+def _log_reaching(directory: Path, last_tick: datetime) -> Path | None:
+    """The newest database that finished the checkpointed month's last cycle.
+
+    Not simply the newest: a Continue that died mid-replay leaves a shorter log than the one it was
+    replaying, and that log is now the only one that can reach the boundary. An older one reaching
+    it may hold answers later overwritten, so it is the newest of those that qualify.
+    """
+    for candidate in (directory / PERIOD_DB, *_abandoned_newest_first(directory)):
+        if not candidate.exists():
+            continue
+        with _log_of(candidate) as store:
+            done = store.read_types(EventType.CYCLE_COMPLETED) if store is not None else ()
+        if done and done[-1].ts >= last_tick:
+            return candidate
+    return None
+
+
+@dataclass(frozen=True, slots=True)
+class _Replay:
+    """What a Continue re-executes: the checkpoint's month rows and the answers behind them."""
+
+    months: tuple[MonthResult, ...]
+    boundary: datetime
+    recorded: tuple[CycleRecord, ...]
+
+
+def _replay_from(
+    directory: Path, checkpoint: PeriodMeta, ticks: tuple[datetime, ...]
+) -> tuple[_Replay, Decimal]:
+    """The replay a checkpoint calls for, and what the log it reads spent up to the boundary."""
+    boundary = checkpoint.period.months[len(checkpoint.months) - 1].end
+    last_tick = max((moment for moment in ticks if moment < boundary), default=None)
+    if last_tick is None:
+        return _Replay(checkpoint.months, boundary, ()), ZERO
+    source = _log_reaching(directory, last_tick)
+    if source is None:
+        raise ConfigError(
+            f"{directory} has a checkpoint at {checkpoint.months[-1].label}, but no database there "
+            "holds the log it vouches for, so nothing can be replayed. Delete the directory to "
+            "start the period again"
+        )
+    kept, _ = _spend_around(source, boundary)
+    return _Replay(checkpoint.months, boundary, recorded_before(source, boundary)), kept
 
 
 def _abandon(database: Path, clock: Clock) -> None:
@@ -711,52 +762,57 @@ def _continue_from(
     *,
     fresh: PeriodMeta,
     found: PeriodMeta | None,
+    ticks: tuple[datetime, ...],
     budget: Decimal,
     clock: Clock,
-) -> PeriodMeta:
-    """Set the directory up to carry on, and return the meta to carry on with (§5.7).
+) -> tuple[PeriodMeta, _Replay | None]:
+    """Clear the way for a fresh database, and say what it will replay (§5.7).
 
-    The checkpoint's meta, or `fresh` when there is no checkpoint and the period starts again.
-    Whatever the interrupted work spent beyond the checkpoint joins what earlier Continues
-    abandoned, and is written down *before* the database moves: a crash between the two counts that
-    work twice, which errs towards stopping, where the other order would forget it.
+    Spend past the boundary in the database being moved joins what earlier Continues abandoned.
+    Spend before it is carried into the new log by the replay, so it is not abandoned, and a
+    database that died mid-replay holds nothing else. Written down *before* the database moves: a
+    crash between the two counts that work twice, which errs towards stopping, where the other order
+    would forget it.
     """
     database = directory / PERIOD_DB
     checkpoint = _latest_checkpoint(directory)
-    kept = _spent_in(checkpoint / PERIOD_DB) if checkpoint is not None else ZERO
-    beyond = _spent_in(database) - kept if database.exists() else ZERO
+    replay, kept = _replay_from(directory, checkpoint, ticks) if checkpoint else (None, ZERO)
+    _, beyond = _spend_around(database, replay.boundary if replay else None)
     abandoned = (found.abandoned_cost_usd if found is not None else ZERO) + beyond
-    labels = [month.label for month in fresh.period.months]
-    months_left = checkpoint is None or checkpoint.name != labels[-1]
+    months_left = checkpoint is None or len(checkpoint.months) < len(fresh.period.months)
     if months_left and kept + abandoned > budget:
         raise BudgetReached(
             f"this run has spent {kept + abandoned}, past the budget of {budget}: continuing it "
             "needs a larger budget"
         )
-    _write_meta(
-        directory / PERIOD_META,
-        (found or fresh).model_copy(update={"abandoned_cost_usd": abandoned}),
+    meta = fresh.model_copy(
+        update={
+            "abandoned_cost_usd": abandoned,
+            "built_at": found.built_at if found is not None else fresh.built_at,
+            # A stamp once earned stays: part of this run's money was made without the gate.
+            "gate_skipped": fresh.gate_skipped or (found is not None and found.gate_skipped),
+        }
     )
+    _write_meta(directory / PERIOD_META, meta)
     _abandon(database, clock)
     logger.warning(
         "continuing an interrupted period run",
         extra={
             "run_id": fresh.run_id,
-            "checkpoint": checkpoint.name if checkpoint is not None else "",
+            "checkpoint": checkpoint.months[-1].label if checkpoint else "",
             "abandoned_cost_usd": str(abandoned),
         },
     )
-    start = restore_latest(directory) or fresh
-    return start.model_copy(
-        update={
-            "budget": budget,
-            "abandoned_cost_usd": abandoned,
-            "ending": RunEnding.RUNNING,
-            "ending_reason": "",
-            # A stamp once earned stays: part of this run's money was made without the gate.
-            "gate_skipped": start.gate_skipped or fresh.gate_skipped,
-        }
-    )
+    return meta, replay
+
+
+def _require_same_month(recorded: MonthResult, replayed: MonthResult) -> None:
+    """A replayed month must come out as it did: its last poll is in no later snapshot."""
+    if replayed != recorded:
+        raise ConfigError(
+            f"the replay differs from the recorded run at the end of {recorded.label}: "
+            f"{replayed.model_dump_json()} against {recorded.model_dump_json()}"
+        )
 
 
 def _profit(valuation: PortfolioAggregate, evidence: Evidence, *, meta: PeriodMeta) -> Profit:
@@ -797,11 +853,13 @@ async def run(
 
     An unexpected exception out of the month loop writes `INTERRUPTED` and is raised again.
 
-    `resume` is Continue (§5.7): an unfinished run carries on from its last month end, under this
-    `budget` rather than the stored one, since a budget stop is exactly what needs a larger one. A
-    finished run is reused as ever, except that a rule's verdict refuses, because being asked to
-    continue one means someone read it as an error. Identity is unchanged, so seats changed since
-    the run began are a different directory and a new run, and the old one is not touched.
+    `resume` is Continue (§5.7): an unfinished run is re-executed in a fresh database, replaying
+    answers up to its last month end, under this `budget` rather than the stored one, since a budget
+    stop is exactly what needs a larger one. A finished run is reused as ever, except that a rule's
+    verdict refuses, because being asked to continue one means someone read it as an error. Identity
+    is unchanged, so seats changed since the run began are a different directory and a new run, and
+    the old one is not touched. A run that used a `news_feed` must be given the same one: its digest
+    is in the identity, and each replayed snapshot compares the news it was served.
     """
     # §6.6's rule, as in `corpus.build`: two arguments that must agree is one that can disagree.
     if news_feed is not None:
@@ -887,28 +945,29 @@ async def run(
         plumbing_check=plumbing_check,
         news_blind=not archive_digest,
     )
+    replay: _Replay | None = None
     if unfinished:
-        meta = _continue_from(directory, fresh=meta, found=found, budget=budget, clock=wall_clock)
-        _write_meta(meta_path, meta)
-    done = len(meta.months)
-    # Before the wiring and recovery: the baselines are established as of the replayed period. A
-    # restored run stands where the unbroken run's clock stood at that month end, on its last tick.
-    last_month_end = period.months[done - 1].end if done else period.start
-    clock.set(max((moment for moment in ticks if moment < last_month_end), default=first))
-    # Past a checkpoint the database holds the configuration a pause or lift left in force, and
-    # publishing `basket` over it would put the candidate's limit back mid-streak. `None` is "what
-    # is stored".
-    restored = database.is_file()
+        meta, replay = _continue_from(
+            directory, fresh=meta, found=found, ticks=ticks, budget=budget, clock=wall_clock
+        )
+    replayer = (
+        Replayer(replay.recorded, boundary=replay.boundary, clock=clock)
+        if replay is not None
+        else None
+    )
+    replayed_months = replay.months if replay is not None else ()
+    # Before the wiring and recovery: the baselines are established as of the replayed period.
+    clock.set(first)
     application = await build_sim(
         clock=clock,
         db_path=database,
-        baskets=None if restored else (basket,),
-        armed_orders=_armed_in_checkpoint(directory) if restored else frozenset(),
+        baskets=(basket,),
         start_equity=start_equity,
         market_data=dataset.market_data,
         catalogue=dataset_catalogue(dataset),
         news_sources=(),
         news_feed=news_feed,
+        deliberate=replayer,
     )
     try:
         recovery = await application.recover()
@@ -917,16 +976,10 @@ async def run(
                 f"startup recovery halted before the period began: {recovery.state.reason}; "
                 f"failures: {', '.join(recovery.failures) or 'none recorded'}"
             )
-        last = meta.months[-1] if meta.months else None
         carried: Decimal | None = start_equity
-        if last is not None:
-            carried = None if last.unvaluable else last.end_equity
-        # Read off the row, so a Continue across this boundary lifts as the unbroken run would.
-        needs_lift = last is not None and last.paused_at is not None
+        needs_lift = False
         try:
             for index, month in enumerate(period.months):
-                if index < done:
-                    continue
                 due = tuple(moment for moment in ticks if month.start <= moment < month.end)
                 planned = sum(1 for moment in grid if month.start <= moment < month.end)
                 # Only a stretch that reached its month's end leaves this set, and `_drive` read
@@ -942,8 +995,20 @@ async def run(
                     )
                     meta = meta.model_copy(update={"lifts": (*meta.lifts, lift)})
                     needs_lift = False
-                driven = await _drive(application, clock, basket, due)
+                driven = await _drive(
+                    application,
+                    clock,
+                    basket,
+                    due,
+                    after_cycle=replayer.raise_if_diverged if replayer else lambda: None,
+                )
                 needs_lift = driven.paused_at is not None
+                # A month that was checkpointed ran whole, so a stop in it now is no verdict.
+                if index < len(replayed_months) and driven.stop is not None:
+                    raise ConfigError(
+                        f"the replay differs from the recorded run: {driven.stop.reason}, in "
+                        f"{month.label}, which the recorded run finished"
+                    )
                 evidence = Evidence.gather(application.store)
                 # Through `Application.valuation`, never a price map built here (ADR 0027).
                 valuation = application.valuation()
@@ -955,6 +1020,10 @@ async def run(
                     valuation=valuation,
                     paused_at=driven.paused_at,
                 )
+                if index < len(replayed_months):
+                    _require_same_month(replayed_months[index], result)
+                if replayer is not None and index == len(replayed_months) - 1:
+                    replayer.require_consumed()
                 carried = None if result.unvaluable else result.end_equity
                 meta = meta.model_copy(
                     update={
@@ -976,12 +1045,12 @@ async def run(
                     # And no checkpoint, because a month cut short is no last good point.
                     _write_meta(meta_path, meta)
                     break
-                write_checkpoint(
-                    directory, month.label, clock=wall_clock, armed=application.armed_orders()
-                )
+                write_checkpoint(directory, month.label, meta=meta)
                 # After the last month nothing is left to refuse, and so nothing to continue (§5.5).
+                # A replayed month spends nothing, and `_continue_from` has already judged them.
                 spent = evidence.cost_usd + meta.abandoned_cost_usd
-                if index + 1 < len(period.months) and spent > budget:
+                is_live = index >= len(replayed_months)
+                if is_live and index + 1 < len(period.months) and spent > budget:
                     raise BudgetReached(
                         f"budget of {budget} passed at the end of {month.label}: {spent} spent"
                     )
@@ -1002,6 +1071,8 @@ async def run(
             )
             raise
     finally:
+        if replayer is not None:
+            await replayer.aclose()
         await application.shutdown()
 
     if meta.ending is RunEnding.RUNNING:

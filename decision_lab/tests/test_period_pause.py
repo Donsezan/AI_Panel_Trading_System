@@ -26,6 +26,7 @@ from decision_lab import candidates as cd
 from decision_lab import cli
 from decision_lab import period as pd
 from decision_lab.candidates import Candidate
+from decision_lab.newsfeed import ArchiveNewsFeed
 from decision_lab.records import records_from_store
 from decision_lab.tests import factories as f
 from decision_lab.tests.test_period_run import read_log, with_loss_limit
@@ -94,9 +95,11 @@ class Plan(StubLLMProvider):
 
     def _text_for(self, request: CompletionRequest) -> str:
         vote = json.loads(DEFAULT_RESPONSE)
-        vote["action"] = self._votes.get((symbol_of(request), as_of(request).date()), "WAIT")
-        # A half-sized SELL would leave the round trip open, and only a closed one is a loss.
-        vote["size_hint"] = "full"
+        planned = self._votes.get((symbol_of(request), as_of(request).date()), "WAIT")
+        # "SELL half" names a size. Otherwise full: a half-sized SELL would leave the round trip
+        # open, and only a closed one is a loss.
+        vote["action"], _, hint = planned.partition(" ")
+        vote["size_hint"] = hint or "full"
         return json.dumps(vote)
 
     def calls_between(self, start: datetime, end: datetime) -> list[CompletionRequest]:
@@ -189,6 +192,7 @@ async def execute(
     cost_usd: Decimal = ZERO,
     resume: bool = False,
     candidate: Candidate | None = None,
+    news_feed: ArchiveNewsFeed | None = None,
 ) -> Ran:
     if resume:
         # A real Continue is a new process. Here a caught exception's frames keep the dead wiring's
@@ -217,6 +221,7 @@ async def execute(
             wall_clock=ManualClock(datetime(2026, 11, 1, tzinfo=UTC)),
             workspace=workspace,
             resume=resume,
+            news_feed=news_feed,
         )
     return Ran(meta, pd.period_dir(meta.run_id, workspace=workspace) / pd.PERIOD_DB, plan)
 

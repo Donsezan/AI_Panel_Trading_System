@@ -536,35 +536,43 @@ poisoned group that does not wait on a cycle.
 
 ---
 
-## 18. A restart forgets a triggered stop, and adopts a group with its leg in the entry's place
+## 18. A bot restart forgets a triggered stop, and its adopted group leaves a stale stop over a sale
 
 **Where** — [sim.py](../tradebot/execution/brokers/sim.py) `SimBroker.restore`, and
 [startup.py](../tradebot/control/startup.py) `_resolve_open_orders` with
-[monitor.py](../tradebot/execution/monitor.py) `track`.
+[monitor.py](../tradebot/execution/monitor.py) `track`. These are facts about `run` and `serve`
+restarts in sim and paper; the paper soak's primary venue is `SimBroker`. `decision_lab`'s Continue
+is not affected: it re-executes from the period's start rather than restarting (period spec §5.7).
 
 **First half: arming.** A stop whose trigger was crossed by a bar wholly below its limit is armed
 and unfilled. Arming lives only in the broker's memory, and `restore` re-derives it from whether the
-order has fills, so after a restart that stop waits for a second crossing. `build_sim` now takes
-`armed_orders` and `Application.armed_orders` reads them, so a caller can carry the set across, but
-**no bot restart passes one**: `run` and `serve` in sim and paper still lose arming, and the paper
-soak's primary venue is `SimBroker`.
+order has fills, so after a restart that stop waits for a second crossing, and a position the
+unbroken path sold stays open.
 
-**Second half: the group.** Recovery re-tracks open orders only. With the entry already filled, the
-first leg recovered becomes the group's `order`, which §9 names as a recovery shape. So when the stop
-later fills, `_maintain` finds no filled *leg*, and no `group_closed` is recorded.
+**Second half: the group.** Recovery re-tracks open orders only, with no protective plan (§9). With
+the entry already filled, the first leg recovered becomes the group's `order`. So when the stop later
+fills, `_maintain` finds no filled *leg*, and no `group_closed` is recorded. Worse, **a panel sale of
+the carried position leaves its stop resting over a flat position**: `target` is `None` for a group
+with no plan, so the legs are not cancelled. When that stop fires the venue refuses to settle it and
+the basket halts.
 
-**Verified**, by replaying one recorded dataset with and without a restart at a month boundary:
-- Without the set, the stop's sale (2.48607 at 99.07 on the next bar) did not happen after the
-  restart, and the position stayed open to the end of the bars.
-- With the set, fills, round trips, cycles and months match the unbroken run.
+**How this was verified, and how far.** All of it was observed in `decision_lab`, by driving
+`build_sim` and `Application.recover()` over one recorded dataset, with and without a restart at a
+month boundary, in the restore-based Continue of commit 4b16492 since replaced. That is the bot's own
+wiring and recovery, but **not** on a `tradebot run` or `serve` process, which was never restarted
+for this:
+- Arming: the stop's sale (2.48607 at 99.07 on the next bar) did not happen after the restart, and
+  the position stayed open to the end of the bars.
+- Stale stop: BUY 20 Feb, restart after February, SELL 5 Mar. The stop left resting then fired, and
+  the basket halted on 11 Mar with `sim venue refuses to settle a sell of 2.48607
+  binance:BTC/USDT: holds 0.00000`; the BUY of 20 Mar never happened.
 - After a restart, a stop filled with its sibling cancelled and no `group_closed` event was written,
-  where the unbroken run wrote one. Fills matched, including one re-entry after that stop.
+  where the unbroken run wrote one.
 
 **Inferred from reading the code, not observed:** that such a group stays in `_tracked` for good (the
-§15 shape), and that it claims no shares later, because the poll that first sees its stop's fill also
-sees nothing held. Replacing legs after a restart was not exercised: `_Tracked.revision` is not
-restored, and it feeds their deterministic ids. How often the first half occurs on real history was
-not measured.
+§15 shape), and that a real venue would reject or short rather than refuse as the sim does. Replacing
+legs after a bot restart was not exercised: `_Tracked.revision` is not restored, and it feeds their
+deterministic ids. How often the first half occurs on real history was not measured.
 
 **To close it.** Decisions rather than fixes: record arming in the log so `restore` can derive it,
 and rebuild a recovered group from the persisted entry, which meets §9's migration.

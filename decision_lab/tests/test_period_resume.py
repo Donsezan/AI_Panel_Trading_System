@@ -1,9 +1,9 @@
 """Checkpoints and Continue: an error continues from the last good point (period spec §5.7).
 
 Every comparison here is against an uninterrupted run, and the panel is `Plan`, which answers from
-the date and the symbol in the prompt. That is forced: a seeded `varied-*` stub keeps its draws in
-one `Random`, so a resumed process would start that sequence again and decide differently from the
-run it is being compared with, and the test would measure the seed instead of the restore.
+the date and the symbol in the prompt, so a live call after the boundary answers as the unbroken run
+did. That is forced: a seeded `varied-*` stub keeps its draws in one `Random`, so a resumed process
+would start that sequence again and the test would measure the seed instead of the Continue.
 
 A kill is a `BaseException` raised after a checkpoint. `run` catches `Exception`, so the meta stays
 `RUNNING` exactly as a dead process leaves it, where an ordinary exception writes `INTERRUPTED`.
@@ -15,7 +15,10 @@ fresh uuids in every process, so they cannot match and say nothing if they do no
 from __future__ import annotations
 
 import gc
+import json
+import os
 import re
+import sqlite3
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from datetime import date, datetime, timedelta
@@ -30,6 +33,9 @@ from decision_lab import cli
 from decision_lab import period as pd
 from decision_lab.candidates import Candidate
 from decision_lab.longrun import ProfitEvidence
+from decision_lab.newsfeed import ArchiveNewsFeed
+from decision_lab.records import CycleRecord
+from decision_lab.replay import Replayer
 from decision_lab.tests import factories as f
 from decision_lab.tests.test_period_pause import (
     BTC,
@@ -52,11 +58,15 @@ from tradebot.control import startup as startup_module
 from tradebot.control.supervisor import BasketWorker
 from tradebot.core.clock import ManualClock
 from tradebot.core.config import Basket
-from tradebot.core.errors import ConfigError, FailClosedError
+from tradebot.core.decision import Decision
+from tradebot.core.enums import Action
+from tradebot.core.errors import ConfigError
+from tradebot.core.events import EventType
 from tradebot.core.market import Candle
 from tradebot.core.money import ZERO
+from tradebot.core.snapshot import ContextSnapshot, NewsCoverage, NewsItemView
 from tradebot.execution import monitor as monitor_module
-from tradebot.maintenance.backup import BackupError
+from tradebot.marketdata.recorder import ReplayDataset
 from tradebot.persistence.store import EventStore
 from tradebot.validation.evidence import Evidence
 
@@ -72,6 +82,18 @@ TRADES: Votes = {
     (BTC, day(1, 13)): "SELL",
     (BTC, day(2, 20)): "BUY",
     (BTC, day(3, 20)): "BUY",
+}
+#: The review's probe: a carried position sold after the boundary, and a fresh entry after that.
+SOLD_THEN_BOUGHT: Votes = {
+    (BTC, day(2, 20)): "BUY",
+    (BTC, day(3, 5)): "SELL",
+    (BTC, day(3, 20)): "BUY",
+}
+#: A carried position trimmed twice, each sale replacing legs the one before it placed.
+TRIMMED: Votes = {
+    (BTC, day(2, 20)): "BUY",
+    (BTC, day(3, 5)): "SELL half",
+    (BTC, day(3, 15)): "SELL half",
 }
 #: Held over the boundary at which the bar below has already armed the stop.
 HELD_INTO_THE_GAP: Votes = {(BTC, day(2, 20)): "BUY"}
@@ -92,6 +114,7 @@ class Killed(BaseException):
     """A process dying. Not an `Exception`, so nothing in `run` can tidy up after it."""
 
 
+Rewrite = Callable[[dict[str, Any]], dict[str, Any] | None]
 Trip = tuple[str, datetime, Decimal]
 Cycle = tuple[datetime, str, Decimal]
 
@@ -210,6 +233,20 @@ def round_trips_of(database: Path) -> tuple[Trip, ...]:
     return read_log(database, read)
 
 
+def protective_orders(database: Path) -> tuple[tuple[datetime, str, Decimal], ...]:
+    """When each leg was placed, its role and size. Ids are fresh uuids, so never compared."""
+
+    def read(store: EventStore) -> tuple[tuple[datetime, str, Decimal], ...]:
+        orders = ((e.ts, e.payload["order"]) for e in store.read_types(EventType.ORDER_SUBMITTED))
+        return tuple(
+            (at, order["role"], Decimal(order["qty"]))
+            for at, order in orders
+            if order["role"] != "entry"
+        )
+
+    return read_log(database, read)
+
+
 def per_cycle(run: Ran) -> Decimal:
     """What one panel-answered cycle costs, off February's whole, unpaused month of 29."""
     return run.meta.months[1].cost_usd / 29
@@ -258,6 +295,268 @@ async def test_a_trade_with_a_triggered_unfilled_stop_survives_a_continue(
     assert_same_outcomes(resumed, whole)
 
 
+async def test_a_sale_of_a_carried_position_after_a_continue_cancels_its_stop(
+    data: dict[str, Path], tmp_path: Path, uninterrupted: Uninterrupted
+) -> None:
+    """The review's probe, and why restoring was abandoned. Recovery rebuilds a held position's
+    group with no plan (KNOWN_GAPS §9), so on a restored run March's sale left the stop resting over
+    a flat position; it then fired on the 10th and the basket halted refusing to settle it."""
+    whole = await uninterrupted(data["drop"], "probe", SOLD_THEN_BOUGHT)
+    await killed_after(data["drop"], tmp_path, "2024-02", SOLD_THEN_BOUGHT)
+
+    resumed = await execute(
+        data["drop"], tmp_path, QUARTER, SOLD_THEN_BOUGHT, cost_usd=COST, resume=True
+    )
+
+    assert resumed.meta.ending is pd.RunEnding.COMPLETED
+    assert [fill[1] for fill in fills_in(resumed.database)] == ["buy", "sell", "buy"]
+    assert_same_outcomes(resumed, whole)
+    assert [m.end_equity for m in resumed.meta.months] == [m.end_equity for m in whole.meta.months]
+
+
+async def test_replaced_legs_after_a_continue_match_the_unbroken_run(
+    data: dict[str, Path], tmp_path: Path, uninterrupted: Uninterrupted
+) -> None:
+    """A trim in March resizes legs placed in February, and `_Tracked.revision`, which feeds the
+    deterministic ids of the replacements, is memory that only a re-execution rebuilds."""
+    whole = await uninterrupted(data["flat"], "trimmed", TRIMMED)
+    legs = protective_orders(whole.database)
+    replaced = {qty for at, _, qty in legs if at >= utc(3)}
+    assert len(replaced) == 2, f"two trims should have placed two sizes of leg: {legs}"
+
+    await killed_after(data["flat"], tmp_path, "2024-02", TRIMMED)
+    resumed = await execute(data["flat"], tmp_path, QUARTER, TRIMMED, cost_usd=COST, resume=True)
+
+    assert protective_orders(resumed.database) == legs
+    assert_same_outcomes(resumed, whole)
+
+
+async def test_continuing_twice_equals_an_uninterrupted_run(
+    data: dict[str, Path], tmp_path: Path, uninterrupted: Uninterrupted
+) -> None:
+    whole = await uninterrupted(data["drop"], "trades", TRADES)
+    await killed_after(data["drop"], tmp_path, "2024-01", TRADES)
+    await killed_after(data["drop"], tmp_path, "2024-02", TRADES, resume=True)
+
+    resumed = await execute(data["drop"], tmp_path, QUARTER, TRADES, cost_usd=COST, resume=True)
+
+    assert_same_outcomes(resumed, whole)
+    assert resumed.meta == whole.meta
+    assert len(abandoned_files(tmp_path)) == 2
+    assert not resumed.plan.calls_between(utc(1), utc(3))
+
+
+async def test_a_crash_mid_replay_loses_nothing_and_bills_nothing(
+    data: dict[str, Path], tmp_path: Path, uninterrupted: Uninterrupted
+) -> None:
+    """The shorter log it leaves cannot reach the boundary, so the second Continue must go back to
+    the one the first was replaying, and neither replay was new spend."""
+    whole = await uninterrupted(data["drop"], "trades", TRADES)
+    await killed_after(data["drop"], tmp_path, "2024-02", TRADES)
+    with pytest.raises(RuntimeError, match="injected crash"):
+        await execute(
+            data["drop"],
+            tmp_path,
+            QUARTER,
+            TRADES,
+            cost_usd=COST,
+            resume=True,
+            before_cycle=explode_on(utc(1, 15)),
+        )
+
+    resumed = await execute(data["drop"], tmp_path, QUARTER, TRADES, cost_usd=COST, resume=True)
+
+    assert_same_outcomes(resumed, whole)
+    assert resumed.meta.abandoned_cost_usd == ZERO
+    assert resumed.meta.profit == whole.meta.profit
+    assert not resumed.plan.calls_between(utc(1), utc(3))
+
+
+async def test_replayed_spend_is_carried_and_not_billed_again(
+    data: dict[str, Path], tmp_path: Path, uninterrupted: Uninterrupted
+) -> None:
+    whole = await uninterrupted(data["flat"], "quiet", {})
+    await killed_after(data["flat"], tmp_path, "2024-02", {})
+
+    resumed = await execute(data["flat"], tmp_path, QUARTER, {}, cost_usd=COST, resume=True)
+
+    # The recorded cost is in the new log, nothing went to the provider for it, and nothing is
+    # counted as abandoned, so the total is the unbroken run's to the cent.
+    assert not resumed.plan.calls_between(utc(1), utc(3))
+    assert resumed.plan.calls_between(utc(3), utc(4))
+    assert resumed.meta.abandoned_cost_usd == ZERO
+    assert resumed.meta.profit.cost_usd == whole.meta.profit.cost_usd
+    assert cycles_of(resumed.database) == cycles_of(whole.database)
+
+
+def _rewrite_event(database: Path, cycle_at: datetime, event: EventType, change: Rewrite) -> None:
+    """Alter one recorded event of the cycle at `cycle_at`, as a file on disk: the recorded run then
+    differs from what a replay will do. `change` returning `None` deletes it."""
+    connection = sqlite3.connect(database)
+    try:
+        rows = connection.execute(
+            "SELECT seq, ts, payload_json FROM events WHERE type = ? ORDER BY seq", (event.value,)
+        ).fetchall()
+        seq, payload = next(
+            (seq, json.loads(body))
+            for seq, ts, body in rows
+            if datetime.fromisoformat(ts) == cycle_at
+        )
+        changed = change(payload)
+        if changed is None:
+            connection.execute("DELETE FROM events WHERE seq = ?", (seq,))
+        else:
+            connection.execute(
+                "UPDATE events SET payload_json = ? WHERE seq = ?", (json.dumps(changed), seq)
+            )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _with_another_price(payload: dict[str, Any]) -> dict[str, Any]:
+    payload["snapshot"]["instruments"][0]["quote"]["last"] = "1234.5"
+    return payload
+
+
+@pytest.mark.parametrize(
+    ("event", "change", "named"),
+    [
+        (EventType.SNAPSHOT_FROZEN, _with_another_price, "quote differs"),
+        (EventType.DECISION_MADE, lambda _: None, "asked the panel at"),
+    ],
+    ids=["market", "cycle"],
+)
+async def test_a_replay_that_differs_refuses_naming_the_cycle_and_keeps_the_old_log(
+    data: dict[str, Path], tmp_path: Path, event: EventType, change: Rewrite, named: str
+) -> None:
+    await killed_after(data["flat"], tmp_path, "2024-02", {})
+    gc.collect()
+    _rewrite_event(run_dir(tmp_path) / pd.PERIOD_DB, utc(1, 20), event, change)
+
+    with pytest.raises(ConfigError, match=rf"2024-01-20.*{named}"):
+        await execute(data["flat"], tmp_path, QUARTER, {}, cost_usd=COST, resume=True)
+
+    gc.collect()
+    assert stored_meta(tmp_path).ending is pd.RunEnding.INTERRUPTED
+    assert "2024-01-20" in stored_meta(tmp_path).ending_reason
+    kept = abandoned_files(tmp_path)
+    assert len(kept) == 1
+    assert max(cycle_stamps(kept[0])) == utc(2, 29)
+    # Refused at the first difference: no later cycle was run, and no live call was made.
+    assert max(cycle_stamps(run_dir(tmp_path) / pd.PERIOD_DB)) <= utc(1, 22)
+
+
+async def test_a_month_that_replays_differently_refuses(
+    data: dict[str, Path], tmp_path: Path
+) -> None:
+    """The month row is the last check: what the final poll did is in no later snapshot."""
+    await killed_after(data["flat"], tmp_path, "2024-02", {})
+    written = run_dir(tmp_path) / pd.CHECKPOINT_DIR / "2024-02.json"
+    meta = pd.PeriodMeta.model_validate_json(written.read_text(encoding="utf-8"))
+    row = meta.months[0].model_copy(update={"end_equity": meta.months[0].end_equity + 1})
+    written.write_text(
+        meta.model_copy(update={"months": (row, meta.months[1])}).model_dump_json(),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="end of 2024-01"):
+        await execute(data["flat"], tmp_path, QUARTER, {}, cost_usd=COST, resume=True)
+
+
+class _Feed:
+    """Stands in for `ArchiveNewsFeed`; only `digest` and the protocol are read."""
+
+    digest = "same-digest"
+
+    def __init__(self, title: str) -> None:
+        self._title = title
+
+    async def snapshot_news(
+        self, instruments: tuple[Any, ...], as_of: datetime, limit: int
+    ) -> tuple[tuple[NewsItemView, ...], NewsCoverage]:
+        item = NewsItemView(
+            source="archive",
+            title=self._title,
+            summary="s",
+            published_at=as_of,
+            observed_at=as_of,
+            relevance=Decimal(1),
+        )
+        return (item,), NewsCoverage(sources_ok=("archive",))
+
+
+async def test_a_news_fed_run_continues_on_the_same_feed_and_refuses_a_different_one(
+    data: dict[str, Path], tmp_path: Path
+) -> None:
+    feed = cast(ArchiveNewsFeed, _Feed("the same headline"))
+    other = cast(ArchiveNewsFeed, _Feed("a different headline"))
+    whole = await execute(data["flat"], tmp_path / "a", QUARTER, {}, cost_usd=COST, news_feed=feed)
+    b, c = tmp_path / "b", tmp_path / "c"
+    await killed_after(data["flat"], b, "2024-01", {}, news_feed=feed)
+    await killed_after(data["flat"], c, "2024-01", {}, news_feed=feed)
+
+    # In its own workspace: pytest's log capture keeps the refused wiring's frames, and with them
+    # its open connections, and Windows will not then move that file. A real Continue is a new
+    # process.
+    with pytest.raises(ConfigError, match="news differs"):
+        await execute(data["flat"], c, QUARTER, {}, cost_usd=COST, resume=True, news_feed=other)
+    resumed = await execute(
+        data["flat"], b, QUARTER, {}, cost_usd=COST, resume=True, news_feed=feed
+    )
+
+    assert resumed.meta.months == whole.meta.months
+    assert not resumed.plan.calls_between(utc(1), utc(2))
+
+
+def test_a_period_basket_carries_no_challenger(data: dict[str, Path]) -> None:
+    """Its answers are not replayed, so a Continue would pay for every one of them again."""
+    candidate = candidate_over(data["flat"], 2)
+    panel = candidate.basket.panel.model_copy(update={"panel_id": "challenger"})
+    shadowed = replace(
+        candidate, basket=candidate.basket.model_copy(update={"shadow_panel": panel})
+    )
+    dataset = ReplayDataset.load(data["flat"], ManualClock(utc(1)))
+
+    assert pd.period_basket(shadowed, dataset, 86_400).shadow_panel is None
+
+
+def _record(at: datetime) -> CycleRecord:
+    snapshot = ContextSnapshot(snapshot_id="old", basket_id="period", as_of=at, instruments=())
+    decision = Decision(instrument_key="binance:BTC/USDT", action=Action.WAIT)
+    return CycleRecord(
+        cycle_id="c", basket_id="period", as_of=at, snapshot=snapshot, decisions=(decision,)
+    )
+
+
+async def test_a_recorded_answer_nobody_asked_for_refuses(data: dict[str, Path]) -> None:
+    candidate = candidate_over(data["flat"], 2)
+    replayer = Replayer(
+        (_record(utc(1, 1)), _record(utc(1, 2))), boundary=utc(2), clock=ManualClock(utc(1))
+    )
+
+    answer = await replayer(_record(utc(1, 1)).snapshot.model_copy(), candidate.basket)
+    assert answer.decisions == _record(utc(1, 1)).decisions
+    with pytest.raises(ConfigError, match=r"2024-01-02.*did not"):
+        replayer.require_consumed()
+
+
+async def test_the_generated_id_is_all_a_replay_ignores(data: dict[str, Path]) -> None:
+    candidate = candidate_over(data["flat"], 2)
+    replayer = Replayer((_record(utc(1, 1)),), boundary=utc(2), clock=ManualClock(utc(1)))
+    same = _record(utc(1, 1)).snapshot.model_copy(update={"snapshot_id": "new"})
+    await replayer(same, candidate.basket)
+    replayer.require_consumed()
+
+    replayer = Replayer((_record(utc(1, 1)),), boundary=utc(2), clock=ManualClock(utc(1)))
+    other = same.model_copy(update={"note": "something else"})
+    with pytest.raises(ConfigError, match="note differs"):
+        await replayer(other, candidate.basket)
+    # The worker absorbs what a cycle raises, so the refusal has to be readable afterwards.
+    with pytest.raises(ConfigError, match="note differs"):
+        replayer.raise_if_diverged()
+
+
 async def test_a_crash_mid_month_redoes_only_that_month(
     data: dict[str, Path], tmp_path: Path, uninterrupted: Uninterrupted
 ) -> None:
@@ -280,7 +579,7 @@ async def test_a_crash_mid_month_redoes_only_that_month(
     stamps = cycle_stamps(resumed.database)
     assert len(stamps) == len(set(stamps))
     assert_same_outcomes(resumed, whole)
-    # January was not redone: the only calls are from the restored checkpoint onward.
+    # January was not asked again: the only calls are from the checkpoint onward.
     assert not resumed.plan.calls_between(utc(1), utc(2))
 
     kept = abandoned_files(tmp_path)
@@ -311,7 +610,7 @@ async def test_spent_budget_still_counts_after_continue(
     resumed = await execute(data["flat"], tmp_path, QUARTER, {}, cost_usd=COST, resume=True)
 
     # Ten February cycles, then five: each crash's work is counted, and the second does not forget
-    # the first even though both restored the same January checkpoint.
+    # the first even though both replayed the same January.
     abandoned = 15 * per_cycle(whole)
     assert resumed.meta.abandoned_cost_usd == abandoned
     assert len(abandoned_files(tmp_path)) == 2
@@ -436,13 +735,26 @@ async def test_a_meta_with_no_database_is_a_continue_that_died_between_its_moves
     whole = await uninterrupted(data["flat"], "quiet", {})
     await killed_after(data["flat"], tmp_path, "2024-01", {})
     gc.collect()  # the dead wiring's connections: see `execute`
-    (run_dir(tmp_path) / pd.PERIOD_DB).unlink()
+    pd._abandon(run_dir(tmp_path) / pd.PERIOD_DB, ManualClock(utc(1)))
 
     with pytest.raises(ConfigError, match="Continue"):
         await execute(data["flat"], tmp_path, QUARTER, {}, cost_usd=COST)
     resumed = await execute(data["flat"], tmp_path, QUARTER, {}, cost_usd=COST, resume=True)
 
     assert resumed.meta.months == whole.meta.months
+    assert not resumed.plan.calls_between(utc(1), utc(2))
+
+
+async def test_a_checkpoint_whose_log_is_gone_refuses(
+    data: dict[str, Path], tmp_path: Path
+) -> None:
+    """Its spend cannot be known and its answers cannot be replayed, so nothing is guessed."""
+    await killed_after(data["flat"], tmp_path, "2024-01", {})
+    gc.collect()
+    (run_dir(tmp_path) / pd.PERIOD_DB).unlink()
+
+    with pytest.raises(ConfigError, match=r"2024-01.*no database"):
+        await execute(data["flat"], tmp_path, QUARTER, {}, cost_usd=COST, resume=True)
 
 
 async def test_killed_after_the_last_month_finishes_without_redoing_anything(
@@ -614,7 +926,7 @@ async def test_a_halted_month_is_redone_from_the_month_before(
     assert stopped.meta.ending is pd.RunEnding.INTERRUPTED
     assert [m.label for m in stopped.meta.months] == ["2024-01", "2024-02"]
     written = run_dir(tmp_path) / pd.CHECKPOINT_DIR
-    assert [path.name for path in written.iterdir()] == ["2024-01"]
+    assert [path.name for path in written.iterdir()] == ["2024-01.json"]
 
     resumed = await execute(data["flat"], tmp_path, QUARTER, {}, cost_usd=COST, resume=True)
 
@@ -625,46 +937,45 @@ async def test_a_halted_month_is_redone_from_the_month_before(
 async def test_a_checkpoint_that_cannot_be_written_interrupts_the_run(
     data: dict[str, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def refuse(*_: object, **__: object) -> None:
-        raise BackupError("injected: no room")
+    def refuse(_: int) -> None:
+        raise OSError("injected: no room")
 
-    monkeypatch.setattr(pd, "take_backup", refuse)
+    monkeypatch.setattr(os, "fsync", refuse)
 
-    with pytest.raises(BackupError, match="no room"):
+    with pytest.raises(OSError, match="no room"):
         await execute(data["flat"], tmp_path, QUARTER, {})
 
     assert stored_meta(tmp_path).ending is pd.RunEnding.INTERRUPTED
-    assert not (run_dir(tmp_path) / pd.CHECKPOINT_DIR / "2024-01").exists()
+    assert not (run_dir(tmp_path) / pd.CHECKPOINT_DIR / "2024-01.json").exists()
 
 
-async def test_each_month_end_writes_a_whole_checkpoint(
+async def test_each_month_end_writes_its_meta_and_no_database_copy(
     data: dict[str, Path], tmp_path: Path
 ) -> None:
     ran = await execute(data["flat"], tmp_path, QUARTER, {})
     root = run_dir(tmp_path) / pd.CHECKPOINT_DIR
 
-    assert sorted(path.name for path in root.iterdir()) == ["2024-01", "2024-02", "2024-03"]
-    january = root / "2024-01"
-    assert sorted(path.name for path in january.iterdir()) == sorted(
-        [pd.CHECKPOINT_ARMED, pd.PERIOD_DB, pd.PERIOD_META]
-    )
-    meta = pd.PeriodMeta.model_validate_json((january / pd.PERIOD_META).read_text(encoding="utf-8"))
+    assert sorted(path.name for path in root.iterdir()) == [
+        "2024-01.json",
+        "2024-02.json",
+        "2024-03.json",
+    ]
+    meta = pd.PeriodMeta.model_validate_json((root / "2024-01.json").read_text(encoding="utf-8"))
     assert [m.label for m in meta.months] == ["2024-01"]
-    assert max(cycle_stamps(january / pd.PERIOD_DB)) == utc(1, 31)
     assert ran.meta.ending is pd.RunEnding.COMPLETED
 
 
-def test_restore_latest_finds_nothing_in_an_empty_run(tmp_path: Path) -> None:
-    assert pd.restore_latest(tmp_path) is None
+def test_a_later_abandoned_file_is_read_as_later_whatever_its_digits(tmp_path: Path) -> None:
+    """Ten Continues in one second: compared as text, `-10` would sort before `-9`."""
+    stem = f"{pd.PERIOD_DB}.abandoned-20240101T000000Z"
+    for name in (stem, f"{stem}-9", f"{stem}-10", f"{stem}-10-wal"):
+        (tmp_path / name).touch()
 
-
-async def test_restore_latest_refuses_over_a_live_database(
-    data: dict[str, Path], tmp_path: Path
-) -> None:
-    await execute(data["flat"], tmp_path, "2024-02", {})
-
-    with pytest.raises(FailClosedError, match="still in place"):
-        pd.restore_latest(run_dir(tmp_path))
+    assert [path.name for path in pd._abandoned_newest_first(tmp_path)] == [
+        f"{stem}-10",
+        f"{stem}-9",
+        stem,
+    ]
 
 
 def _vetoes_of(risk_events: dict[str, int]) -> set[str]:
@@ -701,4 +1012,6 @@ def test_the_excluded_actions_are_the_ones_the_bot_emits() -> None:
         == (pd._NOT_REFUSALS[monitor_module.TRACKED_GROUP_RULE])
     )
     around = startup[startup.index('rule="valuation_basis"') :]
-    assert re.search(r'action="(\w+)"', around)[1] in pd._NOT_REFUSALS["valuation_basis"]  # type: ignore[index]
+    action = re.search(r'action="(\w+)"', around)
+    assert action is not None
+    assert action[1] in pd._NOT_REFUSALS["valuation_basis"]
