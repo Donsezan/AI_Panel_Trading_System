@@ -37,6 +37,7 @@ from decision_lab.newsfeed import ArchiveNewsFeed
 from decision_lab.records import CycleRecord
 from decision_lab.replay import Replayer
 from decision_lab.tests import factories as f
+from decision_lab.tests import test_period_pause as pause
 from decision_lab.tests.test_period_pause import (
     BTC,
     ETH,
@@ -57,7 +58,7 @@ from tradebot.app import Application
 from tradebot.control import startup as startup_module
 from tradebot.control.supervisor import BasketWorker
 from tradebot.core.clock import ManualClock
-from tradebot.core.config import Basket
+from tradebot.core.config import Basket, ProviderBinding
 from tradebot.core.decision import Decision
 from tradebot.core.enums import Action
 from tradebot.core.errors import ConfigError
@@ -65,7 +66,9 @@ from tradebot.core.events import EventType
 from tradebot.core.market import Candle
 from tradebot.core.money import ZERO
 from tradebot.core.snapshot import ContextSnapshot, NewsCoverage, NewsItemView
+from tradebot.decision.providers.stub import DEFAULT_RESPONSE, FAIL
 from tradebot.execution import monitor as monitor_module
+from tradebot.interfaces.llm import CompletionRequest
 from tradebot.marketdata.recorder import ReplayDataset
 from tradebot.persistence.store import EventStore
 from tradebot.validation.evidence import Evidence
@@ -74,7 +77,7 @@ COST = Decimal("0.01")
 QUARTER = "2024-Q1"
 RISE_DAY = date(2024, 2, 10)
 #: Past the entry's stop in March, so a position carried over the February boundary is closed by a
-#: stop that only the restored venue can fire.
+#: stop that only a faithfully re-executed venue can fire.
 DROP_DAY = date(2024, 3, 10)
 #: One trip closed in January, one entry carried over the February boundary, and an entry after it.
 TRADES: Votes = {
@@ -1015,3 +1018,111 @@ def test_the_excluded_actions_are_the_ones_the_bot_emits() -> None:
     action = re.search(r'action="(\w+)"', around)
     assert action is not None
     assert action[1] in pd._NOT_REFUSALS["valuation_basis"]
+
+
+class _Messy(pause.Plan):
+    """What a real panel does that a clean script never does: a primary that is down so the
+    fallback answers, a day on which every model is down, a reply that needs one repair, and one
+    that does not parse after it. Answers vary with the date and the model, never with call order,
+    so a resumed process asks the same question the unbroken one did."""
+
+    def __init__(self, votes: pause.Votes, *, cost_usd: Decimal = ZERO) -> None:
+        super().__init__(votes, cost_usd=cost_usd)
+        self._broken_once: set[tuple[date, str]] = set()
+
+    def _text_for(self, request: CompletionRequest) -> str:
+        at = pause.as_of(request).date()
+        model = request.model
+        phase = at.day % 7
+        if phase == 1 and "technical" in model and "backup" not in model:
+            return FAIL
+        if phase == 2:
+            return FAIL
+        if phase == 3 and "news" in model and (at, model) not in self._broken_once:
+            self._broken_once.add((at, model))
+            return "not json at all"
+        if phase == 4 and "skeptic" in model:
+            return "still not json"
+        vote = json.loads(DEFAULT_RESPONSE)
+        buys = phase == 5 and at.month != 3 and at.day % 14 == 5
+        action = "BUY" if buys else "WAIT"
+        if phase == 0 and "skeptic" not in model:
+            action = "SELL"
+        vote["action"] = action
+        vote["size_hint"] = "half" if action in ("BUY", "SELL") else "none"
+        return json.dumps(vote)
+
+
+def _messy_candidate(data_dir: Path, ceiling: Decimal) -> Candidate:
+    """Three seats, debating, with a backup behind one of them and a cost ceiling per cycle."""
+    base = candidate_over(data_dir, 50)
+    seats = tuple(
+        seat.model_copy(
+            update={
+                "fallbacks": (ProviderBinding(provider_id="stub", model=f"{seat.model}-backup"),)
+                if "technical" in seat.model
+                else ()
+            }
+        )
+        for seat in base.basket.panel.seats
+    )
+    panel = base.basket.panel.model_copy(
+        update={
+            "seats": seats,
+            "max_cost_usd_per_cycle": ceiling,
+            "max_rounds": 3,
+            "protocol": "blind_then_debate",
+        }
+    )
+    return replace(base, basket=base.basket.model_copy(update={"panel": panel}))
+
+
+def _logged(database: Path, kind: EventType, key: str) -> list[tuple[datetime, dict[str, Any]]]:
+    def read(store: EventStore) -> list[tuple[datetime, dict[str, Any]]]:
+        return [(event.ts, event.payload[key]) for event in store.read_types(kind)]
+
+    return read_log(database, read)
+
+
+@pytest.mark.parametrize(
+    "ceiling", [ZERO, Decimal("0.05")], ids=["no-ceiling", "ceiling-truncates"]
+)
+async def test_a_continue_replays_a_panel_that_disagrees_repairs_and_falls_back(
+    data: dict[str, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ceiling: Decimal
+) -> None:
+    """The replay is exercised with a real panel's shapes, not a script that always agrees.
+
+    Debate rounds, a fallback answering, an abstention, a repaired reply and a cost ceiling that
+    cuts a debate short are all in the old log, and the new one must hold the same answers, cost
+    and fingerprints byte for byte up to the boundary, then live calls after it."""
+    monkeypatch.setattr(pause, "Plan", _Messy)
+    source = data["drop"]
+    candidate = _messy_candidate(source, ceiling)
+    options: dict[str, Any] = {"candidate": candidate, "budget": Decimal(100)}
+
+    whole = await execute(source, tmp_path / "a", QUARTER, {}, cost_usd=COST, **options)
+    assert whole.meta.ending is pd.RunEnding.COMPLETED, whole.meta.ending_reason
+    interrupted = tmp_path / "b"
+    await killed_after(source, interrupted, "2024-02", {}, **options)
+    resumed = await execute(source, interrupted, QUARTER, {}, cost_usd=COST, resume=True, **options)
+    assert resumed.meta.ending is pd.RunEnding.COMPLETED, resumed.meta.ending_reason
+
+    answers = _logged(whole.database, EventType.SEAT_RESPONDED, "response")
+    assert {answer["round_index"] for _, answer in answers} >= {0, 1}, "no debate happened"
+    assert any(answer["vote"] is None for _, answer in answers), "no seat abstained"
+    assert any("backup" in answer["model"] for _, answer in answers), "no fallback answered"
+
+    boundary = utc(3)
+    abandoned = abandoned_files(interrupted)[0]
+    for kind, key in (
+        (EventType.SEAT_RESPONDED, "response"),
+        (EventType.DECISION_MADE, "decision"),
+    ):
+        before = [one for one in _logged(abandoned, kind, key) if one[0] < boundary]
+        after = [one for one in _logged(resumed.database, kind, key) if one[0] < boundary]
+        assert after == before, f"{kind} differs across the replayed months"
+    assert resumed.meta.months == whole.meta.months
+    assert resumed.meta.profit == whole.meta.profit
+    assert resumed.meta.abandoned_cost_usd == ZERO
+    assert fills_in(resumed.database) == fills_in(whole.database)
+    assert not resumed.plan.calls_between(utc(1), utc(3)), "a replayed month asked the model"

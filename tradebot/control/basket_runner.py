@@ -215,7 +215,11 @@ class BasketRunner:
 
         # One call covers the whole basket, so the panel's cost ceiling and its decision mode
         # are the engine's to enforce; the runner only sees decisions (DESIGN §6.5).
-        deliberate = self._deliberate or self._decisions.deliberate
+        # `is not None`, not `or`: an injected callable that defines `__bool__` or `__len__` must
+        # not be silently replaced by the real engine.
+        deliberate: Deliberate = self._decisions.deliberate
+        if self._deliberate is not None:
+            deliberate = self._deliberate
         panel = await deliberate(snapshot, self._basket)
         await self._store.append(*(events.seat_responded(r) for r in panel.responses))
 

@@ -20,6 +20,7 @@ import asyncio
 import logging
 import sys
 from collections.abc import Callable, Coroutine
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -35,6 +36,7 @@ from decision_lab import compare as cmp
 from decision_lab import corpus as cp
 from decision_lab import dataset as ds
 from decision_lab import gate, jobs, longrun, registry, sampling
+from decision_lab import period as pd
 from decision_lab import records as rc
 from decision_lab import regimes as rg
 from decision_lab import render as rd
@@ -110,6 +112,7 @@ LOCKED: frozenset[tuple[str, str]] = frozenset(
         ("calibrate", "normal"),
         ("calibrate", "shock"),
         ("calibrate", "long"),
+        ("evaluate", "period"),
     }
 )
 
@@ -443,6 +446,50 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     long_.add_argument("--out", type=Path, default=None)
     long_.add_argument("--verbose", action="store_true")
+
+    evaluate = commands.add_parser(
+        "evaluate", help="one seat set over one chosen calendar period (period spec)"
+    )
+    evaluate_actions = evaluate.add_subparsers(dest="action", required=True)
+    period_ = evaluate_actions.add_parser(
+        "period", help="a month, a quarter or a year, month after month in one ledger"
+    )
+    period_.add_argument("--data", type=Path, required=True)
+    period_.add_argument("--configs", type=Path, required=True)
+    period_.add_argument("--candidate", required=True, help="which candidate to run")
+    period_.add_argument("--start-equity", type=_decimal_arg, default=Decimal(1000))
+    period_.add_argument("--every", default="4h", choices=sorted(CADENCE_SECONDS))
+    period_.add_argument("--period", required=True, help="YYYY, YYYY-Qn or YYYY-MM")
+    # Required with no default, as for `sweep`. Checked at each month boundary, so a run can
+    # overshoot by up to one month's spend and a one-month period has no mid-run ceiling (§5.5).
+    period_.add_argument(
+        "--budget", type=_decimal_arg, required=True, help="USD ceiling, checked at month ends"
+    )
+    period_.add_argument(
+        "--news-source",
+        action="append",
+        default=[],
+        dest="news_sources",
+        metavar="SOURCE",
+        help="a published archive to read, repeatable. Omitted, the run is NEWS-BLIND. Pass the "
+        "same ones to --continue: the archive is part of the run's identity",
+    )
+    period_.add_argument(
+        "--policy", type=Path, default=DEFAULT_POLICY_FILE, help="archive.toml (§6.6)"
+    )
+    period_.add_argument(
+        "--skip-gate",
+        action="store_true",
+        help="run without the §10.6 calibration gate; stamped on the report and the registry row",
+    )
+    period_.add_argument(
+        "--continue",
+        action="store_true",
+        dest="resume",
+        help="carry on an interrupted run from its last month end, under this --budget (§5.7)",
+    )
+    period_.add_argument("--out", type=Path, default=None)
+    period_.add_argument("--verbose", action="store_true")
 
     report_ = commands.add_parser(
         "report", help="score a built corpus and file the result under decision_lab/reports/"
@@ -995,22 +1042,38 @@ async def calibrate_snapshot(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
-async def calibrate_long(args: argparse.Namespace) -> int:
-    """§10.4 — one candidate's own six months, with its own ledger.
+@dataclass(frozen=True, slots=True)
+class _Loaded:
+    """What `calibrate long` and `evaluate period` both open with, once it has not refused."""
 
-    Scenario 3 is the one genuinely different instrument in §10 (§10.1): positions compound, so
-    this is a full `BacktestHarness` pass rather than a snapshot rescoring, and its numbers are
-    not on the same scale as a calibration's accuracy. `--corpus` is deliberately absent — a long
-    run builds its own path from the dataset, and reading a corpus's frozen snapshots would be
-    the very thing that makes scenarios 1 and 2 unable to answer §10.4's question.
+    audit: ds.CoverageAudit
+    dataset: ReplayDataset
+    matrix: cd.Matrix
+    candidate: cd.Candidate
+    #: `None` under `--skip-gate`.
+    record: gate.GateRecord | None
+    dayset_digest: str
+
+
+def _load_candidate(
+    args: argparse.Namespace, clock: SystemClock, *, reachability_first: bool, label: str
+) -> _Loaded | int:
+    """The shared opening of the two single-candidate commands, or the exit code that refuses.
+
+    Verified dataset, the reference basket `corpus.build` derives (so a matrix expands against the
+    same basket it would there; `every_seconds` reaches neither `panel_digest` nor `matrix_digest`,
+    which keeps §10.6's gate valid across cadences), the matrix, the named candidate, the gate and
+    the provider check. Everything refuses before spend.
+
+    The order of the last two is the one thing the commands disagree on. `calibrate long` checks
+    reachability first: it is the command an operator is sent to by a missing key, so there is no
+    second command to defer the key to. `evaluate period` consults the gate first, as `sweep`
+    does: an operator who has not calibrated must fix that before being told about a key, because
+    `calibrate` reports the key itself.
     """
-    clock = SystemClock()
     audit = ds.require_verified(args.data)
     dataset = ReplayDataset.load(args.data, clock)
-
-    # The same reference `corpus.build` derives, so a matrix expands against the same basket it
-    # would there. `every_seconds` differs by design and reaches neither `panel_digest` nor
-    # `matrix_digest` — which is what lets §10.6's gate stay valid across cadences.
+    refusal = f"{label} refused; nothing was spent"
     try:
         reference = dataset_basket(
             dataset,
@@ -1019,9 +1082,10 @@ async def calibrate_long(args: argparse.Namespace) -> int:
             every_seconds=CADENCE_SECONDS[args.every],
         )
         matrix = cd.load_matrix(args.configs, reference=reference)
-        cd.require_reachable(matrix)
+        if reachability_first:
+            cd.require_reachable(matrix)
     except ConfigError as error:
-        logger.error("long run refused; nothing was spent", extra={"reason": str(error)})
+        logger.error(refusal, extra={"reason": str(error)})
         return EXIT_CANDIDATE
 
     candidate = next((one for one in matrix.candidates if one.candidate_id == args.candidate), None)
@@ -1029,7 +1093,7 @@ async def calibrate_long(args: argparse.Namespace) -> int:
         # Naming the ids that do exist, because an expansion suffix is exactly the sort of thing
         # a hand-typed `--candidate` gets wrong, and the matrix is the only place to read them.
         logger.error(
-            "long run refused; no candidate by that id is in this matrix",
+            f"{label} refused; no candidate by that id is in this matrix",
             extra={
                 "requested": args.candidate,
                 "available": [one.candidate_id for one in matrix.candidates],
@@ -1040,7 +1104,7 @@ async def calibrate_long(args: argparse.Namespace) -> int:
     record: gate.GateRecord | None = None
     dayset_digest = ""
     if not args.skip_gate:
-        # §10.6: the long run is the expensive one, so it refuses on the same evidence a sweep
+        # §10.6: these runs are the expensive ones, so they refuse on the same evidence a sweep
         # does. `require_pinned` raises `ConfigError`, which `main` maps to EXIT_DATASET.
         pinned = cday.require_pinned(args.data)
         dayset_digest = pinned.dayset_digest
@@ -1051,8 +1115,32 @@ async def calibrate_long(args: argparse.Namespace) -> int:
                 dayset_digest=pinned.dayset_digest,
             )
         except ConfigError as error:
-            logger.error("long run refused; nothing was spent", extra={"reason": str(error)})
+            logger.error(refusal, extra={"reason": str(error)})
             return EXIT_GATE
+    if not reachability_first:
+        try:
+            cd.require_reachable(matrix)
+        except ConfigError as error:
+            logger.error(refusal, extra={"reason": str(error)})
+            return EXIT_CANDIDATE
+    return _Loaded(audit, dataset, matrix, candidate, record, dayset_digest)
+
+
+async def calibrate_long(args: argparse.Namespace) -> int:
+    """§10.4 — one candidate's own six months, with its own ledger.
+
+    Scenario 3 is the one genuinely different instrument in §10 (§10.1): positions compound, so
+    this is a full `BacktestHarness` pass rather than a snapshot rescoring, and its numbers are
+    not on the same scale as a calibration's accuracy. `--corpus` is deliberately absent — a long
+    run builds its own path from the dataset, and reading a corpus's frozen snapshots would be
+    the very thing that makes scenarios 1 and 2 unable to answer §10.4's question.
+    """
+    clock = SystemClock()
+    loaded = _load_candidate(args, clock, reachability_first=True, label="long run")
+    if isinstance(loaded, int):
+        return loaded
+    audit, matrix, candidate, record = loaded.audit, loaded.matrix, loaded.candidate, loaded.record
+    dayset_digest = loaded.dayset_digest
 
     meta = await longrun.run(
         data_dir=args.data,
@@ -1138,6 +1226,199 @@ async def calibrate_long(args: argparse.Namespace) -> int:
         },
     )
     return EXIT_OK
+
+
+async def evaluate_period(args: argparse.Namespace) -> int:
+    """One candidate through one calendar period (period spec §5), and the page for it.
+
+    Every refusal happens before spend, in this order: an unreadable period (2), a dataset that is
+    unverified or does not cover the period (3), the matrix and candidate (4, 2), the gate (6), the
+    provider check (4), the news archive (4), and a projection over the budget (5). The gate is
+    consulted ahead of the provider check, as in `sweep`.
+
+    A run that ended is filed whatever its ending: a rule's verdict is a result (exit 0), and a
+    budget stop is interrupted work (exit 5) whose page says how to continue it. An exception out
+    of the driver propagates after the run has written `INTERRUPTED`, so the stack trace is the
+    exit code. A run that cannot be started or continued is a `ConfigError` and exits 3 through
+    `main` (an interrupted run met without `--continue`, and a Continue that refuses: a rule's
+    verdict, a replay that differs, a missing log). `--continue` against a spent budget exits 5.
+    """
+    clock = SystemClock()
+    try:
+        period = pd.parse_period(args.period)
+    except ConfigError as error:
+        logger.error("period run refused; nothing was spent", extra={"reason": str(error)})
+        return EXIT_MISUSE
+    # Ahead of the gate: an operator told to calibrate for a period that cannot run has been sent
+    # on an errand. `run` checks again, because it is also reached without this handler.
+    ds.require_verified(args.data)
+    covered_from, covered_to = ReplayDataset.load(args.data, clock).coverage
+    pd.require_covered(period, covered_from, covered_to - timedelta(hours=1))
+
+    loaded = _load_candidate(args, clock, reachability_first=False, label="period run")
+    if isinstance(loaded, int):
+        return loaded
+    matrix, candidate, record = loaded.matrix, loaded.candidate, loaded.record
+
+    feed = None
+    if args.news_sources:
+        # As `corpus build` does: a repeated flag would load the archive twice and read as
+        # corroboration. `main` would call a policy or archive problem a dataset problem.
+        if len(set(args.news_sources)) != len(args.news_sources):
+            logger.error(
+                "period run refused; nothing was spent",
+                extra={"reason": f"--news-source repeats a source: {args.news_sources}"},
+            )
+            return EXIT_CANDIDATE
+        try:
+            feed = load_feed(args.data, tuple(args.news_sources), load_policy(args.policy))
+        except ConfigError as error:
+            logger.error("period run refused; nothing was spent", extra={"reason": str(error)})
+            return EXIT_CANDIDATE
+
+    # §5.5: the calibrated cost per cycle times the cycles the period plans. `None` when there is
+    # nothing to project from, which the page says rather than showing a zero that reads as free.
+    # Not enforced on a Continue: the months it replays cost nothing, and what was already spent
+    # is counted against the ceiling inside `run`, which is the check that knows.
+    cadence = CADENCE_SECONDS[args.every]
+    projected = _projected_cost(record, candidate.candidate_id, period, cadence)
+    if projected is not None and projected > args.budget and not args.resume:
+        logger.error(
+            "period run refused; nothing was spent",
+            extra={
+                "reason": f"projected spend {projected} is over the budget of {args.budget}",
+                "period": period.label,
+            },
+        )
+        return EXIT_BUDGET
+
+    try:
+        meta = await pd.run(
+            data_dir=args.data,
+            candidate=candidate,
+            period=period,
+            cadence_seconds=cadence,
+            start_equity=args.start_equity,
+            budget=args.budget,
+            wall_clock=clock,
+            news_feed=feed,
+            gate_skipped=args.skip_gate,
+            plumbing_check=not matrix.is_evaluation,
+            resume=args.resume,
+        )
+    except pd.BudgetReached as error:
+        logger.error("period run refused; nothing was moved", extra={"reason": str(error)})
+        return EXIT_BUDGET
+    except OSError as error:
+        # A checkpoint that cannot be written: the run has marked itself interrupted.
+        logger.error("period run interrupted", extra={"reason": f"{type(error).__name__}: {error}"})
+        return EXIT_DATASET
+
+    not_run = pd.not_run_months(meta)
+    built = rd.PeriodReport(
+        generated_at=clock.now(),
+        run_id=meta.run_id,
+        dataset_directory=meta.dataset_directory,
+        dataset_digest=meta.dataset_digest,
+        candidate_id=meta.candidate_id,
+        panel_digest=meta.panel_digest,
+        panel_models=tuple(
+            dict.fromkeys(f"{s.provider_id}:{s.model}" for s in candidate.panel.seats)
+        ),
+        archive_digest=meta.archive_digest,
+        cadence_seconds=meta.cadence_seconds,
+        period=meta.period.label,
+        first_cycle_at=meta.first_cycle_at,
+        budget=args.budget,
+        projected_cost=projected,
+        news_blind=meta.news_blind,
+        plumbing_check=meta.plumbing_check,
+        gate_skipped=meta.gate_skipped,
+        months=tuple(rd.PeriodMonthRow.model_validate(m.model_dump()) for m in meta.months),
+        not_run=not_run,
+        lifts=tuple(rd.PeriodLiftRow.model_validate(one.model_dump()) for one in meta.lifts),
+        ending=meta.ending.value,
+        ending_reason=meta.ending_reason,
+        abandoned_cost_usd=meta.abandoned_cost_usd,
+        unvaluable=meta.profit.unvaluable,
+        freeze_reason=meta.profit.freeze_reason,
+        equity=meta.profit.equity,
+        start_equity=meta.profit.start_equity,
+        total_profit=meta.profit.total,
+        realized=meta.profit.realized,
+        unrealized=meta.profit.unrealized,
+        cost_usd=meta.profit.cost_usd,
+        net_profit=meta.profit.net,
+        vetoes=tuple((row.rule, row.action_taken, row.count) for row in meta.vetoes),
+        incidents=meta.incidents,
+    )
+    out = args.out or reports_dir() / f"decision-lab-period-{meta.run_id}.md"
+    rd.write_period(built, out)
+
+    # Recorded on every invocation, and a reused run is not a second row: `registry.record`
+    # replaces by identity, and `corpus_id` carries this run's own id (as `calibrate long` carries
+    # its derived one), so a changed archive or risk limit is a different row.
+    registry.record(
+        registry.RunRow(
+            recorded_at=clock.now(),
+            scenario="evaluate-period",
+            dataset_digest=meta.dataset_digest,
+            corpus_id=meta.run_id,
+            matrix_digest=matrix.matrix_digest,
+            dayset_digest=loaded.dayset_digest,
+            candidate_id=meta.candidate_id,
+            cadence_seconds=meta.cadence_seconds,
+            start_equity=args.start_equity,
+            window=meta.period.label,
+            evaluation=matrix.is_evaluation,
+            on_fallback=matrix.on_fallback.value,
+            gate_skipped=args.skip_gate,
+            cost_usd=meta.profit.cost_usd,
+            total_profit=meta.profit.total,
+            realized_pnl=meta.profit.realized,
+            unrealized_pnl=meta.profit.unrealized,
+            net_profit=meta.profit.net,
+            unvaluable=meta.profit.unvaluable,
+            ending=meta.ending.value,
+            ending_reason=meta.ending_reason,
+            pauses_lifted=len(meta.lifts),
+            not_run=not_run,
+            abandoned_cost_usd=meta.abandoned_cost_usd,
+            news_blind=meta.news_blind,
+            no_projection=projected is None,
+        )
+    )
+    logger.info(
+        "period run reported",
+        extra={
+            "run_id": meta.run_id,
+            "period": meta.period.label,
+            "ending": meta.ending.value,
+            "not_run": list(not_run),
+            "net": str(meta.profit.net),
+            "unvaluable": meta.profit.unvaluable,
+            "report": str(out),
+        },
+    )
+    if meta.ending is pd.RunEnding.INTERRUPTED:
+        logger.error("period run interrupted", extra={"reason": meta.ending_reason})
+        return EXIT_BUDGET if meta.ending_reason.startswith(pd.BUDGET_STOP) else EXIT_DATASET
+    return EXIT_OK
+
+
+def _projected_cost(
+    record: gate.GateRecord | None, candidate_id: str, period: pd.Period, cadence_seconds: int
+) -> Money | None:
+    """The gate's measured cost per cycle times the cycles the period plans (§5.5)."""
+    if record is None or record.normal is None:
+        return None
+    found = next(
+        (one for one in record.normal.candidates if one.candidate_id == candidate_id), None
+    )
+    if found is None:
+        return None
+    planned = (period.end - period.start) // timedelta(seconds=cadence_seconds)
+    return found.cost_per_cycle * planned
 
 
 def _snapshot_accuracy(record: gate.GateRecord | None, candidate_id: str) -> Money | None:
@@ -1609,6 +1890,7 @@ COMMANDS: dict[tuple[str, str], Callable[[argparse.Namespace], Coroutine[Any, An
     ("calibrate", "normal"): calibrate_snapshot,
     ("calibrate", "shock"): calibrate_snapshot,
     ("calibrate", "long"): calibrate_long,
+    ("evaluate", "period"): evaluate_period,
     ("dashboard", ""): dashboard_command,
 }
 

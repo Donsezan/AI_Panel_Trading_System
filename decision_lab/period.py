@@ -89,6 +89,10 @@ from tradebot.validation.evidence import Evidence
 
 _PATTERN: Final = re.compile(r"^(\d{4})(?:-(?:(0[1-9]|1[0-2])|Q([1-4])))?$")
 _BAR: Final = timedelta(hours=1)
+#: How a budget stop opens its reason. The CLI reads an `INTERRUPTED` ending by it, because a
+#: budget stop is the one interruption that comes back as a result rather than an exception, and
+#: it needs its own exit code (§5.7).
+BUDGET_STOP: Final = "budget of"
 #: The one instrument a period run trades, by the operator's decision (§4). It reaches
 #: `config_digest` through the basket, so widening this later mints new runs rather than colliding.
 PERIOD_SYMBOL: Final = "BTC/USDT"
@@ -1052,7 +1056,7 @@ async def run(
                 is_live = index >= len(replayed_months)
                 if is_live and index + 1 < len(period.months) and spent > budget:
                     raise BudgetReached(
-                        f"budget of {budget} passed at the end of {month.label}: {spent} spent"
+                        f"{BUDGET_STOP} {budget} passed at the end of {month.label}: {spent} spent"
                     )
         except BudgetReached as exc:
             meta = meta.model_copy(
@@ -1071,9 +1075,12 @@ async def run(
             )
             raise
     finally:
-        if replayer is not None:
-            await replayer.aclose()
-        await application.shutdown()
+        # Nested so a replayer that fails to close cannot leave the wiring open behind it.
+        try:
+            if replayer is not None:
+                await replayer.aclose()
+        finally:
+            await application.shutdown()
 
     if meta.ending is RunEnding.RUNNING:
         meta = meta.model_copy(update={"ending": RunEnding.COMPLETED})

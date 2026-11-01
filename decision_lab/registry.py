@@ -93,6 +93,20 @@ class RunRow(DomainModel):
     #: ignorance, and a number produced in ignorance is worse than its absence (§10.4).
     unvaluable: bool = False
 
+    # --- `evaluate period` alone (period spec §5.7). Provenance, not identity: they describe how a
+    # run ended and what it was stamped with, and a row that split on them would show one
+    # experiment as several.
+    ending: str = ""
+    ending_reason: str = ""
+    #: How many loss-streak pauses the run lifted. Zero is "none", never "not measured".
+    pauses_lifted: int = 0
+    #: Months with no row on the run's meta: an absent month is never a quiet one.
+    not_run: tuple[str, ...] = ()
+    abandoned_cost_usd: Money = ZERO
+    news_blind: bool = False
+    #: No calibrated cost per cycle existed, so no projection was shown (§5.5).
+    no_projection: bool = False
+
     @property
     def identity(self) -> str:
         return run_id(

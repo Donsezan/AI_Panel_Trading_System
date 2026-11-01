@@ -848,3 +848,240 @@ def write_long_run(report: LongRunReport, path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(long_run_markdown(report), encoding="utf-8")
     return path
+
+
+#: Period spec §5.3. Wherever a period run's profit appears, because the bot's own rule needs a
+#: human to clear a loss-streak pause and this tool did it for the run. Rendered with the banners,
+#: above the identity, and again beside the profit figure.
+PAUSE_LIFTED: Final = (
+    "**PAUSE LIFTED.** The basket stopped on `max_consecutive_losses`, which in the bot needs a "
+    "human to clear. This run cleared it in its own workspace at each month boundary and gave the "
+    "basket its allowance back, so its profit is what the panel made with that rule suspended "
+    "between months. It is not what the bot would have done."
+)
+
+
+class PeriodMonthRow(DomainModel):
+    """One month of a period run, as `render` needs it (it does not import `period`)."""
+
+    label: str
+    start_equity: Money | None
+    end_equity: Money
+    unvaluable: bool = False
+    planned_cycles: int
+    ran_cycles: int
+    paused_at: UtcDatetime | None = None
+    cost_usd: Money
+
+
+class PeriodLiftRow(DomainModel):
+    at: UtcDatetime
+    streak: int
+    new_limit: int
+
+
+class PeriodReport(DomainModel):
+    """The page for one `evaluate period` run (period spec §5.5, §5.7)."""
+
+    generated_at: UtcDatetime
+    run_id: str
+    dataset_directory: str
+    dataset_digest: str
+    candidate_id: str
+    panel_digest: str
+    panel_models: tuple[str, ...] = ()
+    archive_digest: str = ""
+    cadence_seconds: int
+    period: str
+    first_cycle_at: UtcDatetime
+    budget: Money
+    #: `None` when no calibrated cost exists to project from (`--skip-gate`, or an uncalibrated
+    #: candidate): the page then says so rather than printing a zero that reads as "free".
+    projected_cost: Money | None = None
+    news_blind: bool = True
+    plumbing_check: bool = False
+    gate_skipped: bool = False
+    months: tuple[PeriodMonthRow, ...] = ()
+    not_run: tuple[str, ...] = ()
+    lifts: tuple[PeriodLiftRow, ...] = ()
+    ending: str
+    ending_reason: str = ""
+    abandoned_cost_usd: Money = ZERO
+    unvaluable: bool = False
+    freeze_reason: str = ""
+    equity: Money = ZERO
+    start_equity: Money = ZERO
+    total_profit: Money = ZERO
+    realized: Money = ZERO
+    unrealized: Money = ZERO
+    cost_usd: Money = ZERO
+    net_profit: Money = ZERO
+    vetoes: tuple[tuple[str, str, int], ...] = ()
+    incidents: int = 0
+
+
+def period_markdown(report: PeriodReport) -> str:
+    """The period page, in `long_run_markdown`'s banner order: every disclaimer before a number."""
+    sections = [
+        "# decision_lab — one period",
+        "",
+        BANNER,
+        "",
+        DISCLAIMER,
+    ]
+    if report.news_blind:
+        sections += ["", NEWS_BLIND]
+    if report.plumbing_check:
+        sections += ["", PLUMBING_CHECK]
+    if report.gate_skipped:
+        sections += ["", GATE_SKIPPED]
+    if report.lifts:
+        sections += ["", PAUSE_LIFTED]
+    sections += [
+        "",
+        _ending_line(report),
+        "",
+        _period_identity(report),
+        "",
+        "## Profit",
+        "",
+        _period_profit(report),
+        "",
+        "## Months",
+        "",
+        _months_table(report),
+        "",
+        "## Lifted pauses",
+        "",
+        _lifts_table(report.lifts),
+        "",
+        "## Spend",
+        "",
+        _spend_block(report),
+        "",
+        "## Vetoes",
+        "",
+        _veto_table(report.vetoes),
+    ]
+    return "\n".join(sections).rstrip() + "\n"
+
+
+def _ending_line(report: PeriodReport) -> str:
+    """§5.7's outcomes, in the words the spec gives the page."""
+    if report.ending == "RULE_ENDED":
+        return f"**Model failed: {report.ending_reason}.** Needs tuning. Later months were not run."
+    if report.ending == "INTERRUPTED":
+        return (
+            f"**Interrupted: {report.ending_reason}.** Months after the last one shown were not "
+            "run. Re-run with `--continue` to carry on from the last month end."
+        )
+    return f"**{report.ending.title()}.** {report.ending_reason}".rstrip()
+
+
+def _period_identity(report: PeriodReport) -> str:
+    cycles = sum(month.ran_cycles for month in report.months)
+    planned = sum(month.planned_cycles for month in report.months)
+    return _table(
+        ("parameter", "value"),
+        (
+            ("generated", _stamp(report.generated_at)),
+            ("run", report.run_id),
+            ("dataset", f"{report.dataset_directory} (`{report.dataset_digest}`)"),
+            ("candidate", f"{report.candidate_id} (`{report.panel_digest}`)"),
+            ("panel models", ", ".join(report.panel_models) or "none recorded"),
+            ("news archive", report.archive_digest or "none (news-blind)"),
+            ("cadence", f"{report.cadence_seconds}s"),
+            ("period", report.period),
+            # §5.2: a late start is shown, never hidden.
+            ("first cycle", _stamp(report.first_cycle_at)),
+            ("cycles", f"{cycles} of {planned} planned in the months that ran"),
+            ("ending", report.ending),
+            ("not run", ", ".join(report.not_run) or "none"),
+            ("incidents", str(report.incidents)),
+        ),
+    )
+
+
+def _period_profit(report: PeriodReport) -> str:
+    """The table, or the refusal to draw one (§10.4): a frozen portfolio has no figure at all."""
+    lifted = (
+        f"Produced with {len(report.lifts)} lifted pause(s); see the banner above.\n\n"
+        if report.lifts
+        else ""
+    )
+    if report.unvaluable:
+        return (
+            f"{lifted}**UNVALUABLE** — {report.freeze_reason}\n\n"
+            "The portfolio could not be valued, so no profit figure is reported. A stale mark is "
+            "not a mark, and valuing the position at what it cost would be differently wrong "
+            "rather than conservative (ADR 0027)."
+        )
+    return lifted + _table(
+        ("figure", "amount"),
+        (
+            ("equity", str(report.equity)),
+            ("start equity", str(report.start_equity)),
+            ("total profit", str(report.total_profit)),
+            ("realized", str(report.realized)),
+            ("unrealized", str(report.unrealized)),
+            ("deliberation cost", str(report.cost_usd)),
+            ("net profit", str(report.net_profit)),
+        ),
+    )
+
+
+def _months_table(report: PeriodReport) -> str:
+    if not report.months and not report.not_run:
+        return "No month ran."
+    rows = []
+    for month in report.months:
+        if month.unvaluable:
+            end, net = "UNVALUABLE", "—"
+        else:
+            end = str(month.end_equity)
+            net = "—" if month.start_equity is None else str(month.end_equity - month.start_equity)
+        rows.append(
+            (
+                month.label + (" ⚠ paused" if month.paused_at else ""),
+                "—" if month.start_equity is None else str(month.start_equity),
+                end,
+                net,
+                f"{month.ran_cycles} of {month.planned_cycles}",
+                str(month.cost_usd),
+            )
+        )
+    rows += [(label, "—", "—", "—", "not run", "—") for label in report.not_run]
+    return _table(("month", "start", "end", "net before cost", "cycles", "cost"), rows)
+
+
+def _lifts_table(lifts: Sequence[PeriodLiftRow]) -> str:
+    if not lifts:
+        return "No pause was lifted."
+    return _table(
+        ("at", "streak", "new limit"),
+        ((_stamp(lift.at), str(lift.streak), str(lift.new_limit)) for lift in lifts),
+    )
+
+
+def _spend_block(report: PeriodReport) -> str:
+    projection = (
+        f"projected {report.projected_cost}"
+        if report.projected_cost is not None
+        else "no projection was available (no calibrated cost per cycle for this candidate)"
+    )
+    return _table(
+        ("figure", "amount"),
+        (
+            ("budget", str(report.budget)),
+            ("projection", projection),
+            ("spent", str(report.cost_usd)),
+            # Money a Continue threw away: its cycles left the log and the cost did not (§5.7).
+            ("abandoned by Continue", str(report.abandoned_cost_usd)),
+        ),
+    )
+
+
+def write_period(report: PeriodReport, path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(period_markdown(report), encoding="utf-8")
+    return path
