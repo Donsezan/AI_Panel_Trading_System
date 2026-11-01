@@ -312,17 +312,17 @@ Rules that are easy to get backwards:
   `corpus build` with the same arguments returns the existing pass and exits 0 — including a
   short one that auto-paused. Delete the directory to retry. `decision_lab/workspace/` and
   `decision_lab/reports/` are gitignored, so none of this is visible from the repo.
-- **A reference pass is not reproducible and can die on an open bot defect.** `SIM_PANEL`'s
-  `varied-*` seats draw from an unseeded `random.Random` and `corpus build` has no `--seed`; worse,
-  a pass can reach [KNOWN_GAPS](docs/KNOWN_GAPS.md) §5 — the monitor polls only *after* a cycle's
-  order, so a stop that matched during the gap leaves the ledger holding a position the panel then
-  sizes a SELL against, and the build dies on `sell of … exceeds holding …`. Measured over seven
-  seeds, three did. `test_slice_b_end_to_end.py` therefore pins `STUB_SEED = 2024` through the
-  `rng` seam `StubLLMProvider` documents. **The pin stays**: §5's *between-cycle* half closed on
-  2026-09-21 (the supervisor's sweep now polls), but a replay has no such sweep —
-  `BacktestHarness._replay` drives `worker.cycle()` directly and polls only after it, so the race
-  inside one cycle is untouched. Delete the pin when a poll lands between the snapshot and the
-  decision, not before.
+- **A reference pass is not reproducible.** `SIM_PANEL`'s `varied-*` seats draw from an unseeded
+  `random.Random` and `corpus build` has no `--seed`. It no longer dies on
+  [KNOWN_GAPS](docs/KNOWN_GAPS.md) §5: the snapshot polls between its market and position reads
+  (ADR 0030), and over eight unpinned seeds none reached `exceeds holding`. An unbookable fill from
+  any other cause now halts the basket and ends the pass short — `ran_cycles` below
+  `planned_cycles` with a `FAILED` cycle, which is a defect to read, unlike an auto-pause.
+  **`STUB_SEED = 2024` stays pinned in `test_slice_b_end_to_end.py`, for a different reason:** the
+  calibrate and sweep tests need a pass that reaches the calibration days, and an unseeded stub
+  legitimately auto-pauses on `max_consecutive_losses` before them about half the time (seeds 0, 2,
+  3 and 6 of 8 failed six tests with exit 6). Delete the pin when `corpus build` gains `--seed`, or
+  the fixture stops depending on the pass reaching those days — not because §5 is closed.
 - **A pass also ends when the basket auto-pauses.** `max_consecutive_losses` is a legitimate
   Tier-1 rule and a replay has no human to clear it, so the harness stops and the report shows how
   much of the window went unused. `ran_cycles` well below `planned_cycles` is that, not a crash.

@@ -16,9 +16,12 @@ import pytest
 from tradebot.control.context_builder import ContextBuilder
 from tradebot.core.clock import ManualClock
 from tradebot.core.config import Basket, Schedule
-from tradebot.core.errors import ConfigError
+from tradebot.core.enums import Side
+from tradebot.core.errors import ConfigError, VenueError
 from tradebot.core.instrument import Instrument
 from tradebot.core.market import timeframe_interval
+from tradebot.core.orders import Fill
+from tradebot.core.portfolio import Position
 from tradebot.core.snapshot import NewsCoverage, NewsItemView
 from tradebot.indicators.library import DEFAULT_INDICATORS, required_history
 from tradebot.interfaces.market_data import DataCapabilities
@@ -217,3 +220,124 @@ class TestSnapshotShape:
         )
         snapshot = await builder.build(basket)
         assert {r.timeframe for r in snapshot.instruments[0].indicators} == {"1h", "4h"}
+
+
+class RecordingMarketData:
+    """Wraps a provider and writes every read into a shared trace."""
+
+    provider_id = "recording"
+
+    def __init__(self, inner: ReplayMarketData, trace: list[str]) -> None:
+        self._inner = inner
+        self._trace = trace
+
+    async def get_candles(self, instrument: Instrument, *args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+        self._trace.append(f"candles:{instrument.key}")
+        return await self._inner.get_candles(instrument, *args, **kwargs)  # type: ignore[arg-type]
+
+    async def get_quote(self, instrument: Instrument):  # type: ignore[no-untyped-def]
+        self._trace.append(f"quote:{instrument.key}")
+        return await self._inner.get_quote(instrument)
+
+    def capabilities(self) -> DataCapabilities:
+        return self._inner.capabilities()
+
+
+class RecordingLedger(Ledger):
+    def __init__(self, clock: ManualClock, trace: list[str]) -> None:
+        super().__init__(clock, venue="sim", balances={"USDT": Decimal(10_000)})
+        self._trace = trace
+
+    def position(self, instrument_key: str) -> Position:
+        self._trace.append(f"position:{instrument_key}")
+        return super().position(instrument_key)
+
+
+@pytest.fixture
+def two_markets(
+    instrument: Instrument, second_instrument: Instrument, clock: ManualClock
+) -> ReplayMarketData:
+    bars = 260
+    return ReplayMarketData(
+        {
+            (held.key, timeframe): synthetic_candles(
+                start=NOW - timeframe_interval(timeframe) * bars,
+                timeframe=timeframe,
+                count=bars,
+                open_price=Decimal("50000"),
+                step=Decimal("25"),
+            )
+            for held in (instrument, second_instrument)
+            for timeframe in ("1h", "4h", "1d")
+        },
+        clock,
+    )
+
+
+class TestSettleHook:
+    """ADR 0030: what a market read made the venue do is booked before anything reads a holding."""
+
+    async def test_the_hook_runs_after_every_market_read_and_before_every_position_read(
+        self,
+        two_markets: ReplayMarketData,
+        clock: ManualClock,
+        basket: Basket,
+        instrument: Instrument,
+        second_instrument: Instrument,
+    ) -> None:
+        trace: list[str] = []
+        pair = basket.model_copy(update={"instruments": (instrument, second_instrument)})
+        builder = ContextBuilder(
+            RecordingMarketData(two_markets, trace), RecordingLedger(clock, trace), clock
+        )
+
+        async def settle() -> None:
+            trace.append("settle")
+
+        await builder.build(pair, settle=settle)
+
+        assert trace.count("settle") == 1
+        cut = trace.index("settle")
+        before, after = trace[:cut], trace[cut + 1 :]
+        assert {f"quote:{instrument.key}", f"quote:{second_instrument.key}"} <= set(before)
+        assert not [read for read in before if read.startswith("position:")]
+        assert after and all(read.startswith("position:") for read in after)
+
+    async def test_the_snapshot_reports_what_the_hook_booked(
+        self,
+        market_data: ReplayMarketData,
+        ledger: Ledger,
+        clock: ManualClock,
+        basket: Basket,
+        instrument: Instrument,
+    ) -> None:
+        async def settle() -> None:
+            ledger.apply_fill(
+                Fill(
+                    fill_id="booked-by-settle",
+                    client_order_id="sim-SETTLE",
+                    instrument_key=instrument.key,
+                    side=Side.BUY,
+                    qty=Decimal("0.1"),
+                    price=Decimal("50000"),
+                    filled_at=clock.now(),
+                ),
+                base_currency=instrument.base_currency,
+                quote_currency=instrument.quote_currency,
+            )
+
+        snapshot = await ContextBuilder(market_data, ledger, clock).build(basket, settle=settle)
+
+        position = snapshot.instruments[0].position
+        assert position is not None and position.qty == Decimal("0.1")
+
+    async def test_a_hook_that_raises_ends_the_build(
+        self, market_data: ReplayMarketData, ledger: Ledger, clock: ManualClock, basket: Basket
+    ) -> None:
+        """Fail closed: no settled ledger, no snapshot, so no decision and no order."""
+
+        async def settle() -> None:
+            raise VenueError("503 from the venue")
+
+        with pytest.raises(VenueError):
+            await ContextBuilder(market_data, ledger, clock).build(basket, settle=settle)

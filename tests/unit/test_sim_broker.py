@@ -17,7 +17,7 @@ import pytest
 
 from tradebot.core.clock import ManualClock
 from tradebot.core.enums import OrderRole, OrderState, OrderType, Side
-from tradebot.core.errors import SubmitUnknownError
+from tradebot.core.errors import FailClosedError, SubmitUnknownError
 from tradebot.core.orders import OrderIntent
 from tradebot.execution.brokers.sim import SimBroker, Tick
 from tradebot.interfaces.broker import OrderRef
@@ -130,6 +130,7 @@ class TestMatching:
 
     async def test_a_market_sell_slips_the_other_way(self, broker: SimBroker) -> None:
         broker.observe(tick(last="50000"))
+        broker.credit("BTC", Decimal("0.1"))
         await broker.submit(
             intent(side=Side.SELL, qty="0.1", order_type=OrderType.MARKET, price=None)
         )
@@ -178,6 +179,7 @@ class TestProtectiveLegs:
         self, broker: SimBroker
     ) -> None:
         broker.observe(tick(last="50000"))
+        broker.credit("BTC", Decimal("0.1"))
         await broker.submit(
             intent(
                 side=Side.SELL,
@@ -202,6 +204,7 @@ class TestProtectiveLegs:
     ) -> None:
         """Without this, both exits fill and the second one sells a position that is gone."""
         broker.observe(tick(last="50000"))
+        broker.credit("BTC", Decimal("0.1"))
         for leg in _oco_pair():
             await broker.submit(leg)
 
@@ -250,6 +253,73 @@ def _oco_pair() -> tuple[OrderIntent, OrderIntent]:
             group_id=ENTRY,
         ),
     )
+
+
+class TestACancelledSiblingCannotFill:
+    """One bar reaching both OCO legs fills one of them (RCA 2026-10-28 §4).
+
+    The repro: the stop is armed by an earlier bar that could not fill it, then a single wide bar
+    reaches the stop's limit *and* the take-profit's trigger and limit. `observe` used to snapshot
+    the working orders first, so the sibling `_cancel_siblings` had just cancelled still got its
+    turn, and the venue sold the same holding twice — a negative base balance, i.e. a short.
+    """
+
+    async def _arm_then_sweep(self, broker: SimBroker, legs: tuple[OrderIntent, ...]) -> tuple:
+        broker.observe(tick(last="50000"))
+        broker.credit("BTC", Decimal("0.1"))
+        broker._qty[KEY] = Decimal("0.1")
+        broker._cost[KEY] = Decimal("5000")
+        for leg in legs:
+            await broker.submit(leg)
+        # Reaches the stop trigger (48000) but not its limit (47000 sell needs high >= 47000).
+        armed = broker.observe(
+            tick(last="46500", high="46900", low="46000", at=NOW + timedelta(minutes=1))
+        )
+        assert armed == ()
+        return broker.observe(
+            tick(last="53000", high="53500", low="46500", at=NOW + timedelta(minutes=2))
+        )
+
+    async def _assert_one_fill_and_sane_venue(self, broker: SimBroker, fills: tuple) -> None:
+        assert len(fills) == 1
+        states = {cid: (await status_of(broker, cid)).state for cid in ("sim-STOP", "sim-TAKE")}
+        filled = {fills[0].client_order_id}
+        other = ({"sim-STOP", "sim-TAKE"} - filled).pop()
+        assert states[fills[0].client_order_id] is OrderState.FILLED
+        assert states[other] is OrderState.CANCELLED
+        assert broker._qty[KEY] >= Decimal(0)
+        account = await broker.fetch_positions_and_balances()
+        assert account.balance("BTC").locked >= Decimal(0)
+        assert account.balance("BTC").free >= Decimal(0)
+
+    async def test_stop_first_in_insertion_order(self, broker: SimBroker) -> None:
+        stop, take = _oco_pair()
+        fills = await self._arm_then_sweep(broker, (stop, take))
+        await self._assert_one_fill_and_sane_venue(broker, fills)
+
+    async def test_take_profit_first_in_insertion_order(self, broker: SimBroker) -> None:
+        stop, take = _oco_pair()
+        fills = await self._arm_then_sweep(broker, (take, stop))
+        await self._assert_one_fill_and_sane_venue(broker, fills)
+
+    async def test_a_sell_beyond_the_held_quantity_is_refused_not_settled(
+        self, broker: SimBroker
+    ) -> None:
+        """Defence in depth: whatever lets a second exit through, the balance never goes short."""
+        broker.observe(tick(last="50000"))
+        broker.credit("BTC", Decimal("0.05"))
+        await broker.submit(
+            intent(
+                side=Side.SELL,
+                qty="0.1",
+                price="51000",
+                client_order_id="sim-OVER",
+                created_at=NOW,
+            )
+        )
+        with pytest.raises(FailClosedError):
+            broker.observe(tick(last="50500", high="51500", at=NOW + timedelta(minutes=1)))
+        assert (await broker.fetch_positions_and_balances()).balance("BTC").locked == Decimal("0.1")
 
 
 class TestAccount:

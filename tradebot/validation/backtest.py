@@ -220,6 +220,10 @@ class BacktestHarness:
             # sweep (ADR 0027).
             worker = self._application.supervisor.worker_for(basket_id)
             await worker.cycle()
+            # Unscoped, so it never raises for a poisoned group. The cycle's own scoped poll
+            # usually met it first and halted the basket, which `worker.stopped` below turns into
+            # a short pass; if this poll was the first to find it, only the RISK_EVENT is
+            # recorded and the basket halts at its next cycle (ADR 0030).
             await self._application.monitor.poll()
             if worker.stopped:
                 logger.warning(

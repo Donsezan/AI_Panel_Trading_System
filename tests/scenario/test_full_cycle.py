@@ -341,6 +341,21 @@ class TestTheSimulatedVenue:
         finally:
             await application.shutdown()
 
+    async def test_the_snapshot_and_the_close_settle_through_the_one_monitor(
+        self, clock: ManualClock
+    ) -> None:
+        """ADR 0030's hook polls `runner._monitor` and the close polls `_monitor`; a second
+        monitor would settle an empty set and look identical (the efe316b trap, again)."""
+        application = await build_sim(clock=clock, db_path=None)
+        try:
+            await application.recover()
+            record = application.configs.baskets()[0]
+            runner = await application.supervisor._factory.build(record)
+            assert runner._monitor is application.monitor
+            assert application.manual_close._monitor is application.monitor
+        finally:
+            await application.shutdown()
+
     async def test_an_instrument_added_after_wiring_can_be_cycled(self, clock: ManualClock) -> None:
         """A basket published from the dashboard is picked up by the resync sweep, so the venue
         has to price instruments nobody enumerated when the process was wired."""

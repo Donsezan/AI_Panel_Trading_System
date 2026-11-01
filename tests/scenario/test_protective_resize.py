@@ -29,6 +29,7 @@ from tradebot.control.supervisor import Supervisor
 from tradebot.core.clock import ManualClock
 from tradebot.core.config import Basket, GlobalRiskPolicy
 from tradebot.core.enums import CycleOutcome, OrderRole, OrderState
+from tradebot.core.events import EventType
 from tradebot.core.instrument import Instrument
 from tradebot.core.market import Candle, timeframe_interval
 from tradebot.core.money import ZERO
@@ -167,16 +168,18 @@ async def test_a_partial_exit_resizes_the_legs_before_the_stop_fires(
         result = await harness.runner.run_once()
         assert result.outcome is CycleOutcome.NO_ACTION, "HOLD decides nothing this cycle"
 
-        # A venue-held stop fires between cycles, not inside one (DESIGN §6.7) — the cycle above
-        # only reveals the crash bar to the venue; the monitor's own poll is what pulls the fill
-        # into the ledger, exactly as a background poller would between two scheduled cycles.
-        await harness.monitor.poll()
-
+        # The cycle above revealed the crash bar to the venue through its own snapshot, and that
+        # snapshot's settle poll booked the stop's fill (ADR 0030) and released the closed group.
+        # Read before the next poll: a released group stays visible only until then.
         filled = [
             order
             for order in harness.monitor.tracked
             if order.role is OrderRole.STOP_LOSS and order.state is OrderState.FILLED
         ]
+        # A no-op confirmation, kept because it is what a background poller would do next anyway.
+        await harness.monitor.poll()
+        assert not harness.monitor.working, "the closed group left nothing working"
+
         assert filled, "the crash bar crossed the trigger"
         assert filled[0].filled_qty <= reduced, "no exit sells more than was held"
         assert harness.ledger.position(key).is_flat
@@ -184,6 +187,60 @@ async def test_a_partial_exit_resizes_the_legs_before_the_stop_fires(
         # satisfied by any undersized leg, and `is_flat` only forces equality once the stop has
         # already sold whatever it rested at. This is the number KNOWN_GAPS §4 got wrong.
         assert guarded == reduced, "the leg was resized to the surviving position, exactly"
+    finally:
+        harness.close()
+
+
+FULL_SELL = """{
+  "action": "SELL", "conviction": 5, "size_hint": "full",
+  "thesis": "Take the position off.", "key_risks": [], "invalidation": "n/a"
+}"""
+
+
+async def test_a_stop_matched_by_the_snapshot_is_booked_before_the_panel_sizes_a_sell(
+    basket: Basket, clock: ManualClock, crashing_market: ReplayMarketData
+) -> None:
+    """KNOWN_GAPS §5's intra-cycle half, end to end (ADR 0030).
+
+    The crash bar is first read by the cycle's own snapshot, which on the sim stack hands it to
+    the venue and fills the stop right then. Before the fix the snapshot then read the stale
+    holding, the panel's SELL was sized from it and filled, and the cycle's settle poll refused
+    the stop's fill: FAILED, "sell of … exceeds holding 0 …", basket halted.
+    """
+    eager = basket.model_copy(
+        update={"risk_policy": basket.risk_policy.model_copy(update={"cooldown_cycles": 0})}
+    )
+    harness = Harness(
+        eager,
+        clock,
+        crashing_market,
+        [DEFAULT_RESPONSE, FULL_SELL],
+        policy=GlobalRiskPolicy(mark_staleness_seconds=int(timedelta(days=3).total_seconds())),
+    )
+    await harness.start()
+    key = basket.instruments[0].key
+    try:
+        await harness.runner.run_once()
+        assert harness.ledger.position(key).qty > ZERO, "the panel bought"
+
+        clock.advance(timedelta(days=2).total_seconds())
+        result = await harness.runner.run_once()
+
+        assert result.outcome is not CycleOutcome.FAILED, result.detail
+        assert result.outcome is CycleOutcome.RISK_VETOED
+        assert harness.ledger.position(key).is_flat
+        events = harness.store.read_cycle(result.cycle_id)
+        (snapshot,) = [e.payload["snapshot"] for e in events if e.type is EventType.SNAPSHOT_FROZEN]
+        assert snapshot["instruments"][0]["position"] is None, "the panel was told the truth"
+        checks = [
+            c for e in events if e.type is EventType.RISK_CHECKED for c in e.payload["checks"]
+        ]
+        assert any(c["rule"] == "sizing" and "SELL while flat" in c["detail"] for c in checks)
+        assert [
+            order
+            for order in harness.monitor.tracked
+            if order.role is OrderRole.STOP_LOSS and order.state is OrderState.FILLED
+        ], "the stop's fill is booked, not lost"
     finally:
         harness.close()
 

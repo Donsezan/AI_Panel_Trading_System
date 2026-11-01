@@ -29,19 +29,16 @@ from tradebot.decision.providers.stub import StubLLMProvider
 #: exactly this, and its own docstring says so: "tests pass a seeded one, because a flaky suite
 #: proves nothing".
 #:
-#: The seed is not arbitrary. A reference pass can reach a state that trips KNOWN_GAPS §5 — the
-#: monitor polls only *after* a cycle's order, so a venue-held stop that matched during the gap
-#: leaves the ledger holding a position the panel then sizes a SELL against, and the build dies
-#: on `sell of … exceeds holding …`. Measured over seven seeds on these two fixtures, three
-#: failed that way: unseeded, this file would fail roughly two runs in five. 2024 completes both
-#: at 228/228 cycles.
+#: The seed is not arbitrary, and it is no longer about KNOWN_GAPS §5. That closed on 2026-10-29
+#: (ADR 0030: the snapshot polls between its market and position reads); measured unpinned over
+#: seeds 0-6 and 2024, none reached `exceeds holding`, an unbookable fill or a poisoned group.
 #:
-#: §5's *between-cycle* half closed on 2026-09-21 — `Supervisor._poll_orders` polls on the resync
-#: sweep — and it does not help here: `BacktestHarness._replay` drives `worker.cycle()` directly
-#: and polls only after it, so a replay has no sweep between two cycles. The race is inside one:
-#: freezing the snapshot reads prices, which hands the bar to the simulated venue and can match a
-#: resting stop right then, and nothing polls between that and the panel sizing its SELL. The pin
-#: goes when a poll lands there, not before.
+#: What the pin buys now is a reference pass that reaches the calibration days. An unseeded
+#: `varied-*` pass legitimately auto-pauses on `max_consecutive_losses` before them — a replay has
+#: no human to clear it — and then no rows exist: seeds 0, 2, 3 and 6 of those eight failed six
+#: calibrate/sweep tests with exit 6. 2024 completes both fixtures at 228/228 cycles. Delete the pin
+#: when `corpus build` gains a `--seed`, or when the fixture stops depending on the pass reaching
+#: those days — not before.
 STUB_SEED = 2024
 
 

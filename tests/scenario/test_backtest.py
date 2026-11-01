@@ -8,6 +8,7 @@ of (DESIGN §9 rung 4, [L12]).
 
 from __future__ import annotations
 
+import functools
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -19,10 +20,22 @@ from sqlalchemy import select
 from tradebot.app import Application, backtest_database_path, build_sim, dataset_basket
 from tradebot.core.clock import ManualClock
 from tradebot.core.config import PanelConfig, ProviderSettings, SeatConfig
-from tradebot.core.enums import AssetClass, CycleOutcome, ProviderKind
+from tradebot.core.enums import (
+    AssetClass,
+    CycleOutcome,
+    OrderRole,
+    ProviderKind,
+    RiskDecision,
+    Side,
+)
 from tradebot.core.errors import ConfigError
+from tradebot.core.events import EventType
 from tradebot.core.instrument import Instrument
+from tradebot.core.market import Candle, timeframe_interval
 from tradebot.decision.presets import FREE_PANEL, STUB_PANEL
+from tradebot.decision.providers import DEFAULT_RESPONSE, registry
+from tradebot.decision.providers.stub import StubLLMProvider
+from tradebot.indicators.library import DEFAULT_INDICATORS, required_history
 from tradebot.marketdata.recorder import ReplayDataset, record
 from tradebot.marketdata.replay import ReplayMarketData, synthetic_candles
 from tradebot.persistence.schema import PROJECTION_TABLES
@@ -36,6 +49,15 @@ pytestmark = pytest.mark.scenario
 HISTORY_START = datetime(2026, 1, 1, tzinfo=UTC)
 BARS = 400
 TIMEFRAMES = ("1h", "4h")
+CRASH_DEPTH = Decimal("6000")
+FULL_SELL = """{
+  "action": "SELL", "conviction": 5, "size_hint": "full",
+  "thesis": "Take the position off.", "key_risks": [], "invalidation": "n/a"
+}"""
+HOLD = """{
+  "action": "HOLD", "conviction": 3, "size_hint": "none",
+  "thesis": "Nothing to do.", "key_risks": [], "invalidation": "n/a"
+}"""
 
 #: The dataset is sized so that, after the indicators' warm-up has eaten the front of it, what
 #: is left is long enough for the loss streak, the daily cap and TTL expiry to each get a turn.
@@ -110,6 +132,130 @@ async def replayed(
     )
     yield application, replay_clock
     await application.shutdown()
+
+
+def first_cycle_at() -> datetime:
+    """Where `BacktestHarness` starts cycling over this file's timeframes: after the 4h warm-up,
+    on the next hourly tick — `warmup_for` and `plan_ticks` restated, so the crash bar can be
+    placed on the second cycle exactly."""
+    warmup = timeframe_interval("4h") * (required_history(DEFAULT_INDICATORS) + 1)
+    return HISTORY_START + warmup + timedelta(hours=1)
+
+
+@pytest.fixture
+async def crash_dataset(
+    tmp_path: Path, history_instrument: Instrument, replay_clock: ManualClock
+) -> ReplayDataset:
+    """Rising hourly bars to the first cycle, one bar through any stop, then rising again."""
+    rising_hours = (first_cycle_at() - HISTORY_START) // timedelta(hours=1)
+    before = synthetic_candles(
+        start=HISTORY_START,
+        timeframe="1h",
+        count=rising_hours,
+        open_price=Decimal("50000"),
+        step=Decimal("25"),
+    )
+    last = before[-1]
+    crash = Candle(
+        open_time=last.close_time,
+        close_time=last.close_time + timedelta(hours=1),
+        open=last.close,
+        high=last.close,
+        low=last.close - CRASH_DEPTH,
+        close=last.close - CRASH_DEPTH + Decimal(500),
+        volume=Decimal(1),
+    )
+    after = synthetic_candles(
+        start=crash.close_time,
+        timeframe="1h",
+        count=BARS - rising_hours - 1,
+        open_price=crash.close,
+        step=Decimal("25"),
+    )
+    source = ReplayMarketData(
+        {
+            (history_instrument.key, "1h"): (*before, crash, *after),
+            (history_instrument.key, "4h"): synthetic_candles(
+                start=HISTORY_START,
+                timeframe="4h",
+                count=BARS,
+                open_price=Decimal("50000"),
+                step=Decimal("25"),
+            ),
+        },
+        replay_clock,
+    )
+    return await record(
+        source,
+        (history_instrument,),
+        TIMEFRAMES,
+        start=HISTORY_START,
+        end=HISTORY_START + timedelta(hours=BARS),
+        directory=tmp_path / "crash",
+        clock=replay_clock,
+        source="crash fixture",
+    )
+
+
+@pytest.fixture
+async def reentry_dataset(
+    tmp_path: Path, history_instrument: Instrument, replay_clock: ManualClock
+) -> ReplayDataset:
+    """RCA 2026-10-28 §1: rising to the first cycle (the entry), flat for the exit, a fall well
+    below the first entry's stop before the re-entry, then a rally through both of its levels."""
+    rising_hours = (first_cycle_at() - HISTORY_START) // timedelta(hours=1)
+    before = synthetic_candles(
+        start=HISTORY_START,
+        timeframe="1h",
+        count=rising_hours,
+        open_price=Decimal("50000"),
+        step=Decimal("25"),
+    )
+    top = before[-1].close
+    # Close of each hour from the first cycle on: flat (the exit), down 6000 over two hours,
+    # flat (the re-entry at the low), then 9000 back up over three hours and flat after.
+    closes = [top, top - 3000, top - 6000, top - 6000, top - 3000, top, top + 3000]
+    closes += [top + 3000] * (BARS - rising_hours - len(closes))
+    bars: list[Candle] = []
+    opened = before[-1].close_time
+    previous = top
+    for close in closes:
+        bars.append(
+            Candle(
+                open_time=opened,
+                close_time=opened + timedelta(hours=1),
+                open=previous,
+                high=max(previous, close) + 20,
+                low=min(previous, close) - 20,
+                close=close,
+                volume=Decimal(1),
+            )
+        )
+        opened += timedelta(hours=1)
+        previous = close
+    source = ReplayMarketData(
+        {
+            (history_instrument.key, "1h"): (*before, *bars),
+            (history_instrument.key, "4h"): synthetic_candles(
+                start=HISTORY_START,
+                timeframe="4h",
+                count=BARS,
+                open_price=Decimal("50000"),
+                step=Decimal("25"),
+            ),
+        },
+        replay_clock,
+    )
+    return await record(
+        source,
+        (history_instrument,),
+        TIMEFRAMES,
+        start=HISTORY_START,
+        end=HISTORY_START + timedelta(hours=BARS),
+        directory=tmp_path / "reentry",
+        clock=replay_clock,
+        source="re-entry fixture",
+    )
 
 
 class TestPlanning:
@@ -266,6 +412,191 @@ class TestBacktest:
         (verdict,) = report.contamination
         assert verdict.verdict is Contaminated.CLEAN
         assert "meta-llama/llama-3.3" in backtest_markdown(report)
+
+    async def test_a_stop_crossed_by_the_snapshot_does_not_end_the_replay(
+        self,
+        crash_dataset: ReplayDataset,
+        history_instrument: Instrument,
+        tmp_path: Path,
+        replay_clock: ManualClock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """KNOWN_GAPS §5 as decision_lab met it: buy, then a SELL on the cycle whose own read
+        crosses the stop. Before ADR 0030 the cycle FAILED and the harness's own poll re-raised
+        `exceeds holding`, killing the run."""
+        monkeypatch.setattr(
+            registry,
+            "StubLLMProvider",
+            functools.partial(StubLLMProvider, [DEFAULT_RESPONSE, FULL_SELL]),
+        )
+        basket = dataset_basket(crash_dataset, STUB_PANEL)
+        basket = basket.model_copy(
+            update={"risk_policy": basket.risk_policy.model_copy(update={"cooldown_cycles": 0})}
+        )
+        application = await build_sim(
+            clock=replay_clock,
+            db_path=backtest_database_path(tmp_path / "crash-run"),
+            baskets=(basket,),
+            market_data=crash_dataset.market_data,
+        )
+        try:
+            start = crash_dataset.coverage[0]
+            report = await BacktestHarness(
+                application, replay_clock, start=start, end=first_cycle_at() + timedelta(hours=4)
+            ).run()
+            events = application.store.read_all()
+        finally:
+            await application.shutdown()
+
+        assert report.ran_cycles == report.planned_cycles == 5
+        assert CycleOutcome.FAILED.value not in report.evidence.outcomes
+        assert report.evidence.fills > 0
+
+        crash_at = first_cycle_at() + timedelta(hours=1)
+        orders = {
+            e.payload["order"]["client_order_id"]: e.payload["order"]
+            for e in events
+            if e.type is EventType.ORDER_SUBMITTED
+        }
+
+        # (a) The stop crossed on the crash cycle: a SELL fill at that instant, on the protective
+        # stop of the first BUY's group. Scoped to that instant because later cycles legitimately
+        # place reduce-only SELLs of their own, which an unscoped check would also match.
+        entry = next(o for o in orders.values() if o["side"] == Side.BUY.value)
+        stop_fills = [
+            e
+            for e in events
+            if e.type is EventType.FILL_RECEIVED
+            and e.ts == crash_at
+            and e.payload["fill"]["side"] == Side.SELL.value
+        ]
+        assert stop_fills, "no SELL fill on the crash cycle: the stop never crossed"
+        for fill in stop_fills:
+            stop = orders[fill.payload["fill"]["client_order_id"]]
+            assert stop["role"] == OrderRole.STOP_LOSS.value
+            assert stop["group_id"] == entry["group_id"]
+
+        # (b) The cycle-2 SELL decision was refused as a flat SELL, and placed no order of its own.
+        vetoes = [
+            e
+            for e in events
+            if e.type is EventType.RISK_CHECKED
+            and any(
+                check["rule"] == "sizing"
+                and check["decision"] == RiskDecision.VETO.value
+                and check["detail"].startswith("SELL while flat")
+                for check in e.payload["checks"]
+            )
+        ]
+        assert len(vetoes) == 1
+        veto_cycle = vetoes[0].cycle_id
+        started = {e.cycle_id: e.ts for e in events if e.type is EventType.CYCLE_STARTED}
+        assert started[veto_cycle] == crash_at
+        assert not [
+            e for e in events if e.type is EventType.ORDER_SUBMITTED and e.cycle_id == veto_cycle
+        ]
+
+        # (c) The stop closed the position at the crash instant, so the veto saw a flat ledger.
+        # Not asserted at the end of the run: the scripted panel buys again afterwards.
+        booked = [
+            e
+            for e in events
+            if e.type is EventType.POSITION_UPDATED
+            and e.ts == crash_at
+            and e.aggregate_id == history_instrument.key
+        ]
+        assert booked, "the stop's fill never reached the ledger"
+        assert all(Decimal(e.payload["position"]["qty"]) == 0 for e in booked)
+
+    async def test_a_re_entry_is_guarded_by_its_own_stop_not_the_exited_entrys(
+        self,
+        reentry_dataset: ReplayDataset,
+        history_instrument: Instrument,
+        tmp_path: Path,
+        replay_clock: ManualClock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """RCA 2026-10-28 §1 and §4 item 2: buy, a full panel exit, re-entry lower, then a rally
+        through the exited entry's old levels. The exited group used to keep its entitlement,
+        claim the re-entry's shares on its tighter stale stop, and re-place its old legs — a stop
+        above the market, which in the sim armed and rested as a second take-profit."""
+        script = [DEFAULT_RESPONSE, FULL_SELL, HOLD, HOLD, DEFAULT_RESPONSE] + [HOLD] * 4
+        monkeypatch.setattr(registry, "StubLLMProvider", functools.partial(StubLLMProvider, script))
+        basket = dataset_basket(reentry_dataset, STUB_PANEL)
+        basket = basket.model_copy(
+            update={"risk_policy": basket.risk_policy.model_copy(update={"cooldown_cycles": 0})}
+        )
+        application = await build_sim(
+            clock=replay_clock,
+            db_path=backtest_database_path(tmp_path / "reentry-run"),
+            baskets=(basket,),
+            market_data=reentry_dataset.market_data,
+        )
+        try:
+            start = reentry_dataset.coverage[0]
+            report = await BacktestHarness(
+                application, replay_clock, start=start, end=first_cycle_at() + timedelta(hours=8)
+            ).run()
+            events = application.store.read_all()
+        finally:
+            await application.shutdown()
+
+        assert report.ran_cycles == report.planned_cycles
+        assert CycleOutcome.FAILED.value not in report.evidence.outcomes
+        assert not report.evidence.incidents, "no halt"
+        assert not [
+            e
+            for e in events
+            if e.type is EventType.RISK_EVENT and e.payload["rule"] == "unbookable_fill"
+        ]
+
+        entries = [
+            e.payload["order"]
+            for e in events
+            if e.type is EventType.ORDER_SUBMITTED
+            and e.payload["order"]["side"] == Side.BUY.value
+            and e.payload["order"]["role"] == OrderRole.ENTRY.value
+        ]
+        assert len(entries) == 2, "the first entry and the re-entry"
+        first, again = entries
+        assert Decimal(again["protective"]["stop_price"]) < Decimal(first["limit_price"])
+        # The rally closes 3000 above the first entry: through both of its old levels.
+        assert (
+            Decimal(first["protective"]["take_profit_price"]) < Decimal(first["limit_price"]) + 3000
+        )
+
+        (retired,) = [
+            e
+            for e in events
+            if e.type is EventType.RISK_EVENT and e.payload["action_taken"] == "group_retired"
+        ]
+        assert first["client_order_id"] in retired.payload["detail"]
+
+        exited_at = next(
+            e.seq
+            for e in events
+            if e.type is EventType.FILL_RECEIVED and e.payload["fill"]["side"] == Side.SELL.value
+        )
+        armed_after_exit = [
+            e
+            for e in events
+            if e.type is EventType.PROTECTIVE_PLACED
+            and e.payload["protected"]
+            and e.seq is not None
+            and e.seq > exited_at
+        ]
+        assert armed_after_exit, "the re-entry was never guarded"
+        for placed in armed_after_exit:
+            assert placed.payload["group_id"] == again["group_id"]
+            stops = [
+                Decimal(leg["stop_price"])
+                for leg in placed.payload["legs"]
+                if leg["role"] == OrderRole.STOP_LOSS.value
+            ]
+            # Within one tick: the leg's trigger is the plan's stop quantized to the venue grid.
+            planned = Decimal(again["protective"]["stop_price"])
+            assert len(stops) == 1
+            assert abs(stops[0] - planned) < history_instrument.tick_size
 
 
 def _projection_rows(application: Application) -> dict[str, list[tuple[object, ...]]]:

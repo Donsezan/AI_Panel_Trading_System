@@ -6,7 +6,9 @@
    reconciliation, because a skewed clock makes every later signed call unreliable.
 3. For each venue: fetch open orders and `AccountState`, adopt orders carrying our
    `client_order_id` prefix, and reconcile the ledger.
-4. Resolve every non-terminal order in the database to a terminal or monitored state.
+4. Resolve every non-terminal order in the database to a terminal or monitored state. An order
+   carrying a fill the ledger refuses is contained to its group, as mid-run (ADR 0030): it is
+   tracked poisoned, the owning basket halts at its first scoped poll, and the process does not.
 5. **Re-verify every configured instrument's trading rules against the venue** — a filter changed
    under a stopped process is a lot size the risk layer would size against and the venue would
    reject (`control/reference.py`, ADR 0025). This one halts *baskets*, not the process.
@@ -42,7 +44,7 @@ from tradebot.control.valuation import PortfolioWatch
 from tradebot.core.clock import Clock
 from tradebot.core.config import Basket
 from tradebot.core.enums import KillSwitchState, OrderState, RiskTier
-from tradebot.core.errors import TradebotError
+from tradebot.core.errors import TradebotError, UnbookableFillError
 from tradebot.core.events import EventFactory
 from tradebot.core.instrument import Instrument
 from tradebot.core.logging import get_logger
@@ -238,7 +240,22 @@ class StartupSequence:
                     f"order {order.client_order_id} references unknown instrument "
                     f"{order.instrument_key}; its state cannot be resolved"
                 )
-            synced = await self._execution.recover(order, instrument)
+            try:
+                synced = await self._execution.recover(order, instrument)
+            except UnbookableFillError as error:
+                # One group's refused fill is that group's problem, here as mid-run (ADR 0030).
+                # Aborting would fail the whole recovery — no Start, and with supervision
+                # stopped no manual close in any basket — and leave every later order untracked.
+                # The monitor owns it from here: tracked, recorded as `group_poisoned`, and the
+                # owning basket halts at its first scoped poll.
+                synced = error.partial_order or order
+                logger.error(
+                    "an open order carries a fill the ledger refuses; contained to its group",
+                    extra={"client_order_id": order.client_order_id, "error": str(error)},
+                )
+                await self._monitor.adopt_poisoned(synced, instrument, error)
+                resolved.append(synced)
+                continue
             if synced.state.is_open:
                 self._monitor.track(synced, instrument)
             resolved.append(synced)

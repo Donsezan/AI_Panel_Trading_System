@@ -40,7 +40,7 @@ from decimal import Decimal
 
 from tradebot.core.clock import Clock
 from tradebot.core.enums import OrderRole, OrderState, OrderType, Side
-from tradebot.core.errors import SubmitUnknownError
+from tradebot.core.errors import FailClosedError, SubmitUnknownError
 from tradebot.core.ids import new_uuid
 from tradebot.core.instrument import Instrument
 from tradebot.core.market import Candle, CandleSeries, Quote
@@ -224,7 +224,15 @@ class SimBroker:
             for resting in self._orders.values()
             if resting.intent.instrument_key == tick.instrument_key and resting.state.is_open
         ]
-        return tuple(fill for resting in working for fill in self._match(resting, tick))
+        # `working` is a snapshot, but a fill inside this loop can cancel a later entry in it (a
+        # venue-native OCO sibling). Re-check at its turn: a cancelled order never fills, which is
+        # what `oco_groups=True` promises and what the sibling's released lock assumes.
+        return tuple(
+            fill
+            for resting in working
+            if resting.state.is_open
+            for fill in self._match(resting, tick)
+        )
 
     def _match(self, resting: _Resting, tick: Tick) -> tuple[Fill, ...]:
         intent = resting.intent
@@ -302,6 +310,14 @@ class SimBroker:
         if qty <= ZERO:
             return ()
         intent = resting.intent
+        base, _ = self._currencies(intent.instrument_key)
+        held = self._free.get(base, ZERO) + self._locked.get(base, ZERO)
+        if intent.side is Side.SELL and qty > held:
+            # Defence in depth behind the open-state check: a venue never sells what it does not
+            # hold, and a silent negative balance would read as a short the ledger cannot explain.
+            raise FailClosedError(
+                f"sim venue refuses to settle a sell of {qty} {intent.instrument_key}: holds {held}"
+            )
         _, quote = self._currencies(intent.instrument_key)
         fee = percent_of(multiply(qty, price), self._fee_pct)
 

@@ -14,7 +14,7 @@ from hypothesis import strategies as st
 
 from tradebot.core.clock import ManualClock
 from tradebot.core.enums import OrderRole, OrderState, OrderType, Side
-from tradebot.core.errors import RetryableError
+from tradebot.core.errors import FailClosedError, RetryableError, UnbookableFillError, VenueError
 from tradebot.core.events import Event, EventType
 from tradebot.core.instrument import Instrument
 from tradebot.core.money import ZERO
@@ -23,7 +23,7 @@ from tradebot.core.portfolio import Position
 from tradebot.execution.brokers.sim import SimBroker, Tick
 from tradebot.execution.monitor import ExecutionMonitor
 from tradebot.execution.service import ExecutionService
-from tradebot.interfaces.broker import OrderRef
+from tradebot.interfaces.broker import OrderRef, OrderStatus
 from tradebot.ledger.portfolio import Ledger
 from tradebot.persistence.store import EventStore
 
@@ -197,6 +197,52 @@ class TestTtl:
         assert settled.filled_qty == Decimal("0.2")
         assert ledger.position(instrument.key).qty == Decimal("0.2")
 
+    async def test_a_fill_booked_before_a_failed_ttl_cancel_is_not_booked_again(
+        self,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Final review I3: the sync books the fill, then the cancel fails transiently.
+
+        Before the fix the synced order was only assigned once the cancel returned, so the group
+        kept the pre-sync order and the next poll saw the same fill as new and booked it again —
+        a holding inflated by every retry, which a later reduce-only SELL is sized from.
+        """
+        broker = SimBroker(clock, balances={"USDT": Decimal(100_000)}, fill_ratio=Decimal("0.4"))
+        service = ExecutionService(broker, store, ledger, clock)
+        monitor = ExecutionMonitor(broker, service, store, clock)
+        broker.observe(tick(instrument, clock, last="51000"))
+        order = await service.submit(
+            entry_intent(instrument, clock, price="45000", plan=None), instrument
+        )
+        monitor.track(order, instrument)
+        clock.advance(61)
+        broker.observe(tick(instrument, clock, last="45000", low="44000"))
+
+        real_cancel = broker.cancel
+        failures = [VenueError("503 on cancel")]
+
+        async def flaky_cancel(order_ref: OrderRef) -> object:
+            if failures:
+                raise failures.pop()
+            return await real_cancel(order_ref)
+
+        monkeypatch.setattr(broker, "cancel", flaky_cancel)
+
+        with pytest.raises(VenueError):
+            await monitor.poll()
+        assert ledger.position(instrument.key).qty == Decimal("0.2")
+
+        await monitor.poll()
+
+        assert ledger.position(instrument.key).qty == Decimal("0.2"), "booked once, not twice"
+        settled = monitor.tracked[0]
+        assert settled.state is OrderState.EXPIRED
+        assert settled.filled_qty == Decimal("0.2")
+
 
 class TestBooking:
     async def test_polling_twice_does_not_book_a_fill_twice(
@@ -218,6 +264,78 @@ class TestBooking:
         assert ledger.position(instrument.key).qty == Decimal("0.5")
         fills = [e for e in store.read_all() if e.type is EventType.FILL_RECEIVED]
         assert len(fills) == 1
+
+
+class TestScopedPoll:
+    """ADR 0030: a cycle settles its own basket's instruments, and nothing else's."""
+
+    async def test_a_scoped_poll_touches_only_the_named_instruments(
+        self,
+        monitor: ExecutionMonitor,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+        second_instrument: Instrument,
+    ) -> None:
+        # Both entries rest below the market, then both markets trade through them.
+        broker.observe(tick(instrument, clock, last="51000"))
+        broker.observe(tick(second_instrument, clock, last="3000"))
+        await submit_entry(
+            monitor, broker, store, ledger, clock, instrument, price="50000", ttl=None, plan=None
+        )
+        await submit_entry(
+            monitor,
+            broker,
+            store,
+            ledger,
+            clock,
+            second_instrument,
+            price="2900",
+            qty="1",
+            ttl=None,
+            plan=None,
+            coid="sim-ETH",
+        )
+        clock.advance(60)
+        broker.observe(tick(instrument, clock, last="49000"))
+        broker.observe(tick(second_instrument, clock, last="2800"))
+
+        await monitor.poll(frozenset({second_instrument.key}))
+
+        assert ledger.position(second_instrument.key).qty == Decimal("1")
+        assert ledger.position(instrument.key).is_flat, "outside the scope: not synced"
+
+        await monitor.poll()
+        assert ledger.position(instrument.key).qty == Decimal("0.5")
+
+    async def test_a_scope_holding_no_group_reaches_no_venue(
+        self,
+        monitor: ExecutionMonitor,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+        second_instrument: Instrument,
+    ) -> None:
+        """The live-cost claim in ADR 0030: a basket holding nothing pays nothing."""
+        broker.observe(tick(instrument, clock, last="51000"))
+        await submit_entry(
+            monitor, broker, store, ledger, clock, instrument, price="50000", plan=None, ttl=None
+        )
+        calls: list[str] = []
+        real = broker.fetch_order
+
+        async def counted(ref: OrderRef) -> object:
+            calls.append(ref.client_order_id)
+            return await real(ref)
+
+        broker.fetch_order = counted  # type: ignore[method-assign, assignment]
+        await monitor.poll(frozenset({second_instrument.key}))
+
+        assert calls == []
 
 
 class TestProtectiveGroups:
@@ -495,7 +613,10 @@ class TestLegsTrackThePosition:
 
         assert not [leg for leg in monitor.tracked if leg.role.is_protective and leg.state.is_open]
         risk = [e for e in store.read_all() if e.type is EventType.RISK_EVENT]
-        assert not risk, "nothing is at risk, so nothing is flagged"
+        # The group is retired and says so (RCA 2026-10-28 §4 item 2) — a record, not a flag.
+        assert [(e.payload["rule"], e.payload["action_taken"]) for e in risk] == [
+            ("tracked_group", "group_retired")
+        ], "nothing is at risk, so nothing is flagged"
 
     @pytest.mark.parametrize("tight_first", [True, False])
     async def test_the_tighter_stop_keeps_its_cover_whichever_was_opened_first(
@@ -765,36 +886,556 @@ class TestLegsTrackThePosition:
         monitor.track(order, instrument)
         await monitor.poll()
 
-        # Down to dust: 0.0001 at 49 000 is 4.90, under the instrument's min_notional of 10.
-        book(ledger, external_sell(instrument, clock, qty="0.4999"), instrument)
-        clock.advance(30)
-        await monitor.poll()
+        async def rest_an_exit(coid: str) -> None:
+            # Down to dust: 0.0001 at 49 000 is 4.90, under the instrument's min_notional of 10.
+            # A *resting* exit rather than a booked one: a group's entitlement never grows back
+            # after a filled reduction (RCA 2026-10-28 §4 item 2), so the only way back up to
+            # guardable is a commitment that lapses.
+            exit_order = await service.submit(
+                entry_intent(
+                    instrument,
+                    clock,
+                    coid=coid,
+                    qty="0.4999",
+                    price="60000",
+                    side=Side.SELL,
+                    plan=None,
+                    ttl=60,
+                ),
+                instrument,
+            )
+            monitor.track(exit_order, instrument)
+            clock.advance(30)
+            await monitor.poll()
 
-        # Back up, guardable again, then down to the same dust a second time.
-        book(
-            ledger,
-            Fill(
-                fill_id="refill",
-                client_order_id="sim-ELSEWHERE",
-                instrument_key=instrument.key,
-                side=Side.BUY,
-                qty=Decimal("0.4999"),
-                price=Decimal("49000"),
-                filled_at=clock.now(),
-            ),
-            instrument,
-        )
-        clock.advance(30)
+        await rest_an_exit("sim-EXIT-1")
+        # The exit lapses: guardable again at the full size, then down to the same dust again.
+        clock.advance(60)
         await monitor.poll()
-        book(ledger, external_sell(instrument, clock, qty="0.4999"), instrument)
-        clock.advance(30)
-        await monitor.poll()
+        assert monitor._tracked["sim-ENTRY"].resting_qty == Decimal("0.5")
+        await rest_an_exit("sim-EXIT-2")
 
-        risk = [e for e in store.read_all() if e.type is EventType.RISK_EVENT]
+        # The lapsed exit is released with its own `tracked_group` record; only the flags count.
+        risk = [
+            e
+            for e in store.read_all()
+            if e.type is EventType.RISK_EVENT and e.payload["rule"] != "tracked_group"
+        ]
         assert [e.payload["rule"] for e in risk] == [
             "unprotected_position",
             "unprotected_position",
         ], "the second time it becomes unguardable is a second fact, not a repeat"
+
+
+LATER_PLAN = ProtectivePlan(stop_price=Decimal("38000"), take_profit_price=Decimal("44000"))
+
+
+def _guarded(monitor: ExecutionMonitor) -> dict[str, Decimal]:
+    """Each group's resting stop, by group: what the venue is guarding, and for whom."""
+    return {
+        leg.group_id: leg.qty
+        for leg in monitor.tracked
+        if leg.role is OrderRole.STOP_LOSS and leg.state.is_open
+    }
+
+
+def _retired(store: EventStore) -> list[Event]:
+    return [
+        e
+        for e in store.read_all()
+        if e.type is EventType.RISK_EVENT and e.payload["action_taken"] == "group_retired"
+    ]
+
+
+class TestAGroupWhoseHoldingIsGoneDoesNotComeBack:
+    """RCA 2026-10-28 §4 item 2. A group released by a discretionary SELL kept its `filled_qty`
+    entitlement, ranked first on its stale, tighter stop, and took the next entry's shares —
+    re-placing March's legs against May's position. In live the venue rejects those prices and the
+    new position is left with no venue-held stop at all."""
+
+    async def _entry_a(
+        self,
+        monitor: ExecutionMonitor,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+    ) -> None:
+        broker.observe(tick(instrument, clock, last="49000"))
+        await submit_entry(
+            monitor, broker, store, ledger, clock, instrument, coid="sim-A", ttl=None
+        )
+        await monitor.poll()
+        assert _guarded(monitor) == {"sim-A": Decimal("0.5")}
+
+    async def _entry_b(
+        self,
+        monitor: ExecutionMonitor,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+        *,
+        qty: str,
+    ) -> None:
+        clock.advance(30)
+        broker.observe(tick(instrument, clock, last="40000"))
+        await submit_entry(
+            monitor,
+            broker,
+            store,
+            ledger,
+            clock,
+            instrument,
+            coid="sim-B",
+            price="40000",
+            qty=qty,
+            plan=LATER_PLAN,
+            ttl=None,
+        )
+
+    async def test_a_new_entry_is_guarded_by_its_own_plan_not_a_released_group(
+        self,
+        monitor: ExecutionMonitor,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+    ) -> None:
+        await self._entry_a(monitor, broker, store, ledger, clock, instrument)
+        book(ledger, external_sell(instrument, clock, qty="0.5"), instrument)
+        clock.advance(30)
+        broker.observe(tick(instrument, clock, last="49000"))
+        await monitor.poll()
+
+        await self._entry_b(monitor, broker, store, ledger, clock, instrument, qty="0.3")
+        await monitor.poll()
+
+        assert _guarded(monitor) == {"sim-B": Decimal("0.3")}
+        stops = {
+            leg.stop_price
+            for leg in monitor.working
+            if leg.role is OrderRole.STOP_LOSS and leg.group_id == "sim-B"
+        }
+        assert stops == {LATER_PLAN.stop_price}, "B is guarded at B's own stop"
+        assert _armed(store)[-1].aggregate_id == "sim-B"
+        assert "sim-A" not in monitor._tracked, "A's holding is gone, so A is forgotten"
+        (retired,) = _retired(store)
+        assert retired.payload["scope"] == instrument.key
+        assert "sim-A" in retired.payload["detail"]
+        flagged = [
+            e
+            for e in store.read_all()
+            if e.type is EventType.RISK_EVENT and e.payload["rule"] == "unprotected_position"
+        ]
+        assert not flagged
+
+    async def test_a_partial_sell_then_a_new_entry_does_not_grow_the_old_group_back(
+        self,
+        monitor: ExecutionMonitor,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+    ) -> None:
+        await self._entry_a(monitor, broker, store, ledger, clock, instrument)
+        book(ledger, external_sell(instrument, clock, qty="0.2"), instrument)
+        clock.advance(30)
+        broker.observe(tick(instrument, clock, last="49000"))
+        await monitor.poll()
+        assert _guarded(monitor) == {"sim-A": Decimal("0.3")}
+
+        await self._entry_b(monitor, broker, store, ledger, clock, instrument, qty="0.4")
+        await monitor.poll()
+
+        assert _guarded(monitor) == {"sim-A": Decimal("0.3"), "sim-B": Decimal("0.4")}
+        assert not _retired(store), "A still holds 0.3, so it is still live"
+
+    async def test_a_sell_and_a_new_entry_between_the_same_two_polls(
+        self,
+        monitor: ExecutionMonitor,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+    ) -> None:
+        """No poll separates the exit from the re-entry: a resting exit that fills just before the
+        next cycle's entry does. The shares just bought belong to the entry that bought them; what
+        is missing is what the older group lost."""
+        await self._entry_a(monitor, broker, store, ledger, clock, instrument)
+        book(ledger, external_sell(instrument, clock, qty="0.5"), instrument)
+        await self._entry_b(monitor, broker, store, ledger, clock, instrument, qty="0.3")
+        await monitor.poll()
+
+        assert _guarded(monitor) == {"sim-B": Decimal("0.3")}
+        assert "sim-A" not in monitor._tracked
+
+    async def test_a_resting_sell_that_expires_lets_the_group_re_arm_to_its_capacity(
+        self,
+        monitor: ExecutionMonitor,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+    ) -> None:
+        """A resting exit commits the base asset but sells none of it: the group's legs shrink
+        while it rests and grow back when it expires, because nothing was ever taken away."""
+        await self._entry_a(monitor, broker, store, ledger, clock, instrument)
+        service = ExecutionService(broker, store, ledger, clock)
+        exit_order = await service.submit(
+            entry_intent(
+                instrument,
+                clock,
+                coid="sim-EXIT",
+                qty="0.2",
+                price="60000",
+                side=Side.SELL,
+                plan=None,
+                ttl=60,
+            ),
+            instrument,
+        )
+        monitor.track(exit_order, instrument)
+        clock.advance(30)
+        await monitor.poll()
+        assert _guarded(monitor) == {"sim-A": Decimal("0.3")}
+
+        clock.advance(60)
+        await monitor.poll()
+
+        assert _guarded(monitor) == {"sim-A": Decimal("0.5")}
+        assert not _retired(store)
+
+
+def _released(store: EventStore, action: str) -> list[Event]:
+    return [
+        e
+        for e in store.read_all()
+        if e.type is EventType.RISK_EVENT
+        and e.payload["rule"] == "tracked_group"
+        and e.payload["action_taken"] == action
+    ]
+
+
+def _submitted(store: EventStore) -> int:
+    return sum(1 for e in store.read_all() if e.type is EventType.ORDER_SUBMITTED)
+
+
+class TestSettledGroupsAreReleasedWhateverCycleMadeThem:
+    """Task 7b review: the runner prunes only the groups its own cycle named, so a group that
+    settled later — on the supervisor's sweep — was never forgotten. Each is now released by the
+    poll that settles it, with a record, and stays visible through `tracked` until the next poll
+    so a caller reading straight after its own poll reports the order as it settled."""
+
+    async def test_a_group_closed_by_its_own_stop_is_released_and_recorded(
+        self,
+        monitor: ExecutionMonitor,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+    ) -> None:
+        broker.observe(tick(instrument, clock, last="49000"))
+        await submit_entry(monitor, broker, store, ledger, clock, instrument, ttl=None)
+        await monitor.poll()
+        orders_before = _submitted(store)
+
+        clock.advance(60)
+        broker.observe(tick(instrument, clock, last="46500", high="49000", low="46000"))
+        await monitor.poll()
+
+        assert "sim-ENTRY" not in monitor._tracked
+        (closed,) = _released(store, "group_closed")
+        assert "sim-ENTRY" in closed.payload["detail"]
+        # What a caller reading straight after this poll sees: the orders as they settled.
+        settled = {order.client_order_id: order for order in monitor.tracked}
+        assert any(
+            o.role is OrderRole.STOP_LOSS and o.state is OrderState.FILLED for o in settled.values()
+        )
+        assert _submitted(store) == orders_before, "releasing a group places nothing"
+
+        await monitor.poll()
+        assert monitor.tracked == ()
+        assert len(_released(store, "group_closed")) == 1, "recorded once"
+
+    async def test_an_entry_that_lapses_unfilled_on_a_later_sweep_is_released(
+        self,
+        monitor: ExecutionMonitor,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+    ) -> None:
+        broker.observe(tick(instrument, clock, last="51000"))
+        await submit_entry(monitor, broker, store, ledger, clock, instrument, price="45000")
+        await monitor.poll()
+        monitor.prune("sim-ENTRY")  # the cycle's own prune: still working, so it is kept
+        assert monitor.working
+
+        clock.advance(61)
+        await monitor.poll()
+
+        assert "sim-ENTRY" not in monitor._tracked
+        (lapsed,) = _released(store, "group_lapsed")
+        assert "expired" in lapsed.payload["detail"]
+        # `BasketRunner._settle` builds exactly this map after its poll and falls back to the
+        # pre-poll order for anything missing: the release must not change what it reports.
+        settled = {order.client_order_id: order for order in monitor.tracked}
+        assert settled["sim-ENTRY"].state is OrderState.EXPIRED
+        assert not monitor.working
+
+        await monitor.poll()
+        assert monitor.tracked == ()
+
+    async def test_the_runners_prune_still_forgets_a_released_group(
+        self,
+        monitor: ExecutionMonitor,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+    ) -> None:
+        broker.observe(tick(instrument, clock, last="51000"))
+        await submit_entry(monitor, broker, store, ledger, clock, instrument, price="45000")
+        clock.advance(61)
+        await monitor.poll()
+
+        monitor.prune("sim-ENTRY")
+
+        assert monitor.tracked == ()
+
+
+class TestRetirementRetries:
+    """`_retire` releases only after the cancel and the record have both succeeded."""
+
+    async def _flat_group(
+        self,
+        monitor: ExecutionMonitor,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+    ) -> None:
+        broker.observe(tick(instrument, clock, last="49000"))
+        await submit_entry(monitor, broker, store, ledger, clock, instrument, ttl=None)
+        await monitor.poll()
+        book(ledger, external_sell(instrument, clock, qty="0.5"), instrument)
+        clock.advance(30)
+
+    async def test_a_venue_failure_on_the_cancel_leaves_it_tracked_and_the_next_poll_retires(
+        self,
+        monitor: ExecutionMonitor,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        await self._flat_group(monitor, broker, store, ledger, clock, instrument)
+        real_cancel = broker.cancel
+        failures = iter([VenueError("503 on cancel")])
+
+        async def flaky_cancel(ref: OrderRef):  # type: ignore[no-untyped-def]
+            failure = next(failures, None)
+            if failure is not None:
+                raise failure
+            return await real_cancel(ref)
+
+        monkeypatch.setattr(broker, "cancel", flaky_cancel)
+
+        with pytest.raises(VenueError):
+            await monitor.poll()
+        assert "sim-ENTRY" in monitor._tracked
+        assert not _released(store, "group_retired")
+
+        await monitor.poll()
+
+        assert "sim-ENTRY" not in monitor._tracked
+        assert len(_released(store, "group_retired")) == 1
+        assert not monitor.working, "every leg is cancelled"
+
+    async def test_a_store_failure_on_the_record_leaves_it_tracked_and_the_next_poll_retires(
+        self,
+        monitor: ExecutionMonitor,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        await self._flat_group(monitor, broker, store, ledger, clock, instrument)
+        real_append = store.append
+        failed: list[bool] = []
+
+        async def flaky_append(*events: Event) -> None:
+            if not failed and any(e.payload.get("action_taken") == "group_retired" for e in events):
+                failed.append(True)
+                raise OSError("disk full")
+            await real_append(*events)
+
+        monkeypatch.setattr(store, "append", flaky_append)
+
+        with pytest.raises(OSError):
+            await monitor.poll()
+        assert "sim-ENTRY" in monitor._tracked, "no record, so not released"
+
+        await monitor.poll()
+
+        assert "sim-ENTRY" not in monitor._tracked
+        assert len(_released(store, "group_retired")) == 1
+
+
+def _monitor_and_ledger(
+    broker: SimBroker,
+    store: EventStore,
+    clock: ManualClock,
+    instrument: Instrument,
+    holding: str,
+) -> tuple[ExecutionMonitor, Ledger]:
+    ledger = Ledger(clock, venue="sim", balances={"USDT": Decimal(100_000)})
+    ledger.adopt_position(Position(instrument_key=instrument.key, qty=Decimal(holding)))
+    service = ExecutionService(broker, store, ledger, clock)
+    return ExecutionMonitor(broker, service, store, clock), ledger
+
+
+def _hold(ledger: Ledger, instrument: Instrument, qty: str) -> None:
+    ledger.adopt_position(Position(instrument_key=instrument.key, qty=Decimal(qty)))
+
+
+def _stop_leg(instrument: Instrument, clock: ManualClock, *, group: str, filled: str) -> Order:
+    intent = OrderIntent(
+        client_order_id=f"{group}-SL",
+        basket_id="b1",
+        cycle_id="c1",
+        instrument_key=instrument.key,
+        side=Side.SELL,
+        qty=Decimal("0.3"),
+        order_type=OrderType.LIMIT,
+        limit_price=Decimal("47000"),
+        stop_price=Decimal("47000"),
+        role=OrderRole.STOP_LOSS,
+        group_id=group,
+        created_at=clock.now(),
+    )
+    leg = Order.from_intent(intent).transition_to(OrderState.SUBMITTED, at=clock.now())
+    return leg.with_fill(
+        Fill(
+            fill_id=f"{group}-SL-1",
+            client_order_id=leg.client_order_id,
+            instrument_key=instrument.key,
+            side=Side.SELL,
+            qty=Decimal(filled),
+            price=Decimal("47000"),
+            filled_at=clock.now(),
+        )
+    )
+
+
+class TestEntitlementAccounting:
+    """The `_entitle` bookkeeping, driven through `_targets` with the ledger set by hand."""
+
+    def test_an_own_leg_partly_filling_comes_off_its_own_group(
+        self,
+        broker: SimBroker,
+        store: EventStore,
+        clock: ManualClock,
+        instrument: Instrument,
+    ) -> None:
+        """The tight group's own stop sold 0.1. Shared out tightest-first, the shortfall would
+        land on the *wide* group; it is the tight group's own exit and comes off the tight one."""
+        monitor, ledger = _monitor_and_ledger(broker, store, clock, instrument, "0.6")
+        for coid, stop in (("TIGHT", "48000"), ("WIDE", "45000")):
+            monitor.track(
+                _filled_entry(
+                    instrument, clock, coid=coid, filled=Decimal("0.3"), stop=Decimal(stop)
+                ),
+                instrument,
+            )
+        assert monitor._targets() == {"TIGHT": Decimal("0.3"), "WIDE": Decimal("0.3")}
+
+        monitor.track(_stop_leg(instrument, clock, group="TIGHT", filled="0.1"), instrument)
+        _hold(ledger, instrument, "0.5")
+
+        assert monitor._targets() == {"TIGHT": Decimal("0.2"), "WIDE": Decimal("0.3")}
+
+    def test_an_entry_filling_across_polls_grows_by_its_own_fills_only(
+        self,
+        broker: SimBroker,
+        store: EventStore,
+        clock: ManualClock,
+        instrument: Instrument,
+    ) -> None:
+        """A partly filled entry, a reduction that takes all of it, then the rest of the entry
+        fills: the group is entitled to the new fill and nothing of what was sold."""
+        monitor, ledger = _monitor_and_ledger(broker, store, clock, instrument, "0.2")
+        entry = _filled_entry(instrument, clock, coid="E", filled=Decimal("0.2"), stop=Decimal("1"))
+        entry = entry.model_copy(
+            update={"qty": Decimal("0.5"), "state": OrderState.PARTIALLY_FILLED}
+        )
+        monitor.track(entry, instrument)
+        assert monitor._targets() == {"E": Decimal("0.2")}
+
+        _hold(ledger, instrument, "0")
+        assert monitor._targets() == {"E": ZERO}
+        assert "E" in monitor._tracked and monitor._tracked["E"].order.state.is_open
+
+        more = entry.with_fill(
+            Fill(
+                fill_id="E-2",
+                client_order_id="E",
+                instrument_key=instrument.key,
+                side=Side.BUY,
+                qty=Decimal("0.3"),
+                price=Decimal("50000"),
+                filled_at=clock.now(),
+            )
+        )
+        monitor.track(more, instrument)
+        _hold(ledger, instrument, "0.3")
+
+        assert monitor._targets() == {"E": Decimal("0.3")}
+
+    def test_more_held_than_entitled_is_logged_once_per_figure(
+        self,
+        broker: SimBroker,
+        store: EventStore,
+        clock: ManualClock,
+        instrument: Instrument,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Review minor 1: the ratchet never grows back, so a shortfall it leaves is said out
+        loud. Logged, not flagged — a deposit is unguarded by design and the two look alike."""
+        monitor, ledger = _monitor_and_ledger(broker, store, clock, instrument, "0.3")
+        monitor.track(
+            _filled_entry(instrument, clock, coid="E", filled=Decimal("0.3"), stop=Decimal("1")),
+            instrument,
+        )
+        monitor._targets()
+        _hold(ledger, instrument, "0.2")
+        monitor._targets()
+        _hold(ledger, instrument, "0.3")
+
+        with caplog.at_level("WARNING"):
+            monitor._targets()
+            monitor._targets()
+
+        warned = [r for r in caplog.records if "entitled to guard" in r.getMessage()]
+        assert len(warned) == 1
+        assert monitor._targets() == {"E": Decimal("0.2")}, "the ratchet does not grow back"
+        risk = [e for e in store.read_all() if e.type is EventType.RISK_EVENT]
+        assert not risk
 
 
 def _armed(store: EventStore) -> list[Event]:
@@ -1035,3 +1676,420 @@ class TestAllocationInvariant:
         for index, fill in enumerate(fills):
             assert targets[f"g{index}"] <= fill, "a group never guards more than its own fill"
         assert all(target >= ZERO for target in targets.values())
+
+
+ETH_PLAN = ProtectivePlan(stop_price=Decimal("2700"), take_profit_price=Decimal("3200"))
+
+
+async def poisoned_pair(
+    monitor: ExecutionMonitor,
+    broker: SimBroker,
+    store: EventStore,
+    ledger: Ledger,
+    clock: ManualClock,
+    btc: Instrument,
+    eth: Instrument,
+    *,
+    eth_plan: ProtectivePlan | None = None,
+) -> None:
+    """BTC: an armed 0.5 stop the venue has filled, against a ledger something else already cut
+    to 0.2 -- unbookable. ETH: an entry the venue has filled since -- bookable. BTC is first."""
+    broker.observe(tick(btc, clock, last="49000"))
+    await submit_entry(monitor, broker, store, ledger, clock, btc, ttl=None)
+    await monitor.poll()
+    book(ledger, external_sell(btc, clock, qty="0.3"), btc)
+    await submit_entry(
+        monitor, broker, store, ledger, clock, eth,
+        price="2900", qty="1", ttl=None, plan=eth_plan, coid="sim-ETH",
+    )  # fmt: skip
+    clock.advance(60)
+    broker.observe(tick(btc, clock, last="46500", high="49000", low="46000"))
+    broker.observe(tick(eth, clock, last="2800"))
+
+
+def unbookable_events(store: EventStore) -> list[Event]:
+    return [
+        e
+        for e in store.read_all()
+        if e.type is EventType.RISK_EVENT and e.payload["rule"] == "unbookable_fill"
+    ]
+
+
+def open_stops(monitor: ExecutionMonitor, instrument: Instrument) -> list[Order]:
+    return [
+        o
+        for o in monitor.tracked
+        if o.role is OrderRole.STOP_LOSS and o.instrument_key == instrument.key and o.state.is_open
+    ]
+
+
+class TestAnUnbookableFillIsContained:
+    """ADR 0030 / memo Option D: one fill the ledger refuses must not wedge every other group."""
+
+    async def test_a_poisoned_group_does_not_stop_a_sibling_fill_being_booked(
+        self,
+        monitor: ExecutionMonitor,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+        second_instrument: Instrument,
+    ) -> None:
+        await poisoned_pair(monitor, broker, store, ledger, clock, instrument, second_instrument)
+
+        await monitor.poll()  # unscoped: the sweep's call, and it must not raise
+
+        assert ledger.position(second_instrument.key).qty == Decimal("1")
+        assert ledger.position(instrument.key).qty == Decimal("0.2")
+
+    async def test_the_poison_reaches_only_a_caller_scoped_to_it(
+        self,
+        monitor: ExecutionMonitor,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+        second_instrument: Instrument,
+    ) -> None:
+        await poisoned_pair(monitor, broker, store, ledger, clock, instrument, second_instrument)
+
+        with pytest.raises(UnbookableFillError, match="exceeds holding") as raised:
+            await monitor.poll(frozenset({instrument.key}))
+        assert raised.value.qty == Decimal("0.5") and raised.value.held == Decimal("0.2")
+        await monitor.poll(frozenset({second_instrument.key}))
+
+    async def test_an_unscoped_sweep_records_the_poison_and_halts_nothing(
+        self,
+        monitor: ExecutionMonitor,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+        second_instrument: Instrument,
+    ) -> None:
+        """The owning basket halts at its next scoped poll, through the FAILED path; the sweep
+        itself neither raises nor halts anything."""
+        await poisoned_pair(monitor, broker, store, ledger, clock, instrument, second_instrument)
+
+        await monitor.poll()
+
+        assert len(unbookable_events(store)) == 1
+        halts = [e for e in store.read_all() if e.type is EventType.BASKET_STATUS_CHANGED]
+        assert halts == []
+        with pytest.raises(UnbookableFillError):
+            await monitor.poll(frozenset({instrument.key}))
+
+    async def test_it_is_recorded_once_and_the_fill_is_never_dropped(
+        self,
+        monitor: ExecutionMonitor,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+        second_instrument: Instrument,
+    ) -> None:
+        await poisoned_pair(monitor, broker, store, ledger, clock, instrument, second_instrument)
+        for _ in range(3):
+            await monitor.poll()
+
+        (event,) = unbookable_events(store)
+        assert event.payload["scope"] == instrument.key
+        assert "0.5" in event.payload["detail"] and "0.2" in event.payload["detail"]
+        assert open_stops(monitor, instrument), "still tracked, still unbooked"
+
+    async def test_a_poisoned_group_books_once_the_holding_allows_it(
+        self,
+        monitor: ExecutionMonitor,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+        second_instrument: Instrument,
+    ) -> None:
+        await poisoned_pair(monitor, broker, store, ledger, clock, instrument, second_instrument)
+        await monitor.poll()
+        book(
+            ledger,
+            Fill(
+                fill_id="restored",
+                client_order_id="sim-ELSEWHERE",
+                instrument_key=instrument.key,
+                side=Side.BUY,
+                qty=Decimal("0.3"),
+                price=Decimal("49000"),
+                filled_at=clock.now(),
+            ),
+            instrument,
+        )
+
+        await monitor.poll(frozenset({instrument.key}))  # no longer raises
+
+        assert ledger.position(instrument.key).is_flat
+
+    async def test_a_sibling_is_still_maintained_while_another_group_is_poisoned(
+        self,
+        monitor: ExecutionMonitor,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+        second_instrument: Instrument,
+    ) -> None:
+        await poisoned_pair(
+            monitor, broker, store, ledger, clock, instrument, second_instrument,
+            eth_plan=ETH_PLAN,
+        )  # fmt: skip
+
+        await monitor.poll()
+
+        assert open_stops(monitor, second_instrument), "the healthy group was armed"
+
+    async def test_a_venue_error_on_one_group_still_maintains_the_others(
+        self,
+        monitor: ExecutionMonitor,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+        second_instrument: Instrument,
+    ) -> None:
+        broker.observe(tick(instrument, clock, last="49000"))
+        await submit_entry(monitor, broker, store, ledger, clock, instrument, ttl=None)
+        await monitor.poll()
+        await submit_entry(
+            monitor, broker, store, ledger, clock, second_instrument,
+            price="2900", qty="1", ttl=None, plan=ETH_PLAN, coid="sim-ETH",
+        )  # fmt: skip
+        clock.advance(60)
+        broker.observe(tick(second_instrument, clock, last="2800"))
+        real = broker.fetch_order
+
+        async def btc_down(ref: OrderRef) -> object:
+            if ref.instrument_key == instrument.key:
+                raise VenueError("503 from the venue")
+            return await real(ref)
+
+        broker.fetch_order = btc_down  # type: ignore[method-assign]
+        with pytest.raises(VenueError):
+            await monitor.poll()
+
+        assert ledger.position(second_instrument.key).qty == Decimal("1")
+        assert open_stops(monitor, second_instrument), "armed despite its sibling's error"
+
+    async def test_a_fail_closed_error_is_not_masked_by_an_earlier_retryable_one(
+        self,
+        monitor: ExecutionMonitor,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+        second_instrument: Instrument,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """BTC (tracked first) fails retryably, ETH fails closed: the caller must see the latter,
+        because the class is the handling instruction -- and both must be logged."""
+        broker.observe(tick(instrument, clock, last="49000"))
+        await submit_entry(monitor, broker, store, ledger, clock, instrument, ttl=None)
+        await submit_entry(
+            monitor, broker, store, ledger, clock, second_instrument,
+            price="2900", qty="1", ttl=None, plan=ETH_PLAN, coid="sim-ETH",
+        )  # fmt: skip
+
+        async def down(ref: OrderRef) -> object:
+            if ref.instrument_key == instrument.key:
+                raise VenueError("503 from the venue")
+            raise FailClosedError("venue answered something unreadable")
+
+        broker.fetch_order = down  # type: ignore[method-assign]
+        with caplog.at_level("ERROR"), pytest.raises(FailClosedError) as raised:
+            await monitor.poll()
+
+        assert not isinstance(raised.value, RetryableError)
+        text = " ".join(r.getMessage() + str(r.__dict__) for r in caplog.records)
+        assert "sim-ENTRY" in text and "sim-ETH" in text, "every failure is logged"
+
+
+class TestContainmentFollowUps:
+    """Review round: a poisoned retry is idempotent, and every path out of it is recorded."""
+
+    async def test_a_poisoned_retry_does_not_rebook_the_fills_it_already_booked(
+        self,
+        monitor: ExecutionMonitor,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+        second_instrument: Instrument,
+    ) -> None:
+        """The stop filled in two trades; only the second exceeds the holding. Trade 1 must be
+        booked once, not on every 30s retry."""
+        await poisoned_pair(monitor, broker, store, ledger, clock, instrument, second_instrument)
+        real = broker.fetch_order
+
+        async def two_trades(ref: OrderRef) -> OrderStatus:
+            status = await real(ref)
+            if len(status.fills) == 1 and status.fills[0].qty == Decimal("0.5"):
+                whole = status.fills[0]
+                first = whole.model_copy(update={"fill_id": "trade-1", "qty": Decimal("0.1")})
+                second = whole.model_copy(update={"fill_id": "trade-2", "qty": Decimal("0.4")})
+                return status.model_copy(update={"fills": (first, second)})
+            return status
+
+        broker.fetch_order = two_trades  # type: ignore[method-assign]
+
+        def received() -> int:
+            return len([e for e in store.read_all() if e.type is EventType.FILL_RECEIVED])
+
+        await monitor.poll()
+        held, count = ledger.position(instrument.key).qty, received()
+        assert held == Decimal("0.1"), "trade 1 booked once"
+        for _ in range(3):
+            await monitor.poll()
+            await monitor.poll(frozenset({second_instrument.key}))
+
+        assert ledger.position(instrument.key).qty == held
+        assert received() == count
+
+    async def test_a_failure_to_record_the_poison_does_not_skip_the_siblings(
+        self,
+        monitor: ExecutionMonitor,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+        second_instrument: Instrument,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        await poisoned_pair(
+            monitor, broker, store, ledger, clock, instrument, second_instrument,
+            eth_plan=ETH_PLAN,
+        )  # fmt: skip
+        real_append = store.append
+        failing = {"on": True}
+
+        async def append(*events: Event) -> object:
+            if failing["on"] and any(e.type is EventType.RISK_EVENT for e in events):
+                raise RuntimeError("disk full")
+            return await real_append(*events)
+
+        store.append = append  # type: ignore[method-assign]
+        with caplog.at_level("ERROR"), pytest.raises(RuntimeError, match="disk full"):
+            await monitor.poll()
+
+        assert ledger.position(second_instrument.key).qty == Decimal("1")
+        assert open_stops(monitor, second_instrument), "the sibling was still maintained"
+        assert "disk full" in " ".join(str(r.__dict__) for r in caplog.records)
+        assert unbookable_events(store) == []
+
+        failing["on"] = False
+        await monitor.poll()  # the record is retried because the group was left unpoisoned
+        assert len(unbookable_events(store)) == 1
+
+    async def test_clearing_a_poison_is_recorded(
+        self,
+        monitor: ExecutionMonitor,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+        second_instrument: Instrument,
+    ) -> None:
+        await poisoned_pair(monitor, broker, store, ledger, clock, instrument, second_instrument)
+        await monitor.poll()
+        book(
+            ledger,
+            Fill(
+                fill_id="restored",
+                client_order_id="sim-ELSEWHERE",
+                instrument_key=instrument.key,
+                side=Side.BUY,
+                qty=Decimal("0.3"),
+                price=Decimal("49000"),
+                filled_at=clock.now(),
+            ),
+            instrument,
+        )
+
+        await monitor.poll()
+        await monitor.poll()
+
+        actions = [e.payload["action_taken"] for e in unbookable_events(store)]
+        assert actions == ["group_poisoned", "group_unpoisoned"]
+
+    async def test_an_unclassified_error_outranks_a_retryable_one(
+        self,
+        monitor: ExecutionMonitor,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+        second_instrument: Instrument,
+    ) -> None:
+        broker.observe(tick(instrument, clock, last="49000"))
+        await submit_entry(
+            monitor, broker, store, ledger, clock, instrument, price="40000", ttl=None
+        )
+        await submit_entry(
+            monitor, broker, store, ledger, clock, second_instrument,
+            price="2900", qty="1", ttl=None, plan=ETH_PLAN, coid="sim-ETH",
+        )  # fmt: skip
+
+        async def down(ref: OrderRef) -> object:
+            if ref.instrument_key == instrument.key:
+                raise VenueError("503 from the venue")
+            raise RuntimeError("a bug, not a venue answer")
+
+        broker.fetch_order = down  # type: ignore[method-assign]
+        with pytest.raises(RuntimeError, match="a bug"):
+            await monitor.poll()
+
+    async def test_a_group_adopted_during_the_sync_is_maintained_in_that_sweep(
+        self,
+        monitor: ExecutionMonitor,
+        broker: SimBroker,
+        store: EventStore,
+        ledger: Ledger,
+        clock: ManualClock,
+        instrument: Instrument,
+        second_instrument: Instrument,
+    ) -> None:
+        broker.observe(tick(instrument, clock, last="49000"))
+        await submit_entry(
+            monitor, broker, store, ledger, clock, instrument, price="40000", ttl=None
+        )
+        service = ExecutionService(broker, store, ledger, clock)
+        eth = await service.submit(
+            entry_intent(
+                second_instrument, clock, price="2900", qty="1", ttl=None, plan=ETH_PLAN,
+                coid="sim-ETH",
+            ),
+            second_instrument,
+        )  # fmt: skip
+        broker.observe(tick(second_instrument, clock, last="2800"))
+        filled = await service.sync(eth, second_instrument)
+        real = broker.fetch_order
+        adopted = {"done": False}
+
+        async def adopt_midway(ref: OrderRef) -> OrderStatus:
+            if not adopted["done"]:
+                adopted["done"] = True
+                monitor.track(filled, second_instrument)
+            return await real(ref)
+
+        broker.fetch_order = adopt_midway  # type: ignore[method-assign]
+
+        await monitor.poll()
+
+        assert open_stops(monitor, second_instrument), "armed in the sweep that adopted it"

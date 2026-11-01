@@ -25,17 +25,22 @@ from tradebot.app import Application
 from tradebot.control.arming import LIVE_CONFIRMATION_PHRASE
 from tradebot.control.config_store import SINGLETON_ID
 from tradebot.control.supervision import SupervisionController
+from tradebot.core.clock import ManualClock
 from tradebot.core.enums import (
     BasketStatus,
     ConfigKind,
     CycleOutcome,
     KillSwitchState,
     OrderRole,
+    OrderState,
+    Side,
 )
+from tradebot.core.errors import ConfigError, FailClosedError, UnbookableFillError, VenueError
 from tradebot.core.events import EventType
-from tradebot.core.orders import Order
+from tradebot.core.orders import Fill, Order
 from tradebot.dashboard.dock import KILL_PHRASE, QUARANTINE_CONFIRM
 from tradebot.dashboard.queries import Queries
+from tradebot.execution.brokers.sim import Tick
 from tradebot.risk.rules import STOOD_ASIDE
 from tradebot.risk.state import REARM_PHRASE
 
@@ -480,6 +485,52 @@ async def test_a_manual_close_goes_through_the_normal_path(
     assert all(event.payload["approved"] for event in checked)
 
 
+def cross_the_stop(application: Application, instrument_key: str, clock: ManualClock) -> None:
+    """The venue trades through every resting stop on this instrument, and nobody has looked.
+
+    Exactly the state a sim-stack quote read leaves behind when its bar crosses the stop.
+    """
+    one = Decimal(1)
+    application.monitor._broker.observe(  # type: ignore[attr-defined]
+        Tick(
+            instrument_key=instrument_key,
+            bid=one,
+            ask=one,
+            last=one,
+            high=one,
+            low=one,
+            covers_since=clock.now(),
+            observed_at=clock.now(),
+        )
+    )
+
+
+async def test_a_close_after_the_stop_sold_it_sells_nothing(
+    cycled: Application, clock: ManualClock
+) -> None:
+    """ADR 0030 through the operator's door: quote, settle, *then* read the holding.
+
+    Before: the close read the stale holding, sold all of it on top of the stop's sale, and its
+    guarded `_settle` swallowed the "exceeds holding" the stop's fill then raised.
+    """
+    assert resting_stops(cycled, BTC)
+    cross_the_stop(cycled, BTC, clock)
+
+    with pytest.raises(ConfigError, match="nothing to close"):
+        await cycled.manual_close.close("demo", BTC, actor="test")
+
+    assert cycled.ledger.position(BTC).is_flat
+    assert [
+        o
+        for o in cycled.monitor.tracked
+        if o.role is OrderRole.STOP_LOSS
+        and o.instrument_key == BTC
+        and o.state is OrderState.FILLED
+    ]
+    actions = [e.payload["action_taken"] for e in risk_events(cycled, "manual_close")]
+    assert "order_submitted" not in actions
+
+
 async def test_a_manual_close_releases_the_legs_it_leaves_behind(cycled: Application) -> None:
     """KNOWN_GAPS §5, through the second door it names.
 
@@ -738,3 +789,140 @@ async def test_a_sim_process_has_nothing_to_arm(
 
 async def test_the_arming_form_is_absent_outside_live(client: httpx.AsyncClient) -> None:
     assert "Live arming" not in (await client.get("/")).text
+
+
+async def test_a_close_over_an_unbookable_fill_is_refused_and_sends_nothing(
+    cycled: Application, clock: ManualClock
+) -> None:
+    """Fail closed for the operator too: the close would size against a ledger known to be wrong."""
+    held = cycled.ledger.position(BTC).qty
+    cycled.ledger.apply_fill(
+        Fill(
+            fill_id="external",
+            client_order_id="elsewhere",
+            instrument_key=BTC,
+            side=Side.SELL,
+            qty=held / 2,
+            price=Decimal("50000"),
+            filled_at=clock.now(),
+        ),
+        base_currency="BTC",
+        quote_currency="USDT",
+    )
+    cross_the_stop(cycled, BTC, clock)
+    sent = len(events_of(cycled, EventType.ORDER_SUBMITTED))
+
+    with pytest.raises(FailClosedError, match="could not confirm the holding") as refused:
+        await cycled.manual_close.close("demo", BTC, actor="test")
+
+    assert "exceeds holding" in str(refused.value), "the reason names the unbookable fill"
+    assert len(events_of(cycled, EventType.ORDER_SUBMITTED)) == sent
+    assert risk_events(cycled, "unbookable_fill")
+    assert risk_events(cycled, "manual_close")[-1].payload["action_taken"] == "refused"
+
+
+def poison_by_stop(application: Application, instrument_key: str, clock: ManualClock) -> None:
+    """Half the holding sold elsewhere, then the stop fills its full size: unbookable."""
+    base = instrument_key.split(":")[1].split("/")[0]
+    held = application.ledger.position(instrument_key).qty
+    application.ledger.apply_fill(
+        Fill(
+            fill_id=f"external-{base}",
+            client_order_id="elsewhere",
+            instrument_key=instrument_key,
+            side=Side.SELL,
+            qty=held / 2,
+            price=Decimal("50000"),
+            filled_at=clock.now(),
+        ),
+        base_currency=base,
+        quote_currency="USDT",
+    )
+    cross_the_stop(application, instrument_key, clock)
+    # The trough armed the stop; a rebound through its limit fills it — at its full size.
+    high = Decimal(10_000_000)
+    application.monitor._broker.observe(  # type: ignore[attr-defined]
+        Tick(
+            instrument_key=instrument_key,
+            bid=high,
+            ask=high,
+            last=high,
+            high=high,
+            low=high,
+            covers_since=clock.now(),
+            observed_at=clock.now(),
+        )
+    )
+
+
+async def test_a_poisoned_sibling_does_not_refuse_the_close_of_another_instrument(
+    cycled: Application, clock: ManualClock
+) -> None:
+    """Final review I1: the close sizes from one holding, so it polls that one instrument.
+
+    Scoped to the basket, ETH's unbookable stop fill refused the operator's close of BTC — the
+    one act reserved for a human, refused for a reason that had nothing to do with it.
+    """
+    eth = "sim:ETH/USDT"
+    poison_by_stop(cycled, eth, clock)
+    with pytest.raises(UnbookableFillError):
+        await cycled.monitor.poll(frozenset({eth}))
+
+    outcome = await cycled.manual_close.close("demo", BTC, actor="test")
+
+    assert outcome.submitted
+    sent = len(events_of(cycled, EventType.ORDER_SUBMITTED))
+    with pytest.raises(FailClosedError, match=f"could not confirm the holding in {eth}"):
+        await cycled.manual_close.close("demo", eth, actor="test")
+    assert len(events_of(cycled, EventType.ORDER_SUBMITTED)) == sent, "ETH still refuses"
+
+
+@pytest.mark.parametrize(
+    ("problem", "cause"),
+    [
+        (VenueError("503 from the venue"), "503 from the venue"),
+        (RuntimeError("disk I/O error"), "RuntimeError: disk I/O error"),
+    ],
+)
+async def test_a_failed_pre_close_poll_is_a_recorded_refusal(
+    cycled: Application,
+    monkeypatch: pytest.MonkeyPatch,
+    problem: Exception,
+    cause: str,
+) -> None:
+    """Final review Q(c): classified or not, it refuses fail-closed and says so in the log."""
+
+    async def failing_poll(instrument_keys: frozenset[str] | None = None) -> None:
+        raise problem
+
+    monkeypatch.setattr(cycled.monitor, "poll", failing_poll)
+    sent = len(events_of(cycled, EventType.ORDER_SUBMITTED))
+
+    with pytest.raises(FailClosedError) as refused:
+        await cycled.manual_close.close("demo", BTC, actor="test")
+
+    reason = f"close refused: could not confirm the holding in {BTC} with the venue ({cause})"
+    assert str(refused.value) == reason
+    assert len(events_of(cycled, EventType.ORDER_SUBMITTED)) == sent
+    recorded = risk_events(cycled, "manual_close")
+    assert [e.payload["action_taken"] for e in recorded][-2:] == ["requested", "refused"]
+    assert recorded[-1].payload["detail"] == reason
+
+
+async def test_an_unclassified_poll_failure_re_renders_the_workspace_not_a_500(
+    cycled: Application, client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def failing_poll(instrument_keys: frozenset[str] | None = None) -> None:
+        raise RuntimeError("disk I/O error")
+
+    monkeypatch.setattr(cycled.monitor, "poll", failing_poll)
+
+    response = await client.post(
+        "/control/close",
+        data={"basket_id": "demo", "instrument_key": BTC, "scope": "basket:demo"},
+    )
+
+    assert response.status_code == 200
+    assert "Not done" in response.text
+    assert f"could not confirm the holding in {BTC} with the venue" in response.text
+    assert "RuntimeError: disk I/O error" in response.text

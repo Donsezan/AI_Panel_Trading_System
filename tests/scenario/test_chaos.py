@@ -15,19 +15,37 @@ from datetime import timedelta
 from decimal import Decimal
 
 import pytest
-from tests.scenario.harness import Harness
+from tests.conftest import SERIES_START, TIMEFRAMES
+from tests.scenario.harness import IGNORE_STALENESS, Harness
 
+from tradebot.control.basket_runner import BasketRunner
+from tradebot.control.context_builder import ContextBuilder
 from tradebot.core.clock import ManualClock
 from tradebot.core.config import Basket, GlobalRiskPolicy
-from tradebot.core.enums import CycleOutcome, KillSwitchState, OrderState, ReconcileClass
+from tradebot.core.enums import (
+    CycleOutcome,
+    KillSwitchState,
+    Mode,
+    OrderRole,
+    OrderState,
+    ReconcileClass,
+    Side,
+)
 from tradebot.core.errors import VenueError
 from tradebot.core.events import EventType
+from tradebot.core.instrument import Instrument
+from tradebot.core.orders import Fill
 from tradebot.core.portfolio import AccountState
-from tradebot.decision.providers import DEFAULT_RESPONSE, FAIL
+from tradebot.decision.engine import DecisionEngine
+from tradebot.decision.providers import DEFAULT_RESPONSE, FAIL, StubLLMProvider
+from tradebot.decision.seat import SeatRunner
+from tradebot.execution.brokers.sim import Tick
 from tradebot.ledger.portfolio import ExternalFlow
-from tradebot.marketdata.replay import ReplayMarketData
+from tradebot.marketdata.replay import ReplayMarketData, synthetic_candles
 from tradebot.risk.aggregate import PortfolioAggregate
 from tradebot.risk.state import REARM_PHRASE, assert_rearm_phrase
+from tradebot.risk.tier1 import Tier1RiskEngine
+from tradebot.risk.tier2 import Tier2RiskEngine
 
 pytestmark = pytest.mark.scenario
 
@@ -101,6 +119,31 @@ class TestDataAndPanelRows:
 
 
 class TestExecutionRows:
+    async def test_a_venue_error_while_settling_the_snapshot_places_no_order(
+        self, basket: Basket, clock: ManualClock, market_data: ReplayMarketData
+    ) -> None:
+        """ADR 0030: the in-snapshot poll failing is the worker's failure path — no trade."""
+        harness = await make_harness(basket, clock, market_data, [DEFAULT_RESPONSE])
+        try:
+            await harness.runner.run_once()  # buys; legs rest, so the next snapshot must poll
+            frozen = len(
+                [e for e in harness.store.read_all() if e.type is EventType.SNAPSHOT_FROZEN]
+            )
+            sent = len([e for e in harness.store.read_all() if e.type is EventType.ORDER_SUBMITTED])
+
+            async def down(_ref: object) -> None:
+                raise VenueError("503 from the venue")
+
+            harness.broker.fetch_order = down  # type: ignore[method-assign]
+            with pytest.raises(VenueError):
+                await harness.runner.run_once()
+
+            after = harness.store.read_all()
+            assert len([e for e in after if e.type is EventType.SNAPSHOT_FROZEN]) == frozen
+            assert len([e for e in after if e.type is EventType.ORDER_SUBMITTED]) == sent
+        finally:
+            harness.close()
+
     async def test_an_ambiguous_submit_queries_rather_than_resubmitting(
         self, basket: Basket, clock: ManualClock, market_data: ReplayMarketData
     ) -> None:
@@ -426,5 +469,122 @@ class TestProcessCrash:
 
             assert recovery.halted
             assert not recovery.may_run(basket)
+        finally:
+            harness.close()
+
+
+@pytest.fixture
+def two_markets(
+    instrument: Instrument, second_instrument: Instrument, clock: ManualClock
+) -> ReplayMarketData:
+    return ReplayMarketData(
+        {
+            (held.key, timeframe): synthetic_candles(
+                start=SERIES_START,
+                timeframe=timeframe,
+                count=200,
+                open_price=Decimal("50000"),
+                step=Decimal("25"),
+            )
+            for held in (instrument, second_instrument)
+            for timeframe in TIMEFRAMES
+        },
+        clock,
+    )
+
+
+def sibling_runner(harness: Harness, sibling: Basket) -> BasketRunner:
+    """A second basket on the harness's one venue portfolio: its ledger, execution and monitor."""
+    return BasketRunner(
+        sibling,
+        mode=Mode.SIM,
+        context_builder=ContextBuilder(
+            harness.market_data,
+            harness.ledger,
+            harness.clock,
+            staleness_tolerance=IGNORE_STALENESS,
+            protective_orders_supported=True,
+            trading_history=harness.history,
+        ),
+        decision_engine=DecisionEngine(
+            SeatRunner({"stub": StubLLMProvider([DEFAULT_RESPONSE])}, harness.clock)
+        ),
+        risk_engine=Tier1RiskEngine(harness.clock),
+        tier2=Tier2RiskEngine(harness.policy),
+        watchdog=harness.watchdog,
+        history=harness.history,
+        execution=harness.execution,
+        monitor=harness.monitor,
+        ledger=harness.ledger,
+        store=harness.store,
+        clock=harness.clock,
+        venue=harness.broker.venue_id,
+        marks=harness.marks,
+        universe=lambda: (*harness.basket.instruments, *sibling.instruments),
+        global_policy=harness.policy,
+    )
+
+
+class TestUnbookableFill:
+    async def test_an_unbookable_fill_halts_one_basket_not_all(
+        self,
+        basket: Basket,
+        clock: ManualClock,
+        two_markets: ReplayMarketData,
+        second_instrument: Instrument,
+    ) -> None:
+        harness = await make_harness(basket, clock, two_markets, [DEFAULT_RESPONSE])
+        sibling = basket.model_copy(update={"basket_id": "b2", "instruments": (second_instrument,)})
+        other = sibling_runner(harness, sibling)
+        btc = basket.instruments[0].key
+        try:
+            assert (await harness.runner.run_once()).outcome is CycleOutcome.ORDERS_PLACED
+            held = harness.ledger.position(btc).qty
+            # Fault injection: the ledger already lost half the holding, then the venue's stop
+            # sells the whole of it -- a fill the ledger must refuse.
+            harness.ledger.apply_fill(
+                Fill(
+                    fill_id="external",
+                    client_order_id="elsewhere",
+                    instrument_key=btc,
+                    side=Side.SELL,
+                    qty=held / 2,
+                    price=Decimal("50000"),
+                    filled_at=clock.now(),
+                ),
+                base_currency="BTC",
+                quote_currency="USDT",
+            )
+            one = Decimal(1)
+            harness.broker.observe(
+                Tick(
+                    instrument_key=btc,
+                    bid=one,
+                    ask=one,
+                    last=one,
+                    high=one,
+                    low=one,
+                    covers_since=clock.now(),
+                    observed_at=clock.now(),
+                )
+            )
+
+            failed = await harness.runner.run_once()
+            assert failed.outcome is CycleOutcome.FAILED
+            assert "exceeds holding" in failed.detail
+            assert not harness.states.status_of(basket.basket_id).may_trade
+
+            traded = await other.run_once()
+            assert traded.outcome is CycleOutcome.ORDERS_PLACED
+            assert harness.ledger.position(second_instrument.key).qty > 0
+            assert harness.states.status_of("b2").may_trade
+
+            await harness.monitor.poll()  # the supervisor's sweep: unscoped, must not raise
+            assert len([r for r in harness.risk_events() if r[0] == "unbookable_fill"]) == 1
+            assert [
+                o
+                for o in harness.monitor.tracked
+                if o.role is OrderRole.STOP_LOSS and o.instrument_key == btc and o.state.is_open
+            ], "the fill is kept, not dropped"
         finally:
             harness.close()

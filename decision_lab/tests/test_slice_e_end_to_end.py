@@ -345,9 +345,14 @@ def test_the_loop_closes_from_a_raw_store_to_a_news_fed_report(
     )
 
 
-def _changed_under_tradebot(base: str) -> set[str]:
+#: The slice-E merge. A two-parent commit, so its first parent is `main` just before the slice
+#: landed and the diff between them is exactly what the slice introduced.
+SLICE_E_MERGE = "b3a22cd"
+
+
+def _changed_under_tradebot(base: str, head: str) -> set[str]:
     out = subprocess.run(
-        ["git", "diff", "--name-only", base, "--", "tradebot/"],
+        ["git", "diff", "--name-only", base, head, "--", "tradebot/"],
         cwd=REPO,
         capture_output=True,
         text=True,
@@ -357,22 +362,23 @@ def _changed_under_tradebot(base: str) -> set[str]:
 
 
 def test_the_bot_diff_is_exactly_the_licensed_surface() -> None:
-    """The slice's structural exit criterion: the only `tradebot/` file this branch may change is
+    """The slice's structural exit criterion: the only `tradebot/` file slice E changed is
     `app.py` (§2.2), and its guards live in `tests/`, which this check does not cover.
 
-    Diffed against the fork point rather than `main` itself, and as a *subset*: once this branch
-    merges, `main` contains the seam and an equality against it would fail forever. A branch that
-    changed nothing in `tradebot/` also passes - the licence is a ceiling, not a quota.
+    Pinned to the slice-E merge (`b3a22cd^1..b3a22cd`), never to the current branch. Diffed
+    against the fork point instead, it failed on every later branch that touched `tradebot/` for
+    its own reasons and passed vacuously on `main`, where the fork point is HEAD — a test of
+    whatever branch happened to be checked out rather than of the slice. As a *subset*: the
+    licence is a ceiling, not a quota. That nothing *else* under `decision_lab` reaches into the
+    bot is `test_separation.py`'s job, over the tree as it stands.
     """
     try:
-        base = subprocess.run(
-            ["git", "merge-base", "HEAD", "main"],
-            cwd=REPO,
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout.strip()
+        changed = _changed_under_tradebot(f"{SLICE_E_MERGE}^1", SLICE_E_MERGE)
     except (OSError, subprocess.CalledProcessError):
-        pytest.skip("git or `main` is not resolvable here (a shallow checkout, say)")
+        pytest.skip(
+            f"the slice-E merge {SLICE_E_MERGE} or its first parent is not in this checkout "
+            "(a shallow clone, say)"
+        )
 
-    assert _changed_under_tradebot(base) <= {"tradebot/app.py"}
+    assert changed, "the slice-E merge introduced the news_feed seam in tradebot/app.py"
+    assert changed <= {"tradebot/app.py"}

@@ -31,7 +31,7 @@ from decimal import Decimal
 
 from tradebot.core.clock import Clock
 from tradebot.core.enums import OrderState, RiskTier
-from tradebot.core.errors import FailClosedError, SubmitUnknownError
+from tradebot.core.errors import FailClosedError, SubmitUnknownError, UnbookableFillError
 from tradebot.core.events import EventFactory
 from tradebot.core.instrument import Instrument
 from tradebot.core.logging import get_logger
@@ -162,7 +162,13 @@ class ExecutionService:
             return await self._resolve_vanished(order, events)
 
         for fill in order.new_fills(status.fills):
-            order = await self._book_fill(order, fill, instrument, events)
+            try:
+                order = await self._book_fill(order, fill, instrument, events)
+            except UnbookableFillError as error:
+                # Fills already booked in this loop are in the ledger and the log; the caller must
+                # keep the order that knows it, or the next poll books them a second time.
+                error.partial_order = order
+                raise
 
         return await self._adopt_state(order, status, events)
 

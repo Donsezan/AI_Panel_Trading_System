@@ -5,11 +5,14 @@ where the system fails closed on data: a series older than its budget aborts the
 `DATA_STALE` rather than producing a decision from a market that has already moved (DESIGN §6.2).
 
 Failure semantics: `DataStaleError` propagates to the runner, which records the cycle outcome
-and places no order. That is the intended behaviour, not a degradation.
+and places no order. That is the intended behaviour, not a degradation. Whatever the `settle`
+hook raises propagates unchanged; the build produces no snapshot (ADR 0030).
 """
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from tradebot.core.clock import Clock
@@ -17,7 +20,7 @@ from tradebot.core.config import Basket
 from tradebot.core.errors import ConfigError
 from tradebot.core.ids import new_uuid
 from tradebot.core.instrument import Instrument
-from tradebot.core.market import CandleSeries, timeframe_interval
+from tradebot.core.market import CandleSeries, Quote, timeframe_interval
 from tradebot.core.snapshot import (
     BasketState,
     ContextSnapshot,
@@ -40,6 +43,17 @@ from tradebot.ledger.portfolio import Ledger
 
 DEFAULT_TIMEFRAMES = ("1h", "4h", "1d")
 DEFAULT_NEWS_ITEMS = 8
+
+Settle = Callable[[], Awaitable[None]]
+
+
+@dataclass(frozen=True, slots=True)
+class _MarketReads:
+    """Everything one instrument's snapshot needs from the market, read before any holding."""
+
+    summaries: tuple[tuple[str, str], ...]
+    readings: tuple[IndicatorReading, ...]
+    quote: Quote
 
 
 def summarize(series: CandleSeries) -> str:
@@ -103,12 +117,23 @@ class ContextBuilder:
         return self._indicators
 
     async def build(
-        self, basket: Basket, *, news: tuple[NewsItemView, ...] | None = None
+        self,
+        basket: Basket,
+        *,
+        news: tuple[NewsItemView, ...] | None = None,
+        settle: Settle | None = None,
     ) -> ContextSnapshot:
         as_of = self._clock.now()
         self._assert_feed_keeps_up(basket)
+        markets = [await self._market_reads(i) for i in basket.instruments]
+        # After every market read, not per instrument: a read can be what makes the venue fill a
+        # resting stop, and a holding read before the booking would size against a position that
+        # no longer exists (ADR 0030, KNOWN_GAPS §5). A hook that raises ends the build.
+        if settle is not None:
+            await settle()
         contexts = tuple(
-            [await self._build_instrument(i, basket.basket_id) for i in basket.instruments]
+            self._instrument_context(i, basket.basket_id, m)
+            for i, m in zip(basket.instruments, markets, strict=True)
         )
         items, coverage = await self._news(basket, as_of, news)
         return ContextSnapshot(
@@ -155,7 +180,7 @@ class ContextBuilder:
         series.require_fresh(self._clock.now(), timeframe_interval(timeframe) + self._tolerance)
         return series
 
-    async def _build_instrument(self, instrument: Instrument, basket_id: str) -> InstrumentContext:
+    async def _market_reads(self, instrument: Instrument) -> _MarketReads:
         summaries: list[tuple[str, str]] = []
         readings: list[IndicatorReading] = []
         for timeframe in self._timeframes:
@@ -164,17 +189,22 @@ class ContextBuilder:
             readings.extend(compute_readings(series, self._indicators))
 
         quote = await self._market_data.get_quote(instrument)
+        return _MarketReads(tuple(summaries), tuple(readings), quote)
+
+    def _instrument_context(
+        self, instrument: Instrument, basket_id: str, market: _MarketReads
+    ) -> InstrumentContext:
         position = self._ledger.position(instrument.key)
         return InstrumentContext(
             instrument=instrument,
-            quote=quote,
-            candle_summaries=tuple(summaries),
-            indicators=tuple(readings),
+            quote=market.quote,
+            candle_summaries=market.summaries,
+            indicators=market.readings,
             position=None
             if position.is_flat
             else PositionView(
                 qty=position.qty,
-                unrealized_pnl_pct=position.unrealized_pnl_pct(quote.last),
+                unrealized_pnl_pct=position.unrealized_pnl_pct(market.quote.last),
                 held_cycles=self._held_cycles(basket_id, position.opened_at),
             ),
             unprotected_position=not self._protective,

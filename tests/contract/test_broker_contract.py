@@ -106,12 +106,16 @@ class Venue:
         *,
         fill: Callable[[str, Decimal, Decimal], None],
         break_next_submit: Callable[[], None],
+        reach_all: Callable[[Decimal, Decimal], None] | None = None,
     ) -> None:
         self.broker = broker
         self.instrument = instrument
         self.book = book
         self._fill = fill
         self.break_next_submit = break_next_submit
+        #: One observation spanning `(low, high)`. Only a venue that matches against a market can
+        #: express it; the wire fakes fill by decree, one order at a time, so they leave it None.
+        self.reach_all = reach_all
 
     def fill_partly(self, client_order_id_: str, price: Decimal = ENTRY_PRICE) -> None:
         self._fill(client_order_id_, QTY / 2, price)
@@ -152,6 +156,20 @@ def sim_venue(clock: ManualClock) -> Venue:
         tick(price)
         broker.fill_ratio = Decimal(1)
 
+    def sweep(low: Decimal, high: Decimal) -> None:
+        broker.observe(
+            Tick(
+                instrument_key=instrument.key,
+                bid=high,
+                ask=high,
+                last=high,
+                high=high,
+                low=low,
+                covers_since=NOW,
+                observed_at=clock.now(),
+            )
+        )
+
     # A starting book *above* the entry limit, so a buy at `ENTRY_PRICE` rests instead of crossing
     # on submit. Every assertion about a working order needs an order that is actually working.
     tick(ENTRY_PRICE + Decimal(5))
@@ -161,6 +179,7 @@ def sim_venue(clock: ManualClock) -> Venue:
         FakeVenueBook(),
         fill=fill,
         break_next_submit=lambda: setattr(broker, "fail_next_submit", True),
+        reach_all=sweep,
     )
 
 
@@ -432,6 +451,33 @@ class TestProtectiveGroups:
 
         sibling = await venue.broker.fetch_order(venue.ref(stop.client_order_id))
         assert sibling.state.is_terminal, "the unfilled leg must not outlive its group"
+
+    async def test_both_legs_reached_in_one_observation_at_most_one_fills(
+        self, venue: Venue
+    ) -> None:
+        """A bar wide enough for the stop and the target is still one exit, never two.
+
+        Scoped to adapters whose fake can express one observation reaching both legs: the wire
+        fakes fill one order by decree, so there is no single move for them to describe.
+        """
+        if venue.reach_all is None:
+            pytest.skip("this fake fills by decree and cannot express one bar reaching both legs")
+        entry = entry_intent(venue)
+        await venue.broker.submit(entry)
+        venue.fill_fully(entry.client_order_id)
+        stop, target = leg_intents(venue, entry, QTY)
+        await venue.broker.submit_group((stop, target))
+        # Arm the stop (trigger 90) without reaching its limit (89.5 for a sell needs high >= 89.5).
+        venue.reach_all(Decimal(80), Decimal(89))
+
+        venue.reach_all(Decimal(80), Decimal(120))
+
+        statuses = [
+            await venue.broker.fetch_order(venue.ref(leg.client_order_id)) for leg in (stop, target)
+        ]
+        assert sum(status.filled_qty for status in statuses) <= QTY
+        assert sum(1 for status in statuses if status.state is OrderState.FILLED) == 1
+        assert sum(1 for status in statuses if status.state is OrderState.CANCELLED) == 1
 
     async def test_a_single_leg_group_takes_the_ordinary_submit_path(self, venue: Venue) -> None:
         """A venue without linked legs still gets its stop, through the same call (DESIGN §6.7)."""

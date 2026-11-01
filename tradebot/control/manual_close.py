@@ -32,8 +32,15 @@ completed cycles, and letting an operator's close advance every basket's cooldow
 risk limit depend on how often a human intervened.
 
 Failure semantics: an unknown basket, an instrument the basket does not hold, a flat position, a
-stale quote, or a missing Tier-2 policy each refuse before anything is sent. A veto from either
+stale quote, a venue that cannot be polled for what it has already done, or a missing Tier-2
+policy each refuse before anything is sent. A veto from either
 tier refuses and is recorded with full provenance. Only a fully approved intent reaches the venue.
+
+The poll before the holding is read is scoped to **the instrument being closed** and nothing else:
+that is the only holding the close sizes from (ADR 0026 makes it this basket's alone), so a
+poisoned group or a venue error on a sibling instrument must not refuse a human's exit from this
+one. Whatever that poll raises — classified or not — becomes one fail-closed refusal naming the
+instrument, recorded as a `manual_close` `refused` event like a veto, and never a 500.
 """
 
 from __future__ import annotations
@@ -49,7 +56,7 @@ from tradebot.core.clock import Clock
 from tradebot.core.config import Basket, GlobalRiskPolicy
 from tradebot.core.decision import Decision
 from tradebot.core.enums import Action, ConfigKind, Mode, RiskTier, Side, SizeHint
-from tradebot.core.errors import ConfigError, DataStaleError
+from tradebot.core.errors import ConfigError, DataStaleError, FailClosedError, TradebotError
 from tradebot.core.events import EventFactory
 from tradebot.core.ids import new_uuid
 from tradebot.core.instrument import Instrument
@@ -185,7 +192,9 @@ class ManualCloser:
     ) -> CloseOutcome:
         basket = self._basket(basket_id)
         instrument = _instrument_of(basket, instrument_key)
-        proposal = await self._proposal(basket, instrument, actor)
+        # The one instrument the close sizes from, never the whole basket (final review I1).
+        scope = frozenset({instrument.key})
+        proposal = await self._proposal(basket, instrument, actor, scope, events)
 
         outcome = Tier1RiskEngine(self._clock).approve(
             proposal,
@@ -230,7 +239,7 @@ class ManualCloser:
         )
         # After the record above, never before: the poll can fail, and that a human asked and the
         # venue took it must survive that.
-        order = await self._settle(order)
+        order = await self._settle(order, scope)
         return CloseOutcome(
             instrument_key=instrument.key,
             correlation_id=correlation_id,
@@ -239,7 +248,7 @@ class ManualCloser:
             held_qty=proposal.position.qty,
         )
 
-    async def _settle(self, order: Order) -> Order:
+    async def _settle(self, order: Order, scope: frozenset[str]) -> Order:
         """Poll the close just submitted, and report it as the poll found it.
 
         KNOWN_GAPS §5: nothing else polls until a basket happens to place an order, so until this
@@ -256,7 +265,7 @@ class ManualCloser:
         incident that a close which actually happened had failed.
         """
         try:
-            await self._monitor.poll()
+            await self._monitor.poll(scope)
         except Exception:
             logger.exception("polling the manual close raised; the order stands and is tracked")
             return order
@@ -277,6 +286,39 @@ class ManualCloser:
         checks: tuple[RiskCheckResult, ...],
         reason: str,
     ) -> CloseOutcome:
+        await self._record_refusal(instrument_key, events, reason)
+        return CloseOutcome(
+            instrument_key=instrument_key,
+            correlation_id=correlation_id,
+            checks=checks,
+            reason=reason,
+        )
+
+    async def _confirm_holding(
+        self, instrument: Instrument, scope: frozenset[str], events: EventFactory
+    ) -> None:
+        """Poll before the holding is read, and turn any failure into a recorded refusal.
+
+        Not guarded, unlike the poll after submission: no order exists yet, so a poll that fails
+        refuses the close, and a close is never sized from a holding that could not be confirmed.
+        Every exception is caught, classified or not: the monitor re-raises unclassified ones by
+        design (a SQLite error recording a poison, say), and one escaping here would reach the
+        operator as a 500 that loses the screen they were acting from. All of them are refused
+        as `FailClosedError`, because "could not confirm" resolves to no trade.
+        """
+        try:
+            await self._monitor.poll(scope)
+        except Exception as exc:
+            cause = str(exc) if isinstance(exc, TradebotError) else f"{type(exc).__name__}: {exc}"
+            reason = (
+                f"close refused: could not confirm the holding in {instrument.key} with the "
+                f"venue ({cause})"
+            )
+            await self._record_refusal(instrument.key, events, reason)
+            raise FailClosedError(reason) from exc
+
+    async def _record_refusal(self, instrument_key: str, events: EventFactory, reason: str) -> None:
+        """That a human asked and why nothing was sent, in the log beside the request."""
         await self._store.append(
             events.risk_event(
                 tier=RiskTier.EXECUTION,
@@ -287,19 +329,29 @@ class ManualCloser:
             )
         )
         logger.warning("manual close refused", extra={"instrument": instrument_key, "why": reason})
-        return CloseOutcome(
-            instrument_key=instrument_key,
-            correlation_id=correlation_id,
-            checks=checks,
-            reason=reason,
-        )
 
-    async def _proposal(self, basket: Basket, instrument: Instrument, actor: str) -> RiskProposal:
-        position = self._ledger.position(instrument.key)
-        if position.is_flat:
+    async def _proposal(
+        self,
+        basket: Basket,
+        instrument: Instrument,
+        actor: str,
+        scope: frozenset[str],
+        events: EventFactory,
+    ) -> RiskProposal:
+        # A cheap pre-check that answers "nothing to close" without a venue call. It is not the
+        # authority: the holding is read again below, once the venue has been asked.
+        if self._ledger.position(instrument.key).is_flat:
             raise ConfigError(f"nothing to close: no position is held in {instrument.key}")
 
         quote = self._fresh_quote(await self._prices.get_quote(instrument))
+        # Reading the quote can itself move the venue (a sim-stack read feeds the tick to the
+        # broker, which trips any stop the bar crossed), so book what the venue did before
+        # reading the holding the close will be sized from. Sized from the stale holding, a close
+        # sells what a stop already sold (ADR 0030, KNOWN_GAPS section 5).
+        await self._confirm_holding(instrument, scope, events)
+        position = self._ledger.position(instrument.key)
+        if position.is_flat:
+            raise ConfigError(f"nothing to close: no position is held in {instrument.key}")
         # Into the shared cache before valuing: this is the freshest mark in the system for this
         # instrument, and an exit should never be the one act that lets it go stale.
         self._marks.observe_quote(quote)

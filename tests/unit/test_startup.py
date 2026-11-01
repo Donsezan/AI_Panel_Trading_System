@@ -15,7 +15,7 @@ from tradebot.control.valuation import PortfolioWatch
 from tradebot.core.clock import ManualClock
 from tradebot.core.config import Basket, GlobalRiskPolicy
 from tradebot.core.enums import KillSwitchState, Mode, OrderState, OrderType, Side
-from tradebot.core.errors import VenueError
+from tradebot.core.errors import UnbookableFillError, VenueError
 from tradebot.core.events import EventType
 from tradebot.core.instrument import Instrument
 from tradebot.core.orders import Order, OrderIntent, ProtectivePlan
@@ -72,7 +72,9 @@ class Stack:
         instrument: Instrument,
         broker: object | None = None,
         readiness: object | None = None,
+        instruments: tuple[Instrument, ...] = (),
     ) -> None:
+        universe = instruments or (instrument,)
         self.broker = broker or SimBroker(clock, balances={"USDT": Decimal(10_000)})
         self.states = RiskStateStore(store.engine, store._writer, clock)
         self.watchdog = Watchdog(GlobalRiskPolicy(), self.states, store, clock)
@@ -84,7 +86,7 @@ class Stack:
             store,
             clock,
             mode=Mode.SIM,
-            universe=lambda: (instrument,),
+            universe=lambda: universe,
         )
         # The valuation the sequence reads for its reconciliation tolerance and its first-run
         # baseline. No market data: a flat ledger of quote-currency cash needs no marks at all,
@@ -92,7 +94,7 @@ class Stack:
         self.portfolio = PortfolioWatch(
             ledger,
             Marks(),
-            lambda: (instrument,),
+            lambda: universe,
             self.watchdog,
             store,
             clock,
@@ -111,7 +113,7 @@ class Stack:
             self.states,
             self.watchdog,
             clock,
-            instruments=(instrument,),
+            instruments=universe,
             readiness=readiness,  # type: ignore[arg-type]
             portfolio=self.portfolio,
         )
@@ -318,6 +320,72 @@ class TestOpenOrderResolution:
         recovery = await stack.sequence.recover()
 
         assert recovery.halted, "a vanished order is a venue reset, not a routine cancellation"
+
+
+class TestAnUnbookableOrderAtStartup:
+    """Final review I2: one group's unbookable fill is contained at startup as it is mid-run.
+
+    Before, `UnbookableFillError` aborted `_resolve_open_orders` at the first order: a process
+    failure, so Start was refused, every manual close in every basket with it, and the orders
+    after it were never tracked. ADR 0030's containment ends at the group, here too.
+    """
+
+    async def test_the_rest_are_tracked_and_the_poison_is_scoped_to_its_group(
+        self,
+        store: EventStore,
+        clock: ManualClock,
+        instrument: Instrument,
+        second_instrument: Instrument,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        ledger = Ledger(clock, venue="sim", balances={"USDT": Decimal(10_000)})
+        stack = Stack(store, ledger, clock, instrument, instruments=(instrument, second_instrument))
+        broker = stack.broker
+        assert isinstance(broker, SimBroker)
+        broker.observe(tick(instrument, clock, "50000"))
+        broker.observe(tick(second_instrument, clock, "3000"))
+        poisoned = await stack.execution.submit(entry(instrument, clock), instrument)
+        healthy = await stack.execution.submit(
+            entry(second_instrument, clock, price="2500").model_copy(
+                update={"client_order_id": "sim-ENTRY-ETH", "group_id": "sim-ENTRY-ETH"}
+            ),
+            second_instrument,
+        )
+
+        real_sync = stack.execution.sync
+
+        async def sync(order: Order, on: Instrument) -> Order:
+            if order.client_order_id == poisoned.client_order_id:
+                error = UnbookableFillError(
+                    f"sell of 0.2 exceeds holding 0.1 on {on.key}",
+                    client_order_id=order.client_order_id,
+                    instrument_key=on.key,
+                    qty=Decimal("0.2"),
+                    held=Decimal("0.1"),
+                )
+                error.partial_order = order
+                raise error
+            return await real_sync(order, on)
+
+        monkeypatch.setattr(stack.execution, "sync", sync)
+
+        recovery = await stack.sequence.recover()
+
+        assert not recovery.failures, "one group's fill does not halt the process"
+        working = {order.client_order_id for order in stack.monitor.working}
+        assert {poisoned.client_order_id, healthy.client_order_id} <= working
+        recorded = [
+            event
+            for event in store.read_all()
+            if event.type is EventType.RISK_EVENT and event.payload["rule"] == "unbookable_fill"
+        ]
+        assert [event.payload["action_taken"] for event in recorded] == ["group_poisoned"]
+        assert recorded[0].payload["scope"] == instrument.key
+
+        # The owning basket's scoped poll is told; a sibling's is not.
+        await stack.monitor.poll(frozenset({second_instrument.key}))
+        with pytest.raises(UnbookableFillError):
+            await stack.monitor.poll(frozenset({instrument.key}))
 
 
 class TestFailureHalts:
