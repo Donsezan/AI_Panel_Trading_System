@@ -40,9 +40,11 @@ from tradebot.core.money import ZERO
 from tradebot.decision.providers import registry
 from tradebot.decision.providers.stub import DEFAULT_RESPONSE, StubLLMProvider
 from tradebot.interfaces.llm import CompletionRequest
+from tradebot.ledger.history import HistoryReader
 from tradebot.marketdata.recorder import ReplayDataset
 from tradebot.persistence.database import SingleWriter, open_database
 from tradebot.persistence.store import EventStore
+from tradebot.validation.evidence import Evidence
 
 #: Daily, so a quarter costs about ninety cycles. The tick reads the same bar of the oscillation
 #: every day, so a flat price is flat at every decision and only costs can decide a round trip.
@@ -55,6 +57,7 @@ ETH = "ETH/USDT"
 #: range, so a price past the limit would arm the stop and then never fill it.
 THROUGH_THE_STOP = "99.3"
 DROP_DAY = date(2024, 1, 15)
+RISE_DAY = date(2024, 2, 10)
 
 Votes = Mapping[tuple[str, date], str]
 
@@ -67,13 +70,15 @@ def utc(month: int, number: int = 1) -> datetime:
     return datetime(2024, month, number, tzinfo=UTC)
 
 
-def _oscillation(*, drop_on: date | None = None) -> tuple[Candle, ...]:
-    """A flat market with a real ATR, optionally stepping down through a stop on one day."""
+def _oscillation(*, drop_on: date | None = None, rise_on: date | None = None) -> tuple[Candle, ...]:
+    """A flat market with a real ATR, optionally stepping through a stop or up to a win one day."""
     closes = []
     for hour in range(DAYS * 24):
         when = f.EPOCH + timedelta(hours=hour)
         dropped = drop_on is not None and when.date() >= drop_on
         low, high = (THROUGH_THE_STOP, "99.8") if dropped else ("100", "100.5")
+        if rise_on is not None and when.date() >= rise_on:
+            low, high = "110", "110.5"
         # Held at the low all through the drop day, so the stop's trigger is plainly crossed.
         closes.append(low if hour % 2 == 0 or when.date() == drop_on else high)
     return f.walk(closes)
@@ -82,8 +87,8 @@ def _oscillation(*, drop_on: date | None = None) -> tuple[Candle, ...]:
 class Plan(StubLLMProvider):
     """Answers by the date and the symbol in the prompt. Everything unnamed is a WAIT."""
 
-    def __init__(self, votes: Votes) -> None:
-        super().__init__(provider_id="stub")
+    def __init__(self, votes: Votes, *, cost_usd: Decimal = ZERO) -> None:
+        super().__init__(provider_id="stub", cost_usd=cost_usd)
         self._votes = votes
 
     def _text_for(self, request: CompletionRequest) -> str:
@@ -114,11 +119,13 @@ class Ran:
     plan: Plan
 
 
-def _verified(directory: Path, lock: Path, *, drop_on: date | None) -> Path:
+def _verified(
+    directory: Path, lock: Path, *, drop_on: date | None, rise_on: date | None = None
+) -> Path:
     f.write_dataset(
         directory,
         {
-            (f.instrument(), "1h"): _oscillation(drop_on=drop_on),
+            (f.instrument(), "1h"): _oscillation(drop_on=drop_on, rise_on=rise_on),
             (f.instrument(ETH), "1h"): _oscillation(),
         },
     )
@@ -132,6 +139,12 @@ def _verified(directory: Path, lock: Path, *, drop_on: date | None) -> Path:
 def flat_data(tmp_path_factory: pytest.TempPathFactory) -> Path:
     root = tmp_path_factory.mktemp("pause-flat")
     return _verified(root / "history", root / "lock", drop_on=None)
+
+
+@pytest.fixture(scope="module")
+def rising_data(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    root = tmp_path_factory.mktemp("pause-rise")
+    return _verified(root / "history", root / "lock", drop_on=None, rise_on=RISE_DAY)
 
 
 @pytest.fixture(scope="module")
@@ -170,8 +183,11 @@ async def execute(
     limit: int = 2,
     two_instruments: bool = False,
     before_cycle: Callable[[BasketWorker], Awaitable[None]] | None = None,
+    start_equity: Decimal = START_EQUITY,
+    budget: Decimal = Decimal(5),
+    cost_usd: Decimal = ZERO,
 ) -> Ran:
-    plan = Plan(votes)
+    plan = Plan(votes, cost_usd=cost_usd)
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(registry, "StubLLMProvider", lambda **_: plan)
         if two_instruments:
@@ -189,8 +205,8 @@ async def execute(
             candidate=candidate_over(data, limit),
             period=pd.parse_period(label),
             cadence_seconds=CADENCE,
-            start_equity=START_EQUITY,
-            budget=Decimal(5),
+            start_equity=start_equity,
+            budget=budget,
             wall_clock=ManualClock(datetime(2026, 11, 1, tzinfo=UTC)),
             workspace=workspace,
         )
@@ -327,8 +343,14 @@ async def test_a_pause_stops_panel_calls_but_lets_a_held_stop_fire(scenarios: Sc
     assert not ran.plan.calls_between(HELD_PAUSED_ON + timedelta(seconds=1), utc(2))
     assert sells_between(ran.database, HELD_PAUSED_ON, utc(2)), "the resting stop never fired"
     assert not sells_between(ran.database, utc(1), HELD_PAUSED_ON)
-    # Any loss in that stretch counts (§5.4): both round trips' costs and the stop's own loss.
-    assert ZERO < month.end_equity < START_EQUITY
+    # Any loss in that stretch counts (§5.4). Read off the trip the stop closed: equity alone would
+    # also fall on the ETH round trip's fees, before the stretch began.
+    trips = read_log(ran.database, lambda store: Evidence.gather(store).round_trips)
+    assert [
+        trip.realized_pnl < ZERO
+        for trip in trips
+        if trip.instrument_key == f.instrument().key and HELD_PAUSED_ON < trip.at < utc(2)
+    ] == [True]
 
 
 async def test_the_quarantined_stretch_is_neither_scored_nor_counted(scenarios: Scenarios) -> None:
@@ -469,11 +491,12 @@ async def test_an_older_pause_does_not_excuse_a_later_halt(flat_data: Path, tmp_
         flat_data, tmp_path / "w", "2024-Q1", TWO_LOSSES, before_cycle=halt_in_february
     )
 
-    january, february, march = ran.meta.months
+    january, february = ran.meta.months
     assert january.paused_at == PAUSED_ON
     assert february.paused_at is None
     assert february.ran_cycles < february.planned_cycles
-    assert march.ran_cycles == 0
+    assert pd.not_run_months(ran.meta) == ("2024-03",)
+    assert ran.meta.ending is pd.RunEnding.INTERRUPTED
     assert len(ran.meta.lifts) == 1
 
 
@@ -492,3 +515,58 @@ async def test_a_kill_switch_during_the_stretch_is_not_lifted_past(
 
     assert ran.meta.months[0].paused_at == PAUSED_ON
     assert ran.meta.lifts == ()
+
+
+async def test_a_win_returns_the_limit_to_the_configured_one(
+    rising_data: Path, tmp_path: Path
+) -> None:
+    """§5.3 means the full allowance back, not a permanently looser rule: past the win, a limit of
+    four would let March lose four times where the candidate said two."""
+    votes = {
+        **TWO_LOSSES,
+        (BTC, day(2, 5)): "BUY",
+        (BTC, day(2, 14)): "SELL",
+        (BTC, day(3, 1)): "BUY",
+        (BTC, day(3, 4)): "SELL",
+        (BTC, day(3, 7)): "BUY",
+        (BTC, day(3, 10)): "SELL",
+        (BTC, day(3, 13)): "BUY",
+    }
+
+    ran = await execute(rising_data, tmp_path / "w", "2024-Q1", votes)
+
+    assert ran.meta.lifts == (pd.PauseLift(at=utc(2), streak=2, new_limit=4),)
+    pinned = limits_pinned(ran.database)
+    assert pinned[utc(2, 5)] == 4
+    assert pinned[utc(2, 15)] == 2
+    assert ran.meta.months[2].paused_at == utc(3, 13)
+
+    def notes(store: EventStore) -> list[str]:
+        return [str(e.payload.get("note")) for e in store.read_types(EventType.CONFIG_CHANGED)]
+
+    assert any("limit 2" in note for note in read_log(ran.database, notes))
+
+
+async def test_no_win_leaves_the_lifted_limit_in_force(scenarios: Scenarios) -> None:
+    ran = await scenarios.paused_in_january()
+
+    assert set(limits_pinned(ran.database).values()) == {2, 4}
+    assert limits_pinned(ran.database)[utc(3, 31)] == 4
+
+
+async def test_the_streak_agrees_with_the_one_the_rule_reads(scenarios: Scenarios) -> None:
+    """The tool derives from the log what `ConsecutiveLossRule` reads from the projection; two
+    answers to "how long is the streak" would lift a pause to the wrong limit."""
+    ran = await scenarios.paused_twice()
+    engine = open_database(ran.database)
+    writer = SingleWriter(engine)
+    try:
+        ours = pd._consecutive_losses(EventStore(engine, writer), "period")
+        rule = HistoryReader(engine, ManualClock(utc(4))).for_instrument(
+            "period", f.instrument().key
+        )
+    finally:
+        writer.close()
+        engine.dispose()
+
+    assert ours == rule.consecutive_losses == 4

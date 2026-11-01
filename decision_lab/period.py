@@ -18,9 +18,17 @@ portfolio at a month's end is `unvaluable` with no figure: its equity reads zero
 exactly as `longrun.Profit` does (§10.4), and the month after it has no `start_equity` at all.
 
 A loss-streak pause is the one stop that does not end cycling (§5.3, §5.4): the rest of its month
-runs quarantined, and the next month, if there is one, lifts it. Any other halt ends cycling for the
-rest of the period. A kill switch tripped meanwhile means no lift: that was never agreed to. All of
-it is written to this run's own workspace database, through the same public stores a bot edit uses.
+runs quarantined, and the next month, if there is one, lifts it. A win then hands the limit back, so
+a lift restores an allowance rather than loosening the rule. All of it is written to this run's own
+workspace database, through the same public stores a bot edit uses.
+
+Every other stop ends the run, and §5.7 splits them by what they mean. A tripped kill switch, or
+no position with too little cash for any order to exist, is `RULE_ENDED`: a verdict, final and
+reused at its identity. A basket halted for any other cause, spend past the budget at a month
+boundary (with a month still to run), or an unexpected exception is `INTERRUPTED`, because an error
+says nothing about the model. The exception is written and re-raised for the CLI's exit code. Months
+after an ending were not run, and `not_run_months` is how a reader knows: an absent month is never a
+quiet one.
 """
 
 from __future__ import annotations
@@ -29,7 +37,7 @@ import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from enum import StrEnum
+from enum import Enum, StrEnum
 from pathlib import Path
 from typing import Final
 
@@ -41,15 +49,17 @@ from decision_lab.longrun import Profit, VetoRow, profit_of, veto_breakdown
 from decision_lab.newsfeed import ArchiveNewsFeed
 from decision_lab.params import workspace_root
 from tradebot.app import Application, build_sim, dataset_catalogue
+from tradebot.control.supervisor import BasketWorker
 from tradebot.core.clock import Clock, ManualClock
 from tradebot.core.config import Basket, Schedule
 from tradebot.core.enums import BasketStatus, ConfigKind, RiskTier
 from tradebot.core.errors import ConfigError, FailClosedError
 from tradebot.core.events import EventFactory, EventType
 from tradebot.core.logging import get_logger
-from tradebot.core.money import ZERO
+from tradebot.core.money import ZERO, to_decimal
 from tradebot.core.schema import DomainModel, Money, UtcDatetime
 from tradebot.marketdata.recorder import ReplayDataset
+from tradebot.persistence.store import EventStore
 from tradebot.risk.aggregate import PortfolioAggregate
 from tradebot.risk.rules import AUTO_PAUSE_RULE
 from tradebot.validation.backtest import DEFAULT_MAX_CYCLES, plan_ticks, warmup_for
@@ -160,6 +170,15 @@ class RunEnding(StrEnum):
     INTERRUPTED = "INTERRUPTED"
     RULE_ENDED = "RULE_ENDED"
 
+    @property
+    def is_final(self) -> bool:
+        """Whether this is the run's result, reused at its identity without spend (§5.1)."""
+        return self in {RunEnding.COMPLETED, RunEnding.RULE_ENDED}
+
+
+class BudgetReached(FailClosedError):  # noqa: N818 - the plan's name: reaching it is no defect
+    """Spend passed the budget at a month boundary (§5.5). Ends the run as an interruption."""
+
 
 class MonthResult(DomainModel):
     """One month, folded out of the run's log by time."""
@@ -215,6 +234,16 @@ class PeriodMeta(DomainModel):
     gate_skipped: bool = False
     plumbing_check: bool = False
     news_blind: bool = True
+
+
+def not_run_months(meta: PeriodMeta) -> tuple[str, ...]:
+    """The period's months no cycle was attempted for, derived so it cannot disagree with `months`.
+
+    A row per month carrying `not run` was the alternative, and would give a reader a zero-cycle
+    row to add up as though it were a measurement (§5.3).
+    """
+    reached = {month.label for month in meta.months}
+    return tuple(month.label for month in meta.period.months if month.label not in reached)
 
 
 def period_dir(run_id: str, *, workspace: Path | None = None) -> Path:
@@ -320,19 +349,42 @@ async def quarantine_stretch(application: Application, basket: Basket) -> None:
     await application.watchdog.resume_basket(basket.basket_id, actor=ACTOR)
 
 
-def _consecutive_losses(application: Application, basket_id: str) -> int:
+def _consecutive_losses(store: EventStore, basket_id: str) -> int:
     """The streak `ConsecutiveLossRule` read, derived the way `ledger/history.py:96` derives it.
 
     From the log, since `Application` exposes no read of `round_trips`: losing round trips at the
-    head of the basket's history, where anything but a loss ends the count.
+    head of the basket's history, where anything but a loss ends the count. Narrowed to that one
+    event type because a lifted limit asks this after every cycle until a win.
     """
-    trips = Evidence.gather(application.store).round_trips
     streak = 0
-    for trip in reversed([one for one in trips if one.basket_id == basket_id]):
-        if trip.realized_pnl >= ZERO:
+    for event in reversed(store.read_types(EventType.ROUND_TRIP_CLOSED)):
+        if event.basket_id != basket_id:
+            continue
+        if to_decimal(event.payload["round_trip"]["realized_pnl"]) >= ZERO:
             break
         streak += 1
     return streak
+
+
+async def restore_limit(application: Application, basket: Basket) -> None:
+    """Hand back the configured limit once a win has reset the streak (§5.3).
+
+    A lift adds to the limit only so the streak it inherited cannot veto at once. With that streak
+    gone the addition would be a looser rule than the candidate declared, and every later figure
+    would be measured under a limit nobody configured.
+    """
+    configured = basket.risk_policy.max_consecutive_losses
+    current = _current_basket(application, basket.basket_id)
+    if current.risk_policy.max_consecutive_losses == configured:
+        return
+    if _consecutive_losses(application.store, basket.basket_id) != 0:
+        return
+    await application.configs.put(
+        basket.basket_id,
+        _with_policy(current, max_consecutive_losses=configured),
+        actor=ACTOR,
+        note=f"a win reset the streak: limit {configured} again (§5.3)",
+    )
 
 
 async def lift_pause(
@@ -344,7 +396,7 @@ async def lift_pause(
     only a win resets it, so the next proposal would veto and halt again. `configured_limit` is the
     candidate's, never the current version's, or each lift would add to the last one's allowance.
     """
-    streak = _consecutive_losses(application, basket.basket_id)
+    streak = _consecutive_losses(application.store, basket.basket_id)
     new_limit = streak + configured_limit
     current = _current_basket(application, basket.basket_id)
     await application.configs.put(
@@ -366,18 +418,79 @@ async def lift_pause(
     return PauseLift(at=at, streak=streak, new_limit=new_limit)
 
 
+def out_of_money(application: Application, basket: Basket) -> bool:
+    """Flat, with too little cash for any order of this basket to exist again (§5.7).
+
+    `balance` is total funds rather than free, deliberately: this is a final verdict, and cash a
+    resting entry has locked is still an order that can fill. A position only appears at a fill.
+    """
+    if any(not position.is_flat for position in application.ledger.positions()):
+        return False
+    cash = application.ledger.balance(application.quote_currency)
+    return cash < min(instrument.min_notional for instrument in basket.instruments)
+
+
+class _Cause(Enum):
+    """Why cycling stopped. A loss-streak pause is not one: it does not stop cycling."""
+
+    KILL_SWITCH = "kill switch"
+    OUT_OF_MONEY = "out of money"
+    HALTED = "basket stopped"
+
+
+#: §5.7's table. A rule ending the run is a result; an error continues from the last good point.
+_ENDING_OF: Final[dict[_Cause, RunEnding]] = {
+    _Cause.KILL_SWITCH: RunEnding.RULE_ENDED,
+    _Cause.OUT_OF_MONEY: RunEnding.RULE_ENDED,
+    _Cause.HALTED: RunEnding.INTERRUPTED,
+}
+
+
+@dataclass(frozen=True, slots=True)
+class _Stop:
+    cause: _Cause
+    detail: str
+    at: datetime
+
+    @property
+    def reason(self) -> str:
+        return f"{self.cause.value} on {self.at.date().isoformat()}: {self.detail}"
+
+
+def _stop_after_cycle(
+    application: Application, worker: BasketWorker, basket: Basket, at: datetime
+) -> _Stop | None:
+    """What ended cycling at this tick, asked of the database rather than of the worker.
+
+    `_runnable` never reads the kill switch, so a tripped run cycles on as BLOCKED and QUARANTINED
+    and would report every later month fully run. The switch is read first: it outranks whatever
+    else the same cycle did, and its verdict is the one that must not be lost to a lesser reason.
+    """
+    states = application.states
+    state = states.load()
+    if not state.may_trade:
+        return _Stop(_Cause.KILL_SWITCH, state.reason, at)
+    if worker.stopped or not states.status_of(basket.basket_id).may_trade:
+        detail = states.halted_baskets().get(basket.basket_id) or "it is no longer runnable"
+        return _Stop(_Cause.HALTED, detail, at)
+    if out_of_money(application, basket):
+        cash = application.ledger.balance(application.quote_currency)
+        return _Stop(_Cause.OUT_OF_MONEY, f"flat with {cash} {application.quote_currency} left", at)
+    return None
+
+
 @dataclass(frozen=True, slots=True)
 class _Driven:
-    """What one month's ticks did. `stopped_at` is cycling's end; `paused_at` is not."""
+    """What one month's ticks did. `stop` is the run's end; `paused_at` is not."""
 
     paused_at: datetime | None = None
-    stopped_at: datetime | None = None
+    stop: _Stop | None = None
 
 
 async def _drive(
     application: Application, clock: ManualClock, basket: Basket, ticks: tuple[datetime, ...]
 ) -> _Driven:
-    """Cycle each tick in order, through a pause, until the ticks end or the basket stops.
+    """Cycle each tick in order, through a pause, until the ticks end or something ends the run.
 
     The same calls `BacktestHarness._replay` makes, in the same order (§5.4), because this loop
     must not drift from it. `test_the_driver_matches_the_harness_on_one_window` holds it to that.
@@ -399,12 +512,13 @@ async def _drive(
             )
             await quarantine_stretch(application, basket)
             paused_at = moment
-        if worker.stopped:
+        if (stop := _stop_after_cycle(application, worker, basket, moment)) is not None:
             logger.warning(
-                "basket stopped cycling during the period",
-                extra={"basket_id": basket.basket_id, "at": moment.isoformat()},
+                "the period run ended early",
+                extra={"basket_id": basket.basket_id, "reason": stop.reason},
             )
-            return _Driven(paused_at=paused_at, stopped_at=moment)
+            return _Driven(paused_at=paused_at, stop=stop)
+        await restore_limit(application, basket)
     return _Driven(paused_at=paused_at)
 
 
@@ -464,6 +578,8 @@ async def run(
     reasons: a second pass appended into one log doubles every entry, and the database a failed
     pass left behind is the only record of why it failed. Not `BacktestHarness`, which recovers on
     every call and retires a stopped basket for good, so it cannot express a month boundary (§5.4).
+
+    An unexpected exception out of the month loop writes `INTERRUPTED` and is raised again.
     """
     # §6.6's rule, as in `corpus.build`: two arguments that must agree is one that can disagree.
     if news_feed is not None:
@@ -495,16 +611,20 @@ async def run(
     directory = period_dir(identity, workspace=workspace)
     meta_path = directory / PERIOD_META
     database = directory / PERIOD_DB
+    why = ""
     if meta_path.is_file():
         found = PeriodMeta.model_validate_json(meta_path.read_text(encoding="utf-8"))
         # The meta is written after every month, so RUNNING is part of a period, not a result.
-        if found.ending is not RunEnding.RUNNING:
+        if found.ending.is_final:
             return found
+        why = f" ({found.ending_reason})" if found.ending_reason else ""
+    # INTERRUPTED falls through to this refusal too, until Task 5's Continue resumes it from its
+    # checkpoint (§5.7). Appending a second pass to this log would double every entry in it.
     if database.is_file():
         raise ConfigError(
             f"{database} already exists but its run never finished, so a previous pass was "
-            "interrupted. Its event log is the record of why that pass failed — read it before "
-            "you discard it. Remove the directory once you are done with it to run again"
+            f"interrupted{why}. Its event log is the record of why that pass failed — read it "
+            "before you discard it. Remove the directory once you are done with it to run again"
         )
 
     # §5.2: the bars before the period are read for indicators only, so a period whose history can
@@ -558,23 +678,15 @@ async def run(
                 f"failures: {', '.join(recovery.failures) or 'none recorded'}"
             )
         carried: Decimal | None = start_equity
-        stopped_at: datetime | None = None
         needs_lift = False
-        for month in period.months:
-            due = tuple(moment for moment in ticks if month.start <= moment < month.end)
-            planned = sum(1 for moment in grid if month.start <= moment < month.end)
-            # A stopped basket stays stopped: `worker_for` would replace the retired worker, and
-            # the clock and the poll would step over ticks nothing can cycle.
-            driven = _Driven()
-            if stopped_at is None:
-                # Both are read again here: the switch can trip inside the stretch, or the basket
-                # halt for another cause, and §5.3 gives this tool authority over the streak alone.
-                states = application.states
-                if (
-                    needs_lift
-                    and states.load().may_trade
-                    and states.status_of(basket.basket_id).may_trade
-                ):
+        try:
+            for index, month in enumerate(period.months):
+                due = tuple(moment for moment in ticks if month.start <= moment < month.end)
+                planned = sum(1 for moment in grid if month.start <= moment < month.end)
+                # Only a stretch that reached its month's end leaves this set, and `_drive` read
+                # the switch and the basket's status after its every cycle, so no halt is here to
+                # wave through: §5.3 gives this tool authority over the streak alone.
+                if needs_lift:
                     clock.set(month.start)
                     lift = await lift_pause(
                         application,
@@ -585,39 +697,69 @@ async def run(
                     meta = meta.model_copy(update={"lifts": (*meta.lifts, lift)})
                     needs_lift = False
                 driven = await _drive(application, clock, basket, due)
-                stopped_at = driven.stopped_at
-                needs_lift = needs_lift or driven.paused_at is not None
-            evidence = Evidence.gather(application.store)
-            # Through `Application.valuation`, never a price map built here (ADR 0027).
-            valuation = application.valuation()
-            result = _month_result(
-                month,
-                start_equity=carried,
-                planned=planned,
-                evidence=evidence,
-                valuation=valuation,
-                paused_at=driven.paused_at,
-            )
-            carried = None if result.unvaluable else result.end_equity
+                needs_lift = driven.paused_at is not None
+                evidence = Evidence.gather(application.store)
+                # Through `Application.valuation`, never a price map built here (ADR 0027).
+                valuation = application.valuation()
+                result = _month_result(
+                    month,
+                    start_equity=carried,
+                    planned=planned,
+                    evidence=evidence,
+                    valuation=valuation,
+                    paused_at=driven.paused_at,
+                )
+                carried = None if result.unvaluable else result.end_equity
+                meta = meta.model_copy(
+                    update={
+                        "months": (*meta.months, result),
+                        "profit": profit_of(valuation, evidence, start_equity=start_equity),
+                        "vetoes": veto_breakdown(evidence),
+                        "incidents": len(evidence.incidents),
+                    }
+                )
+                _write_meta(meta_path, meta)
+                if driven.stop is not None:
+                    meta = meta.model_copy(
+                        update={
+                            "ending": _ENDING_OF[driven.stop.cause],
+                            "ending_reason": driven.stop.reason,
+                        }
+                    )
+                    break
+                # After the last month nothing is left to refuse, and so nothing to continue (§5.5).
+                if index + 1 < len(period.months) and evidence.cost_usd > budget:
+                    raise BudgetReached(
+                        f"budget of {budget} passed at the end of {month.label}: "
+                        f"{evidence.cost_usd} spent"
+                    )
+        except BudgetReached as exc:
             meta = meta.model_copy(
-                update={
-                    "months": (*meta.months, result),
-                    "profit": profit_of(valuation, evidence, start_equity=start_equity),
-                    "vetoes": veto_breakdown(evidence),
-                    "incidents": len(evidence.incidents),
-                }
+                update={"ending": RunEnding.INTERRUPTED, "ending_reason": str(exc)}
             )
-            _write_meta(meta_path, meta)
+        except Exception as exc:
+            _write_meta(
+                meta_path,
+                meta.model_copy(
+                    update={
+                        "ending": RunEnding.INTERRUPTED,
+                        "ending_reason": f"{type(exc).__name__}: {exc}",
+                    }
+                ),
+            )
+            raise
     finally:
         await application.shutdown()
 
-    meta = meta.model_copy(update={"ending": RunEnding.COMPLETED})
+    if meta.ending is RunEnding.RUNNING:
+        meta = meta.model_copy(update={"ending": RunEnding.COMPLETED})
     _write_meta(meta_path, meta)
     logger.info(
-        "period run complete",
+        "period run finished",
         extra={
             "run_id": identity,
             "period": period.label,
+            "ending": meta.ending.value,
             "cycles": sum(month.ran_cycles for month in meta.months),
             "net": str(meta.profit.net),
             "unvaluable": meta.profit.unvaluable,

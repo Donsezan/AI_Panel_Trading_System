@@ -424,7 +424,7 @@ async def test_an_archive_digest_mints_a_new_run_and_lifts_news_blind(run_period
 async def test_a_stop_that_is_no_loss_pause_skips_the_rest_of_the_period(
     isolated: Runner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Only `AUTO_PAUSE_RULE` is lifted (§5.3); any other halt is simply the end of cycling."""
+    """Only `AUTO_PAUSE_RULE` is lifted (§5.3); any other halt ends the run, as an error (§5.7)."""
     real = BasketWorker.cycle
 
     async def halted_in_february(self: BasketWorker) -> CycleResult | None:
@@ -437,10 +437,11 @@ async def test_a_stop_that_is_no_loss_pause_skips_the_rest_of_the_period(
     meta = await isolated("2024-Q1")
 
     assert meta.lifts == ()
-    assert sum(m.ran_cycles for m in meta.months) < sum(m.planned_cycles for m in meta.months)
-    assert meta.months[-1].ran_cycles == 0
-    assert meta.months[-1].planned_cycles > 0
-    assert meta.ending is pd.RunEnding.COMPLETED
+    assert [m.label for m in meta.months] == ["2024-01", "2024-02"]
+    assert meta.months[-1].ran_cycles < meta.months[-1].planned_cycles
+    assert pd.not_run_months(meta) == ("2024-03",)
+    assert meta.ending is pd.RunEnding.INTERRUPTED
+    assert "injected: not a loss streak" in meta.ending_reason
 
 
 async def test_a_period_the_history_does_not_cover_refuses(run_period: Runner) -> None:
