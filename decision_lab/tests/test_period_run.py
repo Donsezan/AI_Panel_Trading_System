@@ -225,8 +225,9 @@ async def test_a_short_history_starts_late_and_says_so(run_period: Runner) -> No
 
     full_month = timedelta(days=31) // timedelta(seconds=CADENCE)
     assert meta.first_cycle_at > utc(2024, 1)
-    assert meta.months[0].planned_cycles < full_month
-    assert meta.months[0].ran_cycles <= meta.months[0].planned_cycles
+    # The whole grid, or what the warm-up cost would vanish from both sides of coverage (§5.2).
+    assert meta.months[0].planned_cycles == full_month
+    assert meta.months[0].ran_cycles < meta.months[0].planned_cycles
 
 
 async def test_money_and_position_carry_between_months(run_period: Runner) -> None:
@@ -252,7 +253,7 @@ async def test_a_tick_on_a_month_boundary_belongs_to_the_later_month(run_period:
     meta = await run_period("2024-Q1")
 
     every = timedelta(seconds=CADENCE)
-    # Whole months on the six-hour grid: no tick lost and none doubled at either boundary.
+    # Whole months on the cadence's grid: no tick lost and none doubled at either boundary.
     assert meta.months[1].planned_cycles == timedelta(days=29) // every
     assert meta.months[2].planned_cycles == timedelta(days=31) // every
 
@@ -381,6 +382,31 @@ async def test_a_month_ending_frozen_is_unvaluable_with_no_figure(
     assert meta.months[0].end_equity == ZERO
     assert meta.profit.unvaluable
     assert meta.profit.total == ZERO
+
+
+async def test_the_month_after_a_frozen_one_has_no_start_figure(
+    isolated: Runner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Carrying the frozen month's zero would read February's whole equity as February's profit."""
+    real = Application.valuation
+
+    def frozen_in_january(self: Application) -> PortfolioAggregate:
+        valuation = real(self)
+        if valuation.as_of < utc(2024, 2):
+            return valuation.model_copy(update={"frozen_reason": "no mark"})
+        return valuation
+
+    monkeypatch.setattr(Application, "valuation", frozen_in_january)
+
+    january, february, march = (await isolated("2024-Q1")).months
+
+    assert january.start_equity == START_EQUITY
+    assert january.unvaluable
+    assert february.start_equity is None
+    assert not february.unvaluable
+    assert february.end_equity > ZERO
+    # Valuable again, so the carry resumes rather than staying blank for the rest of the run.
+    assert march.start_equity == february.end_equity
 
 
 async def test_an_archive_digest_mints_a_new_run_and_lifts_news_blind(run_period: Runner) -> None:

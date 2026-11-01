@@ -15,7 +15,7 @@ offered, because a result over a subset the tool chose would be reported as the 
 recovery raises `FailClosedError`. A period in which no cycle could run refuses rather than
 reporting an empty result, and a database left without a finished meta refuses, naming it. A frozen
 portfolio at a month's end is `unvaluable` with no figure: its equity reads zero and means nothing,
-as does the start of the month after it, exactly as `longrun.Profit` does (§10.4).
+exactly as `longrun.Profit` does (§10.4), and the month after it has no `start_equity` at all.
 """
 
 from __future__ import annotations
@@ -151,10 +151,14 @@ class MonthResult(DomainModel):
     """One month, folded out of the run's log by time."""
 
     label: str
-    start_equity: Money
+    #: `None` after an unvaluable month. Carrying that month's zero would make this one's whole
+    #: closing equity read as profit on a row that is itself valuable (ADR 0027).
+    start_equity: Money | None
     #: Zero and meaningless when `unvaluable`.
     end_equity: Money
     unvaluable: bool = False
+    #: The month's whole grid, whatever the history allowed, so coverage counts the cycles a late
+    #: start lost (§5.2). `ran_cycles` is what actually ran.
     planned_cycles: int
     ran_cycles: int
     paused_at: UtcDatetime | None = None
@@ -261,7 +265,7 @@ async def _drive(
 def _month_result(
     month: Period,
     *,
-    start_equity: Decimal,
+    start_equity: Decimal | None,
     planned: int,
     evidence: Evidence,
     valuation: PortfolioAggregate,
@@ -354,7 +358,8 @@ async def run(
     # warm them starts on its own first instant. One that cannot starts late and says so.
     warmup = warmup_for((basket,))
     first = max(period.start, covered_start + warmup)
-    ticks = _planned_ticks(basket, first=first, end=period.end)
+    grid = _planned_ticks(basket, first=period.start, end=period.end)
+    ticks = tuple(moment for moment in grid if moment >= first)
     if not ticks:
         raise ConfigError(
             f"no cycle of {period.label} can run: the indicators' warm-up of {warmup} reaches "
@@ -399,10 +404,11 @@ async def run(
                 f"startup recovery halted before the period began: {recovery.state.reason}; "
                 f"failures: {', '.join(recovery.failures) or 'none recorded'}"
             )
-        carried = start_equity
+        carried: Decimal | None = start_equity
         stopped_at: datetime | None = None
         for month in period.months:
             due = tuple(moment for moment in ticks if month.start <= moment < month.end)
+            planned = sum(1 for moment in grid if month.start <= moment < month.end)
             # A stopped basket stays stopped: `worker_for` would replace the retired worker, and
             # the clock and the poll would step over ticks nothing can cycle. §5.3 branches here.
             if stopped_at is None:
@@ -413,11 +419,11 @@ async def run(
             result = _month_result(
                 month,
                 start_equity=carried,
-                planned=len(due),
+                planned=planned,
                 evidence=evidence,
                 valuation=valuation,
             )
-            carried = result.end_equity
+            carried = None if result.unvaluable else result.end_equity
             meta = meta.model_copy(
                 update={
                     "months": (*meta.months, result),
