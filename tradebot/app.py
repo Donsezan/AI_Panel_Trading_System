@@ -210,6 +210,16 @@ class Application:
     _writer: SingleWriter
     #: Async resources that hold sockets — HTTP clients, exchange sessions. Closed by `shutdown`.
     _closers: tuple[Callable[[], Awaitable[None]], ...] = ()
+    _armed_orders: Callable[[], frozenset[str]] = frozenset
+
+    def armed_orders(self) -> frozenset[str]:
+        """Which protective orders the simulated venue holds triggered and unfilled.
+
+        Empty for a real venue, which keeps that state itself and survives our restart. For a
+        simulated one it is memory the log does not record, so whoever means to continue a replay
+        exactly reads it here and hands it to `build_sim`.
+        """
+        return self._armed_orders()
 
     @property
     def baskets(self) -> tuple[Basket, ...]:
@@ -471,6 +481,8 @@ class VenueStack:
     #: Only a *simulated* venue can be handed its books back after a restart (`RestorableVenue`).
     venue_restore: RestorableVenue | None = None
     closers: tuple[Callable[[], Awaitable[None]], ...] = ()
+    #: Likewise simulated only: a real venue holds its own triggered orders.
+    armed_orders: Callable[[], frozenset[str]] = frozenset
 
 
 @dataclass(frozen=True, slots=True)
@@ -495,6 +507,7 @@ class StackRequest:
     feed: PriceFeed
     start_equity: Decimal
     quote_currency: str
+    armed_orders: frozenset[str] = frozenset()
 
 
 def _sim_stack(request: StackRequest) -> VenueStack:
@@ -511,6 +524,7 @@ def _sim_stack(request: StackRequest) -> VenueStack:
         request.clock,
         balances={request.quote_currency: request.start_equity},
         default_quote_currency=request.quote_currency,
+        armed_on_restore=request.armed_orders,
     )
     source = request.feed.prices or SyntheticMarketData(request.clock)
     return VenueStack(
@@ -520,6 +534,7 @@ def _sim_stack(request: StackRequest) -> VenueStack:
         read_only_prices=source,
         calendar=ContinuousCalendar(broker.venue_id),
         venue_restore=broker,
+        armed_orders=broker.armed_orders,
     )
 
 
@@ -893,6 +908,7 @@ async def _assemble(
     news_sources: tuple[str, ...],
     panel_id: str,
     news_feed: NewsFeed | None = None,
+    armed_orders: frozenset[str] = frozenset(),
 ) -> Application:
     """Wire one mode. Everything above the venue is identical for all of them (DESIGN §5).
 
@@ -913,6 +929,13 @@ async def _assemble(
             f"a substituted news feed is simulation-only; {mode.value} must read live sources. "
             "An archived feed decides on news that is not current, and in paper it would "
             "contaminate the evidence report promotion reads."
+        )
+    # The same two closures, for the same evidence: a soak's restart must be an ordinary restart,
+    # and a real venue's triggered orders are the venue's to know.
+    if armed_orders and mode is not Mode.SIM:
+        raise ConfigError(
+            f"a stated set of armed orders is simulation-only; {mode.value} must not be told which "
+            "of its orders have triggered."
         )
     engine = create_database(db_path)
     writer = SingleWriter(engine)
@@ -948,7 +971,7 @@ async def _assemble(
     policy = enforced_policy(configs, arming, mode).policy
 
     stack = _STACKS[broker_choice](
-        StackRequest(universe, clock, mode, feed, start_equity, quote_currency)
+        StackRequest(universe, clock, mode, feed, start_equity, quote_currency, armed_orders)
     )
     # A real venue's balances are *discovered*: the ledger starts empty and the startup
     # reconciliation adopts what the venue actually holds. Seeding it would invent funds and, worse,
@@ -1104,6 +1127,7 @@ async def _assemble(
         marks=marks,
         portfolio_watch=portfolio_watch,
         _writer=writer,
+        _armed_orders=stack.armed_orders,
         _closers=(
             builder.close,
             *news_closers,
@@ -1240,6 +1264,10 @@ async def build_sim(
     #: every call: wired into one, it would stamp today's headlines with the replayed `observed_at`
     #: and serve them into a past decision (DESIGN [L12]).
     news_feed: NewsFeed | None = None,
+    #: Protective orders already triggered when the database being opened was left, as
+    #: `Application.armed_orders` read them. Simulation only, refused alike by `_assemble`. Left
+    #: empty, a restart re-arms a stop only at its next crossing.
+    armed_orders: frozenset[str] = frozenset(),
 ) -> Application:
     """Wire the simulation stack: replayed data, a panel, and `SimBroker`.
 
@@ -1270,6 +1298,7 @@ async def build_sim(
         news_sources=news_sources,
         panel_id=panel_id,
         news_feed=news_feed,
+        armed_orders=armed_orders,
     )
 
 
