@@ -16,11 +16,17 @@ recovery raises `FailClosedError`. A period in which no cycle could run refuses 
 reporting an empty result, and a database left without a finished meta refuses, naming it. A frozen
 portfolio at a month's end is `unvaluable` with no figure: its equity reads zero and means nothing,
 exactly as `longrun.Profit` does (§10.4), and the month after it has no `start_equity` at all.
+
+A loss-streak pause is the one stop that does not end cycling (§5.3, §5.4): the rest of its month
+runs quarantined, and the next month, if there is one, lifts it. Any other halt ends cycling for the
+rest of the period. A kill switch tripped meanwhile means no lift: that was never agreed to. All of
+it is written to this run's own workspace database, through the same public stores a bot edit uses.
 """
 
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
@@ -37,12 +43,15 @@ from decision_lab.params import workspace_root
 from tradebot.app import Application, build_sim, dataset_catalogue
 from tradebot.core.clock import Clock, ManualClock
 from tradebot.core.config import Basket, Schedule
+from tradebot.core.enums import BasketStatus, ConfigKind, RiskTier
 from tradebot.core.errors import ConfigError, FailClosedError
+from tradebot.core.events import EventFactory, EventType
 from tradebot.core.logging import get_logger
 from tradebot.core.money import ZERO
 from tradebot.core.schema import DomainModel, Money, UtcDatetime
 from tradebot.marketdata.recorder import ReplayDataset
 from tradebot.risk.aggregate import PortfolioAggregate
+from tradebot.risk.rules import AUTO_PAUSE_RULE
 from tradebot.validation.backtest import DEFAULT_MAX_CYCLES, plan_ticks, warmup_for
 from tradebot.validation.evidence import Evidence
 
@@ -53,6 +62,11 @@ _BAR: Final = timedelta(hours=1)
 PERIOD_SYMBOL: Final = "BTC/USDT"
 PERIOD_DB: Final = "period.db"
 PERIOD_META: Final = "period.json"
+#: Who published a pause's two configuration versions, so the audit trail names this tool.
+ACTOR: Final = "decision_lab.period"
+#: The `RISK_EVENT` a lift appends. Namespaced because no rule of the bot's ever did this.
+PAUSE_LIFTED_RULE: Final = "decision_lab.pause_lifted"
+_BASKET_PAUSED: Final = "basket_paused"
 
 logger = get_logger("decision_lab.period")
 
@@ -240,26 +254,158 @@ def _planned_ticks(basket: Basket, *, first: datetime, end: datetime) -> tuple[d
     return tuple(moment for moment, _ in ticks if moment < end)
 
 
+async def stopped_on_loss_streak(application: Application, basket_id: str) -> bool:
+    """Whether this basket stands halted by `AUTO_PAUSE_RULE`, with the kill switch armed (§5.3).
+
+    Asks of the *newest halt*, not merely whether a pause exists: the log keeps January's pause
+    when February's halt arrives for some other reason, and that one is not ours to lift.
+    `_on_tier1_veto` appends the pause and then halts with its detail, so the two must agree.
+    """
+    states = application.states
+    if states.status_of(basket_id).may_trade or not states.load().may_trade:
+        return False
+    # The watchdog stamps its own events `global`, so a halt names its basket in the payload alone.
+    halt = next(
+        (
+            event
+            for event in reversed(application.store.read_types(EventType.BASKET_STATUS_CHANGED))
+            if event.payload.get("basket_id") == basket_id
+            and event.payload.get("status") == BasketStatus.HALTED.value
+        ),
+        None,
+    )
+    pause = next(
+        (
+            event
+            for event in reversed(application.store.read_types(EventType.RISK_EVENT))
+            if event.basket_id == basket_id
+            and event.payload.get("rule") == AUTO_PAUSE_RULE
+            and event.payload.get("action_taken") == _BASKET_PAUSED
+        ),
+        None,
+    )
+    if halt is None or pause is None:
+        return False
+    agree = halt.payload.get("reason") == pause.payload.get("detail")
+    return agree and (pause.seq or 0) < (halt.seq or 0)
+
+
+def _current_basket(application: Application, basket_id: str) -> Basket:
+    record = application.configs.latest(ConfigKind.BASKET, basket_id)
+    if record is None:
+        raise FailClosedError(f"basket {basket_id!r} has no stored configuration to pause or lift")
+    document: Basket = record.document
+    return document
+
+
+def _with_policy(basket: Basket, **changes: object) -> Basket:
+    return basket.model_copy(update={"risk_policy": basket.risk_policy.model_copy(update=changes)})
+
+
+async def quarantine_stretch(application: Application, basket: Basket) -> None:
+    """Keep time moving through a pause without the panel (§5.4).
+
+    A quarantined cycle still takes its snapshot, which is what feeds `SimBroker` a tick (so a
+    resting stop can fire) and refreshes the marks (so the month end can be valued). Published
+    first and cleared second, so no instant exists at which the basket is both free and unbarred.
+    """
+    current = _current_basket(application, basket.basket_id)
+    await application.configs.put(
+        basket.basket_id,
+        _with_policy(current, quarantined=True),
+        actor=ACTOR,
+        note="loss-streak pause: the rest of this month runs quarantined (§5.4)",
+    )
+    # `resume_basket` rather than the bare status write, so the clearing is in the log as well.
+    await application.watchdog.resume_basket(basket.basket_id, actor=ACTOR)
+
+
+def _consecutive_losses(application: Application, basket_id: str) -> int:
+    """The streak `ConsecutiveLossRule` read, derived the way `ledger/history.py:96` derives it.
+
+    From the log, since `Application` exposes no read of `round_trips`: losing round trips at the
+    head of the basket's history, where anything but a loss ends the count.
+    """
+    trips = Evidence.gather(application.store).round_trips
+    streak = 0
+    for trip in reversed([one for one in trips if one.basket_id == basket_id]):
+        if trip.realized_pnl >= ZERO:
+            break
+        streak += 1
+    return streak
+
+
+async def lift_pause(
+    application: Application, basket: Basket, *, configured_limit: int, at: datetime
+) -> PauseLift:
+    """Restore the basket's whole allowance at a month boundary (§5.3).
+
+    Clearing the status alone would achieve nothing: the streak is derived rather than stored, and
+    only a win resets it, so the next proposal would veto and halt again. `configured_limit` is the
+    candidate's, never the current version's, or each lift would add to the last one's allowance.
+    """
+    streak = _consecutive_losses(application, basket.basket_id)
+    new_limit = streak + configured_limit
+    current = _current_basket(application, basket.basket_id)
+    await application.configs.put(
+        basket.basket_id,
+        _with_policy(current, quarantined=False, max_consecutive_losses=new_limit),
+        actor=ACTOR,
+        note=f"loss-streak pause lifted at a month boundary: limit {new_limit} (§5.3)",
+    )
+    events = EventFactory(clock=application.clock, basket_id=basket.basket_id, cycle_id="period")
+    await application.store.append(
+        events.risk_event(
+            tier=RiskTier.TIER1,
+            rule=PAUSE_LIFTED_RULE,
+            scope=basket.basket_id,
+            action="pause_lifted",
+            detail=f"streak {streak} plus the configured {configured_limit}: limit {new_limit}",
+        )
+    )
+    return PauseLift(at=at, streak=streak, new_limit=new_limit)
+
+
+@dataclass(frozen=True, slots=True)
+class _Driven:
+    """What one month's ticks did. `stopped_at` is cycling's end; `paused_at` is not."""
+
+    paused_at: datetime | None = None
+    stopped_at: datetime | None = None
+
+
 async def _drive(
-    application: Application, clock: ManualClock, basket_id: str, ticks: tuple[datetime, ...]
-) -> datetime | None:
-    """Cycle each tick in order. Returns when the basket stopped, or `None` if it never did.
+    application: Application, clock: ManualClock, basket: Basket, ticks: tuple[datetime, ...]
+) -> _Driven:
+    """Cycle each tick in order, through a pause, until the ticks end or the basket stops.
 
     The same calls `BacktestHarness._replay` makes, in the same order (§5.4), because this loop
     must not drift from it. `test_the_driver_matches_the_harness_on_one_window` holds it to that.
+
+    The pause is asked of the database after each cycle, not of `worker.stopped`: a worker only
+    learns of a halt at its *next* `_runnable`, so a pause on a month's last tick would otherwise
+    surface in the following month, with no month boundary left to lift it at.
     """
+    paused_at: datetime | None = None
     for moment in ticks:
         clock.set(moment)
-        worker = application.supervisor.worker_for(basket_id)
+        worker = application.supervisor.worker_for(basket.basket_id)
         await worker.cycle()
         await application.monitor.poll()
+        if paused_at is None and await stopped_on_loss_streak(application, basket.basket_id):
+            logger.warning(
+                "loss-streak pause: quarantined for the rest of the month",
+                extra={"basket_id": basket.basket_id, "at": moment.isoformat()},
+            )
+            await quarantine_stretch(application, basket)
+            paused_at = moment
         if worker.stopped:
             logger.warning(
                 "basket stopped cycling during the period",
-                extra={"basket_id": basket_id, "at": moment.isoformat()},
+                extra={"basket_id": basket.basket_id, "at": moment.isoformat()},
             )
-            return moment
-    return None
+            return _Driven(paused_at=paused_at, stopped_at=moment)
+    return _Driven(paused_at=paused_at)
 
 
 def _month_result(
@@ -269,9 +415,15 @@ def _month_result(
     planned: int,
     evidence: Evidence,
     valuation: PortfolioAggregate,
+    paused_at: datetime | None = None,
 ) -> MonthResult:
-    """A month's row. Cycles are folded from the log by time: it alone says what ran (ADR 0016)."""
-    cycles = [c for c in evidence.cycles if month.start <= c.started_at < month.end]
+    """A month's row. Cycles are folded from the log by time: it alone says what ran (ADR 0016).
+
+    Everything after a pause is its stretch, whatever each cycle's outcome was, so a stretch cycle
+    the daily-loss gate blocked still does not read as a cycle the panel ran (§5.4).
+    """
+    last = month.end if paused_at is None else paused_at + timedelta(seconds=1)
+    cycles = [c for c in evidence.cycles if month.start <= c.started_at < last]
     return MonthResult(
         label=month.label,
         start_equity=start_equity,
@@ -279,6 +431,7 @@ def _month_result(
         unvaluable=valuation.frozen,
         planned_cycles=planned,
         ran_cycles=len(cycles),
+        paused_at=paused_at,
         cost_usd=sum((cycle.cost_usd for cycle in cycles), start=ZERO),
     )
 
@@ -406,13 +559,34 @@ async def run(
             )
         carried: Decimal | None = start_equity
         stopped_at: datetime | None = None
+        needs_lift = False
         for month in period.months:
             due = tuple(moment for moment in ticks if month.start <= moment < month.end)
             planned = sum(1 for moment in grid if month.start <= moment < month.end)
             # A stopped basket stays stopped: `worker_for` would replace the retired worker, and
-            # the clock and the poll would step over ticks nothing can cycle. §5.3 branches here.
+            # the clock and the poll would step over ticks nothing can cycle.
+            driven = _Driven()
             if stopped_at is None:
-                stopped_at = await _drive(application, clock, basket.basket_id, due)
+                # Both are read again here: the switch can trip inside the stretch, or the basket
+                # halt for another cause, and §5.3 gives this tool authority over the streak alone.
+                states = application.states
+                if (
+                    needs_lift
+                    and states.load().may_trade
+                    and states.status_of(basket.basket_id).may_trade
+                ):
+                    clock.set(month.start)
+                    lift = await lift_pause(
+                        application,
+                        basket,
+                        configured_limit=basket.risk_policy.max_consecutive_losses,
+                        at=month.start,
+                    )
+                    meta = meta.model_copy(update={"lifts": (*meta.lifts, lift)})
+                    needs_lift = False
+                driven = await _drive(application, clock, basket, due)
+                stopped_at = driven.stopped_at
+                needs_lift = needs_lift or driven.paused_at is not None
             evidence = Evidence.gather(application.store)
             # Through `Application.valuation`, never a price map built here (ADR 0027).
             valuation = application.valuation()
@@ -422,6 +596,7 @@ async def run(
                 planned=planned,
                 evidence=evidence,
                 valuation=valuation,
+                paused_at=driven.paused_at,
             )
             carried = None if result.unvaluable else result.end_equity
             meta = meta.model_copy(

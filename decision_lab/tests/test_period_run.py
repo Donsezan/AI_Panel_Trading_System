@@ -26,6 +26,8 @@ from decision_lab.candidates import Candidate
 from decision_lab.tests import factories as f
 from decision_lab.tests.test_slice_b_end_to_end import STUB_SEED
 from tradebot.app import Application, build_sim, dataset_basket, dataset_catalogue, select_panel
+from tradebot.control.basket_runner import CycleResult
+from tradebot.control.supervisor import BasketWorker
 from tradebot.core.clock import ManualClock
 from tradebot.core.errors import ConfigError
 from tradebot.core.events import EventType
@@ -419,12 +421,22 @@ async def test_an_archive_digest_mints_a_new_run_and_lifts_news_blind(run_period
     assert not fed.news_blind
 
 
-async def test_a_stopped_basket_skips_the_rest_of_the_period(run_period: Runner) -> None:
-    """Lifting a loss pause is §5.3's; without it a stop is simply the end of cycling."""
-    candidate = with_loss_limit(candidate_for(run_period.data), 1)
+async def test_a_stop_that_is_no_loss_pause_skips_the_rest_of_the_period(
+    isolated: Runner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only `AUTO_PAUSE_RULE` is lifted (§5.3); any other halt is simply the end of cycling."""
+    real = BasketWorker.cycle
 
-    meta = await run_period("2024-Q1", candidate=candidate)
+    async def halted_in_february(self: BasketWorker) -> CycleResult | None:
+        if self._clock.now() == utc(2024, 2, 10):
+            await self._watchdog.halt_basket(self.basket_id, "injected: not a loss streak")
+        return await real(self)
 
+    monkeypatch.setattr(BasketWorker, "cycle", halted_in_february)
+
+    meta = await isolated("2024-Q1")
+
+    assert meta.lifts == ()
     assert sum(m.ran_cycles for m in meta.months) < sum(m.planned_cycles for m in meta.months)
     assert meta.months[-1].ran_cycles == 0
     assert meta.months[-1].planned_cycles > 0
