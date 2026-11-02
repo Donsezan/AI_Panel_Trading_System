@@ -40,6 +40,7 @@ from tradebot.validation.backtest import BANNER
 if TYPE_CHECKING:
     # analysis imports this module for its row types; the type is only named, never built, here.
     from decision_lab.analysis import PeriodAnalysis
+    from decision_lab.period import PeriodMeta
 
 #: The tool's own standing disclaimer. §1.1: it compares configurations an operator wrote; it
 #: does not search, does not optimise, and has no authority over anything.
@@ -932,6 +933,11 @@ class PeriodReport(DomainModel):
     decisions: int = 0
     graded: int = 0
     correct: int = 0
+    #: All three pools, always, and the seats. Empty on an incomplete page, which shows neither.
+    regimes: tuple[RegimeMetrics, ...] = ()
+    seats: tuple[SeatMetrics, ...] = ()
+    #: Why the log could not be read. A page with this set carries the run's own record only.
+    incomplete: str = ""
 
 
 def period_markdown(report: PeriodReport) -> str:
@@ -951,6 +957,8 @@ def period_markdown(report: PeriodReport) -> str:
         sections += ["", GATE_SKIPPED]
     if report.lifts:
         sections += ["", PAUSE_LIFTED]
+    if report.incomplete:
+        sections += ["", _incomplete_banner(report)]
     if report.contaminated:
         sections += ["", _contamination_note(report)]
     sections += [
@@ -966,6 +974,10 @@ def period_markdown(report: PeriodReport) -> str:
         "## Months",
         "",
         _months_table(report),
+    ]
+    if not report.incomplete:
+        sections += _measurement_sections(report)
+    sections += [
         "",
         "## Lifted pauses",
         "",
@@ -1017,14 +1029,44 @@ def _period_identity(report: PeriodReport) -> str:
             ("ending", report.ending),
             ("not run", ", ".join(report.not_run) or "none"),
             ("incidents", str(report.incidents)),
-            (
-                "graded decisions",
-                f"{report.graded} of {report.decisions} ({report.correct} correct); "
-                f"{report.decisions - report.graded} unscored",
+            *(
+                ()
+                if report.incomplete
+                else (
+                    (
+                        "graded decisions",
+                        f"{report.graded} of {report.decisions} ({report.correct} correct); "
+                        f"{report.decisions - report.graded} unscored",
+                    ),
+                    ("contaminated cycles", str(report.contaminated)),
+                )
             ),
-            ("contaminated cycles", str(report.contaminated)),
         ),
     )
+
+
+def _incomplete_banner(report: PeriodReport) -> str:
+    return (
+        f"**REPORT INCOMPLETE: {report.incomplete}.** The run's result is safe: its months, profit "
+        "and spend below come from the run's own record, written before this page was. No "
+        "accuracy, seat or regime figure is shown, because the log they are scored from could "
+        "not be read."
+    )
+
+
+def _measurement_sections(report: PeriodReport) -> list[str]:
+    """What the panel's judgement scored: the regimes always, the seats only if anything was."""
+    sections = ["", "## Regimes", "", _regime_table(report.regimes), "", _unscored(report.regimes)]
+    sections += ["", "## Seats", ""]
+    if report.graded == 0:
+        # `rounds_are_identical(())` is vacuously true, so an empty table would claim a protocol.
+        sections.append(
+            "There was no scored decision, so no seat was measured. Nothing is claimed about how "
+            "the seats voted or which protocol ran."
+        )
+    else:
+        sections.append(_seat_tables(report.seats))
+    return sections
 
 
 def _period_profit(report: PeriodReport) -> str:
@@ -1123,11 +1165,10 @@ def _contamination_note(report: PeriodReport) -> str:
     )
 
 
-def period_report(
-    analysis: PeriodAnalysis, *, generated_at: datetime, panel_models: tuple[str, ...]
+def _meta_report(
+    meta: PeriodMeta, *, generated_at: datetime, panel_models: tuple[str, ...], **more: object
 ) -> PeriodReport:
-    """The page's figures, read off the one assembly (never off a second reading of the log)."""
-    meta = analysis.meta
+    reached = {month.label for month in meta.months}
     return PeriodReport(
         generated_at=generated_at,
         run_id=meta.run_id,
@@ -1148,7 +1189,7 @@ def period_report(
         plumbing_check=meta.plumbing_check,
         gate_skipped=meta.gate_skipped,
         months=tuple(PeriodMonthRow.model_validate(m.model_dump()) for m in meta.months),
-        not_run=analysis.not_run,
+        not_run=tuple(m.label for m in meta.period.months if m.label not in reached),
         lifts=tuple(PeriodLiftRow.model_validate(one.model_dump()) for one in meta.lifts),
         ending=meta.ending.value,
         ending_reason=meta.ending_reason,
@@ -1166,10 +1207,24 @@ def period_report(
         net_profit=meta.profit.net,
         vetoes=tuple((row.rule, row.action_taken, row.count) for row in meta.vetoes),
         incidents=meta.incidents,
+        **more,
+    )
+
+
+def period_report(
+    analysis: PeriodAnalysis, *, generated_at: datetime, panel_models: tuple[str, ...]
+) -> PeriodReport:
+    """The page's figures, read off the one assembly (never off a second reading of the log)."""
+    return _meta_report(
+        analysis.meta,
+        generated_at=generated_at,
+        panel_models=panel_models,
         contaminated=analysis.contaminated,
         decisions=sum(row.decisions for row in analysis.regimes),
         graded=sum(row.scored for row in analysis.regimes),
         correct=sum(row.correct for row in analysis.regimes),
+        regimes=analysis.regimes,
+        seats=analysis.seats,
     )
 
 
@@ -1178,6 +1233,27 @@ def write_period(
 ) -> Path:
     """Write the page for an analysed run: the CLI, the dashboard and the notebook share it."""
     report = period_report(analysis, generated_at=generated_at, panel_models=panel_models)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(period_markdown(report), encoding="utf-8")
+    return path
+
+
+def write_incomplete_period(
+    meta: PeriodMeta,
+    path: Path,
+    *,
+    reason: str,
+    generated_at: datetime,
+    panel_models: tuple[str, ...],
+) -> Path:
+    """The page for a run whose log could not be read: the run's own record, and the reason.
+
+    Written from the meta alone so it cannot depend on whatever just failed. It shows no regime,
+    seat or accuracy figure, since inventing zeros for them would read as "measured and worst".
+    """
+    report = _meta_report(
+        meta, generated_at=generated_at, panel_models=panel_models, incomplete=reason
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(period_markdown(report), encoding="utf-8")
     return path

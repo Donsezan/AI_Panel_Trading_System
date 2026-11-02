@@ -79,6 +79,10 @@ class _Indexed:
         """Whether this archive was *measured* at `as_of`. Empty covers nothing."""
         return bool(self.stamps) and self.stamps[0] <= as_of <= self.stamps[-1]
 
+    def covers_span(self, start: datetime, end: datetime) -> bool:
+        """Whether the whole of `[start, end]` was measured, not merely touched by the span."""
+        return self.covers(start) and self.covers(end)
+
     def window(self, as_of: datetime, lookback: timedelta) -> tuple[ArchiveItem, ...]:
         """`observed_at` in `(as_of - lookback, as_of]`, inclusive at the instant.
 
@@ -125,6 +129,16 @@ class ArchiveNewsFeed:
 
     def covers(self, as_of: datetime) -> bool:
         return any(a.covers(as_of) for a in self._archives)
+
+    def covers_span(self, start: datetime, end: datetime) -> bool:
+        """One source measured all of `[start, end]`. Two sources each covering a half do not:
+        the stretch between their spans was measured by neither (§6.8.3)."""
+        return any(a.covers_span(start, end) for a in self._archives)
+
+    @property
+    def items(self) -> tuple[ArchiveItem, ...]:
+        """Every archived row of every source, for explaining an event after the fact."""
+        return tuple(row for a in self._archives for row in a.items)
 
     def in_window(self, as_of: datetime) -> tuple[ArchiveItem, ...]:
         """The point-in-time read, before relevance and before the limit. Public because §16.2

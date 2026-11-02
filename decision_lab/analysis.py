@@ -15,7 +15,7 @@ skipped rather than raising (§12.2).
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
@@ -29,12 +29,12 @@ from decision_lab import regimes as rg
 from decision_lab import scoring as sc
 from decision_lab import seats as st
 from decision_lab import sweep as sw
-from decision_lab.archive.published import ArchiveItem
 from decision_lab.calibration_days import Pool
 from decision_lab.candidates import Matrix
+from decision_lab.newsfeed import ArchiveNewsFeed
 from decision_lab.records import CycleRecord, records_from_store
 from decision_lab.render import CandidateSeats, NewsProvenance, NotMeasured
-from decision_lab.spikes import EventNews, SpikeEvent, find_events, news_for
+from decision_lab.spikes import LEAD_IN, EventNews, SpikeEvent, find_events, news_for
 from tradebot.core.clock import Clock
 from tradebot.core.config import PanelConfig
 from tradebot.core.errors import ConfigError
@@ -315,10 +315,9 @@ def fold_period(
     scoring: Scoring,
     *,
     panel: PanelConfig,
-    archive_items: Iterable[ArchiveItem] = (),
+    archive: ArchiveNewsFeed | None,
 ) -> PeriodAnalysis:
     """Score a run's cycles. Split from the database read so a test can hand it doctored records."""
-    items = tuple(archive_items)
     # Contamination is read off `SeatResponse.fingerprint` exactly as the sweep reads it (§7.7).
     # The cycle is dropped before scoring: the peers read the substitute's arguments.
     clean = tuple(r for r in records if not sw.substitutes_in(r.responses, panel))
@@ -346,14 +345,17 @@ def fold_period(
         inside = (e for e in found if e.end >= meta.period.start and e.start < meta.period.end)
         # Absolute: a merged event can retrace, so the sign of `move_pct` is not its direction.
         events = tuple(sorted(inside, key=lambda e: (-abs(e.move_pct), e.start)))
-    # §6.8.3: coverage is the archive's span (first row to last row), not the presence of items.
-    span = (min(i.observed_at for i in items), max(i.observed_at for i in items)) if items else None
+    # §6.8.3: covered means one source's span holds the whole lead-in and the event, as the feed
+    # itself decides it. A cycle that ran no panel read no news, so it neither adds to what the
+    # panel could see nor moves the last decision; a contaminated one did read it (its panel ran).
+    deciding = tuple(r for r in records if r.decisions)
+    items = archive.items if archive is not None else ()
     event_news = tuple(
         news_for(
             e,
-            clean,
+            deciding,
             items,
-            coverage=span is not None and span[0] <= e.end and e.start <= span[1],
+            coverage=archive is not None and archive.covers_span(e.start - LEAD_IN, e.end),
         )
         for e in events
     )
@@ -378,7 +380,7 @@ def analyse_period(
     scoring: Scoring,
     *,
     panel: PanelConfig,
-    archive_items: Iterable[ArchiveItem] = (),
+    archive: ArchiveNewsFeed | None,
     workspace: Path | None = None,
 ) -> PeriodAnalysis:
     """Read a run's meta and log, and fold them. Writes nothing.
@@ -389,8 +391,15 @@ def analyse_period(
     directory = pd.period_dir(run_id, workspace=workspace)
     meta_path = directory / pd.PERIOD_META
     database = directory / pd.PERIOD_DB
-    if not meta_path.is_file() or not database.is_file():
-        raise ConfigError(f"no period run {run_id!r} in {directory.parent}")
+    # Named apart: a database lost beside its meta is not "no such run", and the operator needs
+    # to know which file to look for and where.
+    if not meta_path.is_file():
+        raise ConfigError(f"no period run {run_id!r}: {pd.PERIOD_META} is missing from {directory}")
+    if not database.is_file():
+        raise ConfigError(
+            f"period run {run_id!r} has its {pd.PERIOD_META} but {pd.PERIOD_DB} is missing "
+            f"from {directory}; its cycles cannot be scored without the log"
+        )
     meta = pd.PeriodMeta.model_validate_json(meta_path.read_text(encoding="utf-8"))
     engine = open_database(database)
     writer = SingleWriter(engine)
@@ -399,4 +408,4 @@ def analyse_period(
     finally:
         writer.close()
         engine.dispose()
-    return fold_period(meta, records, scoring, panel=panel, archive_items=archive_items)
+    return fold_period(meta, records, scoring, panel=panel, archive=archive)

@@ -27,6 +27,7 @@ from typing import Any
 
 import pytest
 
+from decision_lab import analysis as an
 from decision_lab import calibration_days as cday
 from decision_lab import candidates as cd
 from decision_lab import cli, gate, jobs, registry
@@ -294,6 +295,11 @@ def test_the_loaded_feed_reaches_run_and_a_continue(
 ) -> None:
     class Feed:
         digest = "feed-digest"
+        items = ()  # the report reads the feed for coverage and for the news an event explains
+
+        @staticmethod
+        def covers_span(_start: object, _end: object) -> bool:
+            return False
 
     monkeypatch.setattr(cli, "load_feed", lambda *_: Feed())
     run = fake(monkeypatch, meta_of(archive_digest="feed-digest"))
@@ -582,3 +588,117 @@ def test_continue_with_nothing_to_continue_exits_3_and_writes_no_run(
     assert not list((tmp_path / "workspace").glob("period-*"))
     assert not (tmp_path / "p.md").exists()
     assert not rows(tmp_path)
+
+
+# --- a report that cannot be read after the money is spent (task 8, fix 1)
+
+
+def _filed_rows(tmp_path: Path) -> int:
+    return len(rows(tmp_path))
+
+
+def test_a_budget_stop_whose_report_cannot_be_read_still_exits_5_with_a_page_and_a_row(
+    lab: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ending's own code wins: a script told 3 would not know to raise the budget."""
+    fake(
+        monkeypatch,
+        meta_of(
+            months=(month(),),
+            ending=pd.RunEnding.INTERRUPTED,
+            budget_stopped=True,
+            ending_reason="over budget",
+        ),
+    )
+
+    async def moved(*_a: Any, **_k: Any) -> None:
+        raise ConfigError("the dataset has moved")
+
+    monkeypatch.setattr(an, "build_scoring", moved)
+    out = tmp_path / "p.md"
+
+    assert cli.main(argv(lab, out, "--skip-gate")) == cli.EXIT_BUDGET
+
+    text = out.read_text(encoding="utf-8")
+    assert "REPORT INCOMPLETE" in text and "the dataset has moved" in text
+    assert "SHOCK_UP" not in text, "a page that could not be read invents no regime figure"
+    assert _filed_rows(tmp_path) == 1
+
+
+def test_a_completed_run_whose_scoring_raises_exits_3_with_a_page_and_a_row(
+    lab: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake(monkeypatch, meta_of(months=(month(),)))
+
+    def defect(*_a: Any, **_k: Any) -> None:
+        raise KeyError("scoring defect")
+
+    monkeypatch.setattr(an, "fold_period", defect)
+    out = tmp_path / "p.md"
+
+    assert cli.main(argv(lab, out, "--skip-gate")) == cli.EXIT_DATASET
+
+    text = out.read_text(encoding="utf-8")
+    assert "REPORT INCOMPLETE" in text and "scoring defect" in text
+    assert "safe" in text, "the page says the run's result is intact"
+    assert _filed_rows(tmp_path) == 1
+
+
+def test_a_reused_run_with_an_unreadable_row_exits_3_with_a_page(lab: Path, tmp_path: Path) -> None:
+    import sqlite3
+
+    assert cli.main(argv(lab, tmp_path / "a.md", "--skip-gate")) == cli.EXIT_OK
+    database = next((tmp_path / "workspace").glob("period-*")) / pd.PERIOD_DB
+    connection = sqlite3.connect(database)
+    connection.execute("update events set payload_json='{}' where type='SEAT_RESPONDED'")
+    connection.commit()
+    connection.close()
+    out = tmp_path / "b.md"
+
+    assert cli.main(argv(lab, out, "--skip-gate")) == cli.EXIT_DATASET
+
+    assert "REPORT INCOMPLETE" in out.read_text(encoding="utf-8")
+    assert _filed_rows(tmp_path) == 1
+
+
+def test_a_reused_run_whose_database_is_gone_names_what_is_missing(
+    lab: Path, tmp_path: Path
+) -> None:
+    import gc
+
+    assert cli.main(argv(lab, tmp_path / "a.md", "--skip-gate")) == cli.EXIT_OK
+    directory = next((tmp_path / "workspace").glob("period-*"))
+    gc.collect()
+    for leftover in directory.glob(pd.PERIOD_DB + "*"):
+        leftover.unlink()
+    out = tmp_path / "b.md"
+
+    assert cli.main(argv(lab, out, "--skip-gate")) == cli.EXIT_DATASET
+
+    # The banner carries the fault itself: which file is gone, and where it should be.
+    text = out.read_text(encoding="utf-8")
+    assert "REPORT INCOMPLETE" in text and f"{pd.PERIOD_DB} is missing from" in text
+    assert str(directory) in text
+    assert "no period run" not in text
+
+
+# --- what the filed page carries
+
+
+def test_a_real_run_files_regime_rows_seat_figures_and_the_graded_counts(
+    lab: Path, tmp_path: Path
+) -> None:
+    import re
+
+    out = tmp_path / "p.md"
+    assert cli.main(argv(lab, out, "--skip-gate")) == cli.EXIT_OK
+    text = out.read_text(encoding="utf-8")
+
+    for regime in ("NORMAL", "SHOCK_UP", "SHOCK_DOWN"):
+        assert f"| {regime} " in text, f"{regime} must always have a row"
+    graded = re.search(r"(\d+) of (\d+) \((\d+) correct\); (\d+) unscored", text)
+    assert graded, "the graded line must carry its numbers"
+    scored, decisions, correct, unscored = map(int, graded.groups())
+    assert decisions > 0 and scored > 0
+    assert scored + unscored == decisions and correct <= scored
+    assert "## Seats" in text

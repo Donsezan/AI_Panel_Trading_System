@@ -1279,6 +1279,11 @@ async def evaluate_period(args: argparse.Namespace) -> int:
     `main` (an interrupted run met without `--continue`, and a Continue that refuses: a rule's
     verdict, a replay that differs, a missing log, or no unfinished run at all).
     `--continue` against a spent budget exits 5.
+
+    The registry row is recorded from the meta before the page is read, and the page falls back to
+    one written from the meta alone (`REPORT INCOMPLETE`) if the log cannot be read. An ending's
+    own code wins (a budget stop is 5, any other interruption 3); a COMPLETED or RULE_ENDED run
+    whose page is incomplete exits 3.
     """
     clock = SystemClock()
     try:
@@ -1383,19 +1388,8 @@ async def evaluate_period(args: argparse.Namespace) -> int:
         )
 
     not_run = pd.not_run_months(meta)
-    # One read assembly (spec 5.6): the page is written from the same analysis the dashboard and
-    # the notebook read, so the three cannot give different answers about one run.
-    scoring = await an.build_scoring(args.data, clock=clock)
-    analysed = an.analyse_period(meta.run_id, scoring, panel=candidate.panel)
     out = args.out or reports_dir() / f"decision-lab-period-{meta.run_id}.md"
-    rd.write_period(
-        analysed,
-        out,
-        generated_at=clock.now(),
-        panel_models=tuple(
-            dict.fromkeys(f"{s.provider_id}:{s.model}" for s in candidate.panel.seats)
-        ),
-    )
+    panel_models = tuple(dict.fromkeys(f"{s.provider_id}:{s.model}" for s in candidate.panel.seats))
 
     # Recorded on every invocation, and a reused run is not a second row: `registry.record`
     # replaces by identity, and `corpus_id` carries this run's own id (as `calibrate long` carries
@@ -1432,6 +1426,24 @@ async def evaluate_period(args: argparse.Namespace) -> int:
             no_projection=meta.projected_usd is None,
         )
     )
+    # The row above is the record of a run that has already spent, and it is made from the meta, so
+    # nothing below can lose it. The page is the other half of that record. Reading the log can
+    # fail in ways nobody can list (a moved dataset, a corrupt row, a scoring defect), and by now
+    # the money is gone, so this one boundary catches `Exception` and files what the meta holds.
+    incomplete = ""
+    try:
+        scoring = await an.build_scoring(args.data, clock=clock)
+        analysed = an.analyse_period(meta.run_id, scoring, panel=candidate.panel, archive=feed)
+        rd.write_period(analysed, out, generated_at=clock.now(), panel_models=panel_models)
+    except Exception as error:
+        incomplete = f"{type(error).__name__}: {error}"
+        logger.error(
+            "period report incomplete; the run's own record was filed",
+            extra={"run_id": meta.run_id, "reason": incomplete},
+        )
+        rd.write_incomplete_period(
+            meta, out, reason=incomplete, generated_at=clock.now(), panel_models=panel_models
+        )
     logger.info(
         "period run reported",
         extra={
@@ -1448,7 +1460,8 @@ async def evaluate_period(args: argparse.Namespace) -> int:
     if meta.ending is pd.RunEnding.INTERRUPTED:
         logger.error("period run interrupted", extra={"reason": meta.ending_reason})
         return EXIT_BUDGET if meta.budget_stopped else EXIT_DATASET
-    return EXIT_OK
+    # A finished run whose page is incomplete is not a clean result: a script must see that.
+    return EXIT_DATASET if incomplete else EXIT_OK
 
 
 def _projected_cost(

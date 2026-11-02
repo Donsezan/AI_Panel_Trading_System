@@ -60,6 +60,7 @@ async def analysed(scenarios: Scenarios, flat_data: Path) -> tuple[Ran, analysis
         ran.meta.run_id,
         await scoring_for(flat_data),
         panel=candidate_over(flat_data, 2).panel,
+        archive=None,
         workspace=ran.database.parent.parent,
     )
     return ran, result
@@ -79,6 +80,7 @@ async def test_all_three_regime_rows_exist_with_zero_decisions(
         (),
         await scoring_for(flat_data),
         panel=candidate_over(flat_data, 2).panel,
+        archive=None,
     )
 
     assert [row.regime for row in empty.regimes] == [p.value for p in Pool]
@@ -133,7 +135,9 @@ async def test_a_contaminated_cycle_is_unscored_and_counted(
         for r in result.records
     )
 
-    folded = analysis.fold_period(ran.meta, doctored, await scoring_for(flat_data), panel=panel)
+    folded = analysis.fold_period(
+        ran.meta, doctored, await scoring_for(flat_data), panel=panel, archive=None
+    )
 
     assert folded.contaminated == 1
     assert target.cycle_id not in {d.cycle_id for d in folded.scored}
@@ -155,6 +159,7 @@ async def test_seat_trend_buckets_by_month_for_a_quarter_and_by_quarter_for_a_ye
         result.records,
         await scoring_for(flat_data),
         panel=candidate_over(flat_data, 2).panel,
+        archive=None,
     )
     assert all(
         list(row) == ["2024-Q1", "2024-Q2", "2024-Q3", "2024-Q4"]
@@ -175,6 +180,7 @@ async def test_months_never_reached_get_no_row(scenarios: Scenarios, flat_data: 
         before_february,
         await scoring_for(flat_data),
         panel=candidate_over(flat_data, 2).panel,
+        archive=None,
     )
 
     assert folded.not_run == ("2024-02", "2024-03")
@@ -214,6 +220,7 @@ async def test_events_are_largest_move_first_whatever_the_sign(
         (),
         await scoring_for(flat_data),
         panel=candidate_over(flat_data, 2).panel,
+        archive=None,
     )
 
     assert [e.move_pct for e in folded.events] == [Decimal(-7), Decimal(4), Decimal(2)]
@@ -226,7 +233,11 @@ async def test_running_follows_the_meta(scenarios: Scenarios, flat_data: Path) -
 
     live = ran.meta.model_copy(update={"ending": pd.RunEnding.RUNNING})
     folded = analysis.fold_period(
-        live, (), await scoring_for(flat_data), panel=candidate_over(flat_data, 2).panel
+        live,
+        (),
+        await scoring_for(flat_data),
+        panel=candidate_over(flat_data, 2).panel,
+        archive=None,
     )
     assert folded.running
 
