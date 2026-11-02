@@ -566,3 +566,13 @@ async def test_the_streak_agrees_with_the_one_the_rule_reads(scenarios: Scenario
         engine.dispose()
 
     assert ours == rule.consecutive_losses == 4
+
+
+async def test_a_lift_is_not_a_veto(scenarios: Scenarios) -> None:
+    """The lift is this tool's own act, so it is not a refusal and must not read as one (§5.3)."""
+    ran = await scenarios.paused_in_january()
+
+    rules = {row.rule for row in ran.meta.vetoes}
+    assert ran.meta.lifts, "the scenario never lifted a pause"
+    assert pd.PAUSE_LIFTED_RULE not in rules
+    assert "max_consecutive_losses" in rules, "the real refusal that caused the pause stays"

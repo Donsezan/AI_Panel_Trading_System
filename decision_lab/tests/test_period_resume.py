@@ -833,26 +833,27 @@ def with_changed_seat(candidate: Candidate) -> Candidate:
     return replace(candidate, basket=changed)
 
 
-async def test_continue_after_a_seat_change_starts_a_new_run(
+async def test_continue_after_a_seat_change_refuses_and_leaves_the_old_run_alone(
     data: dict[str, Path], tmp_path: Path
 ) -> None:
-    """Review Focus 2: identity differs, so the old directory is untouched."""
+    """Identity differs, so there is nothing to continue at the new one: Continue never starts a
+    run, and the old directory is untouched."""
     await killed_after(data["flat"], tmp_path, "2024-01", {})
     old = run_dir(tmp_path)
     gc.collect()  # the dead wiring's connections, which touch the file as they close
     before = {path.name: path.stat().st_mtime_ns for path in old.iterdir()}
 
-    resumed = await execute(
-        data["flat"],
-        tmp_path,
-        QUARTER,
-        {},
-        resume=True,
-        candidate=with_changed_seat(candidate_over(data["flat"], 2)),
-    )
+    with pytest.raises(ConfigError, match="no unfinished run to continue"):
+        await execute(
+            data["flat"],
+            tmp_path,
+            QUARTER,
+            {},
+            resume=True,
+            candidate=with_changed_seat(candidate_over(data["flat"], 2)),
+        )
 
-    assert resumed.database.parent != old
-    assert [m.label for m in resumed.meta.months] == ["2024-01", "2024-02", "2024-03"]
+    assert _runs_in(tmp_path) == [old], "a refused Continue started a run"
     assert {path.name: path.stat().st_mtime_ns for path in old.iterdir()} == before
 
 
@@ -1029,6 +1030,8 @@ class _Messy(pause.Plan):
     def __init__(self, votes: pause.Votes, *, cost_usd: Decimal = ZERO) -> None:
         super().__init__(votes, cost_usd=cost_usd)
         self._broken_once: set[tuple[date, str]] = set()
+        #: Each time the same seat was asked again after a reply that did not parse: the repair.
+        self.repairs: list[tuple[date, str]] = []
 
     def _text_for(self, request: CompletionRequest) -> str:
         at = pause.as_of(request).date()
@@ -1038,13 +1041,17 @@ class _Messy(pause.Plan):
             return FAIL
         if phase == 2:
             return FAIL
-        if phase == 3 and "news" in model and (at, model) not in self._broken_once:
-            self._broken_once.add((at, model))
-            return "not json at all"
+        if phase == 3 and "news" in model:
+            if (at, model) not in self._broken_once:
+                self._broken_once.add((at, model))
+                return "not json at all"
+            self.repairs.append((at, model))
         if phase == 4 and "skeptic" in model:
             return "still not json"
         vote = json.loads(DEFAULT_RESPONSE)
-        buys = phase == 5 and at.month != 3 and at.day % 14 == 5
+        buys = (phase == 5 and at.month != 3 and at.day % 14 == 5) or (
+            phase == 6 and "technical" in model
+        )
         action = "BUY" if buys else "WAIT"
         if phase == 0 and "skeptic" not in model:
             action = "SELL"
@@ -1085,7 +1092,7 @@ def _logged(database: Path, kind: EventType, key: str) -> list[tuple[datetime, d
 
 
 @pytest.mark.parametrize(
-    "ceiling", [ZERO, Decimal("0.05")], ids=["no-ceiling", "ceiling-truncates"]
+    "ceiling", [Decimal(10), Decimal("0.05")], ids=["roomy-ceiling", "ceiling-truncates"]
 )
 async def test_a_continue_replays_a_panel_that_disagrees_repairs_and_falls_back(
     data: dict[str, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ceiling: Decimal
@@ -1108,7 +1115,18 @@ async def test_a_continue_replays_a_panel_that_disagrees_repairs_and_falls_back(
     assert resumed.meta.ending is pd.RunEnding.COMPLETED, resumed.meta.ending_reason
 
     answers = _logged(whole.database, EventType.SEAT_RESPONDED, "response")
-    assert {answer["round_index"] for _, answer in answers} >= {0, 1}, "no debate happened"
+    # Day 6 of each week splits the panel (one BUY, two WAIT), so it debates and it costs: the
+    # all-abstain days debate for nothing and could not show a ceiling at work.
+    split_rounds = {a["round_index"] for at, a in answers if at.day % 7 == 6}
+    assert split_rounds >= {0}, "no split day was deliberated"
+    if ceiling > COST * 10:
+        assert 1 in split_rounds, "a split panel never debated"
+    else:
+        assert split_rounds == {0}, "the ceiling did not cut the debate short"
+    assert isinstance(whole.plan, _Messy) and whole.plan.repairs, "no reply was repaired"
+    assert any(
+        a["vote"] is not None and "news" in a["model"] and at.day % 7 == 3 for at, a in answers
+    ), "the repaired reply did not become a vote"
     assert any(answer["vote"] is None for _, answer in answers), "no seat abstained"
     assert any("backup" in answer["model"] for _, answer in answers), "no fallback answered"
 
@@ -1126,3 +1144,48 @@ async def test_a_continue_replays_a_panel_that_disagrees_repairs_and_falls_back(
     assert resumed.meta.abandoned_cost_usd == ZERO
     assert fills_in(resumed.database) == fills_in(whole.database)
     assert not resumed.plan.calls_between(utc(1), utc(3)), "a replayed month asked the model"
+
+
+def _runs_in(workspace: Path) -> list[Path]:
+    return list(workspace.glob("period-*"))
+
+
+async def test_continue_with_nothing_to_continue_refuses_and_writes_nothing(
+    data: dict[str, Path], tmp_path: Path
+) -> None:
+    """Continue never starts a run: a typo in the cadence or the period would mint a new identity
+    and spend with the projection check waived (§5.7)."""
+    with pytest.raises(ConfigError, match="no unfinished run to continue"):
+        await execute(data["flat"], tmp_path, "2024-02", {}, cost_usd=COST, resume=True)
+
+    assert not _runs_in(tmp_path), "a refused Continue left a run behind"
+
+
+async def test_continue_on_a_finished_run_still_reuses_it(
+    data: dict[str, Path], tmp_path: Path
+) -> None:
+    first = await execute(data["flat"], tmp_path, "2024-02", {}, cost_usd=COST)
+
+    again = await execute(data["flat"], tmp_path, "2024-02", {}, cost_usd=COST, resume=True)
+
+    assert again.meta == first.meta
+    assert not again.plan.calls, "a reused run asked the model"
+
+
+async def test_finished_run_reads_a_result_without_touching_it(
+    data: dict[str, Path], tmp_path: Path
+) -> None:
+    ran = await execute(data["flat"], tmp_path, "2024-02", {}, cost_usd=COST)
+
+    def look(start_equity: Decimal) -> pd.PeriodMeta | None:
+        return pd.finished_run(
+            data_dir=data["flat"],
+            candidate=candidate_over(data["flat"], 2),
+            period=pd.parse_period("2024-02"),
+            cadence_seconds=pause.CADENCE,
+            start_equity=start_equity,
+            workspace=tmp_path,
+        )
+
+    assert look(pause.START_EQUITY) == ran.meta
+    assert look(Decimal(5)) is None

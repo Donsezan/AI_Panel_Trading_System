@@ -907,6 +907,10 @@ class PeriodReport(DomainModel):
     ending: str
     ending_reason: str = ""
     abandoned_cost_usd: Money = ZERO
+    #: What the panel cost, whatever the valuation: a frozen run has no profit figure but paid.
+    spent_usd: Money = ZERO
+    #: The interruption was spend passing the budget, so continuing needs a larger one (§5.7).
+    budget_stopped: bool = False
     unvaluable: bool = False
     freeze_reason: str = ""
     equity: Money = ZERO
@@ -971,9 +975,12 @@ def _ending_line(report: PeriodReport) -> str:
     if report.ending == "RULE_ENDED":
         return f"**Model failed: {report.ending_reason}.** Needs tuning. Later months were not run."
     if report.ending == "INTERRUPTED":
+        # The last month end is the last good point a Continue resumes from (§5.7).
+        where = f" Last month end kept: {report.months[-1].label}." if report.months else ""
+        larger = " Continuing needs a larger `--budget`." if report.budget_stopped else ""
         return (
-            f"**Interrupted: {report.ending_reason}.** Months after the last one shown were not "
-            "run. Re-run with `--continue` to carry on from the last month end."
+            f"**Interrupted: {report.ending_reason}.**{where} Months after the last one shown "
+            f"were not run. Re-run with `--continue` to carry on from there.{larger}"
         )
     return f"**{report.ending.title()}.** {report.ending_reason}".rstrip()
 
@@ -1074,7 +1081,7 @@ def _spend_block(report: PeriodReport) -> str:
         (
             ("budget", str(report.budget)),
             ("projection", projection),
-            ("spent", str(report.cost_usd)),
+            ("spent", str(report.spent_usd)),
             # Money a Continue threw away: its cycles left the log and the cost did not (§5.7).
             ("abandoned by Continue", str(report.abandoned_cost_usd)),
         ),

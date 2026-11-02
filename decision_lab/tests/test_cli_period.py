@@ -253,11 +253,12 @@ def test_a_projection_within_budget_runs(
     lab: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     open_gate(lab, tmp_path, cost_per_cycle="0.1")
-    run = fake(monkeypatch, meta_of(months=(month(),)))
+    run = fake(monkeypatch, meta_of(months=(month(),), projected_usd=Decimal("3.1")))
 
     assert cli.main(argv(lab, tmp_path / "p.md")) == cli.EXIT_OK
 
     assert len(run.calls) == 1
+    assert run.calls[0]["projected_usd"] == Decimal("3.1")
     assert "projected 3.1" in (tmp_path / "p.md").read_text(encoding="utf-8")
 
 
@@ -308,13 +309,17 @@ def test_a_budget_interrupted_run_exits_5_and_still_files_its_report(
             months=(month(),),
             ending=pd.RunEnding.INTERRUPTED,
             ending_reason="budget of 5 passed at the end of 2024-01: 6 spent",
+            budget_stopped=True,
         ),
     )
     out = tmp_path / "p.md"
 
     assert cli.main(argv(lab, out, "--skip-gate")) == cli.EXIT_BUDGET
 
-    assert "Interrupted: budget of 5 passed" in out.read_text(encoding="utf-8")
+    text = out.read_text(encoding="utf-8")
+    assert "Interrupted: budget of 5 passed" in text
+    assert "Last month end kept: 2024-01" in text
+    assert "needs a larger `--budget`" in text
     assert rows(tmp_path)[0].ending == "INTERRUPTED"
 
 
@@ -364,9 +369,14 @@ def test_a_refusal_to_run_or_to_continue_exits_3(
 def test_a_rule_ended_run_is_a_result_and_exits_0(
     lab: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    period = pd.parse_period("2024-Q1")
     fake(
         monkeypatch,
         meta_of(
+            # A quarter's meta behind a command for one month: the dataset holds two, and the
+            # command refuses what it does not cover. The page reads the run's own period.
+            period=period,
+            first_cycle_at=period.start,
             months=(month(),),
             ending=pd.RunEnding.RULE_ENDED,
             ending_reason="out of money on 2024-01-20",
@@ -378,7 +388,9 @@ def test_a_rule_ended_run_is_a_result_and_exits_0(
 
     text = out.read_text(encoding="utf-8")
     assert "Model failed: out of money on 2024-01-20" in text
-    assert "2024-02" not in text or "not run" in text
+    assert "| 2024-02 | — | — | — | not run | — |" in text
+    assert "| 2024-03 | — | — | — | not run | — |" in text
+    assert "| not run | 2024-02, 2024-03 |" in text
 
 
 # --- the page and the row
@@ -449,7 +461,9 @@ def test_a_frozen_run_shows_unvaluable_and_no_figure(
     text = out.read_text(encoding="utf-8")
     assert "UNVALUABLE" in text and "no mark for BTC/USDT" in text
     assert "| net profit |" not in text, "a frozen portfolio has no figure, not even a zero"
-    assert rows(tmp_path)[0].unvaluable
+    assert "| spent | 0.5 |" in text, "the model was paid for whatever the valuation"
+    row = rows(tmp_path)[0]
+    assert row.unvaluable and row.cost_usd == Decimal("0.5")
 
 
 def test_the_stamps_reach_the_report_and_the_row(
@@ -492,3 +506,67 @@ def test_skipping_the_gate_runs_end_to_end_and_reuses_the_run_without_a_second_r
 
     assert (directories[0] / pd.PERIOD_META).read_text(encoding="utf-8") == stored
     assert len(rows(tmp_path)) == 1, "a reused run is one registry row, not two"
+
+
+# --- reuse, continue, and provenance
+
+
+def test_a_finished_run_is_reused_past_a_shut_gate_a_missing_key_and_a_small_budget(
+    lab: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """§5.1: the gate, the provider and the projection are consulted before spend, never before
+    reuse. One real run, then three invocations each of which would refuse a new one."""
+    assert cli.main(argv(lab, tmp_path / "a.md", "--skip-gate")) == cli.EXIT_OK
+    before = {path: path.read_bytes() for path in (tmp_path / "workspace").glob("period-*/*.json")}
+
+    def no_spend(**_: Any) -> None:
+        raise AssertionError("a finished run was run again")
+
+    monkeypatch.setattr(pd, "run", no_spend)
+
+    # No gate record exists, and --skip-gate is absent: a new run would exit 6.
+    assert cli.main(argv(lab, tmp_path / "b.md")) == cli.EXIT_OK
+    # A provider that cannot be reached: a new run would exit 4.
+    with monkeypatch.context() as scoped:
+        scoped.setattr(
+            cd, "require_reachable", lambda _m: (_ for _ in ()).throw(ConfigError("no key"))
+        )
+        assert cli.main(argv(lab, tmp_path / "c.md", "--skip-gate")) == cli.EXIT_OK
+    # A projection of 31 against a budget of 0.01: a new run would exit 5.
+    open_gate(lab, tmp_path, cost_per_cycle="1")
+    over = argv(lab, tmp_path / "d.md")
+    over[over.index("--budget") + 1] = "0.01"
+    assert cli.main(over) == cli.EXIT_OK
+
+    after = {path: path.read_bytes() for path in (tmp_path / "workspace").glob("period-*/*.json")}
+    assert after == before, "reuse rewrote the run"
+
+
+def test_the_row_of_a_reused_run_keeps_its_provenance_and_stays_one_row(
+    lab: Path, tmp_path: Path
+) -> None:
+    """A run made with --skip-gate is described that way however it is found again (§5.7)."""
+    first = tmp_path / "a.md"
+    assert cli.main(argv(lab, first, "--skip-gate")) == cli.EXIT_OK
+    open_gate(lab, tmp_path)
+
+    second = tmp_path / "b.md"
+    assert cli.main(argv(lab, second)) == cli.EXIT_OK
+
+    [row] = rows(tmp_path)
+    assert row.gate_skipped, "the invocation that found the run overwrote how it was made"
+    assert row.no_projection and row.news_blind
+    assert rd.GATE_SKIPPED in second.read_text(encoding="utf-8")
+
+
+def test_continue_with_nothing_to_continue_exits_3_and_writes_no_run(
+    lab: Path, tmp_path: Path
+) -> None:
+    """A typo in --every, --start-equity or --period must not start a run with the projection
+    check waived."""
+    code = cli.main(argv(lab, tmp_path / "p.md", "--skip-gate", "--continue"))
+
+    assert code == cli.EXIT_DATASET
+    assert not list((tmp_path / "workspace").glob("period-*"))
+    assert not (tmp_path / "p.md").exists()
+    assert not rows(tmp_path)

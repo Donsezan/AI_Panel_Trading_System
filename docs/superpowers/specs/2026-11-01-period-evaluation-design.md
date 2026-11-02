@@ -301,7 +301,7 @@ Raw 2025 news already exists in `data/history-2025/news-raw`: about 12,000 artic
 from `bitcoincom` and `cryptoslate`. It has **not been summarised or published**, and the panel only
 reads a published archive. So:
 
-- `evaluate period` takes `--archive`, feeding `build_sim(news_feed=…)` through the existing seam,
+- `evaluate period` takes `--news-source` (repeatable, as `corpus build` names it), feeding `build_sim(news_feed=…)` through the existing seam,
   and the archive digest joins the run's identity.
 - A run without a real archive still works but is stamped `NEWS-BLIND` or `PLUMBING CHECK`, and the
   event page says *the seats had no news, so this says nothing about reading it*.

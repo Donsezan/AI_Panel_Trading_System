@@ -1055,10 +1055,23 @@ class _Loaded:
     dayset_digest: str
 
 
+@dataclass(frozen=True, slots=True)
+class _Opened:
+    """The dataset, matrix and named candidate: what is known before any gate is consulted."""
+
+    audit: ds.CoverageAudit
+    dataset: ReplayDataset
+    matrix: cd.Matrix
+    candidate: cd.Candidate
+
+
 def _load_candidate(
     args: argparse.Namespace, clock: SystemClock, *, reachability_first: bool, label: str
 ) -> _Loaded | int:
     """The shared opening of the two single-candidate commands, or the exit code that refuses.
+
+    `_open_candidate` then `_clear_gate`; `evaluate period` calls them apart, because a finished
+    run is looked up between the two (§5.1: consulted before spend, never before reuse).
 
     Verified dataset, the reference basket `corpus.build` derives (so a matrix expands against the
     same basket it would there; `every_seconds` reaches neither `panel_digest` nor `matrix_digest`,
@@ -1071,6 +1084,15 @@ def _load_candidate(
     does: an operator who has not calibrated must fix that before being told about a key, because
     `calibrate` reports the key itself.
     """
+    opened = _open_candidate(args, clock, reachability_first=reachability_first, label=label)
+    if isinstance(opened, int):
+        return opened
+    return _clear_gate(args, opened, reachability_first=reachability_first, label=label)
+
+
+def _open_candidate(
+    args: argparse.Namespace, clock: SystemClock, *, reachability_first: bool, label: str
+) -> _Opened | int:
     audit = ds.require_verified(args.data)
     dataset = ReplayDataset.load(args.data, clock)
     refusal = f"{label} refused; nothing was spent"
@@ -1100,7 +1122,20 @@ def _load_candidate(
             },
         )
         return EXIT_MISUSE
+    return _Opened(audit, dataset, matrix, candidate)
 
+
+def _clear_gate(
+    args: argparse.Namespace, opened: _Opened, *, reachability_first: bool, label: str
+) -> _Loaded | int:
+    """The gate, then (unless it came first) the provider check: the two spend-gating steps."""
+    audit, dataset, matrix, candidate = (
+        opened.audit,
+        opened.dataset,
+        opened.matrix,
+        opened.candidate,
+    )
+    refusal = f"{label} refused; nothing was spent"
     record: gate.GateRecord | None = None
     dayset_digest = ""
     if not args.skip_gate:
@@ -1232,16 +1267,18 @@ async def evaluate_period(args: argparse.Namespace) -> int:
     """One candidate through one calendar period (period spec §5), and the page for it.
 
     Every refusal happens before spend, in this order: an unreadable period (2), a dataset that is
-    unverified or does not cover the period (3), the matrix and candidate (4, 2), the gate (6), the
-    provider check (4), the news archive (4), and a projection over the budget (5). The gate is
-    consulted ahead of the provider check, as in `sweep`.
+    unverified or does not cover the period (3), the matrix and candidate (4, 2), the news archive
+    (4), then, only if no finished run is filed at this identity, the gate (6), the provider check
+    (4) and a projection over the budget (5). The gate comes ahead of the provider check, as in
+    `sweep`. A finished run is reused and reported with none of the three (§5.1).
 
     A run that ended is filed whatever its ending: a rule's verdict is a result (exit 0), and a
     budget stop is interrupted work (exit 5) whose page says how to continue it. An exception out
     of the driver propagates after the run has written `INTERRUPTED`, so the stack trace is the
     exit code. A run that cannot be started or continued is a `ConfigError` and exits 3 through
     `main` (an interrupted run met without `--continue`, and a Continue that refuses: a rule's
-    verdict, a replay that differs, a missing log). `--continue` against a spent budget exits 5.
+    verdict, a replay that differs, a missing log, or no unfinished run at all).
+    `--continue` against a spent budget exits 5.
     """
     clock = SystemClock()
     try:
@@ -1255,15 +1292,16 @@ async def evaluate_period(args: argparse.Namespace) -> int:
     covered_from, covered_to = ReplayDataset.load(args.data, clock).coverage
     pd.require_covered(period, covered_from, covered_to - timedelta(hours=1))
 
-    loaded = _load_candidate(args, clock, reachability_first=False, label="period run")
-    if isinstance(loaded, int):
-        return loaded
-    matrix, candidate, record = loaded.matrix, loaded.candidate, loaded.record
+    opened = _open_candidate(args, clock, reachability_first=False, label="period run")
+    if isinstance(opened, int):
+        return opened
+    matrix, candidate = opened.matrix, opened.candidate
 
     feed = None
     if args.news_sources:
         # As `corpus build` does: a repeated flag would load the archive twice and read as
-        # corroboration. `main` would call a policy or archive problem a dataset problem.
+        # corroboration. `main` would call a policy or archive problem a dataset problem. Ahead of
+        # the lookup because the archive's digest is part of the run's identity.
         if len(set(args.news_sources)) != len(args.news_sources):
             logger.error(
                 "period run refused; nothing was spent",
@@ -1276,43 +1314,73 @@ async def evaluate_period(args: argparse.Namespace) -> int:
             logger.error("period run refused; nothing was spent", extra={"reason": str(error)})
             return EXIT_CANDIDATE
 
-    # §5.5: the calibrated cost per cycle times the cycles the period plans. `None` when there is
-    # nothing to project from, which the page says rather than showing a zero that reads as free.
-    # Not enforced on a Continue: the months it replays cost nothing, and what was already spent
-    # is counted against the ceiling inside `run`, which is the check that knows.
     cadence = CADENCE_SECONDS[args.every]
-    projected = _projected_cost(record, candidate.candidate_id, period, cadence)
-    if projected is not None and projected > args.budget and not args.resume:
-        logger.error(
-            "period run refused; nothing was spent",
-            extra={
-                "reason": f"projected spend {projected} is over the budget of {args.budget}",
-                "period": period.label,
-            },
-        )
-        return EXIT_BUDGET
+    # §5.1: the gate, the provider and the projection are consulted before spend, never before
+    # reuse. A finished run (COMPLETED, or ended by a rule: that is its result) costs nothing to
+    # report, so none of the three may refuse it. It is described by its own meta throughout.
+    meta = pd.finished_run(
+        data_dir=args.data,
+        candidate=candidate,
+        period=period,
+        cadence_seconds=cadence,
+        start_equity=args.start_equity,
+        news_feed=feed,
+    )
+    if meta is None:
+        loaded = _clear_gate(args, opened, reachability_first=False, label="period run")
+        if isinstance(loaded, int):
+            return loaded
+        # §5.5: the calibrated cost per cycle times the cycles the period plans. `None` when there
+        # is nothing to project from, which the page says rather than showing a zero that reads as
+        # free. Not enforced on a Continue: the months it replays cost nothing, and what was
+        # already spent is counted against the ceiling inside `run`, which is the check that
+        # knows. `run` refuses a Continue with nothing to continue, so the exemption cannot be
+        # used to start a fresh run past this check.
+        projected = _projected_cost(loaded.record, candidate.candidate_id, period, cadence)
+        if projected is not None and projected > args.budget and not args.resume:
+            logger.error(
+                "period run refused; nothing was spent",
+                extra={
+                    "reason": f"projected spend {projected} is over the budget of {args.budget}",
+                    "period": period.label,
+                },
+            )
+            return EXIT_BUDGET
 
-    try:
-        meta = await pd.run(
-            data_dir=args.data,
-            candidate=candidate,
-            period=period,
-            cadence_seconds=cadence,
-            start_equity=args.start_equity,
-            budget=args.budget,
-            wall_clock=clock,
-            news_feed=feed,
-            gate_skipped=args.skip_gate,
-            plumbing_check=not matrix.is_evaluation,
-            resume=args.resume,
+        try:
+            meta = await pd.run(
+                data_dir=args.data,
+                candidate=candidate,
+                period=period,
+                cadence_seconds=cadence,
+                start_equity=args.start_equity,
+                budget=args.budget,
+                wall_clock=clock,
+                news_feed=feed,
+                gate_skipped=args.skip_gate,
+                plumbing_check=not matrix.is_evaluation,
+                matrix_digest=matrix.matrix_digest,
+                dayset_digest=loaded.dayset_digest,
+                projected_usd=projected,
+                resume=args.resume,
+            )
+        except pd.BudgetReached as error:
+            logger.error("period run refused; nothing was moved", extra={"reason": str(error)})
+            return EXIT_BUDGET
+        except OSError as error:
+            # A checkpoint that cannot be written marks the run interrupted from inside the month
+            # loop. An OS error before that point (the workspace, the dataset) leaves whatever
+            # meta was already there, so this is the handler's own word and not the run's.
+            logger.error(
+                "period run stopped by an OS error",
+                extra={"reason": f"{type(error).__name__}: {error}"},
+            )
+            return EXIT_DATASET
+    else:
+        logger.info(
+            "period run reused; nothing was spent",
+            extra={"run_id": meta.run_id, "ending": meta.ending.value},
         )
-    except pd.BudgetReached as error:
-        logger.error("period run refused; nothing was moved", extra={"reason": str(error)})
-        return EXIT_BUDGET
-    except OSError as error:
-        # A checkpoint that cannot be written: the run has marked itself interrupted.
-        logger.error("period run interrupted", extra={"reason": f"{type(error).__name__}: {error}"})
-        return EXIT_DATASET
 
     not_run = pd.not_run_months(meta)
     built = rd.PeriodReport(
@@ -1329,8 +1397,10 @@ async def evaluate_period(args: argparse.Namespace) -> int:
         cadence_seconds=meta.cadence_seconds,
         period=meta.period.label,
         first_cycle_at=meta.first_cycle_at,
-        budget=args.budget,
-        projected_cost=projected,
+        # The run's own budget and projection, never this invocation's: on reuse they would
+        # describe a run that did not happen under them.
+        budget=meta.budget,
+        projected_cost=meta.projected_usd,
         news_blind=meta.news_blind,
         plumbing_check=meta.plumbing_check,
         gate_skipped=meta.gate_skipped,
@@ -1340,6 +1410,8 @@ async def evaluate_period(args: argparse.Namespace) -> int:
         ending=meta.ending.value,
         ending_reason=meta.ending_reason,
         abandoned_cost_usd=meta.abandoned_cost_usd,
+        spent_usd=meta.spent_usd,
+        budget_stopped=meta.budget_stopped,
         unvaluable=meta.profit.unvaluable,
         freeze_reason=meta.profit.freeze_reason,
         equity=meta.profit.equity,
@@ -1364,16 +1436,18 @@ async def evaluate_period(args: argparse.Namespace) -> int:
             scenario="evaluate-period",
             dataset_digest=meta.dataset_digest,
             corpus_id=meta.run_id,
-            matrix_digest=matrix.matrix_digest,
-            dayset_digest=loaded.dayset_digest,
+            # Provenance is the run's: a reused or continued run is described by how it was
+            # made, not by the flags of the invocation that found it (and so stays one row).
+            matrix_digest=meta.matrix_digest,
+            dayset_digest=meta.dayset_digest,
             candidate_id=meta.candidate_id,
             cadence_seconds=meta.cadence_seconds,
-            start_equity=args.start_equity,
+            start_equity=meta.start_equity,
             window=meta.period.label,
-            evaluation=matrix.is_evaluation,
+            evaluation=not meta.plumbing_check,
             on_fallback=matrix.on_fallback.value,
-            gate_skipped=args.skip_gate,
-            cost_usd=meta.profit.cost_usd,
+            gate_skipped=meta.gate_skipped,
+            cost_usd=meta.spent_usd,
             total_profit=meta.profit.total,
             realized_pnl=meta.profit.realized,
             unrealized_pnl=meta.profit.unrealized,
@@ -1385,7 +1459,7 @@ async def evaluate_period(args: argparse.Namespace) -> int:
             not_run=not_run,
             abandoned_cost_usd=meta.abandoned_cost_usd,
             news_blind=meta.news_blind,
-            no_projection=projected is None,
+            no_projection=meta.projected_usd is None,
         )
     )
     logger.info(
@@ -1395,6 +1469,7 @@ async def evaluate_period(args: argparse.Namespace) -> int:
             "period": meta.period.label,
             "ending": meta.ending.value,
             "not_run": list(not_run),
+            "lifts": len(meta.lifts),
             "net": str(meta.profit.net),
             "unvaluable": meta.profit.unvaluable,
             "report": str(out),
@@ -1402,7 +1477,7 @@ async def evaluate_period(args: argparse.Namespace) -> int:
     )
     if meta.ending is pd.RunEnding.INTERRUPTED:
         logger.error("period run interrupted", extra={"reason": meta.ending_reason})
-        return EXIT_BUDGET if meta.ending_reason.startswith(pd.BUDGET_STOP) else EXIT_DATASET
+        return EXIT_BUDGET if meta.budget_stopped else EXIT_DATASET
     return EXIT_OK
 
 

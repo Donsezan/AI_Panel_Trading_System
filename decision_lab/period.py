@@ -61,7 +61,7 @@ from sqlalchemy import inspect
 from decision_lab import registry
 from decision_lab.candidates import Candidate
 from decision_lab.corpus import config_digest
-from decision_lab.dataset import require_verified
+from decision_lab.dataset import CoverageAudit, require_verified
 from decision_lab.longrun import Profit, ProfitEvidence, VetoRow, profit_of, veto_breakdown
 from decision_lab.newsfeed import ArchiveNewsFeed
 from decision_lab.params import workspace_root
@@ -89,10 +89,6 @@ from tradebot.validation.evidence import Evidence
 
 _PATTERN: Final = re.compile(r"^(\d{4})(?:-(?:(0[1-9]|1[0-2])|Q([1-4])))?$")
 _BAR: Final = timedelta(hours=1)
-#: How a budget stop opens its reason. The CLI reads an `INTERRUPTED` ending by it, because a
-#: budget stop is the one interruption that comes back as a result rather than an exception, and
-#: it needs its own exit code (§5.7).
-BUDGET_STOP: Final = "budget of"
 #: The one instrument a period run trades, by the operator's decision (§4). It reaches
 #: `config_digest` through the basket, so widening this later mints new runs rather than colliding.
 PERIOD_SYMBOL: Final = "BTC/USDT"
@@ -116,6 +112,8 @@ _BASKET_PAUSED: Final = "basket_paused"
 _NOT_REFUSALS: Final[dict[str, frozenset[str]]] = {
     "valuation_basis": frozenset({"recorded"}),
     TRACKED_GROUP_RULE: frozenset({"group_retired", "group_closed", "group_lapsed"}),
+    # This tool's own act, appended so the log shows each lift (§5.3). Nothing was proposed.
+    PAUSE_LIFTED_RULE: frozenset({"pause_lifted"}),
 }
 
 logger = get_logger("decision_lab.period")
@@ -277,6 +275,23 @@ class PeriodMeta(DomainModel):
     gate_skipped: bool = False
     plumbing_check: bool = False
     news_blind: bool = True
+    #: The gate's key parts, as of the run's first build. Provenance read back by whoever files this
+    #: run, so a reused or continued run is described by how it was made, never by the invocation
+    #: that happened to find it.
+    matrix_digest: str = ""
+    dayset_digest: str = ""
+    #: What the calibrated cost per cycle projected at the first build. `None` is "no projection was
+    #: available" (§5.5), which is a different statement from a projection of zero.
+    projected_usd: Money | None = None
+    #: The ending is `INTERRUPTED` because spend passed the budget. A field and not a reading of
+    #: `ending_reason`, which is prose for a human (§5.7).
+    budget_stopped: bool = False
+
+    @property
+    def spent_usd(self) -> Decimal:
+        """What the panel cost, known whatever the valuation: a frozen portfolio has no profit
+        figure, but the model calls were still paid for (§10.4)."""
+        return sum((month.cost_usd for month in self.months), start=ZERO) + self.abandoned_cost_usd
 
 
 def not_run_months(meta: PeriodMeta) -> tuple[str, ...]:
@@ -761,6 +776,17 @@ def _abandon(database: Path, clock: Clock) -> None:
             sidecar.replace(moved)
 
 
+def _first_build(found: PeriodMeta | None) -> dict[str, object]:
+    """The provenance a run keeps from the invocation that began it (§5.7)."""
+    if found is None or not found.matrix_digest:
+        return {}
+    return {
+        "matrix_digest": found.matrix_digest,
+        "dayset_digest": found.dayset_digest,
+        "projected_usd": found.projected_usd,
+    }
+
+
 def _continue_from(
     directory: Path,
     *,
@@ -795,6 +821,8 @@ def _continue_from(
             "built_at": found.built_at if found is not None else fresh.built_at,
             # A stamp once earned stays: part of this run's money was made without the gate.
             "gate_skipped": fresh.gate_skipped or (found is not None and found.gate_skipped),
+            # As first built: this invocation may hold a different gate, key or projection.
+            **_first_build(found),
         }
     )
     _write_meta(directory / PERIOD_META, meta)
@@ -832,39 +860,30 @@ def _profit(valuation: PortfolioAggregate, evidence: Evidence, *, meta: PeriodMe
     )
 
 
-async def run(
+@dataclass(frozen=True, slots=True)
+class _Identity:
+    """Everything that names a run, computed without touching its directory."""
+
+    audit: CoverageAudit
+    coverage_start: datetime
+    archive_digest: str
+    dataset: ReplayDataset
+    clock: ManualClock
+    basket: Basket
+    basket_digest: str
+    run_id: str
+
+
+def _identify(
     *,
     data_dir: Path,
     candidate: Candidate,
     period: Period,
     cadence_seconds: int,
     start_equity: Decimal,
-    budget: Decimal,
-    wall_clock: Clock,
-    news_feed: ArchiveNewsFeed | None = None,
-    archive_digest: str = "",
-    gate_skipped: bool = False,
-    plumbing_check: bool = False,
-    workspace: Path | None = None,
-    resume: bool = False,
-) -> PeriodMeta:
-    """One candidate's path through one period, in its own database, month after month.
-
-    Mirrors `longrun.run`'s shape (identity, reuse-if-finished, refuse-if-interrupted, run) for its
-    reasons: a second pass appended into one log doubles every entry, and the database a failed
-    pass left behind is the only record of why it failed. Not `BacktestHarness`, which recovers on
-    every call and retires a stopped basket for good, so it cannot express a month boundary (§5.4).
-
-    An unexpected exception out of the month loop writes `INTERRUPTED` and is raised again.
-
-    `resume` is Continue (§5.7): an unfinished run is re-executed in a fresh database, replaying
-    answers up to its last month end, under this `budget` rather than the stored one, since a budget
-    stop is exactly what needs a larger one. A finished run is reused as ever, except that a rule's
-    verdict refuses, because being asked to continue one means someone read it as an error. Identity
-    is unchanged, so seats changed since the run began are a different directory and a new run, and
-    the old one is not touched. A run that used a `news_feed` must be given the same one: its digest
-    is in the identity, and each replayed snapshot compares the news it was served.
-    """
+    news_feed: ArchiveNewsFeed | None,
+    archive_digest: str,
+) -> _Identity:
     # §6.6's rule, as in `corpus.build`: two arguments that must agree is one that can disagree.
     if news_feed is not None:
         if archive_digest:
@@ -892,6 +911,94 @@ async def run(
         window=period.label,
         archive_digest=archive_digest,
     )
+    return _Identity(
+        audit, covered_start, archive_digest, dataset, clock, basket, basket_digest, identity
+    )
+
+
+def finished_run(
+    *,
+    data_dir: Path,
+    candidate: Candidate,
+    period: Period,
+    cadence_seconds: int,
+    start_equity: Decimal,
+    news_feed: ArchiveNewsFeed | None = None,
+    archive_digest: str = "",
+    workspace: Path | None = None,
+) -> PeriodMeta | None:
+    """The final result already filed at this identity, or `None`. Read-only (§5.1).
+
+    A finished run is reused at no spend, so whoever is about to ask for a gate, a provider or a
+    projection asks this first: those are consulted before spend, never before reuse. Raises what
+    `run` raises for a dataset that is unverified or does not cover the period.
+    """
+    who = _identify(
+        data_dir=data_dir,
+        candidate=candidate,
+        period=period,
+        cadence_seconds=cadence_seconds,
+        start_equity=start_equity,
+        news_feed=news_feed,
+        archive_digest=archive_digest,
+    )
+    meta_path = period_dir(who.run_id, workspace=workspace) / PERIOD_META
+    if not meta_path.is_file():
+        return None
+    found = PeriodMeta.model_validate_json(meta_path.read_text(encoding="utf-8"))
+    return found if found.ending.is_final else None
+
+
+async def run(
+    *,
+    data_dir: Path,
+    candidate: Candidate,
+    period: Period,
+    cadence_seconds: int,
+    start_equity: Decimal,
+    budget: Decimal,
+    wall_clock: Clock,
+    news_feed: ArchiveNewsFeed | None = None,
+    archive_digest: str = "",
+    gate_skipped: bool = False,
+    plumbing_check: bool = False,
+    matrix_digest: str = "",
+    dayset_digest: str = "",
+    projected_usd: Decimal | None = None,
+    workspace: Path | None = None,
+    resume: bool = False,
+) -> PeriodMeta:
+    """One candidate's path through one period, in its own database, month after month.
+
+    Mirrors `longrun.run`'s shape (identity, reuse-if-finished, refuse-if-interrupted, run) for its
+    reasons: a second pass appended into one log doubles every entry, and the database a failed
+    pass left behind is the only record of why it failed. Not `BacktestHarness`, which recovers on
+    every call and retires a stopped basket for good, so it cannot express a month boundary (§5.4).
+
+    An unexpected exception out of the month loop writes `INTERRUPTED` and is raised again.
+
+    `resume` is Continue (§5.7): an unfinished run is re-executed in a fresh database, replaying
+    answers up to its last month end, under this `budget` rather than the stored one, since a budget
+    stop is exactly what needs a larger one. A finished run is reused as ever, except that a rule's
+    verdict refuses, because being asked to continue one means someone read it as an error. Identity
+    is unchanged, so seats changed since the run began are a different directory, which has
+    nothing to continue, and the old one is not touched. Continue with nothing unfinished at the
+    identity refuses with `ConfigError`: it never starts a run. A run that used a `news_feed` must
+    be given the same one: its digest
+    is in the identity, and each replayed snapshot compares the news it was served.
+    """
+    who = _identify(
+        data_dir=data_dir,
+        candidate=candidate,
+        period=period,
+        cadence_seconds=cadence_seconds,
+        start_equity=start_equity,
+        news_feed=news_feed,
+        archive_digest=archive_digest,
+    )
+    audit, clock, dataset, basket = who.audit, who.clock, who.dataset, who.basket
+    archive_digest, basket_digest, identity = who.archive_digest, who.basket_digest, who.run_id
+    covered_start = who.coverage_start
     directory = period_dir(identity, workspace=workspace)
     meta_path = directory / PERIOD_META
     database = directory / PERIOD_DB
@@ -911,6 +1018,15 @@ async def run(
     # An unfinished run is never run over: a second pass appended to this log would double every
     # entry in it. A meta with no database is a Continue that died between its two moves.
     unfinished = found is not None or database.is_file()
+    if resume and not unfinished:
+        # Continue means continue. Starting fresh here would let a typo in the cadence, the equity
+        # or the period mint a new identity and spend past the projection the command applies only
+        # where there is something to continue (§5.5, §5.7).
+        raise ConfigError(
+            f"there is no unfinished run to continue at this identity ({directory.name}): check "
+            "the data, seat set, period, cadence, start equity and news archive against the run "
+            "you meant. Starting a new run is the same command without --continue"
+        )
     if unfinished and not resume:
         raise ConfigError(
             f"{directory} holds a run that never finished, so a previous pass was "
@@ -948,6 +1064,9 @@ async def run(
         gate_skipped=gate_skipped,
         plumbing_check=plumbing_check,
         news_blind=not archive_digest,
+        matrix_digest=matrix_digest,
+        dayset_digest=dayset_digest,
+        projected_usd=projected_usd,
     )
     replay: _Replay | None = None
     if unfinished:
@@ -1056,11 +1175,15 @@ async def run(
                 is_live = index >= len(replayed_months)
                 if is_live and index + 1 < len(period.months) and spent > budget:
                     raise BudgetReached(
-                        f"{BUDGET_STOP} {budget} passed at the end of {month.label}: {spent} spent"
+                        f"budget of {budget} passed at the end of {month.label}: {spent} spent"
                     )
         except BudgetReached as exc:
             meta = meta.model_copy(
-                update={"ending": RunEnding.INTERRUPTED, "ending_reason": str(exc)}
+                update={
+                    "ending": RunEnding.INTERRUPTED,
+                    "ending_reason": str(exc),
+                    "budget_stopped": True,
+                }
             )
             _write_meta(meta_path, meta)
         except Exception as exc:
