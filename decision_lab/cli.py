@@ -1383,49 +1383,19 @@ async def evaluate_period(args: argparse.Namespace) -> int:
         )
 
     not_run = pd.not_run_months(meta)
-    built = rd.PeriodReport(
+    # One read assembly (spec 5.6): the page is written from the same analysis the dashboard and
+    # the notebook read, so the three cannot give different answers about one run.
+    scoring = await an.build_scoring(args.data, clock=clock)
+    analysed = an.analyse_period(meta.run_id, scoring, panel=candidate.panel)
+    out = args.out or reports_dir() / f"decision-lab-period-{meta.run_id}.md"
+    rd.write_period(
+        analysed,
+        out,
         generated_at=clock.now(),
-        run_id=meta.run_id,
-        dataset_directory=meta.dataset_directory,
-        dataset_digest=meta.dataset_digest,
-        candidate_id=meta.candidate_id,
-        panel_digest=meta.panel_digest,
         panel_models=tuple(
             dict.fromkeys(f"{s.provider_id}:{s.model}" for s in candidate.panel.seats)
         ),
-        archive_digest=meta.archive_digest,
-        cadence_seconds=meta.cadence_seconds,
-        period=meta.period.label,
-        first_cycle_at=meta.first_cycle_at,
-        # The run's own budget and projection, never this invocation's: on reuse they would
-        # describe a run that did not happen under them.
-        budget=meta.budget,
-        projected_cost=meta.projected_usd,
-        news_blind=meta.news_blind,
-        plumbing_check=meta.plumbing_check,
-        gate_skipped=meta.gate_skipped,
-        months=tuple(rd.PeriodMonthRow.model_validate(m.model_dump()) for m in meta.months),
-        not_run=not_run,
-        lifts=tuple(rd.PeriodLiftRow.model_validate(one.model_dump()) for one in meta.lifts),
-        ending=meta.ending.value,
-        ending_reason=meta.ending_reason,
-        abandoned_cost_usd=meta.abandoned_cost_usd,
-        spent_usd=meta.spent_usd,
-        budget_stopped=meta.budget_stopped,
-        unvaluable=meta.profit.unvaluable,
-        freeze_reason=meta.profit.freeze_reason,
-        equity=meta.profit.equity,
-        start_equity=meta.profit.start_equity,
-        total_profit=meta.profit.total,
-        realized=meta.profit.realized,
-        unrealized=meta.profit.unrealized,
-        cost_usd=meta.profit.cost_usd,
-        net_profit=meta.profit.net,
-        vetoes=tuple((row.rule, row.action_taken, row.count) for row in meta.vetoes),
-        incidents=meta.incidents,
     )
-    out = args.out or reports_dir() / f"decision-lab-period-{meta.run_id}.md"
-    rd.write_period(built, out)
 
     # Recorded on every invocation, and a reused run is not a second row: `registry.record`
     # replaces by identity, and `corpus_id` carries this run's own id (as `calibrate long` carries

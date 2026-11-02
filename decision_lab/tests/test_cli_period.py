@@ -38,6 +38,7 @@ from tradebot.app import dataset_basket, select_panel
 from tradebot.core.clock import SystemClock
 from tradebot.core.errors import ConfigError
 from tradebot.marketdata.recorder import ReplayDataset
+from tradebot.persistence.database import create_database
 
 NOW = datetime(2026, 11, 1, tzinfo=UTC)
 
@@ -157,7 +158,18 @@ class FakeRun:
         self.calls.append(kwargs)
         if isinstance(self.outcome, BaseException):
             raise self.outcome
+        self._file(self.outcome)
         return self.outcome
+
+    @staticmethod
+    def _file(meta: pd.PeriodMeta) -> None:
+        """What a real run leaves behind: its meta and a log (here an empty one). The report is
+        written from the one read assembly, which opens both."""
+        directory = pd.period_dir(meta.run_id)
+        directory.mkdir(parents=True, exist_ok=True)
+        pd._write_meta(directory / pd.PERIOD_META, meta)
+        if not (directory / pd.PERIOD_DB).exists():
+            create_database(directory / pd.PERIOD_DB).dispose()
 
 
 def fake(monkeypatch: pytest.MonkeyPatch, outcome: pd.PeriodMeta | BaseException) -> FakeRun:

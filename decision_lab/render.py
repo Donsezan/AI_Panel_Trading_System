@@ -25,7 +25,7 @@ from collections.abc import Iterable, Sequence
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 from pydantic import Field
 
@@ -36,6 +36,10 @@ from decision_lab.seats import FINAL, ROUND_ZERO, SeatMetrics, rounds_are_identi
 from tradebot.core.money import ZERO
 from tradebot.core.schema import DomainModel, Money, UtcDatetime
 from tradebot.validation.backtest import BANNER
+
+if TYPE_CHECKING:
+    # analysis imports this module for its row types; the type is only named, never built, here.
+    from decision_lab.analysis import PeriodAnalysis
 
 #: The tool's own standing disclaimer. §1.1: it compares configurations an operator wrote; it
 #: does not search, does not optimise, and has no authority over anything.
@@ -804,7 +808,7 @@ def _profit_block(report: LongRunReport) -> str:
             ("total profit", str(report.total_profit)),
             ("realized", str(report.realized)),
             ("unrealized", str(report.unrealized)),
-            ("deliberation cost", str(report.cost_usd)),
+            ("deliberation cost (incl. abandoned)", str(report.cost_usd)),
             ("net profit", str(report.net_profit)),
         ),
     )
@@ -922,6 +926,12 @@ class PeriodReport(DomainModel):
     net_profit: Money = ZERO
     vetoes: tuple[tuple[str, str, int], ...] = ()
     incidents: int = 0
+    #: Spec 5.6: cycles a substituted model answered in. Never scored, but their trades happened.
+    contaminated: int = 0
+    #: Decisions the scorer saw, how many it could grade, and how many of those were right.
+    decisions: int = 0
+    graded: int = 0
+    correct: int = 0
 
 
 def period_markdown(report: PeriodReport) -> str:
@@ -941,6 +951,8 @@ def period_markdown(report: PeriodReport) -> str:
         sections += ["", GATE_SKIPPED]
     if report.lifts:
         sections += ["", PAUSE_LIFTED]
+    if report.contaminated:
+        sections += ["", _contamination_note(report)]
     sections += [
         "",
         _ending_line(report),
@@ -1005,6 +1017,12 @@ def _period_identity(report: PeriodReport) -> str:
             ("ending", report.ending),
             ("not run", ", ".join(report.not_run) or "none"),
             ("incidents", str(report.incidents)),
+            (
+                "graded decisions",
+                f"{report.graded} of {report.decisions} ({report.correct} correct); "
+                f"{report.decisions - report.graded} unscored",
+            ),
+            ("contaminated cycles", str(report.contaminated)),
         ),
     )
 
@@ -1058,7 +1076,17 @@ def _months_table(report: PeriodReport) -> str:
             )
         )
     rows += [(label, "—", "—", "—", "not run", "—") for label in report.not_run]
-    return _table(("month", "start", "end", "net before cost", "cycles", "cost"), rows)
+    table = _table(("month", "start", "end", "net before cost", "cycles", "cost"), rows)
+    if report.abandoned_cost_usd == ZERO:
+        return table
+    # The month rows are what the surviving log spent; the profit's cost also counts what a
+    # Continue threw away (§5.7). Stated here so the two figures do not disagree silently.
+    shown = sum((month.cost_usd for month in report.months), start=ZERO)
+    return (
+        f"{table}\n\nThe month costs above add to {shown}. The run also paid "
+        f"{report.abandoned_cost_usd} abandoned by Continue, which the deliberation cost in the "
+        "profit table includes."
+    )
 
 
 def _lifts_table(lifts: Sequence[PeriodLiftRow]) -> str:
@@ -1088,7 +1116,68 @@ def _spend_block(report: PeriodReport) -> str:
     )
 
 
-def write_period(report: PeriodReport, path: Path) -> Path:
+def _contamination_note(report: PeriodReport) -> str:
+    return (
+        f"**{report.contaminated} cycle(s) were contaminated by a substitute model** and are "
+        "never scored. Their trades still happened, so the profit includes them (spec 5.6)."
+    )
+
+
+def period_report(
+    analysis: PeriodAnalysis, *, generated_at: datetime, panel_models: tuple[str, ...]
+) -> PeriodReport:
+    """The page's figures, read off the one assembly (never off a second reading of the log)."""
+    meta = analysis.meta
+    return PeriodReport(
+        generated_at=generated_at,
+        run_id=meta.run_id,
+        dataset_directory=meta.dataset_directory,
+        dataset_digest=meta.dataset_digest,
+        candidate_id=meta.candidate_id,
+        panel_digest=meta.panel_digest,
+        panel_models=panel_models,
+        archive_digest=meta.archive_digest,
+        cadence_seconds=meta.cadence_seconds,
+        period=meta.period.label,
+        first_cycle_at=meta.first_cycle_at,
+        # The run's own budget and projection, never an invocation's: on reuse they would
+        # describe a run that did not happen under them.
+        budget=meta.budget,
+        projected_cost=meta.projected_usd,
+        news_blind=meta.news_blind,
+        plumbing_check=meta.plumbing_check,
+        gate_skipped=meta.gate_skipped,
+        months=tuple(PeriodMonthRow.model_validate(m.model_dump()) for m in meta.months),
+        not_run=analysis.not_run,
+        lifts=tuple(PeriodLiftRow.model_validate(one.model_dump()) for one in meta.lifts),
+        ending=meta.ending.value,
+        ending_reason=meta.ending_reason,
+        abandoned_cost_usd=meta.abandoned_cost_usd,
+        spent_usd=meta.spent_usd,
+        budget_stopped=meta.budget_stopped,
+        unvaluable=meta.profit.unvaluable,
+        freeze_reason=meta.profit.freeze_reason,
+        equity=meta.profit.equity,
+        start_equity=meta.profit.start_equity,
+        total_profit=meta.profit.total,
+        realized=meta.profit.realized,
+        unrealized=meta.profit.unrealized,
+        cost_usd=meta.profit.cost_usd,
+        net_profit=meta.profit.net,
+        vetoes=tuple((row.rule, row.action_taken, row.count) for row in meta.vetoes),
+        incidents=meta.incidents,
+        contaminated=analysis.contaminated,
+        decisions=sum(row.decisions for row in analysis.regimes),
+        graded=sum(row.scored for row in analysis.regimes),
+        correct=sum(row.correct for row in analysis.regimes),
+    )
+
+
+def write_period(
+    analysis: PeriodAnalysis, path: Path, *, generated_at: datetime, panel_models: tuple[str, ...]
+) -> Path:
+    """Write the page for an analysed run: the CLI, the dashboard and the notebook share it."""
+    report = period_report(analysis, generated_at=generated_at, panel_models=panel_models)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(period_markdown(report), encoding="utf-8")
     return path

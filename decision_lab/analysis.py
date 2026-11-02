@@ -15,23 +15,32 @@ skipped rather than raising (§12.2).
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 
 from decision_lab import compare as cmp
 from decision_lab import corpus as cp
 from decision_lab import dataset as ds
+from decision_lab import period as pd
 from decision_lab import regimes as rg
 from decision_lab import scoring as sc
 from decision_lab import seats as st
 from decision_lab import sweep as sw
+from decision_lab.archive.published import ArchiveItem
+from decision_lab.calibration_days import Pool
 from decision_lab.candidates import Matrix
-from decision_lab.records import CycleRecord
+from decision_lab.records import CycleRecord, records_from_store
 from decision_lab.render import CandidateSeats, NewsProvenance, NotMeasured
+from decision_lab.spikes import EventNews, SpikeEvent, find_events, news_for
 from tradebot.core.clock import Clock
+from tradebot.core.config import PanelConfig
+from tradebot.core.errors import ConfigError
 from tradebot.marketdata.recorder import ReplayDataset
+from tradebot.persistence.database import SingleWriter, open_database
+from tradebot.persistence.store import EventStore
 
 
 def news_provenance(meta: cp.CorpusMeta) -> NewsProvenance | None:
@@ -228,3 +237,166 @@ def analyse_matrix(
             )
         )
     return MatrixAnalysis(candidates=tuple(built))
+
+
+@dataclass(frozen=True, slots=True)
+class PeriodAnalysis:
+    """One period run, folded and scored: the single answer the page, the report and the notebook
+    all read (period spec §5.6, §7; `render.write_period` is the CLI's door onto it).
+
+    `records` holds every cycle the log froze, including the quarantined stretch of a paused month
+    (no decision, no spend); `scored`, `by_month`, `seats` and `seat_trend` are derived from the
+    clean ones only. `regimes` is always the three pools, never pooled, with a zero row for a pool
+    that never occurred (§7.2). `event_news` runs parallel to `events`.
+    """
+
+    meta: pd.PeriodMeta
+    records: tuple[CycleRecord, ...]
+    scored: tuple[sc.ScoredDecision, ...]
+    seats: tuple[st.SeatMetrics, ...]
+    regimes: tuple[sc.RegimeMetrics, ...]
+    events: tuple[SpikeEvent, ...]
+    event_news: tuple[EventNews, ...]
+    by_month: Mapping[str, tuple[sc.ScoredDecision, ...]]
+    #: seat -> bucket label -> final-vote accuracy, `None` where the seat had no scored vote there.
+    #: Zero would read as "always wrong" for a bucket in which it was never measured.
+    seat_trend: Mapping[str, Mapping[str, Decimal | None]]
+    #: Cycles a substituted model answered in. Never scored; their trades still happened (§5.6).
+    contaminated: int
+
+    @property
+    def running(self) -> bool:
+        """`RUNNING` on disk means a process is working, or died; the page cannot tell which."""
+        return self.meta.ending is pd.RunEnding.RUNNING
+
+    @property
+    def not_run(self) -> tuple[str, ...]:
+        """Months the run never reached, derived and never stored as a zero row (§5.3)."""
+        return pd.not_run_months(self.meta)
+
+
+def _buckets(period: pd.Period) -> tuple[tuple[str, datetime, datetime], ...]:
+    """Months for a period of up to a quarter, quarters for a year (spec §4, results item 4)."""
+    months = period.months
+    if len(months) <= 3:
+        return tuple((m.label, m.start, m.end) for m in months)
+    quarters = []
+    for first in range(0, len(months), 3):
+        chunk = months[first : first + 3]
+        label = f"{chunk[0].start.year:04d}-Q{(chunk[0].start.month - 1) // 3 + 1}"
+        quarters.append((label, chunk[0].start, chunk[-1].end))
+    return tuple(quarters)
+
+
+def _seat_trend(
+    records: Sequence[CycleRecord],
+    scored: Sequence[sc.ScoredDecision],
+    *,
+    panel: PanelConfig,
+    buckets: Sequence[tuple[str, datetime, datetime]],
+) -> dict[str, dict[str, Decimal | None]]:
+    trend: dict[str, dict[str, Decimal | None]] = {seat.seat_id: {} for seat in panel.seats}
+    for label, start, end in buckets:
+        rows = st.score_seats(
+            [r for r in records if start <= r.as_of < end],
+            [d for d in scored if start <= d.as_of < end],
+            panel=panel,
+        )
+        for seat_id, by_bucket in trend.items():
+            final = [r for r in rows if r.seat_id == seat_id and r.round_label == st.FINAL]
+            graded = sum(r.scored for r in final)
+            by_bucket[label] = sc.ratio(sum(r.correct for r in final), graded) if graded else None
+    return trend
+
+
+def fold_period(
+    meta: pd.PeriodMeta,
+    records: Sequence[CycleRecord],
+    scoring: Scoring,
+    *,
+    panel: PanelConfig,
+    archive_items: Iterable[ArchiveItem] = (),
+) -> PeriodAnalysis:
+    """Score a run's cycles. Split from the database read so a test can hand it doctored records."""
+    items = tuple(archive_items)
+    # Contamination is read off `SeatResponse.fingerprint` exactly as the sweep reads it (§7.7).
+    # The cycle is dropped before scoring: the peers read the substitute's arguments.
+    clean = tuple(r for r in records if not sw.substitutes_in(r.responses, panel))
+    scored = sc.score_records(
+        clean, index=scoring.index, regimes=scoring.regimes, params=scoring.params
+    )
+
+    reached = {m.label for m in meta.months}
+    by_month = {
+        m.label: tuple(d for d in scored if m.start <= d.as_of < m.end)
+        for m in meta.period.months
+        if m.label in reached or any(m.start <= d.as_of < m.end for d in scored)
+    }
+
+    key = next(
+        (one.key for one in scoring.dataset.instruments if one.symbol == pd.PERIOD_SYMBOL), None
+    )
+    events: tuple[SpikeEvent, ...] = ()
+    if key is not None:
+        found = find_events(
+            scoring.regimes.labels[key],
+            scoring.index.candles[key],
+            windows=scoring.regimes.windows,
+        )
+        inside = (e for e in found if e.end >= meta.period.start and e.start < meta.period.end)
+        # Absolute: a merged event can retrace, so the sign of `move_pct` is not its direction.
+        events = tuple(sorted(inside, key=lambda e: (-abs(e.move_pct), e.start)))
+    # §6.8.3: coverage is the archive's span (first row to last row), not the presence of items.
+    span = (min(i.observed_at for i in items), max(i.observed_at for i in items)) if items else None
+    event_news = tuple(
+        news_for(
+            e,
+            clean,
+            items,
+            coverage=span is not None and span[0] <= e.end and e.start <= span[1],
+        )
+        for e in events
+    )
+
+    pools = {pool.value for pool in Pool}
+    return PeriodAnalysis(
+        meta=meta,
+        records=tuple(records),
+        scored=scored,
+        seats=st.score_seats(clean, scored, panel=panel) if scored else (),
+        regimes=tuple(row for row in sc.by_regime(scored) if row.regime in pools),
+        events=events,
+        event_news=event_news,
+        by_month=by_month,
+        seat_trend=_seat_trend(clean, scored, panel=panel, buckets=_buckets(meta.period)),
+        contaminated=len(records) - len(clean),
+    )
+
+
+def analyse_period(
+    run_id: str,
+    scoring: Scoring,
+    *,
+    panel: PanelConfig,
+    archive_items: Iterable[ArchiveItem] = (),
+    workspace: Path | None = None,
+) -> PeriodAnalysis:
+    """Read a run's meta and log, and fold them. Writes nothing.
+
+    `open_database` never migrates, so this is safe against a run another process has open (WAL).
+    A run with no meta or no database refuses, naming the directory.
+    """
+    directory = pd.period_dir(run_id, workspace=workspace)
+    meta_path = directory / pd.PERIOD_META
+    database = directory / pd.PERIOD_DB
+    if not meta_path.is_file() or not database.is_file():
+        raise ConfigError(f"no period run {run_id!r} in {directory.parent}")
+    meta = pd.PeriodMeta.model_validate_json(meta_path.read_text(encoding="utf-8"))
+    engine = open_database(database)
+    writer = SingleWriter(engine)
+    try:
+        records = records_from_store(EventStore(engine, writer))
+    finally:
+        writer.close()
+        engine.dispose()
+    return fold_period(meta, records, scoring, panel=panel, archive_items=archive_items)
