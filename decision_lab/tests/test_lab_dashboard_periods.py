@@ -573,3 +573,19 @@ def test_a_running_jobs_period_page_does_not_refresh_its_drill_downs_shut(
         assert "refresh for progress" in page
     assert "Running, or a process died" in detail
     assert 'http-equiv="refresh"' in listing, "other pages keep their behaviour"
+
+
+def test_a_month_row_opens_in_place(paused: tuple[TestClient, Ran, Path]) -> None:
+    """Fix round 1, item 2: the mockup's month rows are the drill-down, not a second list."""
+    client, ran, workspace = paused
+    short = with_meta(workspace, ran, "short-rows", months=ran.meta.months[:1])
+    page = client.get(f"/periods/{short}").text
+
+    assert "Inside a month" not in page
+    rows = re.findall(
+        r'<details class="drill month-row"[^>]*>\s*<summary[^>]*>(.*?)</summary>', page, re.S
+    )
+    assert len(rows) == 1, "one row that ran, and it opens"
+    assert "Jan 2024" in rows[0] and "/months/2024-01" in page
+    assert page.count("not run") >= 2, "the months that never ran are still rows, and say so"
+    assert "/months/2024-02" not in page, "a month that never ran has nothing to open"

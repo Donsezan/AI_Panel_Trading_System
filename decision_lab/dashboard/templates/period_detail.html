@@ -180,40 +180,39 @@ are never combined. Long-only: standing aside from a fall while flat is correct.
 
 <section>
 <h2>Months</h2>
-<table>
-  <thead><tr><th>Month</th><th>Start → end</th><th>Net before cost</th><th>Correct</th><th>Cycles</th><th>Cost</th><th>Ended</th></tr></thead>
-  <tbody>
+{# The approved mockup's rows: each month that ran is a <details> that opens in place onto its
+   timeline and cycles, loaded when opened (fix round 1, item 2). A month that never ran is a row
+   that says so and has nothing to open; it is never a zero. #}
+{% macro month_cells(month) %}
+  {% set row = month.row %}
+  <span>{{ month.name }}</span>
+  {% if row %}
+  <span>{{ row.start_equity | money }} → {% if row.unvaluable %}<span class="warning">UNVALUABLE</span>{% else %}{{ row.end_equity | money }}{% endif %}</span>
+  <span>{% if row.unvaluable or row.start_equity is none %}{{ absent }}{% else %}{{ (row.end_equity - row.start_equity) | money }}{% endif %}</span>
+  <span>{{ month.accuracy | percent }}{% if analysed %} <small class="muted">of {{ month.graded }}</small>{% endif %}</span>
+  <span class="{{ 'warning' if row.ran_cycles < row.planned_cycles else '' }}">{{ row.ran_cycles }} / {{ row.planned_cycles }}</span>
+  <span>{{ row.cost_usd | money }}</span>
+  <span>{% if row.paused_at %}<span class="warning">⚠ Paused {{ row.paused_at | moment }}: too many losses in a row</span>{% else %}Completed{% endif %}</span>
+  {% else %}
+  <span class="muted month-gap">not run</span>
+  {% endif %}
+{% endmacro %}
+<div class="scroll"><div class="months">
+  <div class="mrow mhead"><span></span><span>Month</span><span>Start → end</span><span>Net before cost</span><span>Correct</span><span>Cycles</span><span>Cost</span><span>Ended</span></div>
   {% for month in months %}
-    {% set row = month.row %}
-    <tr>
-      <td>{{ month.name }}</td>
-      {% if row %}
-      <td>{{ row.start_equity | money }} → {% if row.unvaluable %}<span class="warning">UNVALUABLE</span>{% else %}{{ row.end_equity | money }}{% endif %}</td>
-      <td>{% if row.unvaluable or row.start_equity is none %}{{ absent }}{% else %}{{ (row.end_equity - row.start_equity) | money }}{% endif %}</td>
-      <td>{{ month.accuracy | percent }}{% if analysed %} <small class="muted">of {{ month.graded }}</small>{% endif %}</td>
-      <td class="{{ 'warning' if row.ran_cycles < row.planned_cycles else '' }}">{{ row.ran_cycles }} / {{ row.planned_cycles }}</td>
-      <td>{{ row.cost_usd | money }}</td>
-      <td>{% if row.paused_at %}<span class="warning">⚠ Paused {{ row.paused_at | moment }}: too many losses in a row</span>{% else %}Completed{% endif %}</td>
-      {% else %}
-      <td colspan="6" class="muted">not run</td>
-      {% endif %}
-    </tr>
+  {% if month.row and analysed %}
+  <details class="drill month-row" hx-get="/periods/{{ view.run_id }}/months/{{ month.label }}?{{ query }}" hx-trigger="toggle once" hx-target="find .drill-body">
+    <summary class="mrow"><span class="tw"></span>{{ month_cells(month) }}</summary>
+    <div class="drill-body"><a href="/periods/{{ view.run_id }}/months/{{ month.label }}?{{ query }}">Open {{ month.name }}</a></div>
+  </details>
+  {% else %}
+  <div class="mrow"><span></span>{{ month_cells(month) }}</div>
+  {% endif %}
   {% endfor %}
-  </tbody>
-</table>
+</div></div>
 {% if meta.abandoned_cost_usd > 0 %}
 <p class="muted">The month costs above add to {{ shown_month_cost | money }}. The run also paid
 {{ meta.abandoned_cost_usd | money }} abandoned by Continue, which the model costs above include.</p>
-{% endif %}
-
-{% if analysed %}
-<h3>Inside a month</h3>
-{% for month in months if month.row %}
-<details class="drill" hx-get="/periods/{{ view.run_id }}/months/{{ month.label }}?{{ query }}" hx-trigger="toggle once" hx-target="find .drill-body">
-  <summary>{{ month.name }} — timeline and cycles</summary>
-  <div class="drill-body"><a href="/periods/{{ view.run_id }}/months/{{ month.label }}?{{ query }}">Open {{ month.name }}</a></div>
-</details>
-{% endfor %}
 {% endif %}
 </section>
 
