@@ -109,25 +109,24 @@ def input_named(page: str, name: str) -> str:
 
 
 def test_auth_covers_every_new_route(tmp_path: Path) -> None:
-    """As `test_lab_dashboard_auth` walks the bare routes, here with the path parameters filled."""
+    """The shared walk (`test_lab_dashboard_auth`), narrowed to this router's routes."""
+    from decision_lab.tests.test_lab_dashboard_auth import filled, protected_routes
+
     client = TestClient(create_lab_dashboard(workspace=tmp_path, token=TOKEN))
-    # From the router itself: this FastAPI wraps an included router in one opaque route, so
-    # `app.routes` no longer lists the paths a walk could reach.
-    paths = [route.path for route in periods_routes.router.routes]  # type: ignore[attr-defined]
-    assert len(paths) >= 6, paths
-    for path in paths:
-        filled = (
-            path.replace("{run_id}", "r")
-            .replace("{label}", "2024-01")
-            .replace("{cycle_id}", "c")
-            .replace("{index}", "0")
-        )
-        if path.endswith(("/continue", "/run")):
-            assert client.post(filled, data={}, follow_redirects=False).status_code == 401, path
-        else:
-            response = client.get(filled, follow_redirects=False)
-            assert response.status_code == 303, path
-            assert response.headers["location"] == "/login", path
+    routes = [
+        (path, methods)
+        for path, methods, module in protected_routes(client.app)
+        if module == periods_routes.__name__
+    ]
+    assert len(routes) >= 7, routes
+    for path, methods in routes:
+        for method in methods - {"HEAD"}:
+            response = client.request(method, filled(path), follow_redirects=False)
+            if method == "GET":
+                assert response.status_code == 303, path
+                assert response.headers["location"] == "/login", path
+            else:
+                assert response.status_code == 401, path
 
 
 # ------------------------------------------------------------------------------- the form
