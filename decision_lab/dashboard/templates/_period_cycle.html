@@ -1,0 +1,89 @@
+{# One cycle (spec §4 item 7): the dispute, round by round with the blind round first; the result;
+   the market after; the grades. `decision.html`'s seat-vote tables are the base. #}
+{% set unscored_reasons = {
+  "UNSCORED (gap)": "the ATR lookback or the forward window crosses a known hole in the data",
+  "UNSCORED (horizon)": "the forward window runs past the end of the recorded history",
+  "UNSCORED (no ATR)": "the frozen snapshot carried no ATR reading for the scoring timeframe",
+} %}
+<h3>The dispute · {{ record.as_of | moment }}</h3>
+{% if not rounds %}
+<p class="empty">No seat was asked: {{ record.outcome or "no panel ran" }}.</p>
+{% endif %}
+{% for index, responses in rounds %}
+<div class="round">
+  <b>Round {{ index }}{% if index == 0 %}, blind{% else %}, debate{% endif %}</b>
+  {% if index == 0 %}<span class="muted">— seats had not seen each other's arguments</span>{% endif %}
+  <table>
+    <thead><tr><th>seat</th><th>vote</th><th>conviction</th><th>size hint</th><th>argument</th><th>abstain reason</th></tr></thead>
+    <tbody>
+    {% for response in responses %}
+      <tr>
+        <td><code>{{ response.seat_id }}</code></td>
+        <td>{{ response.vote.action.value if response.vote else absent }}</td>
+        <td>{{ response.vote.conviction | count if response.vote else absent }}</td>
+        <td>{{ response.vote.size_hint if response.vote else absent }}</td>
+        <td style="white-space:normal">{{ response.vote.thesis if response.vote else absent }}</td>
+        <td>{{ response.abstain_reason or absent }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endfor %}
+
+<h3>The result</h3>
+{% if record.decisions %}
+{% set made = record.decisions[0] %}
+<p>Final round: {% for action, number in tally | dictsort %}{{ number }} {{ action }}{% if not loop.last %}, {% endif %}{% endfor %}.
+The panel decided <strong>{{ made.action.value }}</strong>{% if made.dissent %}; dissent: {{ made.dissent | join(", ") }}{% endif %}.
+Cycle outcome: <code>{{ record.outcome or absent }}</code>.</p>
+{% if made.flags %}<p class="muted">Flags: {{ made.flags | join(", ") }}</p>{% endif %}
+{% else %}
+<p>No decision: <code>{{ record.outcome or absent }}</code>.</p>
+{% endif %}
+{% if result.vetoes %}
+<p>Refused by risk: {% for veto in result.vetoes %}<code>{{ veto }}</code>{% if not loop.last %}; {% endif %}{% endfor %}.</p>
+{% endif %}
+{% if result.orders %}
+<table>
+  <thead><tr><th>order</th><th>side</th><th>type</th><th>qty</th><th>state</th><th>filled</th><th>avg price</th></tr></thead>
+  <tbody>
+  {% for order in result.orders %}
+    <tr><td>{{ order.role }}</td><td>{{ order.side }}</td><td>{{ order.order_type }}</td><td>{{ order.qty }}</td>
+      <td>{{ order.state }}</td><td>{{ order.filled_qty }}</td><td>{{ order.avg_fill_price | money if order.avg_fill_price is not none else absent }}</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="muted">No order followed.</p>
+{% endif %}
+
+<h3>How the market performed</h3>
+{% if decision %}
+{% if after_svg %}<div style="max-width:560px">{{ after_svg | safe }}</div>{% endif %}
+<p class="muted">Grading band ±{{ decision.band | money(2) if decision.band is not none else absent }}
+({{ band_k }} × ATR from the frozen snapshot), over {{ horizon }} bars.
+Moved {{ decision.move | money(2) if decision.move is not none else absent }};
+{{ "holding" if decision.holding else "flat" }} at the time; should have:
+{{ decision.truth.value if decision.truth else absent }}.</p>
+{% else %}
+<p class="empty">This cycle carried no scored decision, so there is no grading window to show.</p>
+{% endif %}
+
+<h3>Grades</h3>
+{% if grades %}
+<table>
+  <thead><tr><th>Seat</th><th>First vote</th><th>Final vote</th><th>Grade</th></tr></thead>
+  <tbody>
+  {% for row in grades %}
+    <tr><td><code>{{ row.seat_id }}</code></td><td>{{ row.first or absent }}</td><td>{{ row.final or absent }}</td>
+      <td>{% if row.grade == "correct" %}<span class="good">✓ CORRECT</span>{% elif row.grade == "wrong" %}<span class="bad">✗ WRONG</span>{% elif row.grade == "none" %}<span class="muted">abstained</span>{% else %}<span class="muted">? unscored</span>{% endif %}</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% if decision %}
+<p>Panel: <code>{{ decision.verdict.value }}</code>{% if decision.verdict.value in unscored_reasons %} <span class="warning">— {{ unscored_reasons[decision.verdict.value] }}</span>{% endif %}</p>
+{% endif %}
+{% else %}
+<p class="empty">No seat voted on this cycle.</p>
+{% endif %}

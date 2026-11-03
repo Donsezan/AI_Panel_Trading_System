@@ -19,9 +19,12 @@ from typing import Final, TypeVar
 
 from decision_lab import analysis as an
 from decision_lab import corpus as cp
+from decision_lab import period as pd
 from decision_lab import sweep as sw
 from decision_lab.candidates import Matrix
+from decision_lab.newsfeed import ArchiveNewsFeed
 from tradebot.core.clock import Clock
+from tradebot.core.config import PanelConfig
 
 #: Entries kept. Small deliberately: each holds a price index over the whole dataset.
 MAX_ENTRIES: Final = 4
@@ -38,6 +41,7 @@ class AnalysisCache:
         self._clock = clock
         self._scoring: OrderedDict[str, an.Scoring] = OrderedDict()
         self._analysis: OrderedDict[str, an.MatrixAnalysis] = OrderedDict()
+        self._periods: OrderedDict[str, an.PeriodAnalysis] = OrderedDict()
         self._lock = asyncio.Lock()
 
     async def scoring_for(self, data_dir: Path) -> an.Scoring:
@@ -65,9 +69,43 @@ class AnalysisCache:
                 self._store(self._analysis, key, found)
             return scoring, found
 
+    async def period_analysis(
+        self,
+        run_id: str,
+        scoring: an.Scoring,
+        *,
+        panel: PanelConfig,
+        archive: ArchiveNewsFeed | None,
+        workspace: Path | None,
+    ) -> an.PeriodAnalysis:
+        """One period run, re-read whenever its meta or its log has moved (a running job).
+
+        Keyed on the panel and the archive as well, because both are inputs to the fold: the same
+        run read with a different archive answers a different news question.
+        """
+        stamp = _period_stamp(run_id, workspace=workspace)
+        key = "|".join(
+            (
+                run_id,
+                stamp,
+                scoring.params.digest(),
+                panel.model_dump_json(),
+                archive.digest if archive is not None else "-",
+            )
+        )
+        async with self._lock:
+            found = self._periods.get(key)
+            if found is None:
+                found = an.analyse_period(
+                    run_id, scoring, panel=panel, archive=archive, workspace=workspace
+                )
+                self._store(self._periods, key, found)
+            return found
+
     def clear(self) -> None:
         self._scoring.clear()
         self._analysis.clear()
+        self._periods.clear()
 
     @staticmethod
     def _store(store: OrderedDict[str, _V], key: str, value: _V) -> None:
@@ -100,4 +138,18 @@ def _rows_stamp(
             parts.append(f"{candidate.candidate_id}:-")
         else:
             parts.append(f"{candidate.candidate_id}:{stat.st_size}:{stat.st_mtime_ns}")
+    return "|".join(parts)
+
+
+def _period_stamp(run_id: str, *, workspace: Path | None) -> str:
+    """The meta, the log and its WAL, by size and modification time, as `_rows_stamp` does."""
+    directory = pd.period_dir(run_id, workspace=workspace)
+    parts = []
+    for name in (pd.PERIOD_META, pd.PERIOD_DB, f"{pd.PERIOD_DB}-wal"):
+        try:
+            stat = (directory / name).stat()
+        except FileNotFoundError:
+            parts.append(f"{name}:-")
+        else:
+            parts.append(f"{name}:{stat.st_size}:{stat.st_mtime_ns}")
     return "|".join(parts)

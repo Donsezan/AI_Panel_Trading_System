@@ -1,0 +1,7 @@
+{% extends "base.html" %}
+{# A drill-down reached without htmx: the same fragment, inside the page shell. #}
+{% block title %}decision_lab — {{ part_title }}{% endblock %}
+{% block content %}
+{% if view is defined and view %}<p><a href="/periods/{{ view.run_id }}?{{ query if query is defined else '' }}">&larr; back to the period</a></p>{% endif %}
+{% include part %}
+{% endblock %}

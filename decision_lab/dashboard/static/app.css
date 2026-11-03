@@ -13,6 +13,8 @@
   --warning: #8a5a00;
   --warning-bg: #fff3d6;
   --busy-bg: #eef3fb;
+  --good: #14753f;
+  --bad: #b42318;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -26,6 +28,8 @@
     --warning: #e0b23c;
     --warning-bg: #3a2f00;
     --busy-bg: #16233a;
+    --good: #55c98a;
+    --bad: #f0837a;
   }
 }
 
@@ -144,3 +148,52 @@ button {
   border-color: var(--accent);
   font-weight: 600;
 }
+
+/* The period page (period spec §4): profit first, drill-downs as <details>, charts as inline SVG. */
+
+.good { color: var(--good); }
+.bad { color: var(--bad); }
+.muted { color: var(--muted); }
+
+.stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+  gap: 0.6rem;
+  margin: 1rem 0;
+}
+
+.stat {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.6rem 0.75rem;
+}
+
+.stat b {
+  display: block;
+  font-size: 1.25rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.stat small { color: var(--muted); display: block; }
+
+.scroll { overflow-x: auto; }
+
+svg.chart { display: block; max-width: 100%; height: auto; }
+svg.chart.lanes { max-width: none; }
+svg.chart text { fill: var(--muted); font: 11px system-ui, "Segoe UI", sans-serif; }
+svg.chart text.strong { fill: var(--fg); font-weight: 600; }
+svg.chart .grid { stroke: var(--border); }
+svg.chart .line { fill: none; stroke: var(--accent); stroke-width: 2; }
+svg.chart .dot { fill: var(--accent); stroke: var(--bg); stroke-width: 2; }
+svg.chart .band { fill: var(--border); opacity: 0.55; }
+svg.chart .decision { stroke: var(--fg); stroke-dasharray: 3 3; }
+
+details.drill { border-bottom: 1px solid var(--border); }
+details.drill > summary { cursor: pointer; padding: 0.4rem 0.25rem; }
+details.drill > summary:hover { background: var(--busy-bg); }
+.drill-body { padding: 0.25rem 0 0.75rem 1.25rem; }
+
+.round { border-left: 3px solid var(--border); padding: 0.1rem 0 0.1rem 0.6rem; margin: 0.4rem 0; }
+.news-later { border-left: 3px dashed var(--warning); padding-left: 0.6rem; }
+form.inline { display: inline; }
+form.inline label { display: inline-block; margin-right: 0.75rem; }

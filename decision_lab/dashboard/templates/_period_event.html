@@ -1,0 +1,78 @@
+{# One spike event (spec §7.3). The move is its own signed price change: a merged event can
+   retrace, so its sign is printed as it is, never assumed from its direction. #}
+<h3>The move</h3>
+<p>{{ {"SHOCK_UP": "↑ spike up", "SHOCK_DOWN": "↓ spike down"}.get(event.direction.value) }}
+from {{ event.start | moment }} to {{ event.end | moment }}; price change
+<strong>{{ "+" if event.move_pct > 0 else "" }}{{ event.move_pct | money(2) }}%</strong>, peak
+volatility {{ event.peak_volatility | money(4) }}{% if event.window_name %}; named window
+<em>{{ event.window_name }}</em>{% endif %}.</p>
+{% if lanes_svg %}
+<div class="scroll">{{ lanes_svg | safe }}</div>
+<p class="muted">From 48 hours before the event to 48 hours after, price above each seat's final vote.</p>
+{% endif %}
+
+<h3>Each seat's calls through it</h3>
+{% if clipped %}<p class="warning">The lead-in reaches back past the period's start, so it is cut short.</p>{% endif %}
+{% for name, calls in stretches %}
+<h4>{{ name }}</h4>
+{% if not calls %}
+<p class="empty">No decision in this stretch.</p>
+{% else %}
+<table>
+  <thead><tr><th>decision</th><th>regime</th><th>panel</th><th>verdict</th>
+    {% for seat in view.panel_seats %}<th>{{ seat }}</th>{% endfor %}</tr></thead>
+  <tbody>
+  {% for decision, seats in calls %}
+    <tr>
+      <td><a href="/periods/{{ view.run_id }}/cycles/{{ decision.cycle_id }}">{{ decision.as_of | moment }}</a></td>
+      <td>{{ decision.regime.value }}</td>
+      <td>{{ decision.action.value }}</td>
+      <td>{{ decision.verdict.value }}</td>
+      {% for call in seats %}
+      <td style="white-space:normal" title="{{ call.thesis }}">
+        {{ call.action or "abstained" }}
+        {% if call.grade == "correct" %}<span class="good">✓</span>{% elif call.grade == "wrong" %}<span class="bad">✗</span>{% elif call.grade == "unscored" %}<span class="muted">?</span>{% endif %}
+        {% if call.thesis %}<br><small class="muted">{{ call.thesis }}</small>{% endif %}
+      </td>
+      {% endfor %}
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+{% endfor %}
+<p class="muted">The lead-in answers "did it predict": a decision taken just before a spike is
+labelled NORMAL yet is graded on the spike. ✓ means the seat's final vote was right for the move
+that followed, long-only.</p>
+
+<h3>The news</h3>
+{% if view.meta.news_blind %}
+<p class="warning">NEWS-BLIND: the seats had no news, so this says nothing about reading it.</p>
+{% else %}
+{% if not news.covered %}
+<p class="warning">Outside news coverage: no source measured the whole lead-in and the event, so an
+empty list here is not a quiet market.</p>
+{% endif %}
+<h4>What the panel could see</h4>
+{% if not news.could_see %}
+<p class="empty">The snapshots in the lead-in and the event served no news item.</p>
+{% else %}
+<ul>
+{% for item in news.could_see %}
+  <li>{{ item.observed_at | moment }} · {{ item.source }} · <strong>{{ item.title }}</strong> — {{ item.summary }}</li>
+{% endfor %}
+</ul>
+{% endif %}
+<div class="news-later">
+<h4>Published later — not evidence the panel had</h4>
+{% if not news.published_later %}
+<p class="empty">Nothing in the archive was published after the event's last decision and within 48 hours of its end.</p>
+{% else %}
+<ul>
+{% for item in news.published_later %}
+  <li>{{ item.observed_at | moment }} · <strong>{{ item.title }}</strong> — {{ item.summary }}</li>
+{% endfor %}
+</ul>
+{% endif %}
+</div>
+{% endif %}

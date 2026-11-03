@@ -28,6 +28,7 @@ from decision_lab.dashboard.auth import (
 from decision_lab.dashboard.cache import AnalysisCache
 from decision_lab.dashboard.routes import jobs as jobs_routes
 from decision_lab.dashboard.routes import matrices as matrices_routes
+from decision_lab.dashboard.routes import periods as periods_routes
 from decision_lab.dashboard.routes import runs as runs_routes
 from decision_lab.dashboard.views import PACKAGE, LabState, build_templates, render, state_of
 from tradebot.core.clock import Clock, SystemClock
@@ -61,6 +62,7 @@ def create_lab_dashboard(
     app.include_router(runs_routes.router)
     app.include_router(matrices_routes.router)
     app.include_router(jobs_routes.router)
+    app.include_router(periods_routes.router)
     _add_session_routes(app)
     return app
 

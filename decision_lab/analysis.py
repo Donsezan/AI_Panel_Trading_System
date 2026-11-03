@@ -16,7 +16,7 @@ skipped rather than raising (§12.2).
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
@@ -38,6 +38,8 @@ from decision_lab.spikes import LEAD_IN, EventNews, SpikeEvent, find_events, new
 from tradebot.core.clock import Clock
 from tradebot.core.config import PanelConfig
 from tradebot.core.errors import ConfigError
+from tradebot.core.events import EventType
+from tradebot.core.money import ZERO, to_decimal
 from tradebot.marketdata.recorder import ReplayDataset
 from tradebot.persistence.database import SingleWriter, open_database
 from tradebot.persistence.store import EventStore
@@ -240,6 +242,93 @@ def analyse_matrix(
 
 
 @dataclass(frozen=True, slots=True)
+class OrderNote:
+    """One order a cycle placed, as the log last knew it: the state it reached and what filled."""
+
+    client_order_id: str
+    instrument_key: str
+    role: str
+    side: str
+    order_type: str
+    qty: Decimal
+    state: str
+    filled_qty: Decimal = ZERO
+    avg_fill_price: Decimal | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CycleResult:
+    """What came of one cycle's decision (spec §4 item 7): its orders and the rules that refused."""
+
+    orders: tuple[OrderNote, ...] = ()
+    #: `rule: detail`, one per refusing check, in the order the engine recorded them.
+    vetoes: tuple[str, ...] = ()
+
+
+def cycle_results(store: EventStore) -> dict[str, CycleResult]:
+    """Fold each cycle's orders (to their latest state) and its vetoes out of the log.
+
+    An order belongs to the cycle that created it; a later state change or fill, which another
+    cycle's poll may have booked, still lands on that order. A refusal is a `RISK_CHECKED` that was
+    not approved, reported by the rules whose decision was a veto.
+    """
+    orders: dict[str, dict[str, object]] = {}
+    owner: dict[str, str] = {}
+    vetoes: dict[str, list[str]] = {}
+    for event in store.read_types(
+        EventType.ORDER_SUBMITTED,
+        EventType.ORDER_STATE_CHANGED,
+        EventType.FILL_RECEIVED,
+        EventType.RISK_CHECKED,
+    ):
+        payload = event.payload
+        if event.type is EventType.ORDER_SUBMITTED:
+            order = payload["order"]
+            orders[order["client_order_id"]] = dict(order)
+            owner[order["client_order_id"]] = order["cycle_id"]
+        elif event.type is EventType.ORDER_STATE_CHANGED:
+            if event.aggregate_id in orders:
+                orders[event.aggregate_id]["state"] = payload["state"]
+        elif event.type is EventType.FILL_RECEIVED:
+            if event.aggregate_id in orders:
+                orders[event.aggregate_id].update(
+                    state=payload["order_state"],
+                    filled_qty=payload["filled_qty"],
+                    avg_fill_price=payload["avg_fill_price"],
+                )
+        elif not payload.get("approved", True) and event.cycle_id:
+            vetoes.setdefault(event.cycle_id, []).extend(
+                f"{check['rule']}: {check.get('detail', '')}".rstrip(": ")
+                for check in payload.get("checks", ())
+                if check.get("decision") == "veto"
+            )
+    notes: dict[str, list[OrderNote]] = {}
+    for order_id, order in orders.items():
+        filled = to_decimal(str(order.get("filled_qty") or "0"))
+        price = order.get("avg_fill_price")
+        notes.setdefault(owner[order_id], []).append(
+            OrderNote(
+                client_order_id=order_id,
+                instrument_key=str(order["instrument_key"]),
+                role=str(order.get("role", "")),
+                side=str(order["side"]),
+                order_type=str(order["order_type"]),
+                qty=to_decimal(str(order["qty"])),
+                state=str(order.get("state", "")),
+                filled_qty=filled,
+                # A fill's average is meaningless until something filled.
+                avg_fill_price=to_decimal(str(price))
+                if price not in (None, "None") and filled
+                else None,
+            )
+        )
+    return {
+        cycle: CycleResult(orders=tuple(notes.get(cycle, ())), vetoes=tuple(vetoes.get(cycle, ())))
+        for cycle in {*notes, *vetoes}
+    }
+
+
+@dataclass(frozen=True, slots=True)
 class PeriodAnalysis:
     """One period run, folded and scored: the single answer the page, the report and the notebook
     all read (period spec §5.6, §7; `render.write_period` is the CLI's door onto it).
@@ -263,6 +352,9 @@ class PeriodAnalysis:
     seat_trend: Mapping[str, Mapping[str, Decimal | None]]
     #: Cycles a substituted model answered in. Never scored; their trades still happened (§5.6).
     contaminated: int
+    #: cycle id -> its orders and refusals. A cycle absent here placed nothing and was refused
+    #: nothing, which is what `CycleResult()` says.
+    outcomes: Mapping[str, CycleResult] = field(default_factory=dict)
 
     @property
     def running(self) -> bool:
@@ -316,6 +408,7 @@ def fold_period(
     *,
     panel: PanelConfig,
     archive: ArchiveNewsFeed | None,
+    outcomes: Mapping[str, CycleResult] | None = None,
 ) -> PeriodAnalysis:
     """Score a run's cycles. Split from the database read so a test can hand it doctored records."""
     # Contamination is read off `SeatResponse.fingerprint` exactly as the sweep reads it (§7.7).
@@ -372,6 +465,7 @@ def fold_period(
         by_month=by_month,
         seat_trend=_seat_trend(clean, scored, panel=panel, buckets=_buckets(meta.period)),
         contaminated=len(records) - len(clean),
+        outcomes=dict(outcomes or {}),
     )
 
 
@@ -404,8 +498,10 @@ def analyse_period(
     engine = open_database(database)
     writer = SingleWriter(engine)
     try:
-        records = records_from_store(EventStore(engine, writer))
+        store = EventStore(engine, writer)
+        records = records_from_store(store)
+        outcomes = cycle_results(store)
     finally:
         writer.close()
         engine.dispose()
-    return fold_period(meta, records, scoring, panel=panel, archive=archive)
+    return fold_period(meta, records, scoring, panel=panel, archive=archive, outcomes=outcomes)

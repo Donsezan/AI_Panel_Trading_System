@@ -299,3 +299,17 @@ def _with(
         meta=meta or result.meta,
         contaminated=result.contaminated if contaminated is None else contaminated,
     )
+
+
+async def test_each_cycle_says_what_came_of_its_decision(
+    scenarios: Scenarios, flat_data: Path
+) -> None:
+    """Spec §4 item 7, "the result": whether an order followed, and what happened to it."""
+    _ran, result = await analysed(scenarios, flat_data)
+    bought = next(r for r in result.records if r.as_of == datetime(2024, 1, 10, tzinfo=UTC))
+    vetoed = next(r for r in result.records if r.as_of == datetime(2024, 1, 22, tzinfo=UTC))
+
+    entry = next(o for o in result.outcomes[bought.cycle_id].orders if o.role == "entry")
+    assert entry.side == "buy" and entry.filled_qty > 0 and entry.avg_fill_price is not None
+    assert result.outcomes[vetoed.cycle_id].vetoes, "the paused BUY names the rule that refused it"
+    assert not result.outcomes[vetoed.cycle_id].orders

@@ -1341,7 +1341,7 @@ async def evaluate_period(args: argparse.Namespace) -> int:
         # already spent is counted against the ceiling inside `run`, which is the check that
         # knows. `run` refuses a Continue with nothing to continue, so the exemption cannot be
         # used to start a fresh run past this check.
-        projected = _projected_cost(loaded.record, candidate.candidate_id, period, cadence)
+        projected = pd.projected_cost(loaded.record, candidate.candidate_id, period, cadence)
         if projected is not None and projected > args.budget and not args.resume:
             logger.error(
                 "period run refused; nothing was spent",
@@ -1462,21 +1462,6 @@ async def evaluate_period(args: argparse.Namespace) -> int:
         return EXIT_BUDGET if meta.budget_stopped else EXIT_DATASET
     # A finished run whose page is incomplete is not a clean result: a script must see that.
     return EXIT_DATASET if incomplete else EXIT_OK
-
-
-def _projected_cost(
-    record: gate.GateRecord | None, candidate_id: str, period: pd.Period, cadence_seconds: int
-) -> Money | None:
-    """The gate's measured cost per cycle times the cycles the period plans (§5.5)."""
-    if record is None or record.normal is None:
-        return None
-    found = next(
-        (one for one in record.normal.candidates if one.candidate_id == candidate_id), None
-    )
-    if found is None:
-        return None
-    planned = (period.end - period.start) // timedelta(seconds=cadence_seconds)
-    return found.cost_per_cycle * planned
 
 
 def _snapshot_accuracy(record: gate.GateRecord | None, candidate_id: str) -> Money | None:

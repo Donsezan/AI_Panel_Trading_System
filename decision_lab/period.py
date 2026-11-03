@@ -62,6 +62,7 @@ from decision_lab import registry
 from decision_lab.candidates import Candidate
 from decision_lab.corpus import config_digest
 from decision_lab.dataset import CoverageAudit, require_verified
+from decision_lab.gate import GateRecord
 from decision_lab.longrun import Profit, ProfitEvidence, VetoRow, profit_of, veto_breakdown
 from decision_lab.newsfeed import ArchiveNewsFeed
 from decision_lab.params import workspace_root
@@ -306,6 +307,25 @@ def not_run_months(meta: PeriodMeta) -> tuple[str, ...]:
     """
     reached = {month.label for month in meta.months}
     return tuple(month.label for month in meta.period.months if month.label not in reached)
+
+
+def projected_cost(
+    record: GateRecord | None, candidate_id: str, period: Period, cadence_seconds: int
+) -> Decimal | None:
+    """The gate's measured cost per cycle times the cycles the period plans (§5.5).
+
+    `None` when there is nothing to project from, which a page says rather than showing a zero
+    that reads as free. Shared by the CLI and the dashboard so the two quote one number.
+    """
+    if record is None or record.normal is None:
+        return None
+    found = next(
+        (one for one in record.normal.candidates if one.candidate_id == candidate_id), None
+    )
+    if found is None:
+        return None
+    planned = (period.end - period.start) // timedelta(seconds=cadence_seconds)
+    return found.cost_per_cycle * planned
 
 
 def period_dir(run_id: str, *, workspace: Path | None = None) -> Path:
