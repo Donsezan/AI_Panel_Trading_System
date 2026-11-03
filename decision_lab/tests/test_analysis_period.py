@@ -326,3 +326,29 @@ def test_fold_period_requires_the_cycle_results() -> None:
 
     parameter = inspect.signature(analysis.fold_period).parameters["outcomes"]
     assert parameter.default is inspect.Parameter.empty
+
+
+async def test_each_seat_has_its_summary_on_the_analysis(
+    scenarios: Scenarios, flat_data: Path
+) -> None:
+    """Fix round 1, item 7: a notebook reads the same seat figures the page shows."""
+    _ran, result = await analysed(scenarios, flat_data)
+    seat_ids = [seat.seat_id for seat in candidate_over(flat_data, 2).panel.seats]
+    assert list(result.seat_summary) == seat_ids
+    for seat_id, summary in result.seat_summary.items():
+        finals = [s for s in result.seats if s.seat_id == seat_id and s.round_label == st.FINAL]
+        scored = sum(s.scored for s in finals)
+        assert summary.final == sc.ratio(sum(s.correct for s in finals), scored)
+        assert list(summary.by_regime) == [p.value for p in Pool]
+        for pool in Pool:
+            rows = [s for s in finals if s.regime == pool.value]
+            graded = sum(s.scored for s in rows)
+            expected = sc.ratio(sum(s.correct for s in rows), graded) if graded else None
+            # None where the seat was never graded: unknown, never zero.
+            assert summary.by_regime[pool.value] == expected, pool
+        assert summary.changed is not None and Decimal(0) <= summary.changed <= Decimal(1)
+    ungraded = [row.regime for row in result.regimes if row.scored == 0]
+    for ungraded_pool in ungraded:
+        assert all(one.by_regime[ungraded_pool] is None for one in result.seat_summary.values()), (
+            ungraded_pool
+        )

@@ -40,7 +40,6 @@ from decision_lab import dataset as ds
 from decision_lab import gate, jobs, matrices
 from decision_lab import period as pd
 from decision_lab import scoring as sc
-from decision_lab import seats as st
 from decision_lab.archive.config import DEFAULT_POLICY_FILE, load_policy
 from decision_lab.corpus import config_digest
 from decision_lab.dashboard import charts
@@ -587,19 +586,13 @@ def regime_rows(view: RunView) -> tuple[RegimeRow, ...]:
     rows = []
     for key, name, question in REGIME_ROWS:
         metrics = by_key.get(key, sc.RegimeMetrics(regime=key))
-        seat_cells = []
-        for seat_id in view.panel_seats:
-            found = next(
-                (
-                    s
-                    for s in analysed.seats
-                    if s.seat_id == seat_id and s.regime == key and s.round_label == st.FINAL
-                ),
-                None,
-            )
-            seat_cells.append(
-                sc.ratio(found.correct, found.scored) if found and found.scored else None
-            )
+        # Read off the analysis (fix round 1, item 7): the page formats, it never derives.
+        seat_cells = [
+            analysed.seat_summary[seat_id].by_regime.get(key)
+            if seat_id in analysed.seat_summary
+            else None
+            for seat_id in view.panel_seats
+        ]
         rows.append(
             RegimeRow(
                 key=key,
@@ -624,29 +617,8 @@ class SeatRow:
     trend: tuple[Decimal | None, ...]
 
 
-def _accuracy(rows: Iterable[st.SeatMetrics]) -> Decimal | None:
-    listed = list(rows)
-    scored = sum(r.scored for r in listed)
-    return sc.ratio(sum(r.correct for r in listed), scored) if scored else None
-
-
-def changed_votes(records: Iterable[CycleRecord], seat_id: str) -> Decimal | None:
-    """How often a seat's final vote differs from its blind one, over cycles it voted in both."""
-    voted = changed = 0
-    for record in records:
-        for decision in record.decisions:
-            first = _vote_of(record.round_zero_for(decision.instrument_key), seat_id)
-            last = _vote_of(record.final_round_for(decision.instrument_key), seat_id)
-            if first is None or last is None:
-                continue
-            voted += 1
-            changed += first != last
-    return sc.ratio(changed, voted) if voted else None
-
-
-def _vote_of(responses: Sequence[SeatResponse], seat_id: str) -> str | None:
-    found = next((r for r in responses if r.seat_id == seat_id), None)
-    return found.vote.action.value if found is not None and found.vote is not None else None
+#: One reading of a seat's vote out of a round, shared with the analysis that counts them.
+_vote_of = an.vote_of
 
 
 def seat_rows(view: RunView) -> tuple[tuple[str, ...], tuple[SeatRow, ...]]:
@@ -656,16 +628,13 @@ def seat_rows(view: RunView) -> tuple[tuple[str, ...], tuple[SeatRow, ...]]:
     rows = tuple(
         SeatRow(
             seat_id=seat_id,
-            final=_accuracy(
-                s for s in analysed.seats if s.seat_id == seat_id and s.round_label == st.FINAL
-            ),
-            first=_accuracy(
-                s for s in analysed.seats if s.seat_id == seat_id and s.round_label == st.ROUND_ZERO
-            ),
-            changed=changed_votes(analysed.records, seat_id),
+            final=summary.final if summary else None,
+            first=summary.first if summary else None,
+            changed=summary.changed if summary else None,
             trend=tuple(analysed.seat_trend.get(seat_id, {}).get(b) for b in buckets),
         )
         for seat_id in view.panel_seats
+        for summary in (analysed.seat_summary.get(seat_id),)
     )
     return buckets, rows
 

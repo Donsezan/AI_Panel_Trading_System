@@ -37,6 +37,7 @@ from decision_lab.render import CandidateSeats, NewsProvenance, NotMeasured
 from decision_lab.spikes import LEAD_IN, EventNews, SpikeEvent, find_events, news_for
 from tradebot.core.clock import Clock
 from tradebot.core.config import PanelConfig
+from tradebot.core.decision import SeatResponse
 from tradebot.core.errors import ConfigError
 from tradebot.core.events import EventType
 from tradebot.core.money import ZERO, to_decimal
@@ -329,6 +330,62 @@ def cycle_results(store: EventStore) -> dict[str, CycleResult]:
 
 
 @dataclass(frozen=True, slots=True)
+class SeatSummary:
+    """One seat over the whole run, as the page's tables show it. `None` is "not measured"."""
+
+    #: Accuracy of the final vote and of the blind (round 0) vote, over every regime.
+    final: Decimal | None
+    first: Decimal | None
+    #: How often its final vote differs from its blind one, over cycles it voted in both.
+    changed: Decimal | None
+    #: Final-vote accuracy per pool, all three always present, never pooled (§7.2).
+    by_regime: Mapping[str, Decimal | None]
+
+
+def _accuracy(rows: Sequence[st.SeatMetrics]) -> Decimal | None:
+    scored = sum(r.scored for r in rows)
+    return sc.ratio(sum(r.correct for r in rows), scored) if scored else None
+
+
+def vote_of(responses: Sequence[SeatResponse], seat_id: str) -> str | None:
+    """A seat's action in one round, or `None` if it abstained or was not asked."""
+    found = next((r for r in responses if r.seat_id == seat_id), None)
+    return found.vote.action.value if found is not None and found.vote is not None else None
+
+
+def changed_votes(records: Sequence[CycleRecord], seat_id: str) -> Decimal | None:
+    """How often a seat's final vote differs from its blind one, over cycles it voted in both."""
+    voted = changed = 0
+    for record in records:
+        for decision in record.decisions:
+            first = vote_of(record.round_zero_for(decision.instrument_key), seat_id)
+            last = vote_of(record.final_round_for(decision.instrument_key), seat_id)
+            if first is None or last is None:
+                continue
+            voted += 1
+            changed += first != last
+    return sc.ratio(changed, voted) if voted else None
+
+
+def seat_summaries(
+    records: Sequence[CycleRecord], seats: Sequence[st.SeatMetrics], *, panel: PanelConfig
+) -> dict[str, SeatSummary]:
+    """Every seat of the panel, in seat order, whether or not it was ever measured."""
+    pools = [pool.value for pool in Pool]
+    out = {}
+    for seat in panel.seats:
+        mine = [s for s in seats if s.seat_id == seat.seat_id]
+        finals = [s for s in mine if s.round_label == st.FINAL]
+        out[seat.seat_id] = SeatSummary(
+            final=_accuracy(finals),
+            first=_accuracy([s for s in mine if s.round_label == st.ROUND_ZERO]),
+            changed=changed_votes(records, seat.seat_id),
+            by_regime={pool: _accuracy([s for s in finals if s.regime == pool]) for pool in pools},
+        )
+    return out
+
+
+@dataclass(frozen=True, slots=True)
 class PeriodAnalysis:
     """One period run, folded and scored: the single answer the page, the report and the notebook
     all read (period spec §5.6, §7; `render.write_period` is the CLI's door onto it).
@@ -355,6 +412,8 @@ class PeriodAnalysis:
     #: cycle id -> its orders and refusals. A cycle absent here placed nothing and was refused
     #: nothing, which is what `CycleResult()` says.
     outcomes: Mapping[str, CycleResult] = field(default_factory=dict)
+    #: seat -> its figures over the run (fix round 1, item 7), so the page only formats them.
+    seat_summary: Mapping[str, SeatSummary] = field(default_factory=dict)
 
     @property
     def running(self) -> bool:
@@ -454,11 +513,12 @@ def fold_period(
     )
 
     pools = {pool.value for pool in Pool}
+    seat_rows = st.score_seats(clean, scored, panel=panel) if scored else ()
     return PeriodAnalysis(
         meta=meta,
         records=tuple(records),
         scored=scored,
-        seats=st.score_seats(clean, scored, panel=panel) if scored else (),
+        seats=seat_rows,
         regimes=tuple(row for row in sc.by_regime(scored) if row.regime in pools),
         events=events,
         event_news=event_news,
@@ -466,6 +526,7 @@ def fold_period(
         seat_trend=_seat_trend(clean, scored, panel=panel, buckets=_buckets(meta.period)),
         contaminated=len(records) - len(clean),
         outcomes=dict(outcomes),
+        seat_summary=seat_summaries(clean, seat_rows, panel=panel),
     )
 
 
