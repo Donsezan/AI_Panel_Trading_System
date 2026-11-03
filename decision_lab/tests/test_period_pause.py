@@ -193,6 +193,7 @@ async def execute(
     resume: bool = False,
     candidate: Candidate | None = None,
     news_feed: ArchiveNewsFeed | None = None,
+    matrix_source: str = "",
 ) -> Ran:
     if resume:
         # A real Continue is a new process. Here a caught exception's frames keep the dead wiring's
@@ -222,6 +223,7 @@ async def execute(
             workspace=workspace,
             resume=resume,
             news_feed=news_feed,
+            **({"matrix_source": matrix_source} if matrix_source else {}),
         )
     return Ran(meta, pd.period_dir(meta.run_id, workspace=workspace) / pd.PERIOD_DB, plan)
 

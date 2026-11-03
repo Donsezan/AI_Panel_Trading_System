@@ -42,6 +42,7 @@ from decision_lab import period as pd
 from decision_lab import scoring as sc
 from decision_lab import seats as st
 from decision_lab.archive.config import DEFAULT_POLICY_FILE, load_policy
+from decision_lab.corpus import config_digest
 from decision_lab.dashboard import charts
 from decision_lab.dashboard.views import render, state_of
 from decision_lab.newsfeed import ArchiveNewsFeed, load_feed
@@ -367,32 +368,52 @@ class RunView:
     scoring: an.Scoring | None = None
 
 
-def _candidate_files(configs: str, workspace: Path | None) -> Iterable[Path]:
-    """Where a run's seat set may be: the URL's, then every stored version, then the shipped."""
+def _candidate_files(meta: pd.PeriodMeta, configs: str, workspace: Path | None) -> Iterable[Path]:
+    """Where a run's seat set may be: the file it recorded, the URL's, every stored version, then
+    the shipped templates (fix round 1, item 3)."""
+    if meta.matrix_source:
+        yield Path(meta.matrix_source)
     if configs:
         yield Path(configs)
     for name in matrices.names(workspace=workspace):
         for version in reversed(matrices.versions(name, workspace=workspace)):
             yield matrices.path_for(name, version, workspace=workspace)
-    yield from sorted(matrices.CONFIG_DIR.glob("*.toml"))
+    yield from (matrices.CONFIG_DIR / f"{name}.toml" for name in matrices.templates())
+
+
+def _is_this_run(
+    meta: pd.PeriodMeta, matrix: cd.Matrix, candidate: cd.Candidate, dataset: ReplayDataset
+) -> bool:
+    """The candidate this run ran: its id, its whole basket and, when recorded, its matrix.
+
+    Never the panel alone. A seat set edited since the run, or one whose candidate carries the same
+    seats under another risk limit, would read this run's votes against a basket that did not run.
+    """
+    if candidate.candidate_id != meta.candidate_id:
+        return False
+    if meta.matrix_digest and matrix.matrix_digest != meta.matrix_digest:
+        return False
+    basket = pd.period_basket(candidate, dataset, meta.cadence_seconds)
+    return config_digest(basket) == meta.basket_digest
 
 
 def _find_panel(
-    meta: pd.PeriodMeta, dataset: ReplayDataset, configs: str, workspace: Path | None
+    meta: pd.PeriodMeta, dataset: ReplayDataset, configs: str, request: Request
 ) -> tuple[cd.Candidate | None, str]:
-    """The candidate whose panel this run ran, matched on `panel_digest`, and the file it is in.
-
-    The digest, never the name alone: a seat set edited since the run has a candidate of the same
-    id and different seats, and reading the run's votes against it would grade the wrong panel.
-    """
+    """The run's own candidate, and the file it was found in, or `None` and no file."""
+    state = state_of(request)
     reference = _reference(dataset, meta.cadence_seconds)
-    for path in _candidate_files(configs, workspace):
-        try:
-            matrix = cd.load_matrix(path, reference=reference)
-        except (ConfigError, OSError):
+    reference_key = f"{meta.dataset_digest}|{meta.cadence_seconds}"
+    seen: set[Path] = set()
+    for path in _candidate_files(meta, configs, state.workspace):
+        if path in seen:
+            continue
+        seen.add(path)
+        matrix = state.cache.matrix_for(path, reference=reference, reference_key=reference_key)
+        if matrix is None:
             continue
         for one in matrix.candidates:
-            if one.candidate_id == meta.candidate_id and one.panel_digest == meta.panel_digest:
+            if _is_this_run(meta, matrix, one, dataset):
                 return one, str(path)
     return None, ""
 
@@ -426,20 +447,21 @@ async def run_view(
     if entry.meta is None:
         return RunView(run_id=run_id, meta=None, problem=entry.problem, configs=configs)
     meta = entry.meta
-    sources = sources_of(news_source)
+    # The URL may override the recorded sources; the digest check below holds either way.
+    sources = sources_of(news_source) or meta.news_sources
     # §8's ruling: a page read is one boundary where anything may fail (a moved dataset, a
     # corrupt row, a log mid-write); the run's own record is still worth showing, so this catches
     # broadly and says why, exactly as the CLI's page does.
     try:
         scoring = await state.cache.scoring_for(Path(meta.dataset_directory))
-        candidate, found_in = _find_panel(meta, scoring.dataset, configs, state.workspace)
+        candidate, found_in = _find_panel(meta, scoring.dataset, configs, request)
         if candidate is None:
             return RunView(
                 run_id=run_id,
                 meta=meta,
                 incomplete=(
-                    f"the seat set this run ran (candidate {meta.candidate_id}, panel "
-                    f"{meta.panel_digest}) is not on file: name its TOML in the form above"
+                    f"the seat set this run ran (candidate {meta.candidate_id}, basket "
+                    f"{meta.basket_digest}) is not on file: name its TOML as configs"
                 ),
                 configs=configs,
                 sources=sources,

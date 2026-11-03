@@ -11,6 +11,7 @@ import re
 import shutil
 import warnings
 from collections.abc import Iterator
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -48,14 +49,42 @@ def client_over(workspace: Path) -> TestClient:
     return client
 
 
+def limit_of_two(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Load every seat set as the scenarios' candidates were built: a loss limit of two.
+
+    A matrix cannot express a risk limit, and the page matches a run's candidate on the whole
+    basket it ran (fix round 1, item 3), so without this no file on disk is the scenarios' basket.
+    """
+    from decision_lab import candidates as cd
+    from decision_lab.tests.test_period_run import with_loss_limit
+
+    real = cd.load_matrix
+
+    def limited(path: Path, *, reference: object) -> cd.Matrix:
+        matrix = real(path, reference=reference)  # type: ignore[arg-type]
+        return replace(
+            matrix, candidates=tuple(with_loss_limit(one, 2) for one in matrix.candidates)
+        )
+
+    monkeypatch.setattr(cd, "load_matrix", limited)
+
+
+def copied(ran: Ran, tmp_path: Path) -> Path:
+    workspace = tmp_path / "workspace"
+    shutil.copytree(ran.database.parent.parent, workspace)
+    return workspace
+
+
 @pytest.fixture
-def paused(scenarios: Scenarios, tmp_path: Path) -> Iterator[tuple[TestClient, Ran, Path]]:
+def paused(
+    scenarios: Scenarios, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[tuple[TestClient, Ran, Path]]:
     """A copy of the January-paused quarter's workspace, and a signed-in client over it."""
     import asyncio
 
     ran = asyncio.run(scenarios.paused_in_january())
-    workspace = tmp_path / "workspace"
-    shutil.copytree(ran.database.parent.parent, workspace)
+    limit_of_two(monkeypatch)
+    workspace = copied(ran, tmp_path)
     yield client_over(workspace), ran, workspace
 
 
@@ -424,3 +453,94 @@ def test_the_vendored_htmx_is_the_bots_own_copy() -> None:
     assert (root / "decision_lab/dashboard/static/htmx.min.js").read_bytes() == (
         root / "tradebot/dashboard/static/htmx.min.js"
     ).read_bytes()
+
+
+# --------------------------------------------------------- fix round 1: provenance (items 3, 4)
+
+
+def test_a_candidate_with_the_same_panel_and_another_basket_is_not_this_run(
+    scenarios: Scenarios, tmp_path: Path
+) -> None:
+    """The shipped stub matrix has these seats under the default loss limit, not the run's two."""
+    import asyncio
+
+    ran = asyncio.run(scenarios.paused_in_january())
+    client = client_over(copied(ran, tmp_path))
+    page = client.get(f"/periods/{ran.meta.run_id}").text
+    assert "REPORT INCOMPLETE" in page and "not on file" in page
+
+
+def test_the_recorded_seat_set_file_is_tried_first(
+    paused: tuple[TestClient, Ran, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from decision_lab import candidates as cd
+    from decision_lab.tests.factories import stub_matrix_file
+
+    client, ran, workspace = paused
+    recorded = tmp_path / "recorded.toml"
+    shutil.copyfile(stub_matrix_file(), recorded)
+    name = with_meta(workspace, ran, "sourced", matrix_source=str(recorded))
+    loaded: list[Path] = []
+    real = cd.load_matrix
+    monkeypatch.setattr(
+        cd, "load_matrix", lambda path, **k: loaded.append(Path(path)) or real(path, **k)
+    )
+
+    page = client.get(f"/periods/{name}").text
+
+    assert "REPORT INCOMPLETE" not in page
+    assert loaded == [recorded], "the recorded file answered, so nothing else was opened"
+    assert str(recorded) in page
+
+
+def test_the_stored_version_scan_is_cached(
+    paused: tuple[TestClient, Ran, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from decision_lab import candidates as cd
+
+    client, ran, _ = paused
+    client.get(f"/periods/{ran.meta.run_id}")
+    calls: list[Path] = []
+    real = cd.load_matrix
+    monkeypatch.setattr(
+        cd, "load_matrix", lambda path, **k: calls.append(Path(path)) or real(path, **k)
+    )
+    client.get(f"/periods/{ran.meta.run_id}")
+    client.get(f"/periods/{ran.meta.run_id}/months/2024-01")
+    assert calls == [], "an unchanged seat-set file is not re-read"
+
+
+def test_a_fed_run_reads_its_recorded_sources_and_the_url_overrides_them(
+    paused: tuple[TestClient, Ran, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, ran, workspace = paused
+    fed = with_meta(
+        workspace,
+        ran,
+        "fed-sources",
+        archive_digest="right",
+        news_blind=False,
+        news_sources=("cryptoslate",),
+    )
+    asked: list[tuple[str, ...]] = []
+
+    class Feed:
+        def __init__(self, digest: str) -> None:
+            self.digest, self.items = digest, ()
+
+        @staticmethod
+        def covers_span(*_: object) -> bool:
+            return False
+
+    def load(_data: Path, sources: tuple[str, ...], _policy: object) -> Feed:
+        asked.append(sources)
+        return Feed("right" if sources == ("cryptoslate",) else "wrong")
+
+    monkeypatch.setattr(periods_routes, "load_feed", load)
+
+    bookmarked = client.get(f"/periods/{fed}").text
+    assert asked[-1] == ("cryptoslate",) and "REPORT INCOMPLETE" not in bookmarked
+
+    overridden = client.get(f"/periods/{fed}", params={"news_source": "bitcoincom"}).text
+    assert asked[-1] == ("bitcoincom",)
+    assert "REPORT INCOMPLETE" in overridden and "is not the one this run read" in overridden

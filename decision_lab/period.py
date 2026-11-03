@@ -284,6 +284,12 @@ class PeriodMeta(DomainModel):
     #: What the calibrated cost per cycle projected at the first build. `None` is "no projection was
     #: available" (§5.5), which is a different statement from a projection of zero.
     projected_usd: Money | None = None
+    #: The seat-set file the run was started from, and the news sources it read, as of the first
+    #: build. Where a reader finds the panel and the archive to read this run with; both are checked
+    #: against the digests above, so a moved or edited file is refused rather than trusted. Empty on
+    #: a run made before they were recorded, which a reader then looks up by digest.
+    matrix_source: str = ""
+    news_sources: tuple[str, ...] = ()
     #: The ending is `INTERRUPTED` because spend passed the budget. A field and not a reading of
     #: `ending_reason`, which is prose for a human (§5.7).
     budget_stopped: bool = False
@@ -798,13 +804,21 @@ def _abandon(database: Path, clock: Clock) -> None:
 
 def _first_build(found: PeriodMeta | None) -> dict[str, object]:
     """The provenance a run keeps from the invocation that began it (§5.7)."""
-    if found is None or not found.matrix_digest:
+    if found is None:
         return {}
-    return {
-        "matrix_digest": found.matrix_digest,
-        "dayset_digest": found.dayset_digest,
-        "projected_usd": found.projected_usd,
-    }
+    # Each kept only when recorded: a run begun before a field existed takes this invocation's.
+    kept: dict[str, object] = {}
+    if found.matrix_digest:
+        kept.update(
+            matrix_digest=found.matrix_digest,
+            dayset_digest=found.dayset_digest,
+            projected_usd=found.projected_usd,
+        )
+    if found.matrix_source:
+        kept["matrix_source"] = found.matrix_source
+    if found.news_sources:
+        kept["news_sources"] = found.news_sources
+    return kept
 
 
 def _continue_from(
@@ -987,6 +1001,8 @@ async def run(
     projected_usd: Decimal | None = None,
     workspace: Path | None = None,
     resume: bool = False,
+    matrix_source: str = "",
+    news_sources: tuple[str, ...] = (),
 ) -> PeriodMeta:
     """One candidate's path through one period, in its own database, month after month.
 
@@ -1087,6 +1103,8 @@ async def run(
         matrix_digest=matrix_digest,
         dayset_digest=dayset_digest,
         projected_usd=projected_usd,
+        matrix_source=matrix_source,
+        news_sources=news_sources,
     )
     replay: _Replay | None = None
     if unfinished:

@@ -1189,3 +1189,29 @@ async def test_finished_run_reads_a_result_without_touching_it(
 
     assert look(pause.START_EQUITY) == ran.meta
     assert look(Decimal(5)) is None
+
+
+async def test_a_continue_keeps_the_seat_set_file_the_run_began_from(
+    data: dict[str, Path], tmp_path: Path
+) -> None:
+    """Fix round 1, item 3: `matrix_source` is first-build provenance, as `matrix_digest` is."""
+    first = await execute(
+        data["flat"], tmp_path, QUARTER, {}, cost_usd=COST, budget=COST, matrix_source="first.toml"
+    )
+    assert first.meta.ending is pd.RunEnding.INTERRUPTED
+    assert first.meta.matrix_source == "first.toml"
+    gc.collect()
+
+    resumed = await execute(
+        data["flat"],
+        tmp_path,
+        QUARTER,
+        {},
+        cost_usd=COST,
+        budget=Decimal(5),
+        resume=True,
+        matrix_source="moved.toml",
+    )
+
+    assert resumed.meta.ending is pd.RunEnding.COMPLETED
+    assert resumed.meta.matrix_source == "first.toml"

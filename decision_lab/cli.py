@@ -1368,6 +1368,8 @@ async def evaluate_period(args: argparse.Namespace) -> int:
                 dayset_digest=loaded.dayset_digest,
                 projected_usd=projected,
                 resume=args.resume,
+                matrix_source=str(args.configs.resolve()),
+                news_sources=tuple(args.news_sources),
             )
         except pd.BudgetReached as error:
             logger.error("period run refused; nothing was moved", extra={"reason": str(error)})

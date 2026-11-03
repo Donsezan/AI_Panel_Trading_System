@@ -311,6 +311,8 @@ def test_the_loaded_feed_reaches_run_and_a_continue(
     )
 
     assert [type(call["news_feed"]) for call in run.calls] == [Feed, Feed]
+    # Fix round 1, item 4: the sources travel with the run, so a bookmark of it reads complete.
+    assert [call["news_sources"] for call in run.calls] == [("s",), ("s",)]
     assert [call["resume"] for call in run.calls] == [False, True]
     assert "feed-digest" in (tmp_path / "p.md").read_text(encoding="utf-8")
 
@@ -524,6 +526,10 @@ def test_skipping_the_gate_runs_end_to_end_and_reuses_the_run_without_a_second_r
 
     assert (directories[0] / pd.PERIOD_META).read_text(encoding="utf-8") == stored
     assert len(rows(tmp_path)) == 1, "a reused run is one registry row, not two"
+    # Fix round 1, item 3: the seat-set file the run was started from, so its page can find it.
+    meta = pd.PeriodMeta.model_validate_json(stored)
+    assert Path(meta.matrix_source) == cd.STUB_MATRIX.resolve()
+    assert meta.news_sources == ()
 
 
 # --- reuse, continue, and provenance
