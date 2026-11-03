@@ -211,6 +211,21 @@ def lanes_svg(
         if labelled is None or x0 - labelled >= _MIN_LABEL_GAP + 12:
             parts.append(_text(x0 - 4, top - 4, name, 'class="strong"'))
             labelled = x0
+    # The day grid first: SVG paints in document order, so a line drawn after a vote would
+    # strike through its letter.
+    day = start.replace(hour=0, minute=0, second=0, microsecond=0)
+    last_label: Decimal | None = None
+    while day <= end:
+        if day >= start:
+            here = x(day)
+            if last_label is None or here - last_label >= _MIN_LABEL_GAP:
+                parts.append(
+                    f'<line x1="{fmt(here)}" x2="{fmt(here)}" y1="{top}" y2="{height - 22}" '
+                    f'class="grid"/>'
+                )
+                parts.append(_text(here + 2, height - 6, day.strftime("%b %d")))
+                last_label = here
+        day += timedelta(days=1)
     parts.append(_text(4, top + 10, "Price"))
     if prices:
         values = [value for _, value in prices]
@@ -235,19 +250,6 @@ def lanes_svg(
                 f'style="fill:{"var(--bg)" if filled else colour};font-weight:700">'
                 f"{escape(mark.letter)}</text></g>"
             )
-    day = start.replace(hour=0, minute=0, second=0, microsecond=0)
-    last_label: Decimal | None = None
-    while day <= end:
-        if day >= start:
-            here = x(day)
-            if last_label is None or here - last_label >= _MIN_LABEL_GAP:
-                parts.append(
-                    f'<line x1="{fmt(here)}" x2="{fmt(here)}" y1="{top}" y2="{height - 22}" '
-                    f'class="grid"/>'
-                )
-                parts.append(_text(here + 2, height - 6, day.strftime("%b %d")))
-                last_label = here
-        day += timedelta(days=1)
     parts.append("</svg>")
     return "".join(parts)
 

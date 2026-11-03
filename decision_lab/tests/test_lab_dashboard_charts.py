@@ -121,3 +121,15 @@ def test_neighbouring_spike_labels_do_not_overprint() -> None:
     xs = [Decimal(v) for v in re.findall(r'<text x="([^"]+)" y="14.0" class="strong"', svg)]
     assert len(xs) >= 2 and min(b - a for a, b in pairwise(xs)) >= 72
     assert svg.count("<rect") - 28 == 4, "every event is still shaded"
+
+
+def test_the_day_grid_is_drawn_beneath_the_votes() -> None:
+    """Fix round 1, item 6: SVG paints in order, so a grid drawn after a mark strikes through it."""
+    marks = [
+        charts.Mark(at=at(1) + timedelta(days=i), letter="B", grade="correct", title="t")
+        for i in range(10)
+    ]
+    svg = charts.lanes_svg([(at(1), Decimal(1)), (at(10), Decimal(2))], {"Panel": marks}, [])
+    last_grid = svg.rindex('class="grid"')
+    first_mark = svg.index('width="14"')
+    assert last_grid < first_mark
