@@ -156,7 +156,8 @@ def line_svg(points: Sequence[Point], *, width: int = 960, height: int = 210) ->
     if last is not None:
         where, final = last
         y = _scale(final, lo, hi, top, bottom)
-        parts.append(_text(x(where) + 8, y + 16, _short(final), 'class="strong"'))
+        # Anchored at its end so the last month's figure never runs off the right edge.
+        parts.append(_text(x(where) - 8, y - 10, _short(final), 'text-anchor="end" class="strong"'))
     parts.append("</svg>")
     return "".join(parts)
 
@@ -193,20 +194,23 @@ def lanes_svg(
         f'<svg viewBox="0 0 {width} {height}" width="{width}" role="img" class="chart lanes" '
         f'aria-label="Price above one row of votes per seat, on one time axis">'
     ]
-    for shade in spikes:
+    # Shading is always drawn; a label only where it clears the previous one, so neighbouring
+    # events never print over each other. Each shade carries its name as a tooltip regardless.
+    labelled: Decimal | None = None
+    for shade in sorted(spikes, key=lambda one: one.start):
         if shade.end < start or shade.start > end:
             continue
         x0, x1 = x(max(shade.start, start)), x(min(shade.end, end))
         colour = SPIKE_COLOUR.get(shade.direction, "var(--muted)")
+        name = SPIKE_LABEL.get(shade.direction, shade.direction)
         parts.append(
+            f"<g><title>{escape(name)}</title>"
             f'<rect x="{fmt(x0 - 6)}" y="{top}" width="{fmt(x1 - x0 + 12)}" '
-            f'height="{height - 22 - top}" fill="{colour}" opacity="0.12"/>'
+            f'height="{height - 22 - top}" fill="{colour}" opacity="0.12"/></g>'
         )
-        parts.append(
-            _text(
-                x0 - 4, top - 4, SPIKE_LABEL.get(shade.direction, shade.direction), 'class="strong"'
-            )
-        )
+        if labelled is None or x0 - labelled >= _MIN_LABEL_GAP + 12:
+            parts.append(_text(x0 - 4, top - 4, name, 'class="strong"'))
+            labelled = x0
     parts.append(_text(4, top + 10, "Price"))
     if prices:
         values = [value for _, value in prices]

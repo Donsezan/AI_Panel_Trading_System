@@ -136,7 +136,9 @@ are never combined. Long-only: standing aside from a fall while flat is correct.
 {% if not analysed.events %}
 <p class="empty">No spikes in this period.</p>
 {% else %}
+{# A year can hold ~100 events: the largest are shown, the rest folded, none dropped. #}
 {% for event in analysed.events %}
+{% if loop.index0 == 15 %}<details><summary>{{ analysed.events | length - 15 }} smaller events</summary>{% endif %}
 <details class="drill" hx-get="/periods/{{ view.run_id }}/events/{{ loop.index0 }}?{{ query }}" hx-trigger="toggle once" hx-target="find .drill-body">
   <summary>{{ {"SHOCK_UP": "↑ spike up", "SHOCK_DOWN": "↓ spike down"}.get(event.direction.value) }}
     · {{ event.start | moment }} → {{ event.end | moment }}
@@ -144,6 +146,7 @@ are never combined. Long-only: standing aside from a fall while flat is correct.
     {% if event.window_name %}· {{ event.window_name }}{% endif %}</summary>
   <div class="drill-body"><a href="/periods/{{ view.run_id }}/events/{{ loop.index0 }}?{{ query }}">Open this event</a></div>
 </details>
+{% if loop.last and loop.length > 15 %}</details>{% endif %}
 {% endfor %}
 {% endif %}
 </section>

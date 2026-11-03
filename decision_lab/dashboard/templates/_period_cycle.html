@@ -35,7 +35,7 @@
 {% if record.decisions %}
 {% set made = record.decisions[0] %}
 <p>Final round: {% for action, number in tally | dictsort %}{{ number }} {{ action }}{% if not loop.last %}, {% endif %}{% endfor %}.
-The panel decided <strong>{{ made.action.value }}</strong>{% if made.dissent %}; dissent: {{ made.dissent | join(", ") }}{% endif %}.
+The panel decided <strong>{{ made.action.value }}</strong>{% set dissenters = grades | selectattr("final") | rejectattr("final", "equalto", made.action.value) | list %}{% if dissenters %}; dissent: {% for row in dissenters %}<code>{{ row.seat_id }}</code> ({{ row.final }}){% if not loop.last %}, {% endif %}{% endfor %} — their arguments are in the dispute above{% else %}; no seat dissented{% endif %}.
 Cycle outcome: <code>{{ record.outcome or absent }}</code>.</p>
 {% if made.flags %}<p class="muted">Flags: {{ made.flags | join(", ") }}</p>{% endif %}
 {% else %}

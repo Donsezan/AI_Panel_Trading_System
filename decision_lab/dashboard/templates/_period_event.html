@@ -24,7 +24,7 @@ volatility {{ event.peak_volatility | money(4) }}{% if event.window_name %}; nam
   <tbody>
   {% for decision, seats in calls %}
     <tr>
-      <td><a href="/periods/{{ view.run_id }}/cycles/{{ decision.cycle_id }}">{{ decision.as_of | moment }}</a></td>
+      <td><a href="/periods/{{ view.run_id }}/cycles/{{ decision.cycle_id }}?{{ query }}">{{ decision.as_of | moment }}</a></td>
       <td>{{ decision.regime.value }}</td>
       <td>{{ decision.action.value }}</td>
       <td>{{ decision.verdict.value }}</td>

@@ -106,3 +106,18 @@ def test_empty_inputs_draw_nothing() -> None:
 def test_text_is_escaped() -> None:
     svg = charts.line_svg([charts.Point(label="<b>", value=Decimal(1), title="<script>")])
     assert "<script>" not in svg and "&lt;b&gt;" in svg
+
+
+def test_neighbouring_spike_labels_do_not_overprint() -> None:
+    marks = [
+        charts.Mark(at=at(1) + timedelta(days=i), letter="W", grade="none", title="t")
+        for i in range(28)
+    ]
+    shades = [
+        charts.Shade(start=at(day), end=at(day, 6), direction=("SHOCK_UP", "SHOCK_DOWN")[day % 2])
+        for day in (3, 4, 5, 20)
+    ]
+    svg = charts.lanes_svg([], {"Panel": marks}, shades)
+    xs = [Decimal(v) for v in re.findall(r'<text x="([^"]+)" y="14.0" class="strong"', svg)]
+    assert len(xs) >= 2 and min(b - a for a, b in pairwise(xs)) >= 72
+    assert svg.count("<rect") - 28 == 4, "every event is still shaded"
