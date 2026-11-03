@@ -408,7 +408,7 @@ def fold_period(
     *,
     panel: PanelConfig,
     archive: ArchiveNewsFeed | None,
-    outcomes: Mapping[str, CycleResult] | None = None,
+    outcomes: Mapping[str, CycleResult],
 ) -> PeriodAnalysis:
     """Score a run's cycles. Split from the database read so a test can hand it doctored records."""
     # Contamination is read off `SeatResponse.fingerprint` exactly as the sweep reads it (§7.7).
@@ -465,7 +465,7 @@ def fold_period(
         by_month=by_month,
         seat_trend=_seat_trend(clean, scored, panel=panel, buckets=_buckets(meta.period)),
         contaminated=len(records) - len(clean),
-        outcomes=dict(outcomes or {}),
+        outcomes=dict(outcomes),
     )
 
 

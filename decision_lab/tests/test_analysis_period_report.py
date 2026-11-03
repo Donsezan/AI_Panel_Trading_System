@@ -88,6 +88,7 @@ async def covered(
         await scoring_for(flat_data),
         panel=candidate_over(flat_data, 2).panel,
         archive=feed,
+        outcomes={},
     )
     return folded.event_news[0].covered
 
@@ -169,6 +170,7 @@ async def test_could_see_counts_cycles_whose_panel_ran_contaminated_included_qua
         await scoring_for(flat_data),
         panel=candidate_over(flat_data, 2).panel,
         archive=feed_of(archive(story(1, "early"), later, story(28, "late"))),
+        outcomes={},
     )
 
     assert folded.contaminated == 1
@@ -205,6 +207,7 @@ async def test_a_named_window_adds_no_regime_row(scenarios: Scenarios, flat_data
         named,
         panel=candidate_over(flat_data, 2).panel,
         archive=None,
+        outcomes={},
     )
 
     assert any(d.window_name for d in folded.scored), "the window must actually label decisions"
@@ -241,6 +244,7 @@ async def test_a_page_with_no_decisions_still_has_three_regime_rows_and_no_seat_
         await scoring_for(flat_data),
         panel=candidate_over(flat_data, 2).panel,
         archive=None,
+        outcomes={},
     )
 
     page = render.write_period(
