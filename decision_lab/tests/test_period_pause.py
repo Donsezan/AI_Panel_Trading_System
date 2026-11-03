@@ -223,7 +223,7 @@ async def execute(
             workspace=workspace,
             resume=resume,
             news_feed=news_feed,
-            **({"matrix_source": matrix_source} if matrix_source else {}),
+            matrix_source=matrix_source,
         )
     return Ran(meta, pd.period_dir(meta.run_id, workspace=workspace) / pd.PERIOD_DB, plan)
 

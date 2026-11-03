@@ -15,6 +15,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -126,6 +127,16 @@ def recording(started: list[list[str]], job_id: str):  # type: ignore[no-untyped
         )
 
     return start
+
+
+def counting(seen: list[Path], real: Any) -> Any:
+    """A `load_matrix` that records each path it is asked to open, then loads it."""
+
+    def load(path: Path, **kwargs: Any) -> Any:
+        seen.append(Path(path))
+        return real(path, **kwargs)
+
+    return load
 
 
 def input_named(page: str, name: str) -> str:
@@ -482,9 +493,7 @@ def test_the_recorded_seat_set_file_is_tried_first(
     name = with_meta(workspace, ran, "sourced", matrix_source=str(recorded))
     loaded: list[Path] = []
     real = cd.load_matrix
-    monkeypatch.setattr(
-        cd, "load_matrix", lambda path, **k: loaded.append(Path(path)) or real(path, **k)
-    )
+    monkeypatch.setattr(cd, "load_matrix", counting(loaded, real))
 
     page = client.get(f"/periods/{name}").text
 
@@ -502,9 +511,7 @@ def test_the_stored_version_scan_is_cached(
     client.get(f"/periods/{ran.meta.run_id}")
     calls: list[Path] = []
     real = cd.load_matrix
-    monkeypatch.setattr(
-        cd, "load_matrix", lambda path, **k: calls.append(Path(path)) or real(path, **k)
-    )
+    monkeypatch.setattr(cd, "load_matrix", counting(calls, real))
     client.get(f"/periods/{ran.meta.run_id}")
     client.get(f"/periods/{ran.meta.run_id}/months/2024-01")
     assert calls == [], "an unchanged seat-set file is not re-read"
