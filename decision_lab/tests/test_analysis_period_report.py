@@ -108,6 +108,21 @@ async def test_coverage_requires_one_sources_span_to_contain_the_lead_in_and_the
     assert await case(archive(story(1, "a"), story(25, "b"))), "one source really covers it"
 
 
+async def test_a_source_starting_inside_the_lead_in_does_not_cover_the_event(
+    scenarios: Scenarios, flat_data: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Task 8's surviving mutant: `covers_span(e.start, e.end)` would call this covered.
+
+    The event is [Jan 10, Jan 11] and its lead-in starts Jan 8. A source whose first row is Jan 9
+    measured the event but only half the 48 hours that answer "did it predict" (spec 7.3).
+    """
+    late_start = archive(story(9, "a"), story(25, "b"))
+    assert not await covered(scenarios, flat_data, monkeypatch, feed_of(late_start))
+    assert feed_of(late_start).covers_span(at(1, 10), at(1, 11)), (
+        "the source must cover the event itself, or this asserts nothing about the lead-in"
+    )
+
+
 def with_news(record: CycleRecord, title: str) -> CycleRecord:
     view = NewsItemView(
         source="x",
