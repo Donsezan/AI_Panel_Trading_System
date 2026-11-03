@@ -698,7 +698,9 @@ async def detail(
 ) -> HTMLResponse:
     """The result. A run with no directory at all is a 404; one mid-write is a page saying so."""
     view = await run_view(request, run_id, configs, news_source)
-    page = render(request, "period_detail.html", error="", job=job, **_detail_context(view))
+    page = render(
+        request, "period_detail.html", hold_open=True, error="", job=job, **_detail_context(view)
+    )
     if (
         view.meta is None
         and not pd.period_dir(run_id, workspace=state_of(request).workspace).is_dir()
@@ -714,7 +716,9 @@ def _fragment(request: Request, template: str, title: str, **context: Any) -> HT
     """The fragment for htmx; the same fragment inside the page shell for a plain navigation."""
     if request.headers.get("HX-Request"):
         return render(request, template, **context)
-    return render(request, "period_part.html", part=template, part_title=title, **context)
+    return render(
+        request, "period_part.html", part=template, part_title=title, hold_open=True, **context
+    )
 
 
 def _missing(request: Request, run_id: str, why: str) -> HTMLResponse:
@@ -992,7 +996,14 @@ async def continue_run(request: Request, run_id: str) -> Response:
     view = await run_view(request, run_id, fields.get("configs", ""), fields.get("news_source", ""))
 
     def refuse(reason: str, status: int) -> HTMLResponse:
-        page = render(request, "period_detail.html", error=reason, job="", **_detail_context(view))
+        page = render(
+            request,
+            "period_detail.html",
+            hold_open=True,
+            error=reason,
+            job="",
+            **_detail_context(view),
+        )
         page.status_code = status
         return page
 

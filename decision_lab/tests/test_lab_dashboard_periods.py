@@ -551,3 +551,25 @@ def test_a_fed_run_reads_its_recorded_sources_and_the_url_overrides_them(
     overridden = client.get(f"/periods/{fed}", params={"news_source": "bitcoincom"}).text
     assert asked[-1] == ("bitcoincom",)
     assert "REPORT INCOMPLETE" in overridden and "is not the one this run read" in overridden
+
+
+def test_a_running_jobs_period_page_does_not_refresh_its_drill_downs_shut(
+    paused: tuple[TestClient, Ran, Path],
+) -> None:
+    """Fix round 1, item 8: a year run takes hours, and a 5-second reload closes every <details>."""
+    client, ran, workspace = paused
+    running = with_meta(workspace, ran, "running-now", ending=pd.RunEnding.RUNNING)
+    lock = jobs.WorkspaceLock(workspace=workspace)
+    lock.acquire(("evaluate", "period", "--period", "2024-Q1"), clock=SystemClock())
+    try:
+        detail = client.get(f"/periods/{running}").text
+        month = client.get(f"/periods/{running}/months/2024-01").text
+        listing = client.get("/periods").text
+    finally:
+        lock.release()
+
+    for page in (detail, month):
+        assert 'http-equiv="refresh"' not in page
+        assert "refresh for progress" in page
+    assert "Running, or a process died" in detail
+    assert 'http-equiv="refresh"' in listing, "other pages keep their behaviour"
