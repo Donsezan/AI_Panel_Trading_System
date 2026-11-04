@@ -878,6 +878,7 @@ async def test_an_interrupted_run_refuses_without_continue_and_names_it(
     data: dict[str, Path], tmp_path: Path
 ) -> None:
     await killed_after(data["flat"], tmp_path, "2024-01", {})
+    gc.collect()  # the killed wiring's connections, or its WAL files would come and go
     before = sorted(path.name for path in run_dir(tmp_path).iterdir())
 
     with pytest.raises(ConfigError, match="Continue"):
