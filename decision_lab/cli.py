@@ -1370,6 +1370,7 @@ async def evaluate_period(args: argparse.Namespace) -> int:
                 resume=args.resume,
                 matrix_source=str(args.configs.resolve()),
                 news_sources=tuple(args.news_sources),
+                on_fallback=matrix.on_fallback.value,
             )
         except pd.BudgetReached as error:
             logger.error("period run refused; nothing was moved", extra={"reason": str(error)})
@@ -1411,7 +1412,9 @@ async def evaluate_period(args: argparse.Namespace) -> int:
             start_equity=meta.start_equity,
             window=meta.period.label,
             evaluation=not meta.plumbing_check,
-            on_fallback=matrix.on_fallback.value,
+            # The run's own, like the rest: `on_fallback` is not in its identity, so the seat set
+            # of the invocation that found it may say otherwise.
+            on_fallback=meta.on_fallback,
             gate_skipped=meta.gate_skipped,
             cost_usd=meta.spent_usd,
             total_profit=meta.profit.total,

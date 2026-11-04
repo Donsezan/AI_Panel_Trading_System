@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -606,6 +607,26 @@ def test_a_run_that_died_without_an_ending_says_so_and_continues(
     resumed = pd.PeriodMeta.model_validate_json((directory / pd.PERIOD_META).read_text("utf-8"))
     assert resumed.ending is pd.RunEnding.COMPLETED
     assert resumed.months == finished.months
+
+
+def test_the_row_of_a_reused_run_keeps_its_own_on_fallback(
+    lab: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Final review M14: `on_fallback` is not in the run's identity, so a second invocation under
+    a seat set that says `exclude` finds the same run, which was made under `halt`."""
+    assert cli.main(argv(lab, tmp_path / "a.md", "--skip-gate")) == cli.EXIT_OK
+    assert rows(tmp_path)[0].on_fallback == cd.SweepPolicy.HALT.value
+    real = cd.load_matrix
+
+    def excluding(path: Path, *, reference: Any) -> cd.Matrix:
+        return replace(real(path, reference=reference), on_fallback=cd.SweepPolicy.EXCLUDE)
+
+    monkeypatch.setattr(cd, "load_matrix", excluding)
+
+    assert cli.main(argv(lab, tmp_path / "b.md", "--skip-gate")) == cli.EXIT_OK
+
+    [row] = rows(tmp_path)
+    assert row.on_fallback == cd.SweepPolicy.HALT.value, "the invocation's seat set relabelled it"
 
 
 def test_continue_with_nothing_to_continue_exits_3_and_writes_no_run(

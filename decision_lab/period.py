@@ -297,6 +297,10 @@ class PeriodMeta(DomainModel):
     #: The ending is `INTERRUPTED` because spend passed the budget. A field and not a reading of
     #: `ending_reason`, which is prose for a human (§5.7).
     budget_stopped: bool = False
+    #: The seat set's `on_fallback` as of the first build. Provenance for the registry row only: it
+    #: is not in the identity, and a period run never acts on it, so a later invocation's seat set
+    #: must not relabel this run. Empty on a run made before it was recorded.
+    on_fallback: str = ""
 
     @property
     def spent_usd(self) -> Decimal:
@@ -870,6 +874,8 @@ def _first_build(found: PeriodMeta | None) -> dict[str, object]:
         kept["matrix_source"] = found.matrix_source
     if found.news_sources:
         kept["news_sources"] = found.news_sources
+    if found.on_fallback:
+        kept["on_fallback"] = found.on_fallback
     return kept
 
 
@@ -1055,6 +1061,7 @@ async def run(
     resume: bool = False,
     matrix_source: str = "",
     news_sources: tuple[str, ...] = (),
+    on_fallback: str = "",
 ) -> PeriodMeta:
     """One candidate's path through one period, in its own database, month after month.
 
@@ -1161,6 +1168,7 @@ async def run(
         projected_usd=projected_usd,
         matrix_source=matrix_source,
         news_sources=news_sources,
+        on_fallback=on_fallback,
     )
     replay: _Replay | None = None
     if unfinished:
