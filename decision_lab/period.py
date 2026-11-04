@@ -88,7 +88,10 @@ from tradebot.risk.rules import AUTO_PAUSE_RULE
 from tradebot.validation.backtest import DEFAULT_MAX_CYCLES, plan_ticks, warmup_for
 from tradebot.validation.evidence import Evidence
 
-_PATTERN: Final = re.compile(r"^(\d{4})(?:-(?:(0[1-9]|1[0-2])|Q([1-4])))?$")
+#: Matched whole, over ASCII digits only. The label is part of a run's identity, so `$` (which admits
+#: a trailing newline) or `\d` (which admits full-width digits) would give one span a second name and
+#: a second paid run.
+_PATTERN: Final = re.compile(r"([0-9]{4})(?:-(?:(0[1-9]|1[0-2])|Q([1-4])))?")
 _BAR: Final = timedelta(hours=1)
 #: The one instrument a period run trades, by the operator's decision (§4). It reaches
 #: `config_digest` through the basket, so widening this later mints new runs rather than colliding.
@@ -156,7 +159,7 @@ def _span(label: str, year: int, first_month: int, last_month: int) -> Period:
 
 
 def parse_period(text: str) -> Period:
-    match = _PATTERN.match(text)
+    match = _PATTERN.fullmatch(text)
     if match is None:
         raise ConfigError(
             f"unreadable period {text!r}: expected YYYY, YYYY-MM or YYYY-Qn (for example 2025-Q2)"

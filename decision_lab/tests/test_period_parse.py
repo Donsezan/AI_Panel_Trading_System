@@ -31,6 +31,17 @@ def test_an_unreadable_period_refuses(bad: str) -> None:
         parse_period(bad)
 
 
+@pytest.mark.parametrize(
+    "noncanonical",
+    ["2025\n", "2025-Q1\n", "2025-03\n", "２０２５-Q1", "２０２５"],
+    ids=["year-newline", "quarter-newline", "month-newline", "fullwidth-quarter", "fullwidth"],
+)
+def test_a_second_spelling_of_one_period_refuses(noncanonical: str) -> None:
+    """The label is part of the run's identity: a second spelling would be a second paid run."""
+    with pytest.raises(ConfigError, match="unreadable period"):
+        parse_period(noncanonical)
+
+
 def test_only_fully_covered_periods_are_offered() -> None:
     offered = covered_periods(utc(2024, 1, 1), utc(2024, 6, 30, 23))
     assert offered["year"] == ()
