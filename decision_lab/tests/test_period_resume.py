@@ -524,6 +524,22 @@ def test_a_period_basket_carries_no_challenger(data: dict[str, Path]) -> None:
     assert pd.period_basket(shadowed, dataset, 86_400).shadow_panel is None
 
 
+def test_a_period_basket_is_validated_after_it_is_narrowed(data: dict[str, Path]) -> None:
+    """A quarantine naming ETH matches nothing once the basket holds BTC alone, and the basket's
+    own rule refuses that (ADR 0022). Without re-validation it surfaces mid-run instead, at the
+    first `configs.put` of a pause, as a confusing error that interrupts the run."""
+    candidate = candidate_over(data["flat"], 2)
+    eth = next(one.key for one in candidate.basket.instruments if one.symbol == ETH)
+    policy = candidate.basket.risk_policy.model_copy(update={"quarantined_instruments": (eth,)})
+    quarantined = replace(
+        candidate, basket=candidate.basket.model_copy(update={"risk_policy": policy})
+    )
+    dataset = ReplayDataset.load(data["flat"], ManualClock(utc(1)))
+
+    with pytest.raises(ConfigError, match=re.escape(eth)):
+        pd.period_basket(quarantined, dataset, 86_400)
+
+
 def _record(at: datetime) -> CycleRecord:
     snapshot = ContextSnapshot(snapshot_id="old", basket_id="period", as_of=at, instruments=())
     decision = Decision(instrument_key="binance:BTC/USDT", action=Action.WAIT)

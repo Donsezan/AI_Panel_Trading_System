@@ -347,17 +347,25 @@ def period_basket(candidate: Candidate, dataset: ReplayDataset, cadence_seconds:
     if not instruments:
         held = ", ".join(one.symbol for one in dataset.instruments)
         raise ConfigError(f"this dataset holds no {PERIOD_SYMBOL}; it holds {held}")
-    return candidate.basket.model_copy(
-        update={
-            "basket_id": "period",
-            "instruments": instruments,
-            "timeframes": dataset.timeframes,
-            "schedule": Schedule(every_seconds=cadence_seconds),
-            # As `candidates._basket_for` does, and here for one more reason: a challenger's
-            # answers are not replayed, so a Continue would pay for them all again, unread.
-            "shadow_panel": None,
-        }
-    )
+    updates = {
+        "basket_id": "period",
+        "instruments": instruments,
+        "timeframes": dataset.timeframes,
+        "schedule": Schedule(every_seconds=cadence_seconds),
+        # As `candidates._basket_for` does, and here for one more reason: a challenger's
+        # answers are not replayed, so a Continue would pay for them all again, unread.
+        "shadow_panel": None,
+    }
+    # Validated again rather than `model_copy`'d, which skips the validators: a basket narrowed to
+    # one instrument must still pass the basket's own rules (a quarantine naming an instrument it
+    # no longer holds, above all), or the refusal arrives mid-run at the first `configs.put`.
+    try:
+        return Basket.model_validate({**candidate.basket.model_dump(), **updates})
+    except ValueError as error:
+        raise ConfigError(
+            f"candidate {candidate.candidate_id!r} is not a valid basket over {PERIOD_SYMBOL} "
+            f"alone: {error}"
+        ) from error
 
 
 def _planned_ticks(basket: Basket, *, first: datetime, end: datetime) -> tuple[datetime, ...]:
