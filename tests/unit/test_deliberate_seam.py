@@ -121,6 +121,40 @@ async def test_a_substitute_replaces_the_engines_call(monkeypatch: pytest.Monkey
     )
 
 
+class FalsySubstitute(Substitute):
+    """A substitute that reads as false, as an empty container or a stateful wrapper might."""
+
+    def __bool__(self) -> bool:
+        return False
+
+    def __len__(self) -> int:
+        return 0
+
+
+async def test_a_falsy_substitute_still_replaces_the_engine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The seam reads `is not None`: a truthiness test would hand a falsy substitute's cycles to
+    the real engine, silently, and a replay would then pay for answers it was meant to recite."""
+
+    async def never(*_: object) -> PanelOutcome:
+        raise AssertionError("the engine answered although a substitute was given")
+
+    monkeypatch.setattr(DecisionEngine, "deliberate", never)
+    substitute = FalsySubstitute()
+    assert not substitute, "the substitute must read as false for this test to bite"
+    application = await build_sim(clock=ManualClock(PAST), deliberate=substitute)
+    try:
+        await application.recover()
+        results = await application.supervisor.run_once()
+    finally:
+        await application.shutdown()
+
+    assert results
+    assert len(substitute.asked) == len(results)
+    assert [result.outcome for result in results] == [CycleOutcome.NO_ACTION] * len(results)
+
+
 async def test_the_engine_is_still_built_and_validated(monkeypatch: pytest.MonkeyPatch) -> None:
     """A substitute must not be how a panel the bot would refuse gets to run."""
     refusal = "this panel names an unknown protocol"
