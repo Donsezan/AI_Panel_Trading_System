@@ -211,19 +211,91 @@ def _requested_action(items: Mapping[str, str]) -> tuple[str, str]:
     return items.get("action", ""), ""
 
 
+#: Fields the second click adds. They are not part of the document, and left in `forms.nest`'s
+#: input they would land as spurious top-level keys `matrices.dumps` refuses.
+_CHOICE_FIELDS: Final = frozenset({"choice", "new_name"})
+
+
+def _changes_a_stored_set(name: str, document: dict[str, Any], workspace: Path | None) -> bool:
+    """Whether saving `document` under `name` would differ from the latest stored version.
+
+    Compared as the bytes `matrices.save` would publish against the bytes of the latest version,
+    because a stored version *is* what a previous form post dumped: an unchanged re-save is
+    byte-identical, and nothing is restated here about which fields matter. A name nothing is
+    stored under yet has nothing to change, so it never asks.
+    """
+    stored = matrices.versions(name, workspace=workspace)
+    if not stored:
+        return False
+    latest = matrices.path_for(name, stored[-1], workspace=workspace)
+    return latest.read_bytes() != matrices.dumps(document).encode("utf-8")
+
+
+def _ask(
+    request: Request, name: str, document: dict[str, Any], items: Mapping[str, str], **more: Any
+) -> Response:
+    """Re-render the editor with the question above it.
+
+    Every submitted value rides in the prompt's own hidden fields, because a browser posts only the
+    form that was clicked: without them the second click would save an empty document (period spec
+    §12.3). The editor below it is the document as submitted, so nothing is lost on the way.
+    """
+    carried = {k: v for k, v in items.items() if k not in _CHOICE_FIELDS and k != "action"}
+    status = more.pop("status", 200)
+    page = render(
+        request,
+        "matrix_edit.html",
+        name=name,
+        document=document,
+        version=None,
+        saved="",
+        digest="",
+        error=more.pop("error", ""),
+        asking=carried,
+        **more,
+    )
+    page.status_code = status
+    return page
+
+
 @router.post("/matrices/{name}", response_class=HTMLResponse)
 async def edit_post(request: Request, name: str) -> Response:
     state = state_of(request)
     form = await request.form()
     items = {key: str(value) for key, value in form.items()}
     action, row = _requested_action(items)
-    document = forms.nest(items)
+    document = forms.nest({k: v for k, v in items.items() if k not in _CHOICE_FIELDS})
 
     if action == "save":
+        choice = items.get("choice", "")
+        target = name
+        if _changes_a_stored_set(name, document, state.workspace):
+            if choice not in ("create", "update"):
+                return _ask(request, name, document, items)
+            if choice == "create":
+                target = items.get("new_name", "").strip()
+                if not target:
+                    return _ask(
+                        request,
+                        name,
+                        document,
+                        items,
+                        status=400,
+                        error="Create needs a new name for the seat set.",
+                    )
+                if target in matrices.names(workspace=state.workspace):
+                    return _ask(
+                        request,
+                        name,
+                        document,
+                        items,
+                        status=400,
+                        error=f"A seat set named {target!r} already exists; pick a new name.",
+                    )
         reference, reference_label = await _reference_basket(state.workspace)
         try:
             version, matrix = matrices.save(
-                name, document, reference=reference, workspace=state.workspace
+                target, document, reference=reference, workspace=state.workspace
             )
         except ConfigError as error:
             page = render(
@@ -240,7 +312,7 @@ async def edit_post(request: Request, name: str) -> Response:
             page.status_code = 400
             return page
         return RedirectResponse(
-            f"/matrices/{name}?saved={version}&digest={matrix.matrix_digest}"
+            f"/matrices/{target}?saved={version}&digest={matrix.matrix_digest}"
             f"&reference={quote(reference_label)}",
             status_code=303,
         )
