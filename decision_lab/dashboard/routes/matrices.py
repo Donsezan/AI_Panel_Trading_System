@@ -17,6 +17,7 @@ restates one of that loader's rules.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from enum import Enum
 from pathlib import Path
 from typing import Any, Final
 from urllib.parse import quote
@@ -78,6 +79,7 @@ async def edit_form(
         document=document,
         version=shown_version,
         saved=request.query_params.get("saved", ""),
+        unchanged=bool(request.query_params.get("unchanged", "")),
         digest=request.query_params.get("digest", ""),
         reference_label=request.query_params.get("reference", ""),
         error=error,
@@ -216,19 +218,35 @@ def _requested_action(items: Mapping[str, str]) -> tuple[str, str]:
 _CHOICE_FIELDS: Final = frozenset({"choice", "new_name"})
 
 
-def _changes_a_stored_set(name: str, document: dict[str, Any], workspace: Path | None) -> bool:
+class _Against(Enum):
+    """How a submitted document stands against the latest stored version of its name."""
+
+    #: Nothing is stored under this name yet, so there is nothing to change and nothing to ask.
+    NEW = "new"
+    SAME = "same"
+    CHANGED = "changed"
+    #: The writer refused the document. `save` refuses it again and renders that as a 400 with the
+    #: draft on the page; asking first would carry it into a prompt whose answer is that refusal.
+    UNWRITABLE = "unwritable"
+
+
+def _against_stored(name: str, document: dict[str, Any], workspace: Path | None) -> _Against:
     """Whether saving `document` under `name` would differ from the latest stored version.
 
     Compared as the bytes `matrices.save` would publish against the bytes of the latest version,
     because a stored version *is* what a previous form post dumped: an unchanged re-save is
-    byte-identical, and nothing is restated here about which fields matter. A name nothing is
-    stored under yet has nothing to change, so it never asks.
+    byte-identical, and nothing is restated here about which fields matter.
     """
     stored = matrices.versions(name, workspace=workspace)
     if not stored:
-        return False
+        return _Against.NEW
+    try:
+        rendered = matrices.dumps(document).encode("utf-8")
+    except ConfigError:
+        # Never a 500 here: an unhandled refusal loses the operator's draft (CLAUDE.md).
+        return _Against.UNWRITABLE
     latest = matrices.path_for(name, stored[-1], workspace=workspace)
-    return latest.read_bytes() != matrices.dumps(document).encode("utf-8")
+    return _Against.SAME if latest.read_bytes() == rendered else _Against.CHANGED
 
 
 def _ask(
@@ -269,7 +287,12 @@ async def edit_post(request: Request, name: str) -> Response:
     if action == "save":
         choice = items.get("choice", "")
         target = name
-        if _changes_a_stored_set(name, document, state.workspace):
+        against = _against_stored(name, document, state.workspace)
+        if against is _Against.SAME:
+            # Byte-identical, so the same digest: minting a version would record an edit that
+            # never happened, and its banner would call an unchanged seat set uncalibrated.
+            return RedirectResponse(f"/matrices/{name}?unchanged=1", status_code=303)
+        if against is _Against.CHANGED:
             if choice not in ("create", "update"):
                 return _ask(request, name, document, items)
             if choice == "create":
@@ -298,10 +321,11 @@ async def edit_post(request: Request, name: str) -> Response:
                 target, document, reference=reference, workspace=state.workspace
             )
         except ConfigError as error:
+            # Under `target`: a refused Create is the new set's refusal, and its form posts there.
             page = render(
                 request,
                 "matrix_edit.html",
-                name=name,
+                name=target,
                 document=document,
                 version=None,
                 saved="",

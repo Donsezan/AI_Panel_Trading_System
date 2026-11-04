@@ -19,6 +19,12 @@ against the dataset you intend to sweep. A sweep will refuse until they have.
 {% if reference_label %}Validated against {{ reference_label }}.{% endif %}</p>
 {% endif %}
 
+{% if unchanged %}
+{# A byte-identical save mints no version, so its digest and its calibration are unchanged. #}
+<p>Nothing changed: this is the latest saved version, so no new version was made and its
+calibration stands.</p>
+{% endif %}
+
 {% if error %}
 <p class="error">{{ error }}</p>
 {% endif %}
