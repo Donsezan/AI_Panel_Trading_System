@@ -1,4 +1,4 @@
-"""The period evaluation's exit criterion: one quarter, run from the page's own argv, read on the page.
+"""The period evaluation's exit criterion: one quarter run from the page's argv, read on the page.
 
 Offline and free: the stub matrix, so the loop is exercised and nothing is measured (a plumbing
 check, §7.2 of the lab spec). Nothing here is patched on the page side — the run goes through
@@ -23,7 +23,6 @@ import pytest
 
 with warnings.catch_warnings():
     warnings.simplefilter("ignore")
-    from fastapi.testclient import TestClient
 
 from decision_lab import candidates as cd
 from decision_lab import cli, gate, longrun, matrices, registry
@@ -40,7 +39,9 @@ QUARTER = "2024-Q1"
 
 
 def _own_seat_set(tmp_path: Path) -> Path:
-    """The stub matrix with one seat's role reworded: a digest nothing else holds. (Not `instruction`:
+    """The stub matrix with one seat's role reworded: a digest nothing else holds.
+
+    (Not `instruction`:
     a seat that names a library prompt has it overridden, so the digest would not move.)"""
     document = tomllib.loads(f.stub_matrix_file().read_text(encoding="utf-8"))
     document["candidates"][0]["seats"][0]["role"] += " (this copy)"

@@ -427,7 +427,7 @@ def test_the_prompt_carries_every_value_so_the_second_click_loses_nothing(
         html.unescape(name): html.unescape(value)
         for name, value in re.findall(r'<input type="hidden" name="([^"]*)" value="([^"]*)"', page)
     }
-    assert {k for k in posted} <= set(hidden), sorted(set(posted) - set(hidden))
+    assert set(posted) <= set(hidden), sorted(set(posted) - set(hidden))
     assert hidden["candidates.0.seats.0.instruction"].replace("\r\n", "\n") == wording
 
     lab_client.post("/matrices/mine", data=hidden | {"action": "save", "choice": "update"})
