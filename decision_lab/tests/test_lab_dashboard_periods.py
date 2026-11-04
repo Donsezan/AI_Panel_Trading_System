@@ -332,6 +332,55 @@ def test_model_failed_has_no_continue_and_interrupted_does(
     assert argv[argv.index("--budget") + 1] == "9"
 
 
+def test_a_running_meta_nobody_holds_is_interrupted_and_offers_continue(
+    paused: tuple[TestClient, Ran, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review I1: Stop, a crash or a reboot leaves `RUNNING` on disk and no process behind it.
+    The lock is free, so the run is read as interrupted, and the page's Continue reaches it."""
+    client, ran, workspace = paused
+    dead = with_meta(
+        workspace, ran, "dead", ending=pd.RunEnding.RUNNING, months=ran.meta.months[:1]
+    )
+    meta_file = pd.period_dir(dead, workspace=workspace) / pd.PERIOD_META
+    before = meta_file.read_bytes()
+    assert jobs.holder(workspace=workspace) is None
+
+    page = client.get(f"/periods/{dead}").text
+    assert pd.STALE_REASON in page
+    assert f'action="/periods/{dead}/continue"' in page
+    assert "Running:" not in page
+    assert meta_file.read_bytes() == before, "reading the page must not rewrite the meta"
+
+    started: list[list[str]] = []
+    monkeypatch.setattr(jobs, "start", recording(started, "j3"))
+    went = client.post(f"/periods/{dead}/continue", data={"budget": "9"}, follow_redirects=False)
+    assert went.status_code == 303 and "job=j3" in went.headers["location"]
+    assert "--continue" in started[0]
+    assert started[0][started[0].index("--period") + 1] == ran.meta.period.label
+    assert meta_file.read_bytes() == before, "the Continue run records the real ending"
+
+
+def test_a_running_meta_whose_lock_is_held_is_running_and_offers_no_continue(
+    paused: tuple[TestClient, Ran, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, ran, workspace = paused
+    live = with_meta(workspace, ran, "live", ending=pd.RunEnding.RUNNING)
+    started: list[list[str]] = []
+    monkeypatch.setattr(jobs, "start", recording(started, "j4"))
+    lock = jobs.WorkspaceLock(workspace=workspace)
+    lock.acquire(("evaluate", "period", "--period", "2024-Q1"), clock=SystemClock())
+    try:
+        page = client.get(f"/periods/{live}").text
+        refused = client.post(f"/periods/{live}/continue", data={"budget": "9"})
+    finally:
+        lock.release()
+
+    assert "Running: a process holds the workspace" in page
+    assert "/continue" not in page and pd.STALE_REASON not in page
+    assert refused.status_code == 409 and "still running" in refused.text
+    assert not started
+
+
 def test_a_running_job_with_half_written_meta_is_not_a_500(
     paused: tuple[TestClient, Ran, Path],
 ) -> None:
@@ -352,7 +401,8 @@ def test_a_running_job_with_half_written_meta_is_not_a_500(
         assert response.status_code == 200, run_id
     page = client.get(f"/periods/{running}")
     assert page.status_code == 200 and "REPORT INCOMPLETE" in page.text
-    assert "Running, or a process died" in page.text
+    # No process holds the workspace, so a RUNNING meta is a run that died (review I1).
+    assert pd.STALE_REASON in page.text
     assert client.get("/periods/nothing-here").status_code == 404
     assert client.get(f"/periods/{running}/months/2024-01").status_code == 404
 
@@ -571,7 +621,7 @@ def test_a_running_jobs_period_page_does_not_refresh_its_drill_downs_shut(
     for page in (detail, month):
         assert 'http-equiv="refresh"' not in page
         assert "refresh for progress" in page
-    assert "Running, or a process died" in detail
+    assert "Running: a process holds the workspace" in detail
     assert 'http-equiv="refresh"' in listing, "other pages keep their behaviour"
 
 

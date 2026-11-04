@@ -205,7 +205,8 @@ def require_covered(period: Period, first: datetime, last: datetime) -> None:
 
 
 class RunEnding(StrEnum):
-    """How a run stands. `RUNNING` on disk means a process died, never that one is alive (§5.7)."""
+    """How a run stands. `RUNNING` on disk is a process writing it, or one that died; `standing`
+    tells the two apart by the workspace lock (§5.7)."""
 
     RUNNING = "RUNNING"
     COMPLETED = "COMPLETED"
@@ -316,6 +317,30 @@ def not_run_months(meta: PeriodMeta) -> tuple[str, ...]:
     """
     reached = {month.label for month in meta.months}
     return tuple(month.label for month in meta.period.months if month.label not in reached)
+
+
+#: What a `RUNNING` meta means when no process holds the workspace: Stop, a crash or a reboot,
+#: none of which can write an ending (§5.7). Said by the page and by the CLI in the same words.
+STALE_REASON: Final = (
+    "the run stopped without recording an ending; Continue resumes it from the last checkpointed "
+    "month"
+)
+
+
+def standing(meta: PeriodMeta, *, held: bool) -> PeriodMeta:
+    """How a run stands for a reader: its meta, with a stale `RUNNING` read as `INTERRUPTED`.
+
+    The one classification the CLI, the page and `analysis` share. `held` is whether any process
+    holds the workspace lock (`jobs.holder`). Every `evaluate period` holds it for its whole run,
+    so a `RUNNING` meta with the lock free is a process that died without writing its ending, and
+    Continue is what recovers it. Treating it so is race-free, because a Continue's own CLI takes
+    the lock itself and refuses with exit 7 if another got there first.
+
+    Nothing is written: the copy is for the reader, and the Continue records the real ending.
+    """
+    if meta.ending is not RunEnding.RUNNING or held:
+        return meta
+    return meta.model_copy(update={"ending": RunEnding.INTERRUPTED, "ending_reason": STALE_REASON})
 
 
 def projected_cost(
@@ -1068,7 +1093,11 @@ async def run(
     found: PeriodMeta | None = None
     why = ""
     if meta_path.is_file():
-        found = PeriodMeta.model_validate_json(meta_path.read_text(encoding="utf-8"))
+        # `held=False`: whoever calls this holds the workspace (the CLI takes the lock, exit 7),
+        # so no other process can be writing this run, and a RUNNING meta is one that died.
+        found = standing(
+            PeriodMeta.model_validate_json(meta_path.read_text(encoding="utf-8")), held=False
+        )
         if resume and found.ending is RunEnding.RULE_ENDED:
             raise ConfigError(
                 "this run was ended by a rule, which is its result and has nothing to continue: "

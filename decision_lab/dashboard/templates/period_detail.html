@@ -63,8 +63,10 @@ and there is no Continue: a rule's verdict is the result.</p>
   </form>
 </div>
 {% elif meta.ending.value == "RUNNING" %}
-<p class="busy">Running, or a process died mid-run: the record on disk cannot tell which. Months
-appear as they end.</p>
+{# Only while a process holds the workspace: a run whose process died without writing an ending
+   reads as interrupted, above, and is offered Continue (`period.standing`). #}
+<p class="busy">Running: a process holds the workspace and this run has recorded no ending yet.
+Months appear as they end.</p>
 {% else %}
 <p>Completed.</p>
 {% endif %}

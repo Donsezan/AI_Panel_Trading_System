@@ -24,6 +24,7 @@ from pathlib import Path
 from decision_lab import compare as cmp
 from decision_lab import corpus as cp
 from decision_lab import dataset as ds
+from decision_lab import jobs
 from decision_lab import period as pd
 from decision_lab import regimes as rg
 from decision_lab import scoring as sc
@@ -417,7 +418,7 @@ class PeriodAnalysis:
 
     @property
     def running(self) -> bool:
-        """`RUNNING` on disk means a process is working, or died; the page cannot tell which."""
+        """A process holds the workspace and this run has recorded no ending (`standing`)."""
         return self.meta.ending is pd.RunEnding.RUNNING
 
     @property
@@ -530,6 +531,15 @@ def fold_period(
     )
 
 
+def standing(meta: pd.PeriodMeta, *, workspace: Path | None) -> pd.PeriodMeta:
+    """`period.standing`, asked of this workspace's lock now: how a reader sees the run.
+
+    The page, the notebook and this module read a run through here, so a dead `RUNNING` run is
+    `INTERRUPTED` with the same reason everywhere, and nobody has to rewrite the meta to say so.
+    """
+    return pd.standing(meta, held=jobs.holder(workspace=workspace) is not None)
+
+
 def analyse_period(
     run_id: str,
     scoring: Scoring,
@@ -555,7 +565,10 @@ def analyse_period(
             f"period run {run_id!r} has its {pd.PERIOD_META} but {pd.PERIOD_DB} is missing "
             f"from {directory}; its cycles cannot be scored without the log"
         )
-    meta = pd.PeriodMeta.model_validate_json(meta_path.read_text(encoding="utf-8"))
+    meta = standing(
+        pd.PeriodMeta.model_validate_json(meta_path.read_text(encoding="utf-8")),
+        workspace=workspace,
+    )
     engine = open_database(database)
     writer = SingleWriter(engine)
     try:

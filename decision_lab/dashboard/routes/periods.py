@@ -142,6 +142,7 @@ class RunEntry:
 
 
 def _read_meta(run_id: str, workspace: Path | None) -> RunEntry:
+    """The run's meta as a reader sees it now (`analysis.standing`), or why there is none."""
     path = pd.period_dir(run_id, workspace=workspace) / pd.PERIOD_META
     try:
         text = path.read_text(encoding="utf-8")
@@ -152,12 +153,13 @@ def _read_meta(run_id: str, workspace: Path | None) -> RunEntry:
     except OSError as error:
         return RunEntry(run_id, None, f"its record cannot be read: {error}")
     try:
-        return RunEntry(run_id, pd.PeriodMeta.model_validate_json(text))
+        meta = pd.PeriodMeta.model_validate_json(text)
     except ValueError as error:
         first = str(error).splitlines()[0]
         return RunEntry(
             run_id, None, f"its record cannot be read (being written, or another version): {first}"
         )
+    return RunEntry(run_id, an.standing(meta, workspace=workspace))
 
 
 def period_runs(workspace: Path | None) -> tuple[RunEntry, ...]:
@@ -1016,9 +1018,10 @@ async def continue_run(request: Request, run_id: str) -> Response:
             "result, and there is nothing to continue."
         ),
         pd.RunEnding.COMPLETED: "This run completed; there is nothing to continue.",
+        # Only while a process holds the workspace: a dead run reads INTERRUPTED (`standing`).
         pd.RunEnding.RUNNING: (
-            "This run is still marked running: a process is writing it, or one died. Wait for "
-            "it to end (or stop it on Runs in progress) before continuing."
+            "This run is still running: a process holds the workspace. Wait for it to end (or "
+            "stop it on Runs in progress) before continuing."
         ),
     }
     if meta.ending in refusals:

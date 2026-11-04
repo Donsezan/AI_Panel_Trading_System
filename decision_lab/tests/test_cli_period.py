@@ -583,6 +583,31 @@ def test_the_row_of_a_reused_run_keeps_its_provenance_and_stays_one_row(
     assert rd.GATE_SKIPPED in second.read_text(encoding="utf-8")
 
 
+def test_a_run_that_died_without_an_ending_says_so_and_continues(
+    lab: Path, tmp_path: Path, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """Review I1: Stop, a crash or a reboot leaves `RUNNING` on disk. Without `--continue` the
+    refusal says what happened and what recovers it; with it the run resumes and records its end."""
+    assert cli.main(argv(lab, tmp_path / "a.md", "--skip-gate")) == cli.EXIT_OK
+    [directory] = (tmp_path / "workspace").glob("period-*")
+    finished = pd.PeriodMeta.model_validate_json((directory / pd.PERIOD_META).read_text("utf-8"))
+    died = finished.model_copy(
+        update={"ending": pd.RunEnding.RUNNING, "months": (), "profit": Profit()}
+    )
+    pd._write_meta(directory / pd.PERIOD_META, died)
+
+    capfd.readouterr()
+    refused = cli.main(argv(lab, tmp_path / "b.md", "--skip-gate"))
+    assert refused == cli.EXIT_DATASET
+    # `main` configures its own JSON logging, so the refusal is read where the operator reads it.
+    assert pd.STALE_REASON in capfd.readouterr().err
+
+    assert cli.main(argv(lab, tmp_path / "c.md", "--skip-gate", "--continue")) == cli.EXIT_OK
+    resumed = pd.PeriodMeta.model_validate_json((directory / pd.PERIOD_META).read_text("utf-8"))
+    assert resumed.ending is pd.RunEnding.COMPLETED
+    assert resumed.months == finished.months
+
+
 def test_continue_with_nothing_to_continue_exits_3_and_writes_no_run(
     lab: Path, tmp_path: Path
 ) -> None:
