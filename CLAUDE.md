@@ -252,7 +252,7 @@ Specced in [docs/superpowers/specs/2026-08-23-decision-lab-design.md](docs/super
 five slices, of which **A (integrity, day set, corpus), B (regimes, scoring, per-seat, report),
 C (the sweep) and D — both pass 1 (calibration and the gate) and pass 2 (the tuning dashboard and
 the notebook) — have shipped**. E (news): **the code has shipped** — the `build_sim(news_feed=…)`
-seam (the only slice that touches `tradebot` at all), the summarising pass, `archive publish`,
+seam (the first slice to touch `tradebot`; period evaluation's deliberate seam is the second), the summarising pass, `archive publish`,
 `ArchiveNewsFeed`, clustering and the provenance banners — but **the real summarising run and the
 news-fed corpus built over it are pending**, so every report is still `NEWS-BLIND` or stamped
 `PLUMBING CHECK`. **Period evaluation has shipped on the unmerged branch `period-evaluation`** — one
