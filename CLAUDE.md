@@ -135,6 +135,9 @@ was lost.
 .venv\Scripts\python.exe -m decision_lab calibrate shock  --corpus <id> --configs <matrix.toml>
 .venv\Scripts\python.exe -m decision_lab calibrate long --data data\history --configs <matrix.toml> `
     --candidate baseline --start-equity 1000 --every 4h --window 6m
+.venv\Scripts\python.exe -m decision_lab evaluate period --data data\history --configs <matrix.toml> `
+    --candidate baseline --start-equity 1000 --every 4h --period 2025-Q1 --budget 5   # a month, quarter or year
+.venv\Scripts\python.exe -m decision_lab evaluate period <the same arguments> --budget 10 --continue
 .\decision_lab\check.ps1                                                      # its own format/lint/mypy/tests
 ```
 
@@ -146,6 +149,11 @@ cookies are not port-scoped:
 $env:DECISION_LAB_DASHBOARD_TOKEN = "at-least-sixteen-characters"
 .venv\Scripts\python.exe -m decision_lab dashboard --port 8788
 ```
+
+Its **Periods** page is `evaluate period` with a form: it builds the same argv and spawns the
+same CLI. `--period` is `2025-03`, `2025-Q1` or `2025`; `--budget` has no default; `--continue`
+resumes an interrupted run under a larger one ([ADR 0031](docs/adr/0031-a-period-run-lifts-a-loss-pause-in-its-own-database.md)).
+Saving a changed seat set on the Seat sets page asks **Create new seat set** or **Update `<name>`**.
 
 `sweep` and `calibrate long` **refuse with exit 6** until both calibration halves have passed for
 that exact dataset, matrix and day set — so a sweep now needs a pinned day set where before it did
@@ -247,7 +255,9 @@ the notebook) — have shipped**. E (news): **the code has shipped** — the `bu
 seam (the only slice that touches `tradebot` at all), the summarising pass, `archive publish`,
 `ArchiveNewsFeed`, clustering and the provenance banners — but **the real summarising run and the
 news-fed corpus built over it are pending**, so every report is still `NEWS-BLIND` or stamped
-`PLUMBING CHECK`. Pass 2 is **not** the read-only surface §12 first specified — that was reversed
+`PLUMBING CHECK`. **Period evaluation has shipped on the unmerged branch `period-evaluation`** — one
+seat set over one chosen month, quarter or year, with its spikes read by event; real spike results
+need the paid summarising run (roadmap D2 / Stage 5). Pass 2 is **not** the read-only surface §12 first specified — that was reversed
 deliberately, and §12.1 records why: a loop that means editing TOML in one window, running a
 command in a second and reading Markdown in a third is a loop nobody closes. What the reversal did
 not license is unchanged — no authority over the bot, no promotion authority, no automatic search.
@@ -269,6 +279,10 @@ dataset.py             audit recorded history, repair holes, refuse an unverifie
       gate.py          the §10.6 record alone: its key, its file, and `require_satisfied`
         calibration.py scenarios 1 and 2 — the pinned days through `sweep.run`, then four conditions
         longrun.py     scenario 3 — one candidate's own six months, its own ledger, its own profit
+period.py              one seat set over one calendar period: its own db, month checkpoints, endings
+  replay.py            Continue: recorded answers replayed into a fresh database, each snapshot verified
+  spikes.py            spike events, the lead-in/during/after stretches, what the seats could see
+  analysis.py          (above) also folds a period: `PeriodAnalysis`, the one read for CLI, page, notebook
 archive/               raw store and crawl (staging, with bodies) -> summarise -> publish (travels, none)
   fields.py            §6.5's two closed vocabularies: EventType, Modality
   published.py         ArchiveItem (no body field), ArchiveHeader, archive_digest, PublishedArchive
@@ -284,8 +298,10 @@ Rules that are easy to get backwards:
 - **Nothing under `tradebot/` may name `decision_lab`**, and the bot's CLI is untouched — a tuning
   tool reachable from a live process by accident is one an operator reaches by accident.
   `test_separation.py` enforces it, and `git diff --stat main -- tradebot/` staying empty is a
-  slice exit criterion. Slice E is the one sanctioned exception, and its seam and its guard tests
-  are **one change, never two**.
+  slice exit criterion. There are two sanctioned exceptions — Slice E's `build_sim(news_feed=…)`
+  and period evaluation's `build_sim(deliberate=…)`, sim-only, refused first in `_assemble` for any
+  other mode, with an `is not None` in `basket_runner.py` — and each seam and its guard tests are
+  **one change, never two**.
 - **No `float`, anywhere**, enforced by `test_discipline.py` — the same rule
   `test_money_discipline.py` gives the bot, applied to a package that is entirely arithmetic.
 - **The truth label is long-only aware, and it is the thing easiest to get backwards.** Tier-1
@@ -437,6 +453,45 @@ Rules that are easy to get backwards:
 - **The derivation cache keys on the rows files' size and mtime**, so a running job invalidates
   its own entry — size as well as mtime, because a one-second mtime resolution would serve a
   stale page for the length of a write burst.
+
+Period evaluation ([ADR 0031](docs/adr/0031-a-period-run-lifts-a-loss-pause-in-its-own-database.md),
+[spec](docs/superpowers/specs/2026-11-01-period-evaluation-design.md)). Rules that are easy to get
+backwards:
+
+- **A loss pause is lifted inside the run's own database, and is shown wherever profit is.**
+  Clearing the halt alone does nothing — the streak is derived from round trips — so the run
+  publishes `max_consecutive_losses = streak + L` and puts L back after a win. The bot would have
+  stayed halted; the `PAUSE LIFTED` banner and the "lifted pause" note beside the profit say so.
+- **The rest of a paused month runs as whole-basket quarantine cycles**, which take a snapshot (so
+  stops fire and marks stay fresh) and ask no panel. They are **never scored and never counted**:
+  coverage reads 74 / 168 because they carry no decision.
+- **Three endings, and only two are results.** `COMPLETED`, `RULE_ENDED` ("Model failed, requires
+  tuning": out of money or the kill switch, final, reused) and `INTERRUPTED` (continuable). Both
+  count **total** cash, free plus locked, because locked cash can still become a position. Months a
+  run never reached are `not_run_months(meta)`, never stored as zero rows.
+- **`--continue` with nothing to continue refuses with exit 3**, and never starts a fresh run — a
+  typo'd flag must not bypass the spend refusal. On a rule-ended run it reuses the report at exit 0.
+- **Continue re-executes; it does not restore.** A fresh database from the period start, recorded
+  panel answers replayed up to the last checkpointed month, each replayed snapshot verified against
+  the recorded one (a difference refuses, naming the cycle). `SimBroker.restore` loses a stop's
+  armed state and recovery leaves no protective plan (KNOWN_GAPS §9, §18).
+- **A finished run is reused past the gate, the key check and the projection** — nothing is spent.
+  Budget is checked at month boundaries, strictly greater-than, and not after the last month.
+- **Registry provenance comes from the run's meta, not the invocation**: a reused run is not a
+  second row. `matrix_source` and `news_sources` are on the meta, so the page finds the run's own
+  seat set and archive; lookups fall back on `matrix_digest`, never `panel_digest` alone.
+- **"Could see" and "published later" are never mixed**, and an event is covered only if **one**
+  source's span contains the lead-in through the event's end — the lead-in is what answers "did it
+  predict". Could-see reads cycles that carry a decision, contaminated ones included, quarantined
+  ones excluded.
+- **`move_pct` is the signed start-to-end change and may disagree with the event's direction** (a
+  merged event can retrace); sort on `abs(move_pct)`. **Clipped means the period edge** — a
+  paused lead-in is not one.
+- **A failed read writes `REPORT INCOMPLETE`, and the exit code of the ending wins.** The meta
+  alone is shown, because the page is the record of money spent; a finished run whose read failed
+  exits 3.
+- **BTC only for now.** `period_basket` narrows to the one instrument, and coverage reads every
+  series, so a short ETH series can refuse or delay a BTC period (fails closed).
 
 ### Phase 11 — the instrument master
 
