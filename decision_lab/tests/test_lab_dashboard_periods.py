@@ -23,7 +23,7 @@ with warnings.catch_warnings():
     warnings.simplefilter("ignore")
     from fastapi.testclient import TestClient
 
-from decision_lab import analysis, jobs
+from decision_lab import analysis, jobs, registry
 from decision_lab import period as pd
 from decision_lab.dashboard.app import create_lab_dashboard
 from decision_lab.dashboard.routes import periods as periods_routes
@@ -89,14 +89,21 @@ def paused(
     yield client_over(workspace), ran, workspace
 
 
+def id_for(name: str) -> str:
+    """A run id in the shape `registry.run_id` mints, named for the test: the routes refuse any
+    other shape before they touch the filesystem."""
+    return registry.run_id(test=name)
+
+
 def with_meta(workspace: Path, ran: Ran, name: str, **changes: object) -> str:
     """Copy the run to a sibling id whose meta carries `changes`; return the new id."""
+    run_id = id_for(name)
     source = pd.period_dir(ran.meta.run_id, workspace=workspace)
-    target = pd.period_dir(name, workspace=workspace)
+    target = pd.period_dir(run_id, workspace=workspace)
     shutil.copytree(source, target)
-    meta = ran.meta.model_copy(update={"run_id": name, **changes})
+    meta = ran.meta.model_copy(update={"run_id": run_id, **changes})
     (target / pd.PERIOD_META).write_text(meta.model_dump_json(), encoding="utf-8")
-    return name
+    return run_id
 
 
 def at(day: int, hour: int = 0) -> datetime:
@@ -386,24 +393,24 @@ def test_a_running_job_with_half_written_meta_is_not_a_500(
 ) -> None:
     """Review Focus 4: a running job's record is absent, cut off or ahead of its log."""
     client, ran, workspace = paused
-    half = pd.period_dir("half", workspace=workspace)
+    half = pd.period_dir(id_for("half"), workspace=workspace)
     half.mkdir()
     (half / pd.PERIOD_META).write_text('{"run_id": "half", "period": {"lab', encoding="utf-8")
-    empty = pd.period_dir("starting", workspace=workspace)
+    empty = pd.period_dir(id_for("starting"), workspace=workspace)
     empty.mkdir()
     running = with_meta(workspace, ran, "running", ending=pd.RunEnding.RUNNING)
     (pd.period_dir(running, workspace=workspace) / pd.PERIOD_DB).unlink()
 
     listing = client.get("/periods")
     assert listing.status_code == 200 and "cannot be read" in listing.text
-    for run_id in ("half", "starting"):
+    for run_id in (id_for("half"), id_for("starting")):
         response = client.get(f"/periods/{run_id}")
         assert response.status_code == 200, run_id
     page = client.get(f"/periods/{running}")
     assert page.status_code == 200 and "REPORT INCOMPLETE" in page.text
     # No process holds the workspace, so a RUNNING meta is a run that died (review I1).
     assert pd.STALE_REASON in page.text
-    assert client.get("/periods/nothing-here").status_code == 404
+    assert client.get(f"/periods/{id_for('nothing-here')}").status_code == 404
     assert client.get(f"/periods/{running}/months/2024-01").status_code == 404
 
 
@@ -639,3 +646,29 @@ def test_a_month_row_opens_in_place(paused: tuple[TestClient, Ran, Path]) -> Non
     assert "Jan 2024" in rows[0] and "/months/2024-01" in page
     assert page.count("not run") >= 2, "the months that never ran are still rows, and say so"
     assert "/months/2024-02" not in page, "a month that never ran has nothing to open"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/periods/..%5C..%5Coutside",
+        "/periods/%2E%2E",
+        "/periods/..%5Coutside/months/2024-01",
+        "/periods/abc%5C..%5Cx/cycles/c",
+        "/periods/ABCDEF0123456789ABCDEF0123456789",
+        "/periods/short/events/0",
+    ],
+)
+def test_a_run_id_that_is_not_one_is_a_404_before_any_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    """Final review M15: on Windows an encoded backslash decodes inside one path segment, so an
+    id is checked against the shape `registry.run_id` mints before it names a directory."""
+
+    def no_read(*_: object, **__: object) -> Path:
+        raise AssertionError("an id that is not one reached the filesystem")
+
+    client = client_over(tmp_path / "workspace")
+    monkeypatch.setattr(pd, "period_dir", no_read)
+    assert client.get(path).status_code == 404, path
+    assert client.post("/periods/..%5Cx/continue", data={"budget": "1"}).status_code == 404

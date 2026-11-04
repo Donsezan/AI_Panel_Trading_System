@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import tempfile
 from pathlib import Path
 from typing import Final
@@ -127,6 +128,15 @@ def run_id(**parts: str) -> str:
     """§11's identity. Sorted by key, so the caller's argument order cannot change it."""
     payload = "|".join(f"{key}={parts[key]}" for key in sorted(parts))
     return hashlib.blake2s(payload.encode("utf-8"), digest_size=16).hexdigest()
+
+
+#: The shape `run_id` mints: blake2s at 16 bytes, as lowercase hex.
+_RUN_ID: Final = re.compile(r"[0-9a-f]{32}")
+
+
+def is_run_id(text: str) -> bool:
+    """Whether `text` is shaped like an id `run_id` minted. Checked before an id names a path."""
+    return _RUN_ID.fullmatch(text) is not None
 
 
 def registry_path(*, workspace: Path | None = None) -> Path:

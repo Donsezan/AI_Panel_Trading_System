@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any, Final
 from urllib.parse import urlencode
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from starlette.responses import Response
 
@@ -37,7 +37,7 @@ from decision_lab import analysis as an
 from decision_lab import calibration_days as cday
 from decision_lab import candidates as cd
 from decision_lab import dataset as ds
-from decision_lab import gate, jobs, matrices
+from decision_lab import gate, jobs, matrices, registry
 from decision_lab import period as pd
 from decision_lab import scoring as sc
 from decision_lab.archive.config import DEFAULT_POLICY_FILE, load_policy
@@ -139,6 +139,16 @@ class RunEntry:
     run_id: str
     meta: pd.PeriodMeta | None
     problem: str = ""
+
+
+def _require_run_id(run_id: str) -> None:
+    """A 404 for anything not shaped like a minted id, before it names a directory (review M15).
+
+    On Windows an encoded backslash decodes inside one path segment, so `period_dir` joining a
+    crafted id could point a read at a `period.json` outside the workspace.
+    """
+    if not registry.is_run_id(run_id):
+        raise HTTPException(status_code=404, detail="no such period run")
 
 
 def _read_meta(run_id: str, workspace: Path | None) -> RunEntry:
@@ -443,6 +453,8 @@ def _feed_for(meta: pd.PeriodMeta, sources: tuple[str, ...]) -> tuple[ArchiveNew
 async def run_view(
     request: Request, run_id: str, configs: str = "", news_source: str = ""
 ) -> RunView:
+    # Every drill-down reads through here, so none of them can name a path with an unshaped id.
+    _require_run_id(run_id)
     state = state_of(request)
     entry = _read_meta(run_id, state.workspace)
     if entry.meta is None:
@@ -699,6 +711,7 @@ async def detail(
     request: Request, run_id: str, configs: str = "", news_source: str = "", job: str = ""
 ) -> HTMLResponse:
     """The result. A run with no directory at all is a 404; one mid-write is a page saying so."""
+    _require_run_id(run_id)
     view = await run_view(request, run_id, configs, news_source)
     page = render(
         request, "period_detail.html", hold_open=True, error="", job=job, **_detail_context(view)
@@ -993,6 +1006,7 @@ async def event(
 @router.post("/periods/{run_id}/continue")
 async def continue_run(request: Request, run_id: str) -> Response:
     """§5.7: Continue is for an interrupted run only, and it is the CLI's `--continue`."""
+    _require_run_id(run_id)
     state = state_of(request)
     fields = {key: str(value) for key, value in (await request.form()).items()}
     view = await run_view(request, run_id, fields.get("configs", ""), fields.get("news_source", ""))
