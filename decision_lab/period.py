@@ -67,7 +67,7 @@ from decision_lab.longrun import Profit, ProfitEvidence, VetoRow, profit_of, vet
 from decision_lab.newsfeed import ArchiveNewsFeed
 from decision_lab.params import workspace_root
 from decision_lab.records import CycleRecord
-from decision_lab.replay import Replayer, recorded_before
+from decision_lab.replay import Replayer, failed_before, recorded_before
 from tradebot.app import Application, build_sim, dataset_catalogue
 from tradebot.control.supervisor import BasketWorker
 from tradebot.core.clock import Clock, ManualClock
@@ -88,9 +88,9 @@ from tradebot.risk.rules import AUTO_PAUSE_RULE
 from tradebot.validation.backtest import DEFAULT_MAX_CYCLES, plan_ticks, warmup_for
 from tradebot.validation.evidence import Evidence
 
-#: Matched whole, over ASCII digits only. The label is part of a run's identity, so `$` (which admits
-#: a trailing newline) or `\d` (which admits full-width digits) would give one span a second name and
-#: a second paid run.
+#: Matched whole, over ASCII digits only. The label is part of a run's identity, so `$` (which
+#: admits a trailing newline) or `\d` (which admits full-width digits) would give one span a second
+#: name and a second paid run.
 _PATTERN: Final = re.compile(r"([0-9]{4})(?:-(?:(0[1-9]|1[0-2])|Q([1-4])))?")
 _BAR: Final = timedelta(hours=1)
 #: The one instrument a period run trades, by the operator's decision (§4). It reaches
@@ -718,19 +718,27 @@ def _log_of(database: Path) -> Iterator[EventStore | None]:
         engine.dispose()
 
 
-def _spend_around(database: Path, boundary: datetime | None) -> tuple[Decimal, Decimal]:
-    """What a database's log spent before `boundary`, and from it on.
+def _responses(store: EventStore) -> list[tuple[datetime, SeatResponse]]:
+    """Every model response the log holds, when it was recorded: the one source spend is read from.
 
     Off the responses rather than `Evidence.cost_usd`: a cycle that failed, or died part way,
-    records no cost of its own, and the provider was still paid.
+    records no cost of its own, and the provider was still paid. The in-run budget check and a
+    Continue both read this, through `total_cost`, so the two can never disagree (§5.5).
     """
+    return [
+        (e.ts, SeatResponse.model_validate(e.payload["response"]))
+        for e in store.read_types(EventType.SEAT_RESPONDED)
+    ]
+
+
+def _spend_around(database: Path, boundary: datetime | None) -> tuple[Decimal, Decimal]:
+    """What a database's log spent before `boundary`, and from it on (`_responses`)."""
     if not database.exists():
         return ZERO, ZERO
     with _log_of(database) as store:
         if store is None:
             return ZERO, ZERO
-        events = store.read_types(EventType.SEAT_RESPONDED)
-    responses = [(e.ts, SeatResponse.model_validate(e.payload["response"])) for e in events]
+        responses = _responses(store)
     before = [one for at, one in responses if boundary is not None and at < boundary]
     after = [one for at, one in responses if boundary is None or at >= boundary]
     return total_cost(before), total_cost(after)
@@ -770,6 +778,8 @@ class _Replay:
     months: tuple[MonthResult, ...]
     boundary: datetime
     recorded: tuple[CycleRecord, ...]
+    #: When the recorded run failed a cycle without deciding, so a replay can name it (`Replayer`).
+    failed: tuple[datetime, ...] = ()
 
 
 def _replay_from(
@@ -788,7 +798,13 @@ def _replay_from(
             "start the period again"
         )
     kept, _ = _spend_around(source, boundary)
-    return _Replay(checkpoint.months, boundary, recorded_before(source, boundary)), kept
+    replay = _Replay(
+        checkpoint.months,
+        boundary,
+        recorded_before(source, boundary),
+        failed_before(source, boundary),
+    )
+    return replay, kept
 
 
 def _abandon(database: Path, clock: Clock) -> None:
@@ -1123,7 +1139,7 @@ async def run(
             directory, fresh=meta, found=found, ticks=ticks, budget=budget, clock=wall_clock
         )
     replayer = (
-        Replayer(replay.recorded, boundary=replay.boundary, clock=clock)
+        Replayer(replay.recorded, boundary=replay.boundary, clock=clock, failed=replay.failed)
         if replay is not None
         else None
     )
@@ -1220,7 +1236,12 @@ async def run(
                 write_checkpoint(directory, month.label, meta=meta)
                 # After the last month nothing is left to refuse, and so nothing to continue (§5.5).
                 # A replayed month spends nothing, and `_continue_from` has already judged them.
-                spent = evidence.cost_usd + meta.abandoned_cost_usd
+                # From the responses, as `_continue_from` counts: a failed cycle's spend is on no
+                # completion, and the provider was paid for it all the same.
+                spent = (
+                    total_cost([one for _, one in _responses(application.store)])
+                    + meta.abandoned_cost_usd
+                )
                 is_live = index >= len(replayed_months)
                 if is_live and index + 1 < len(period.months) and spent > budget:
                     raise BudgetReached(

@@ -9,7 +9,9 @@ Failure semantics: every replayed cycle compares its snapshot with the recorded 
 aside, and any difference raises `ConfigError` naming the first cycle that differs. Answers applied
 to a different market would be evidence nobody could name. `BasketWorker` absorbs what a cycle
 raises (a supervised run must survive a defect), so the refusal is also kept here, and the caller
-reads it back with `raise_if_diverged` after each cycle. Nothing here writes. A model unreachable
+reads it back with `raise_if_diverged` after each cycle. A recorded cycle that failed before it
+decided has no answer to recite, and a replay asking the panel there refuses naming that cycle as
+failed rather than as a market that differed. Nothing here writes. A model unreachable
 after the boundary behaves as it does in any run, because that part is the real engine.
 """
 
@@ -34,6 +36,21 @@ from tradebot.persistence.store import EventStore
 _GENERATED = "snapshot_id"
 
 
+#: A cycle that froze its snapshot and then ended without a decision: `CycleOutcome.FAILED`, or no
+#: completion at all because `BasketWorker` absorbed what it raised.
+_FAILED_OUTCOMES = frozenset({"failed", ""})
+
+
+def _records(database: Path) -> tuple[CycleRecord, ...]:
+    engine = open_database(database)
+    writer = SingleWriter(engine)
+    try:
+        return records_from_store(EventStore(engine, writer))
+    finally:
+        writer.close()
+        engine.dispose()
+
+
 def recorded_before(database: Path, boundary: datetime) -> tuple[CycleRecord, ...]:
     """The cycles before `boundary` that asked the panel, in order.
 
@@ -41,14 +58,21 @@ def recorded_before(database: Path, boundary: datetime) -> tuple[CycleRecord, ..
     re-executed run reaches the same conclusion for itself. A compacted snapshot refuses, in
     `records_from_store`, since there would be nothing to compare against.
     """
-    engine = open_database(database)
-    writer = SingleWriter(engine)
-    try:
-        records = records_from_store(EventStore(engine, writer))
-    finally:
-        writer.close()
-        engine.dispose()
-    return tuple(one for one in records if one.decisions and one.as_of < boundary)
+    return tuple(one for one in _records(database) if one.decisions and one.as_of < boundary)
+
+
+def failed_before(database: Path, boundary: datetime) -> tuple[datetime, ...]:
+    """When a cycle before `boundary` froze its snapshot and then failed without deciding.
+
+    The recorded run holds no answer for it, so a replay that asks the panel there has nothing to
+    recite. The refusal is the same either way; this is what lets it name the real cause rather
+    than a market difference that never happened.
+    """
+    return tuple(
+        one.as_of
+        for one in _records(database)
+        if not one.decisions and one.outcome in _FAILED_OUTCOMES and one.as_of < boundary
+    )
 
 
 def _instrument_difference(recorded: ContextSnapshot, now: ContextSnapshot) -> str:
@@ -90,9 +114,15 @@ class Replayer:
     """Stands in for `DecisionEngine.deliberate` through `build_sim(deliberate=...)`."""
 
     def __init__(
-        self, recorded: tuple[CycleRecord, ...], *, boundary: datetime, clock: Clock
+        self,
+        recorded: tuple[CycleRecord, ...],
+        *,
+        boundary: datetime,
+        clock: Clock,
+        failed: tuple[datetime, ...] = (),
     ) -> None:
         self._recorded = recorded
+        self._failed = frozenset(failed)
         self._boundary = boundary
         self._clock = clock
         self._next = 0
@@ -104,6 +134,13 @@ class Replayer:
         if snapshot.as_of >= self._boundary:
             return await self._live(basket).deliberate(snapshot, basket)
         self.raise_if_diverged()
+        if snapshot.as_of in self._failed:
+            self._divergence = ConfigError(
+                f"the recorded month holds a FAILED cycle at {snapshot.as_of.isoformat()}, so it "
+                "cannot be replayed: the recorded run paid for no decision there, and there is no "
+                "answer to recite into it"
+            )
+            raise self._divergence
         if self._next >= len(self._recorded):
             self._refuse(snapshot.as_of, "the recorded run asked the panel nothing more")
         expected = self._recorded[self._next]

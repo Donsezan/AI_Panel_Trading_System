@@ -56,13 +56,14 @@ from decision_lab.tests.test_period_pause import (
 from decision_lab.tests.test_period_run import cycle_stamps, fills_in, read_log
 from tradebot.app import Application
 from tradebot.control import startup as startup_module
+from tradebot.control import supervisor as supervisor_module
 from tradebot.control.supervisor import BasketWorker
 from tradebot.core.clock import ManualClock
 from tradebot.core.config import Basket, ProviderBinding
 from tradebot.core.decision import Decision
 from tradebot.core.enums import Action
 from tradebot.core.errors import ConfigError
-from tradebot.core.events import EventType
+from tradebot.core.events import Event, EventFactory, EventType
 from tradebot.core.market import Candle
 from tradebot.core.money import ZERO
 from tradebot.core.snapshot import ContextSnapshot, NewsCoverage, NewsItemView
@@ -952,6 +953,84 @@ async def test_a_halted_month_is_redone_from_the_month_before(
 
     assert resumed.meta.months == whole.meta.months
     assert resumed.meta.ending is pd.RunEnding.COMPLETED
+
+
+async def test_a_stop_inside_a_replayed_month_refuses(
+    data: dict[str, Path], tmp_path: Path
+) -> None:
+    """A checkpointed month ran whole, so a stop in its replay is no verdict: it is a replay that
+    went somewhere the recorded run did not, and the run stays continuable."""
+    await killed_after(data["flat"], tmp_path, "2024-02", {})
+
+    async def halt(worker: BasketWorker) -> None:
+        if worker._clock.now() == utc(1, 20):
+            await worker._watchdog.halt_basket(worker.basket_id, "injected: a replayed halt")
+
+    with pytest.raises(ConfigError, match=r"2024-01.*which the recorded run finished"):
+        await execute(
+            data["flat"], tmp_path, QUARTER, {}, cost_usd=COST, resume=True, before_cycle=halt
+        )
+
+    gc.collect()
+    meta = stored_meta(tmp_path)
+    assert meta.ending is pd.RunEnding.INTERRUPTED, "an error, never a rule's verdict"
+    assert "which the recorded run finished" in meta.ending_reason
+
+
+def fail_after_paying(monkeypatch: pytest.MonkeyPatch, moment: datetime) -> None:
+    """The cycle at `moment` pays for its panel, then raises before it decides anything.
+
+    `BasketWorker` absorbs it, as it absorbs any defect a cycle raises, so the cycle has seat
+    responses (money spent) and no `CYCLE_COMPLETED`, which is where `Evidence` reads cost from.
+    """
+    real = EventFactory.decision_made
+
+    def raising(self: EventFactory, decision: Decision) -> Event:
+        if self._clock.now() == moment:
+            raise RuntimeError("injected: a defect after the panel was paid")
+        return real(self, decision)
+
+    monkeypatch.setattr(EventFactory, "decision_made", raising)
+    # Logged without its traceback: pytest's log capture keeps a record's frames, and with them the
+    # wiring's open connections, and Windows will not then move the database a Continue abandons.
+    monkeypatch.setattr(
+        supervisor_module.logger,
+        "exception",
+        lambda message, **kwargs: supervisor_module.logger.error(message, **kwargs),
+    )
+
+
+async def test_a_failed_cycles_spend_reaches_the_budget_check(
+    data: dict[str, Path],
+    tmp_path: Path,
+    uninterrupted: Uninterrupted,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Counted from the responses, as Continue counts it, so the two never disagree (§5.5)."""
+    whole = await uninterrupted(data["flat"], "quiet", {})
+    january = whole.meta.months[0].cost_usd
+    # Inside the budget only if the failed cycle's spend is forgotten.
+    budget = january - per_cycle(whole) / 2
+    fail_after_paying(monkeypatch, utc(1, 15))
+
+    ran = await execute(data["flat"], tmp_path, QUARTER, {}, cost_usd=COST, budget=budget)
+
+    assert ran.meta.budget_stopped
+    assert [m.label for m in ran.meta.months] == ["2024-01"]
+    assert "end of 2024-01" in ran.meta.ending_reason
+
+
+async def test_a_failed_cycle_in_a_checkpointed_month_names_itself(
+    data: dict[str, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Its answers were never recorded as a decision, so there is nothing to replay into it. The
+    refusal must say that, rather than that the market differed, which it did not."""
+    fail_after_paying(monkeypatch, utc(1, 15))
+    await killed_after(data["flat"], tmp_path, "2024-02", {})
+    monkeypatch.undo()
+
+    with pytest.raises(ConfigError, match=r"FAILED cycle at 2024-01-15.*cannot be replayed"):
+        await execute(data["flat"], tmp_path, QUARTER, {}, cost_usd=COST, resume=True)
 
 
 async def test_a_checkpoint_that_cannot_be_written_interrupts_the_run(
