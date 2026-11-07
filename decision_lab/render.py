@@ -25,7 +25,7 @@ from collections.abc import Iterable, Sequence
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 from pydantic import Field
 
@@ -36,6 +36,11 @@ from decision_lab.seats import FINAL, ROUND_ZERO, SeatMetrics, rounds_are_identi
 from tradebot.core.money import ZERO
 from tradebot.core.schema import DomainModel, Money, UtcDatetime
 from tradebot.validation.backtest import BANNER
+
+if TYPE_CHECKING:
+    # analysis imports this module for its row types; the type is only named, never built, here.
+    from decision_lab.analysis import PeriodAnalysis
+    from decision_lab.period import PeriodMeta
 
 #: The tool's own standing disclaimer. §1.1: it compares configurations an operator wrote; it
 #: does not search, does not optimise, and has no authority over anything.
@@ -804,7 +809,7 @@ def _profit_block(report: LongRunReport) -> str:
             ("total profit", str(report.total_profit)),
             ("realized", str(report.realized)),
             ("unrealized", str(report.unrealized)),
-            ("deliberation cost", str(report.cost_usd)),
+            ("deliberation cost (incl. abandoned)", str(report.cost_usd)),
             ("net profit", str(report.net_profit)),
         ),
     )
@@ -847,4 +852,408 @@ def _rankings_note(report: LongRunReport) -> str:
 def write_long_run(report: LongRunReport, path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(long_run_markdown(report), encoding="utf-8")
+    return path
+
+
+#: Period spec §5.3. Wherever a period run's profit appears, because the bot's own rule needs a
+#: human to clear a loss-streak pause and this tool did it for the run. Rendered with the banners,
+#: above the identity, and again beside the profit figure.
+PAUSE_LIFTED: Final = (
+    "**PAUSE LIFTED.** The basket stopped on `max_consecutive_losses`, which in the bot needs a "
+    "human to clear. This run cleared it in its own workspace at each month boundary and gave the "
+    "basket its allowance back, so its profit is what the panel made with that rule suspended "
+    "between months. It is not what the bot would have done."
+)
+
+
+class PeriodMonthRow(DomainModel):
+    """One month of a period run, as `render` needs it (it does not import `period`)."""
+
+    label: str
+    start_equity: Money | None
+    end_equity: Money
+    unvaluable: bool = False
+    planned_cycles: int
+    ran_cycles: int
+    paused_at: UtcDatetime | None = None
+    cost_usd: Money
+
+
+class PeriodLiftRow(DomainModel):
+    at: UtcDatetime
+    streak: int
+    new_limit: int
+
+
+class PeriodReport(DomainModel):
+    """The page for one `evaluate period` run (period spec §5.5, §5.7)."""
+
+    generated_at: UtcDatetime
+    run_id: str
+    dataset_directory: str
+    dataset_digest: str
+    candidate_id: str
+    panel_digest: str
+    panel_models: tuple[str, ...] = ()
+    archive_digest: str = ""
+    cadence_seconds: int
+    period: str
+    first_cycle_at: UtcDatetime
+    budget: Money
+    #: `None` when no calibrated cost exists to project from (`--skip-gate`, or an uncalibrated
+    #: candidate): the page then says so rather than printing a zero that reads as "free".
+    projected_cost: Money | None = None
+    news_blind: bool = True
+    plumbing_check: bool = False
+    gate_skipped: bool = False
+    months: tuple[PeriodMonthRow, ...] = ()
+    not_run: tuple[str, ...] = ()
+    lifts: tuple[PeriodLiftRow, ...] = ()
+    ending: str
+    ending_reason: str = ""
+    abandoned_cost_usd: Money = ZERO
+    #: What the panel cost, whatever the valuation: a frozen run has no profit figure but paid.
+    spent_usd: Money = ZERO
+    #: The interruption was spend passing the budget, so continuing needs a larger one (§5.7).
+    budget_stopped: bool = False
+    unvaluable: bool = False
+    freeze_reason: str = ""
+    equity: Money = ZERO
+    start_equity: Money = ZERO
+    total_profit: Money = ZERO
+    realized: Money = ZERO
+    unrealized: Money = ZERO
+    cost_usd: Money = ZERO
+    net_profit: Money = ZERO
+    vetoes: tuple[tuple[str, str, int], ...] = ()
+    incidents: int = 0
+    #: Spec 5.6: cycles a substituted model answered in. Never scored, but their trades happened.
+    contaminated: int = 0
+    #: Decisions the scorer saw, how many it could grade, and how many of those were right.
+    decisions: int = 0
+    graded: int = 0
+    correct: int = 0
+    #: All three pools, always, and the seats. Empty on an incomplete page, which shows neither.
+    regimes: tuple[RegimeMetrics, ...] = ()
+    seats: tuple[SeatMetrics, ...] = ()
+    #: Why the log could not be read. A page with this set carries the run's own record only.
+    incomplete: str = ""
+
+
+def period_markdown(report: PeriodReport) -> str:
+    """The period page, in `long_run_markdown`'s banner order: every disclaimer before a number."""
+    sections = [
+        "# decision_lab — one period",
+        "",
+        BANNER,
+        "",
+        DISCLAIMER,
+    ]
+    if report.news_blind:
+        sections += ["", NEWS_BLIND]
+    if report.plumbing_check:
+        sections += ["", PLUMBING_CHECK]
+    if report.gate_skipped:
+        sections += ["", GATE_SKIPPED]
+    if report.lifts:
+        sections += ["", PAUSE_LIFTED]
+    if report.incomplete:
+        sections += ["", _incomplete_banner(report)]
+    if report.contaminated:
+        sections += ["", _contamination_note(report)]
+    sections += [
+        "",
+        _ending_line(report),
+        "",
+        _period_identity(report),
+        "",
+        "## Profit",
+        "",
+        _period_profit(report),
+        "",
+        "## Months",
+        "",
+        _months_table(report),
+    ]
+    if not report.incomplete:
+        sections += _measurement_sections(report)
+    sections += [
+        "",
+        "## Lifted pauses",
+        "",
+        _lifts_table(report.lifts),
+        "",
+        "## Spend",
+        "",
+        _spend_block(report),
+        "",
+        "## Vetoes",
+        "",
+        _veto_table(report.vetoes),
+    ]
+    return "\n".join(sections).rstrip() + "\n"
+
+
+def _ending_line(report: PeriodReport) -> str:
+    """§5.7's outcomes, in the words the spec gives the page."""
+    if report.ending == "RULE_ENDED":
+        return f"**Model failed: {report.ending_reason}.** Needs tuning. Later months were not run."
+    if report.ending == "INTERRUPTED":
+        # The last month end is the last good point a Continue resumes from (§5.7).
+        where = f" Last month end kept: {report.months[-1].label}." if report.months else ""
+        larger = " Continuing needs a larger `--budget`." if report.budget_stopped else ""
+        return (
+            f"**Interrupted: {report.ending_reason}.**{where} Months after the last one shown "
+            f"were not run. Re-run with `--continue` to carry on from there.{larger}"
+        )
+    return f"**{report.ending.title()}.** {report.ending_reason}".rstrip()
+
+
+def _period_identity(report: PeriodReport) -> str:
+    cycles = sum(month.ran_cycles for month in report.months)
+    planned = sum(month.planned_cycles for month in report.months)
+    return _table(
+        ("parameter", "value"),
+        (
+            ("generated", _stamp(report.generated_at)),
+            ("run", report.run_id),
+            ("dataset", f"{report.dataset_directory} (`{report.dataset_digest}`)"),
+            ("candidate", f"{report.candidate_id} (`{report.panel_digest}`)"),
+            ("panel models", ", ".join(report.panel_models) or "none recorded"),
+            ("news archive", report.archive_digest or "none (news-blind)"),
+            ("cadence", f"{report.cadence_seconds}s"),
+            ("period", report.period),
+            # §5.2: a late start is shown, never hidden.
+            ("first cycle", _stamp(report.first_cycle_at)),
+            ("cycles", f"{cycles} of {planned} planned in the months that ran"),
+            ("ending", report.ending),
+            ("not run", ", ".join(report.not_run) or "none"),
+            ("incidents", str(report.incidents)),
+            *(
+                ()
+                if report.incomplete
+                else (
+                    (
+                        "graded decisions",
+                        f"{report.graded} of {report.decisions} ({report.correct} correct); "
+                        f"{report.decisions - report.graded} unscored",
+                    ),
+                    ("contaminated cycles", str(report.contaminated)),
+                )
+            ),
+        ),
+    )
+
+
+def _incomplete_banner(report: PeriodReport) -> str:
+    return (
+        f"**REPORT INCOMPLETE: {report.incomplete}.** The run's result is safe: its months, profit "
+        "and spend below come from the run's own record, written before this page was. No "
+        "accuracy, seat or regime figure is shown, because the log they are scored from could "
+        "not be read."
+    )
+
+
+def _measurement_sections(report: PeriodReport) -> list[str]:
+    """What the panel's judgement scored: the regimes always, the seats only if anything was."""
+    sections = ["", "## Regimes", "", _regime_table(report.regimes), "", _unscored(report.regimes)]
+    sections += ["", "## Seats", ""]
+    if report.graded == 0:
+        # `rounds_are_identical(())` is vacuously true, so an empty table would claim a protocol.
+        sections.append(
+            "There was no scored decision, so no seat was measured. Nothing is claimed about how "
+            "the seats voted or which protocol ran."
+        )
+    else:
+        sections.append(_seat_tables(report.seats))
+    return sections
+
+
+def _period_profit(report: PeriodReport) -> str:
+    """The table, or the refusal to draw one (§10.4): a frozen portfolio has no figure at all."""
+    lifted = (
+        f"Produced with {len(report.lifts)} lifted pause(s); see the banner above.\n\n"
+        if report.lifts
+        else ""
+    )
+    if report.unvaluable:
+        return (
+            f"{lifted}**UNVALUABLE** — {report.freeze_reason}\n\n"
+            "The portfolio could not be valued, so no profit figure is reported. A stale mark is "
+            "not a mark, and valuing the position at what it cost would be differently wrong "
+            "rather than conservative (ADR 0027)."
+        )
+    return lifted + _table(
+        ("figure", "amount"),
+        (
+            ("equity", str(report.equity)),
+            ("start equity", str(report.start_equity)),
+            ("total profit", str(report.total_profit)),
+            ("realized", str(report.realized)),
+            ("unrealized", str(report.unrealized)),
+            ("deliberation cost", str(report.cost_usd)),
+            ("net profit", str(report.net_profit)),
+        ),
+    )
+
+
+def _months_table(report: PeriodReport) -> str:
+    if not report.months and not report.not_run:
+        return "No month ran."
+    rows = []
+    for month in report.months:
+        if month.unvaluable:
+            end, net = "UNVALUABLE", "—"
+        else:
+            end = str(month.end_equity)
+            net = "—" if month.start_equity is None else str(month.end_equity - month.start_equity)
+        rows.append(
+            (
+                month.label + (" ⚠ paused" if month.paused_at else ""),
+                "—" if month.start_equity is None else str(month.start_equity),
+                end,
+                net,
+                f"{month.ran_cycles} of {month.planned_cycles}",
+                str(month.cost_usd),
+            )
+        )
+    rows += [(label, "—", "—", "—", "not run", "—") for label in report.not_run]
+    table = _table(("month", "start", "end", "net before cost", "cycles", "cost"), rows)
+    if report.abandoned_cost_usd == ZERO:
+        return table
+    # The month rows are what the surviving log spent; the profit's cost also counts what a
+    # Continue threw away (§5.7). Stated here so the two figures do not disagree silently.
+    shown = sum((month.cost_usd for month in report.months), start=ZERO)
+    return (
+        f"{table}\n\nThe month costs above add to {shown}. The run also paid "
+        f"{report.abandoned_cost_usd} abandoned by Continue, which the deliberation cost in the "
+        "profit table includes."
+    )
+
+
+def _lifts_table(lifts: Sequence[PeriodLiftRow]) -> str:
+    if not lifts:
+        return "No pause was lifted."
+    return _table(
+        ("at", "streak", "new limit"),
+        ((_stamp(lift.at), str(lift.streak), str(lift.new_limit)) for lift in lifts),
+    )
+
+
+def _spend_block(report: PeriodReport) -> str:
+    projection = (
+        f"projected {report.projected_cost}"
+        if report.projected_cost is not None
+        else "no projection was available (no calibrated cost per cycle for this candidate)"
+    )
+    return _table(
+        ("figure", "amount"),
+        (
+            ("budget", str(report.budget)),
+            ("projection", projection),
+            ("spent", str(report.spent_usd)),
+            # Money a Continue threw away: its cycles left the log and the cost did not (§5.7).
+            ("abandoned by Continue", str(report.abandoned_cost_usd)),
+        ),
+    )
+
+
+def _contamination_note(report: PeriodReport) -> str:
+    return (
+        f"**{report.contaminated} cycle(s) were contaminated by a substitute model** and are "
+        "never scored. Their trades still happened, so the profit includes them (spec 5.6)."
+    )
+
+
+def _meta_report(
+    meta: PeriodMeta, *, generated_at: datetime, panel_models: tuple[str, ...], **more: object
+) -> PeriodReport:
+    reached = {month.label for month in meta.months}
+    return PeriodReport(
+        generated_at=generated_at,
+        run_id=meta.run_id,
+        dataset_directory=meta.dataset_directory,
+        dataset_digest=meta.dataset_digest,
+        candidate_id=meta.candidate_id,
+        panel_digest=meta.panel_digest,
+        panel_models=panel_models,
+        archive_digest=meta.archive_digest,
+        cadence_seconds=meta.cadence_seconds,
+        period=meta.period.label,
+        first_cycle_at=meta.first_cycle_at,
+        # The run's own budget and projection, never an invocation's: on reuse they would
+        # describe a run that did not happen under them.
+        budget=meta.budget,
+        projected_cost=meta.projected_usd,
+        news_blind=meta.news_blind,
+        plumbing_check=meta.plumbing_check,
+        gate_skipped=meta.gate_skipped,
+        months=tuple(PeriodMonthRow.model_validate(m.model_dump()) for m in meta.months),
+        not_run=tuple(m.label for m in meta.period.months if m.label not in reached),
+        lifts=tuple(PeriodLiftRow.model_validate(one.model_dump()) for one in meta.lifts),
+        ending=meta.ending.value,
+        ending_reason=meta.ending_reason,
+        abandoned_cost_usd=meta.abandoned_cost_usd,
+        spent_usd=meta.spent_usd,
+        budget_stopped=meta.budget_stopped,
+        unvaluable=meta.profit.unvaluable,
+        freeze_reason=meta.profit.freeze_reason,
+        equity=meta.profit.equity,
+        start_equity=meta.profit.start_equity,
+        total_profit=meta.profit.total,
+        realized=meta.profit.realized,
+        unrealized=meta.profit.unrealized,
+        cost_usd=meta.profit.cost_usd,
+        net_profit=meta.profit.net,
+        vetoes=tuple((row.rule, row.action_taken, row.count) for row in meta.vetoes),
+        incidents=meta.incidents,
+        **more,
+    )
+
+
+def period_report(
+    analysis: PeriodAnalysis, *, generated_at: datetime, panel_models: tuple[str, ...]
+) -> PeriodReport:
+    """The page's figures, read off the one assembly (never off a second reading of the log)."""
+    return _meta_report(
+        analysis.meta,
+        generated_at=generated_at,
+        panel_models=panel_models,
+        contaminated=analysis.contaminated,
+        decisions=sum(row.decisions for row in analysis.regimes),
+        graded=sum(row.scored for row in analysis.regimes),
+        correct=sum(row.correct for row in analysis.regimes),
+        regimes=analysis.regimes,
+        seats=analysis.seats,
+    )
+
+
+def write_period(
+    analysis: PeriodAnalysis, path: Path, *, generated_at: datetime, panel_models: tuple[str, ...]
+) -> Path:
+    """Write the page for an analysed run: the CLI, the dashboard and the notebook share it."""
+    report = period_report(analysis, generated_at=generated_at, panel_models=panel_models)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(period_markdown(report), encoding="utf-8")
+    return path
+
+
+def write_incomplete_period(
+    meta: PeriodMeta,
+    path: Path,
+    *,
+    reason: str,
+    generated_at: datetime,
+    panel_models: tuple[str, ...],
+) -> Path:
+    """The page for a run whose log could not be read: the run's own record, and the reason.
+
+    Written from the meta alone so it cannot depend on whatever just failed. It shows no regime,
+    seat or accuracy figure, since inventing zeros for them would read as "measured and worst".
+    """
+    report = _meta_report(
+        meta, generated_at=generated_at, panel_models=panel_models, incomplete=reason
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(period_markdown(report), encoding="utf-8")
     return path

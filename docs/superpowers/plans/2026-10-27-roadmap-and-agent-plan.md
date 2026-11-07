@@ -30,6 +30,13 @@ then `report promotion`. Arming live stays the human's act in [OPERATIONS.md](..
 One known sim quirk: XRP never trades because synthetic prices and real lot sizes do not match.
 That limits what a sim soak covers. Fix it before the soak only if XRP matters.
 
+**Status, 2026-11-04.** Period evaluation (`evaluate period` and the dashboard's Periods page;
+[ADR 0031](../../adr/0031-a-period-run-lifts-a-loss-pause-in-its-own-database.md)) has shipped on the
+unmerged branch `period-evaluation`, offline on the stub. It adds the second sanctioned `tradebot` seam,
+`build_sim(deliberate=…)`, so the branch needs the operator's merge. Real spike results are not yet
+possible: they need the news-fed summarising run, which is **D2 / Stage 5**, with its cost measured on a
+sample first (`--limit 50`) before any batch is paid for.
+
 **Order of work:** 0 → 1 → (2 runs alongside the end of 1) → 3 → **stop at D2**. Everything
 up to D2 is free and offline.
 

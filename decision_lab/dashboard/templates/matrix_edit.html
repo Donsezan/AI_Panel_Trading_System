@@ -13,14 +13,39 @@
    page says the seat set is uncalibrated at the moment it saves rather than leaving it to be
    discovered later as an exit 6 from `sweep` or `calibrate long`. #}
 <p class="warning">Saved as version {{ saved }}. Its matrix digest is <code>{{ digest }}</code>,
-which is a third of the §10.6 gate key — so this seat set is <strong>uncalibrated</strong> until
-<code>calibrate normal</code> and <code>calibrate shock</code> have run over the nine pinned days
+which is a third of the §10.6 gate key — so this seat set is
+<strong>uncalibrated until the nine days run again</strong>: <code>calibrate normal</code> and <code>calibrate shock</code> have run over the nine pinned days
 against the dataset you intend to sweep. A sweep will refuse until they have.
 {% if reference_label %}Validated against {{ reference_label }}.{% endif %}</p>
 {% endif %}
 
+{% if unchanged %}
+{# A byte-identical save mints no version, so its digest and its calibration are unchanged. #}
+<p>Nothing changed: this is the latest saved version, so no new version was made and its
+calibration stands.</p>
+{% endif %}
+
 {% if error %}
 <p class="error">{{ error }}</p>
+{% endif %}
+
+{% if asking is defined %}
+{# A second form, because a browser posts only the form that was clicked: every submitted value is
+   carried as a hidden field or the second click would save nothing (period spec §12.3). The
+   editor below is the same document, unsaved. #}
+<form method="post" action="/matrices/{{ name }}" class="warning">
+  <p>This changes <code>{{ name }}</code>. Results are reused until the seat set changes, and
+  either choice mints a new matrix digest, so the saved set is
+  <strong>uncalibrated until the nine days run again</strong>.</p>
+  {% for field, value in asking.items() %}<input type="hidden" name="{{ field }}" value="{{ value }}">
+  {% endfor %}
+  <input type="hidden" name="action" value="save">
+  <p><button type="submit" name="choice" value="update">Update {{ name }}</button>
+  (a new version of this set; the old version stays)</p>
+  <p><label>New name <input type="text" name="new_name" value=""></label>
+  <button type="submit" name="choice" value="create">Create new seat set</button>
+  (this set is left unchanged)</p>
+</form>
 {% endif %}
 
 {% if reference_label and not saved %}

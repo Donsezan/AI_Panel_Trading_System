@@ -16,22 +16,35 @@ skipped rather than raising (§12.2).
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 
 from decision_lab import compare as cmp
 from decision_lab import corpus as cp
 from decision_lab import dataset as ds
+from decision_lab import jobs
+from decision_lab import period as pd
 from decision_lab import regimes as rg
 from decision_lab import scoring as sc
 from decision_lab import seats as st
 from decision_lab import sweep as sw
+from decision_lab.calibration_days import Pool
 from decision_lab.candidates import Matrix
-from decision_lab.records import CycleRecord
+from decision_lab.newsfeed import ArchiveNewsFeed
+from decision_lab.records import CycleRecord, records_from_store
 from decision_lab.render import CandidateSeats, NewsProvenance, NotMeasured
+from decision_lab.spikes import LEAD_IN, EventNews, SpikeEvent, find_events, news_for
 from tradebot.core.clock import Clock
+from tradebot.core.config import PanelConfig
+from tradebot.core.decision import SeatResponse
+from tradebot.core.errors import ConfigError
+from tradebot.core.events import EventType
+from tradebot.core.money import ZERO, to_decimal
 from tradebot.marketdata.recorder import ReplayDataset
+from tradebot.persistence.database import SingleWriter, open_database
+from tradebot.persistence.store import EventStore
 
 
 def news_provenance(meta: cp.CorpusMeta) -> NewsProvenance | None:
@@ -228,3 +241,341 @@ def analyse_matrix(
             )
         )
     return MatrixAnalysis(candidates=tuple(built))
+
+
+@dataclass(frozen=True, slots=True)
+class OrderNote:
+    """One order a cycle placed, as the log last knew it: the state it reached and what filled."""
+
+    client_order_id: str
+    instrument_key: str
+    role: str
+    side: str
+    order_type: str
+    qty: Decimal
+    state: str
+    filled_qty: Decimal = ZERO
+    avg_fill_price: Decimal | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CycleResult:
+    """What came of one cycle's decision (spec §4 item 7): its orders and the rules that refused."""
+
+    orders: tuple[OrderNote, ...] = ()
+    #: `rule: detail`, one per refusing check, in the order the engine recorded them.
+    vetoes: tuple[str, ...] = ()
+
+
+def cycle_results(store: EventStore) -> dict[str, CycleResult]:
+    """Fold each cycle's orders (to their latest state) and its vetoes out of the log.
+
+    An order belongs to the cycle that created it; a later state change or fill, which another
+    cycle's poll may have booked, still lands on that order. A refusal is a `RISK_CHECKED` that was
+    not approved, reported by the rules whose decision was a veto.
+    """
+    orders: dict[str, dict[str, object]] = {}
+    owner: dict[str, str] = {}
+    vetoes: dict[str, list[str]] = {}
+    for event in store.read_types(
+        EventType.ORDER_SUBMITTED,
+        EventType.ORDER_STATE_CHANGED,
+        EventType.FILL_RECEIVED,
+        EventType.RISK_CHECKED,
+    ):
+        payload = event.payload
+        if event.type is EventType.ORDER_SUBMITTED:
+            order = payload["order"]
+            orders[order["client_order_id"]] = dict(order)
+            owner[order["client_order_id"]] = order["cycle_id"]
+        elif event.type is EventType.ORDER_STATE_CHANGED:
+            if event.aggregate_id in orders:
+                orders[event.aggregate_id]["state"] = payload["state"]
+        elif event.type is EventType.FILL_RECEIVED:
+            if event.aggregate_id in orders:
+                orders[event.aggregate_id].update(
+                    state=payload["order_state"],
+                    filled_qty=payload["filled_qty"],
+                    avg_fill_price=payload["avg_fill_price"],
+                )
+        elif not payload.get("approved", True) and event.cycle_id:
+            vetoes.setdefault(event.cycle_id, []).extend(
+                f"{check['rule']}: {check.get('detail', '')}".rstrip(": ")
+                for check in payload.get("checks", ())
+                if check.get("decision") == "veto"
+            )
+    notes: dict[str, list[OrderNote]] = {}
+    for order_id, order in orders.items():
+        filled = to_decimal(str(order.get("filled_qty") or "0"))
+        price = order.get("avg_fill_price")
+        notes.setdefault(owner[order_id], []).append(
+            OrderNote(
+                client_order_id=order_id,
+                instrument_key=str(order["instrument_key"]),
+                role=str(order.get("role", "")),
+                side=str(order["side"]),
+                order_type=str(order["order_type"]),
+                qty=to_decimal(str(order["qty"])),
+                state=str(order.get("state", "")),
+                filled_qty=filled,
+                # A fill's average is meaningless until something filled.
+                avg_fill_price=to_decimal(str(price))
+                if price not in (None, "None") and filled
+                else None,
+            )
+        )
+    return {
+        cycle: CycleResult(orders=tuple(notes.get(cycle, ())), vetoes=tuple(vetoes.get(cycle, ())))
+        for cycle in {*notes, *vetoes}
+    }
+
+
+@dataclass(frozen=True, slots=True)
+class SeatSummary:
+    """One seat over the whole run, as the page's tables show it. `None` is "not measured"."""
+
+    #: Accuracy of the final vote and of the blind (round 0) vote, over every regime.
+    final: Decimal | None
+    first: Decimal | None
+    #: How often its final vote differs from its blind one, over cycles it voted in both.
+    changed: Decimal | None
+    #: Final-vote accuracy per pool, all three always present, never pooled (§7.2).
+    by_regime: Mapping[str, Decimal | None]
+
+
+def _accuracy(rows: Sequence[st.SeatMetrics]) -> Decimal | None:
+    scored = sum(r.scored for r in rows)
+    return sc.ratio(sum(r.correct for r in rows), scored) if scored else None
+
+
+def vote_of(responses: Sequence[SeatResponse], seat_id: str) -> str | None:
+    """A seat's action in one round, or `None` if it abstained or was not asked."""
+    found = next((r for r in responses if r.seat_id == seat_id), None)
+    return found.vote.action.value if found is not None and found.vote is not None else None
+
+
+def changed_votes(records: Sequence[CycleRecord], seat_id: str) -> Decimal | None:
+    """How often a seat's final vote differs from its blind one, over cycles it voted in both."""
+    voted = changed = 0
+    for record in records:
+        for decision in record.decisions:
+            first = vote_of(record.round_zero_for(decision.instrument_key), seat_id)
+            last = vote_of(record.final_round_for(decision.instrument_key), seat_id)
+            if first is None or last is None:
+                continue
+            voted += 1
+            changed += first != last
+    return sc.ratio(changed, voted) if voted else None
+
+
+def seat_summaries(
+    records: Sequence[CycleRecord], seats: Sequence[st.SeatMetrics], *, panel: PanelConfig
+) -> dict[str, SeatSummary]:
+    """Every seat of the panel, in seat order, whether or not it was ever measured."""
+    pools = [pool.value for pool in Pool]
+    out = {}
+    for seat in panel.seats:
+        mine = [s for s in seats if s.seat_id == seat.seat_id]
+        finals = [s for s in mine if s.round_label == st.FINAL]
+        out[seat.seat_id] = SeatSummary(
+            final=_accuracy(finals),
+            first=_accuracy([s for s in mine if s.round_label == st.ROUND_ZERO]),
+            changed=changed_votes(records, seat.seat_id),
+            by_regime={pool: _accuracy([s for s in finals if s.regime == pool]) for pool in pools},
+        )
+    return out
+
+
+@dataclass(frozen=True, slots=True)
+class PeriodAnalysis:
+    """One period run, folded and scored: the single answer the page, the report and the notebook
+    all read (period spec §5.6, §7; `render.write_period` is the CLI's door onto it).
+
+    `records` holds every cycle the log froze, including the quarantined stretch of a paused month
+    (no decision, no spend); `scored`, `by_month`, `seats` and `seat_trend` are derived from the
+    clean ones only. `regimes` is always the three pools, never pooled, with a zero row for a pool
+    that never occurred (§7.2). `event_news` runs parallel to `events`.
+    """
+
+    meta: pd.PeriodMeta
+    records: tuple[CycleRecord, ...]
+    scored: tuple[sc.ScoredDecision, ...]
+    seats: tuple[st.SeatMetrics, ...]
+    regimes: tuple[sc.RegimeMetrics, ...]
+    events: tuple[SpikeEvent, ...]
+    event_news: tuple[EventNews, ...]
+    by_month: Mapping[str, tuple[sc.ScoredDecision, ...]]
+    #: seat -> bucket label -> final-vote accuracy, `None` where the seat had no scored vote there.
+    #: Zero would read as "always wrong" for a bucket in which it was never measured.
+    seat_trend: Mapping[str, Mapping[str, Decimal | None]]
+    #: Cycles a substituted model answered in. Never scored; their trades still happened (§5.6).
+    contaminated: int
+    #: cycle id -> its orders and refusals. A cycle absent here placed nothing and was refused
+    #: nothing, which is what `CycleResult()` says.
+    outcomes: Mapping[str, CycleResult] = field(default_factory=dict)
+    #: seat -> its figures over the run (fix round 1, item 7), so the page only formats them.
+    seat_summary: Mapping[str, SeatSummary] = field(default_factory=dict)
+
+    @property
+    def running(self) -> bool:
+        """A process holds the workspace and this run has recorded no ending (`standing`)."""
+        return self.meta.ending is pd.RunEnding.RUNNING
+
+    @property
+    def not_run(self) -> tuple[str, ...]:
+        """Months the run never reached, derived and never stored as a zero row (§5.3)."""
+        return pd.not_run_months(self.meta)
+
+
+def _buckets(period: pd.Period) -> tuple[tuple[str, datetime, datetime], ...]:
+    """Months for a period of up to a quarter, quarters for a year (spec §4, results item 4)."""
+    months = period.months
+    if len(months) <= 3:
+        return tuple((m.label, m.start, m.end) for m in months)
+    quarters = []
+    for first in range(0, len(months), 3):
+        chunk = months[first : first + 3]
+        label = f"{chunk[0].start.year:04d}-Q{(chunk[0].start.month - 1) // 3 + 1}"
+        quarters.append((label, chunk[0].start, chunk[-1].end))
+    return tuple(quarters)
+
+
+def _seat_trend(
+    records: Sequence[CycleRecord],
+    scored: Sequence[sc.ScoredDecision],
+    *,
+    panel: PanelConfig,
+    buckets: Sequence[tuple[str, datetime, datetime]],
+) -> dict[str, dict[str, Decimal | None]]:
+    trend: dict[str, dict[str, Decimal | None]] = {seat.seat_id: {} for seat in panel.seats}
+    for label, start, end in buckets:
+        rows = st.score_seats(
+            [r for r in records if start <= r.as_of < end],
+            [d for d in scored if start <= d.as_of < end],
+            panel=panel,
+        )
+        for seat_id, by_bucket in trend.items():
+            final = [r for r in rows if r.seat_id == seat_id and r.round_label == st.FINAL]
+            graded = sum(r.scored for r in final)
+            by_bucket[label] = sc.ratio(sum(r.correct for r in final), graded) if graded else None
+    return trend
+
+
+def fold_period(
+    meta: pd.PeriodMeta,
+    records: Sequence[CycleRecord],
+    scoring: Scoring,
+    *,
+    panel: PanelConfig,
+    archive: ArchiveNewsFeed | None,
+    outcomes: Mapping[str, CycleResult],
+) -> PeriodAnalysis:
+    """Score a run's cycles. Split from the database read so a test can hand it doctored records."""
+    # Contamination is read off `SeatResponse.fingerprint` exactly as the sweep reads it (§7.7).
+    # The cycle is dropped before scoring: the peers read the substitute's arguments.
+    clean = tuple(r for r in records if not sw.substitutes_in(r.responses, panel))
+    scored = sc.score_records(
+        clean, index=scoring.index, regimes=scoring.regimes, params=scoring.params
+    )
+
+    reached = {m.label for m in meta.months}
+    by_month = {
+        m.label: tuple(d for d in scored if m.start <= d.as_of < m.end)
+        for m in meta.period.months
+        if m.label in reached or any(m.start <= d.as_of < m.end for d in scored)
+    }
+
+    key = next(
+        (one.key for one in scoring.dataset.instruments if one.symbol == pd.PERIOD_SYMBOL), None
+    )
+    events: tuple[SpikeEvent, ...] = ()
+    if key is not None:
+        found = find_events(
+            scoring.regimes.labels[key],
+            scoring.index.candles[key],
+            windows=scoring.regimes.windows,
+        )
+        inside = (e for e in found if e.end >= meta.period.start and e.start < meta.period.end)
+        # Absolute: a merged event can retrace, so the sign of `move_pct` is not its direction.
+        events = tuple(sorted(inside, key=lambda e: (-abs(e.move_pct), e.start)))
+    # §6.8.3: covered means one source's span holds the whole lead-in and the event, as the feed
+    # itself decides it. A cycle that ran no panel read no news, so it neither adds to what the
+    # panel could see nor moves the last decision; a contaminated one did read it (its panel ran).
+    deciding = tuple(r for r in records if r.decisions)
+    items = archive.items if archive is not None else ()
+    event_news = tuple(
+        news_for(
+            e,
+            deciding,
+            items,
+            coverage=archive is not None and archive.covers_span(e.start - LEAD_IN, e.end),
+        )
+        for e in events
+    )
+
+    pools = {pool.value for pool in Pool}
+    seat_rows = st.score_seats(clean, scored, panel=panel) if scored else ()
+    return PeriodAnalysis(
+        meta=meta,
+        records=tuple(records),
+        scored=scored,
+        seats=seat_rows,
+        regimes=tuple(row for row in sc.by_regime(scored) if row.regime in pools),
+        events=events,
+        event_news=event_news,
+        by_month=by_month,
+        seat_trend=_seat_trend(clean, scored, panel=panel, buckets=_buckets(meta.period)),
+        contaminated=len(records) - len(clean),
+        outcomes=dict(outcomes),
+        seat_summary=seat_summaries(clean, seat_rows, panel=panel),
+    )
+
+
+def standing(meta: pd.PeriodMeta, *, workspace: Path | None) -> pd.PeriodMeta:
+    """`period.standing`, asked of this workspace's lock now: how a reader sees the run.
+
+    The page, the notebook and this module read a run through here, so a dead `RUNNING` run is
+    `INTERRUPTED` with the same reason everywhere, and nobody has to rewrite the meta to say so.
+    """
+    return pd.standing(meta, held=jobs.holder(workspace=workspace) is not None)
+
+
+def analyse_period(
+    run_id: str,
+    scoring: Scoring,
+    *,
+    panel: PanelConfig,
+    archive: ArchiveNewsFeed | None,
+    workspace: Path | None = None,
+) -> PeriodAnalysis:
+    """Read a run's meta and log, and fold them. Writes nothing.
+
+    `open_database` never migrates, so this is safe against a run another process has open (WAL).
+    A run with no meta or no database refuses, naming the directory.
+    """
+    directory = pd.period_dir(run_id, workspace=workspace)
+    meta_path = directory / pd.PERIOD_META
+    database = directory / pd.PERIOD_DB
+    # Named apart: a database lost beside its meta is not "no such run", and the operator needs
+    # to know which file to look for and where.
+    if not meta_path.is_file():
+        raise ConfigError(f"no period run {run_id!r}: {pd.PERIOD_META} is missing from {directory}")
+    if not database.is_file():
+        raise ConfigError(
+            f"period run {run_id!r} has its {pd.PERIOD_META} but {pd.PERIOD_DB} is missing "
+            f"from {directory}; its cycles cannot be scored without the log"
+        )
+    meta = standing(
+        pd.PeriodMeta.model_validate_json(meta_path.read_text(encoding="utf-8")),
+        workspace=workspace,
+    )
+    engine = open_database(database)
+    writer = SingleWriter(engine)
+    try:
+        store = EventStore(engine, writer)
+        records = records_from_store(store)
+        outcomes = cycle_results(store)
+    finally:
+        writer.close()
+        engine.dispose()
+    return fold_period(meta, records, scoring, panel=panel, archive=archive, outcomes=outcomes)

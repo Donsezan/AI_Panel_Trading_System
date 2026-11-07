@@ -1,0 +1,30 @@
+{# One month (spec §4 item 6): price above one row per seat and the panel on one time axis, then
+   its cycles, newest first, each opening onto its own drill-down. #}
+<h3>All seats on one timeline · {{ label }}</h3>
+{% if lanes_svg %}
+<div class="scroll">{{ lanes_svg | safe }}</div>
+<p class="muted">One time axis for price and every seat's final vote. B buy, S sell, H hold, W wait,
+– abstained. Filled: correct; outlined red: wrong; grey: unscored. Shaded: a spike event.</p>
+{% else %}
+<p class="empty">No price or vote was recorded in this month.</p>
+{% endif %}
+
+<h3>Cycles</h3>
+{% if not cycles %}
+<p class="empty">No cycle ran in {{ label }}.</p>
+{% endif %}
+{% for record in cycles %}
+{% set decision = scored.get(record.cycle_id) %}
+<details class="drill" hx-get="/periods/{{ view.run_id }}/cycles/{{ record.cycle_id }}?{{ query }}" hx-trigger="toggle once" hx-target="find .drill-body">
+  <summary>{{ record.as_of | moment }} · BTC/USDT ·
+    {% if record.outcome == "quarantined" %}<span class="muted">quarantined (paused on losses): no panel call, never scored</span>
+    {% elif decision %}panel {{ decision.action.value }} · should have {{ decision.truth.value if decision.truth else absent }} ·
+      {% if decision.verdict.value == "CORRECT" %}<span class="good">✓ CORRECT</span>
+      {% elif decision.verdict.value == "WRONG" %}<span class="bad">✗ WRONG</span>
+      {% else %}<span class="muted">? {{ decision.verdict.value }}</span>{% endif %}
+    {% elif record.decisions %}panel {{ record.decisions[0].action.value }} · <span class="muted">not scored (a substitute model answered)</span>
+    {% else %}<span class="muted">{{ record.outcome or "no decision" }}</span>{% endif %}
+  </summary>
+  <div class="drill-body"><a href="/periods/{{ view.run_id }}/cycles/{{ record.cycle_id }}?{{ query }}">Open this cycle</a></div>
+</details>
+{% endfor %}

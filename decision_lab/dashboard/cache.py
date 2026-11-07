@@ -18,13 +18,20 @@ from pathlib import Path
 from typing import Final, TypeVar
 
 from decision_lab import analysis as an
+from decision_lab import candidates as cd
 from decision_lab import corpus as cp
+from decision_lab import period as pd
 from decision_lab import sweep as sw
 from decision_lab.candidates import Matrix
+from decision_lab.newsfeed import ArchiveNewsFeed
 from tradebot.core.clock import Clock
+from tradebot.core.config import Basket, PanelConfig
+from tradebot.core.errors import ConfigError
 
 #: Entries kept. Small deliberately: each holds a price index over the whole dataset.
 MAX_ENTRIES: Final = 4
+#: Seat-set files kept. Each is a few kilobytes, and a page scans every stored version.
+MAX_MATRICES: Final = 256
 
 #: `_store` is shared by two caches of different value types; `OrderedDict` is invariant in its
 #: value parameter, so one non-generic signature could not serve both without a cast at each call.
@@ -38,6 +45,10 @@ class AnalysisCache:
         self._clock = clock
         self._scoring: OrderedDict[str, an.Scoring] = OrderedDict()
         self._analysis: OrderedDict[str, an.MatrixAnalysis] = OrderedDict()
+        self._periods: OrderedDict[str, an.PeriodAnalysis] = OrderedDict()
+        #: Seat-set files, loaded. `None` remembers one that would not load, so a page does not
+        #: re-parse every stored version on every request to find the one that does.
+        self._matrices: OrderedDict[str, Matrix | None] = OrderedDict()
         self._lock = asyncio.Lock()
 
     async def scoring_for(self, data_dir: Path) -> an.Scoring:
@@ -65,9 +76,67 @@ class AnalysisCache:
                 self._store(self._analysis, key, found)
             return scoring, found
 
+    async def period_analysis(
+        self,
+        run_id: str,
+        scoring: an.Scoring,
+        *,
+        panel: PanelConfig,
+        archive: ArchiveNewsFeed | None,
+        workspace: Path | None,
+    ) -> an.PeriodAnalysis:
+        """One period run, re-read whenever its meta or its log has moved (a running job).
+
+        Keyed on the panel and the archive as well, because both are inputs to the fold: the same
+        run read with a different archive answers a different news question.
+        """
+        stamp = _period_stamp(run_id, workspace=workspace)
+        key = "|".join(
+            (
+                run_id,
+                stamp,
+                scoring.params.digest(),
+                panel.model_dump_json(),
+                archive.digest if archive is not None else "-",
+            )
+        )
+        async with self._lock:
+            found = self._periods.get(key)
+            if found is None:
+                found = an.analyse_period(
+                    run_id, scoring, panel=panel, archive=archive, workspace=workspace
+                )
+                self._store(self._periods, key, found)
+            return found
+
+    def matrix_for(self, path: Path, *, reference: Basket, reference_key: str) -> Matrix | None:
+        """One seat-set file expanded against `reference`, or `None` if it will not load.
+
+        Keyed on the file's size and modification time, as `_rows_stamp` is, so an edit or a new
+        version is read fresh and an unchanged file is never parsed twice.
+        """
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+        key = f"{path.resolve()}|{stat.st_size}|{stat.st_mtime_ns}|{reference_key}"
+        if key in self._matrices:
+            self._matrices.move_to_end(key)
+            return self._matrices[key]
+        try:
+            found: Matrix | None = cd.load_matrix(path, reference=reference)
+        except (ConfigError, OSError):
+            found = None
+        self._matrices[key] = found
+        while len(self._matrices) > MAX_MATRICES:
+            self._matrices.popitem(last=False)
+        return found
+
     def clear(self) -> None:
         self._scoring.clear()
         self._analysis.clear()
+        self._periods.clear()
+        self._matrices.clear()
 
     @staticmethod
     def _store(store: OrderedDict[str, _V], key: str, value: _V) -> None:
@@ -100,4 +169,18 @@ def _rows_stamp(
             parts.append(f"{candidate.candidate_id}:-")
         else:
             parts.append(f"{candidate.candidate_id}:{stat.st_size}:{stat.st_mtime_ns}")
+    return "|".join(parts)
+
+
+def _period_stamp(run_id: str, *, workspace: Path | None) -> str:
+    """The meta, the log and its WAL, by size and modification time, as `_rows_stamp` does."""
+    directory = pd.period_dir(run_id, workspace=workspace)
+    parts = []
+    for name in (pd.PERIOD_META, pd.PERIOD_DB, f"{pd.PERIOD_DB}-wal"):
+        try:
+            stat = (directory / name).stat()
+        except FileNotFoundError:
+            parts.append(f"{name}:-")
+        else:
+            parts.append(f"{name}:{stat.st_size}:{stat.st_mtime_ns}")
     return "|".join(parts)

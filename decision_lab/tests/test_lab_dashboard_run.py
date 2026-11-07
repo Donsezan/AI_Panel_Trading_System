@@ -23,13 +23,14 @@ from tradebot.core.errors import ConfigError
 
 
 def test_a_builder_exists_for_every_launchable_command() -> None:
-    """§12.4 names five. A sixth added to the page without a builder would 500 on submit."""
+    """§12.4 names five, and the period spec (§8) a sixth. One without a builder would 500."""
     assert set(jobs_routes.BUILDERS) == {
         "corpus-build",
         "calibrate-normal",
         "calibrate-shock",
         "sweep",
         "calibrate-long",
+        "evaluate-period",
     }
 
 

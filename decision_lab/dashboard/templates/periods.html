@@ -1,0 +1,118 @@
+{% extends "base.html" %}
+{% block title %}decision_lab — evaluate a period{% endblock %}
+{% block content %}
+<h1>Evaluate a seat set over a period</h1>
+
+{% if error %}
+<p class="error">{{ error }}</p>
+{% endif %}
+{% if job %}
+<p class="busy">Started as job <code>{{ job }}</code> — <a href="/jobs?job={{ job }}">its log</a>.
+The result appears in the list below once its first month is written.</p>
+{% endif %}
+
+{# Spec §4's controls. One form: "Show periods" re-reads it as a GET, so the period list follows
+   the dataset and the kind and the selection stays in the URL; "Run evaluation" posts the same
+   fields to the CLI. #}
+<form method="get" action="/periods">
+  <fieldset>
+    <legend>What to evaluate</legend>
+    <label>dataset directory <input type="text" name="data" value="{{ selection.data }}" size="40"></label>
+    <label>seat set (TOML path) <input type="text" name="configs" value="{{ selection.configs }}" size="40"></label>
+    <p class="muted">A stored seat set lives under the workspace's <code>matrices/</code>;
+    <a href="/matrices">edit seat sets</a> (saving asks whether to create a new one or update it).
+    Results are reused until the seat set changes.</p>
+    {% if facts.configs_problem %}<p class="muted">{{ facts.configs_problem }}</p>{% endif %}
+    <label>candidate
+      {% if facts.candidates %}
+      <select name="candidate">
+        {% for one in facts.candidates %}
+        <option value="{{ one }}" {% if one == selection.candidate %}selected{% endif %}>{{ one }}</option>
+        {% endfor %}
+      </select>
+      {% else %}
+      <input type="text" name="candidate" value="{{ selection.candidate }}">
+      {% endif %}
+    </label>
+    <div><span>Evaluate one</span>
+      {% for kind in kinds %}
+      <label class="inline-choice" style="display:inline-block;margin-right:1rem">
+        <input type="radio" name="kind" value="{{ kind }}" {% if kind == selection.kind %}checked{% endif %}> {{ kind | title }}
+      </label>
+      {% endfor %}
+    </div>
+    <label>period
+      {% if facts.periods %}
+      <select name="period">
+        {% for one in facts.periods %}
+        <option value="{{ one }}" {% if one == selection.period %}selected{% endif %}>{{ one }}</option>
+        {% endfor %}
+      </select>
+      {% else %}
+      <select name="period" disabled><option>none offered</option></select>
+      {% endif %}
+    </label>
+    {% if facts.data_problem %}<p class="muted">{{ facts.data_problem }}</p>
+    {% elif not facts.periods %}<p class="muted">This dataset fully covers no calendar {{ selection.kind }}.</p>{% endif %}
+    <p class="muted">Only calendar periods the dataset fully covers are offered. BTC/USDT only.</p>
+    <label>start equity <input type="text" name="start_equity" value="{{ selection.start_equity }}" required></label>
+    <label>cycle every
+      <select name="every">
+        {% for one in cadences %}
+        <option value="{{ one }}" {% if one == selection.every %}selected{% endif %}>{{ one }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>news sources (optional; none means NEWS-BLIND)
+      <input type="text" name="news_source" value="{{ selection.news_source }}">
+    </label>
+    <label>budget (USD, required) <input type="text" name="budget" required></label>
+    <p class="warning">Spend is checked at each month end, so {{ cost_note }}. Stop remains on
+    <a href="/jobs">Runs in progress</a>.</p>
+    {% if facts.projection is not none %}
+    <p>Projected spend from the calibrated cost per cycle: <strong>{{ facts.projection | money }}</strong>.
+    A projection over the budget refuses before anything is spent (exit 5).</p>
+    {% elif facts.projection_note %}
+    <p class="muted">{{ facts.projection_note }}</p>
+    {% endif %}
+    <label><input type="checkbox" name="skip_gate" {% if selection.skip_gate %}checked{% endif %}> skip the §10.6 gate (stamped on the report)</label>
+    <button type="submit" formnovalidate>Show periods</button>
+    <button type="submit" formmethod="post" formaction="/periods/run">Run evaluation</button>
+  </fieldset>
+</form>
+<p class="muted">Only the selected period runs. Month: one month. Quarter: its 3 months. Year: all
+12. Inside a period each month continues from the last, with money and open positions carried.</p>
+
+<h2>Period runs</h2>
+{% if not runs %}
+<p class="empty">No period has been evaluated in this workspace yet.</p>
+{% else %}
+<table>
+  <thead><tr>
+    <th>period</th><th>candidate</th><th>ending</th><th>net profit</th><th>spent</th>
+    <th>cycles</th><th>started</th>
+  </tr></thead>
+  <tbody>
+  {% for entry in runs %}
+    {% set meta = entry.meta %}
+    <tr>
+      {% if meta %}
+      <td><a href="/periods/{{ entry.run_id }}?{{ selection.query() }}">{{ meta.period.label }}</a>
+        {% if meta.lifts %}<span class="warning">pause lifted ×{{ meta.lifts | length }}</span>{% endif %}
+        {% if meta.plumbing_check %}<span class="warning">PLUMBING CHECK</span>{% endif %}</td>
+      <td><code>{{ meta.candidate_id }}</code></td>
+      <td>{{ meta.ending.value }}</td>
+      <td>{% if meta.profit.unvaluable %}<span class="warning">UNVALUABLE</span>{% else %}{{ meta.profit.net | money }}{% endif %}</td>
+      <td>{{ meta.spent_usd | money }}</td>
+      <td>{{ meta.months | sum(attribute="ran_cycles") }} / {{ meta.months | sum(attribute="planned_cycles") }}</td>
+      <td>{{ meta.built_at | moment }}</td>
+      {% else %}
+      <td><a href="/periods/{{ entry.run_id }}?{{ selection.query() }}"><code>{{ entry.run_id }}</code></a></td>
+      <td colspan="6" class="muted">{{ entry.problem }}</td>
+      {% endif %}
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+{% endblock %}

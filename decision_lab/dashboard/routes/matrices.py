@@ -17,6 +17,7 @@ restates one of that loader's rules.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from enum import Enum
 from pathlib import Path
 from typing import Any, Final
 from urllib.parse import quote
@@ -78,6 +79,7 @@ async def edit_form(
         document=document,
         version=shown_version,
         saved=request.query_params.get("saved", ""),
+        unchanged=bool(request.query_params.get("unchanged", "")),
         digest=request.query_params.get("digest", ""),
         reference_label=request.query_params.get("reference", ""),
         error=error,
@@ -211,25 +213,119 @@ def _requested_action(items: Mapping[str, str]) -> tuple[str, str]:
     return items.get("action", ""), ""
 
 
+#: Fields the second click adds. They are not part of the document, and left in `forms.nest`'s
+#: input they would land as spurious top-level keys `matrices.dumps` refuses.
+_CHOICE_FIELDS: Final = frozenset({"choice", "new_name"})
+
+
+class _Against(Enum):
+    """How a submitted document stands against the latest stored version of its name."""
+
+    #: Nothing is stored under this name yet, so there is nothing to change and nothing to ask.
+    NEW = "new"
+    SAME = "same"
+    CHANGED = "changed"
+    #: The writer refused the document. `save` refuses it again and renders that as a 400 with the
+    #: draft on the page; asking first would carry it into a prompt whose answer is that refusal.
+    UNWRITABLE = "unwritable"
+
+
+def _against_stored(name: str, document: dict[str, Any], workspace: Path | None) -> _Against:
+    """Whether saving `document` under `name` would differ from the latest stored version.
+
+    Compared as the bytes `matrices.save` would publish against the bytes of the latest version,
+    because a stored version *is* what a previous form post dumped: an unchanged re-save is
+    byte-identical, and nothing is restated here about which fields matter.
+    """
+    stored = matrices.versions(name, workspace=workspace)
+    if not stored:
+        return _Against.NEW
+    try:
+        rendered = matrices.dumps(document).encode("utf-8")
+    except ConfigError:
+        # Never a 500 here: an unhandled refusal loses the operator's draft (CLAUDE.md).
+        return _Against.UNWRITABLE
+    latest = matrices.path_for(name, stored[-1], workspace=workspace)
+    return _Against.SAME if latest.read_bytes() == rendered else _Against.CHANGED
+
+
+def _ask(
+    request: Request, name: str, document: dict[str, Any], items: Mapping[str, str], **more: Any
+) -> Response:
+    """Re-render the editor with the question above it.
+
+    Every submitted value rides in the prompt's own hidden fields, because a browser posts only the
+    form that was clicked: without them the second click would save an empty document (period spec
+    §12.3). The editor below it is the document as submitted, so nothing is lost on the way.
+    """
+    carried = {k: v for k, v in items.items() if k not in _CHOICE_FIELDS and k != "action"}
+    status = more.pop("status", 200)
+    page = render(
+        request,
+        "matrix_edit.html",
+        name=name,
+        document=document,
+        version=None,
+        saved="",
+        digest="",
+        error=more.pop("error", ""),
+        asking=carried,
+        **more,
+    )
+    page.status_code = status
+    return page
+
+
 @router.post("/matrices/{name}", response_class=HTMLResponse)
 async def edit_post(request: Request, name: str) -> Response:
     state = state_of(request)
     form = await request.form()
     items = {key: str(value) for key, value in form.items()}
     action, row = _requested_action(items)
-    document = forms.nest(items)
+    document = forms.nest({k: v for k, v in items.items() if k not in _CHOICE_FIELDS})
 
     if action == "save":
+        choice = items.get("choice", "")
+        target = name
+        against = _against_stored(name, document, state.workspace)
+        if against is _Against.SAME:
+            # Byte-identical, so the same digest: minting a version would record an edit that
+            # never happened, and its banner would call an unchanged seat set uncalibrated.
+            return RedirectResponse(f"/matrices/{name}?unchanged=1", status_code=303)
+        if against is _Against.CHANGED:
+            if choice not in ("create", "update"):
+                return _ask(request, name, document, items)
+            if choice == "create":
+                target = items.get("new_name", "").strip()
+                if not target:
+                    return _ask(
+                        request,
+                        name,
+                        document,
+                        items,
+                        status=400,
+                        error="Create needs a new name for the seat set.",
+                    )
+                if target in matrices.names(workspace=state.workspace):
+                    return _ask(
+                        request,
+                        name,
+                        document,
+                        items,
+                        status=400,
+                        error=f"A seat set named {target!r} already exists; pick a new name.",
+                    )
         reference, reference_label = await _reference_basket(state.workspace)
         try:
             version, matrix = matrices.save(
-                name, document, reference=reference, workspace=state.workspace
+                target, document, reference=reference, workspace=state.workspace
             )
         except ConfigError as error:
+            # Under `target`: a refused Create is the new set's refusal, and its form posts there.
             page = render(
                 request,
                 "matrix_edit.html",
-                name=name,
+                name=target,
                 document=document,
                 version=None,
                 saved="",
@@ -240,7 +336,7 @@ async def edit_post(request: Request, name: str) -> Response:
             page.status_code = 400
             return page
         return RedirectResponse(
-            f"/matrices/{name}?saved={version}&digest={matrix.matrix_digest}"
+            f"/matrices/{target}?saved={version}&digest={matrix.matrix_digest}"
             f"&reference={quote(reference_label)}",
             status_code=303,
         )

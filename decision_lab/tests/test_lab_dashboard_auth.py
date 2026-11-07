@@ -10,7 +10,9 @@ out of the surface holding the kill switch.
 from __future__ import annotations
 
 import warnings
+from collections.abc import Iterator
 from pathlib import Path
+from typing import Any, Final
 
 import pytest
 
@@ -58,17 +60,88 @@ def test_the_cookie_name_differs_from_the_bots() -> None:
     assert auth.SESSION_COOKIE != bot_auth.SESSION_COOKIE
 
 
-def test_every_route_is_protected(client: TestClient) -> None:
-    checked = 0
-    for route in client.app.routes:  # type: ignore[attr-defined]
-        path = getattr(route, "path", "")
-        if not path or auth.is_public(path) or "{" in path:
+#: Every router the app includes, by the module its endpoints live in. A router dropped from the
+#: app, or one the walk stopped reaching, fails `test_the_walk_reaches_every_router`.
+ROUTERS: Final = frozenset(
+    {
+        "decision_lab.dashboard.routes.runs",
+        "decision_lab.dashboard.routes.matrices",
+        "decision_lab.dashboard.routes.jobs",
+        "decision_lab.dashboard.routes.periods",
+    }
+)
+#: Values for every path parameter a route declares, so a parameterised route is walked too.
+PARAMETERS: Final = {
+    "run_id": "r",
+    "candidate_id": "c",
+    "name": "n",
+    "label": "2024-01",
+    "cycle_id": "c",
+    "index": "0",
+}
+
+
+def served_routes(app: Any) -> Iterator[tuple[str, frozenset[str], str]]:
+    """Every route the app serves, as `(path, methods, endpoint module)`, routers included.
+
+    FastAPI 0.141 lists an included router in `app.routes` as one `_IncludedRouter` with no path,
+    so walking `app.routes` alone reaches only the app's own few routes (fix round 1, item 1). This
+    descends into each included router and applies its prefix.
+    """
+    for route in app.routes:
+        nested = getattr(route, "original_router", None)
+        if nested is not None:
+            prefix = route.include_context.prefix
+            for inner, methods, module in served_routes(nested):
+                yield prefix + inner, methods, module
             continue
-        response = client.get(path, follow_redirects=False)
-        assert response.status_code == 303, path
-        assert response.headers["location"] == "/login", path
-        checked += 1
-    assert checked, "no protected routes were found; the walk is not testing anything"
+        path = getattr(route, "path", None)
+        if path is None:
+            continue
+        endpoint = getattr(route, "endpoint", None)
+        yield (
+            path,
+            frozenset(getattr(route, "methods", None) or ()),
+            getattr(endpoint, "__module__", ""),
+        )
+
+
+def filled(path: str) -> str:
+    for name, value in PARAMETERS.items():
+        path = path.replace("{" + name + "}", value)
+    assert "{" not in path, f"no value for a path parameter in {path}; add it to PARAMETERS"
+    return path
+
+
+def protected_routes(app: Any) -> list[tuple[str, frozenset[str], str]]:
+    return [
+        (path, methods, module)
+        for path, methods, module in served_routes(app)
+        if methods and not auth.is_public(path) and path != "/openapi.json"
+    ]
+
+
+def test_the_walk_reaches_every_router(client: TestClient) -> None:
+    reached = {module for _, _, module in served_routes(client.app)}
+    assert reached >= ROUTERS, f"routers the walk does not reach: {sorted(ROUTERS - reached)}"
+    assert len(protected_routes(client.app)) >= 17, "the walk has gone nearly empty again"
+
+
+def test_every_route_is_protected(client: TestClient) -> None:
+    """GET is redirected to the login form; anything else is refused outright (401)."""
+    checked = 0
+    for path, methods, _ in protected_routes(client.app):
+        target = filled(path)
+        for method in sorted(methods - {"HEAD"}):
+            if method == "GET":
+                response = client.get(target, follow_redirects=False)
+                assert response.status_code == 303, (method, path)
+                assert response.headers["location"] == "/login", path
+            else:
+                response = client.request(method, target, data={}, follow_redirects=False)
+                assert response.status_code == 401, (method, path)
+            checked += 1
+    assert checked >= 17, f"only {checked} route/method pairs were walked"
 
 
 def test_unauthenticated_post_is_refused_not_redirected(client: TestClient) -> None:
@@ -94,17 +167,40 @@ def test_static_is_the_only_route_that_serves_a_file(client: TestClient) -> None
     The run forms *pass* operator-typed paths to a child process, which is the CLI's own argument
     and is checked by the CLI. What must not exist is a route that reads a path from a request and
     answers with the file — that would turn an authenticated tuning surface into a file browser
-    over `data/`.
+    over `data/`. Walked through every included router (fix round 1, item 1): a mount or a
+    file-serving endpoint inside a router is exactly the one `app.routes` alone never shows.
     """
+    import inspect
+
     from starlette.staticfiles import StaticFiles
 
-    mounts = [
-        route
-        for route in client.app.routes  # type: ignore[attr-defined]
-        if isinstance(getattr(route, "app", None), StaticFiles)
+    def mounts(app: Any) -> Iterator[Any]:
+        for route in app.routes:
+            nested = getattr(route, "original_router", None)
+            if nested is not None:
+                yield from mounts(nested)
+            elif isinstance(getattr(route, "app", None), StaticFiles):
+                yield route
+
+    found = list(mounts(client.app))
+    assert len(found) == 1
+    assert found[0].path == "/static"
+
+    def endpoints(app: Any) -> Iterator[tuple[str, Any]]:
+        for route in app.routes:
+            nested = getattr(route, "original_router", None)
+            if nested is not None:
+                yield from endpoints(nested)
+            elif getattr(route, "endpoint", None) is not None:
+                yield route.path, route.endpoint
+
+    serving = [
+        path
+        for path, endpoint in endpoints(client.app)
+        if "FileResponse" in inspect.getsource(endpoint)
     ]
-    assert len(mounts) == 1
-    assert mounts[0].path == "/static"
+    assert not serving, f"routes answering with a file: {serving}"
+    assert len(list(served_routes(client.app))) >= 20, "the walk reached nothing"
 
 
 def _lab_core_dashboard_imports(directory: Path) -> list[str]:

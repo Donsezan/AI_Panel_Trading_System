@@ -13,11 +13,14 @@ import warnings
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from decision_lab import matrices
 from decision_lab.candidates import load_matrix
 from decision_lab.dashboard import forms
 from tradebot.app import demo_basket, select_panel
 from tradebot.core.enums import DecisionMode
+from tradebot.core.errors import ConfigError
 from tradebot.marketdata.catalogue import sim_catalogue
 
 # See test_lab_dashboard_read.py's own note: starlette's TestClient now prefers `httpx2`, which is
@@ -323,3 +326,172 @@ def _flatten(document: dict[str, Any], prefix: str = "") -> dict[str, str]:
         else:
             flat[name] = str(value)
     return flat
+
+
+# --- period spec §12.3 and ADR 0031: a changed seat set asks whether it is new -------------------
+
+
+def _stub_flat() -> dict[str, str]:
+    document = tomllib.loads((SHIPPED / "sweep-stub.toml").read_text(encoding="utf-8"))
+    return _flatten(document)
+
+
+def _stored(lab_client: TestClient) -> dict[str, str]:
+    """`mine` saved once from the stub matrix; returns the flat form that reproduces it."""
+    flat = _stub_flat()
+    assert lab_client.post("/matrices/mine", data=flat | {"action": "save"}).status_code == 200
+    return flat
+
+
+def _changed(flat: dict[str, str]) -> dict[str, str]:
+    return flat | {"candidates.0.seats.0.instruction": "Name the invalidation level first."}
+
+
+def test_a_changed_seat_set_asks_whether_it_is_new_and_writes_nothing(
+    lab_client: TestClient, tmp_path: Path
+) -> None:
+    flat = _stored(lab_client)
+
+    response = lab_client.post("/matrices/mine", data=_changed(flat) | {"action": "save"})
+
+    page = response.text
+    assert response.status_code == 200
+    assert "Create new seat set" in page and "Update mine" in page
+    assert "uncalibrated until the nine days run again" in page
+    assert matrices.versions("mine", workspace=tmp_path / "workspace") == (1,)
+
+
+def test_update_makes_a_new_version_of_the_same_set(lab_client: TestClient, tmp_path: Path) -> None:
+    flat = _stored(lab_client)
+
+    response = lab_client.post(
+        "/matrices/mine",
+        data=_changed(flat) | {"action": "save", "choice": "update"},
+        follow_redirects=True,
+    )
+
+    assert "uncalibrated until the nine days run again" in response.text
+    workspace = tmp_path / "workspace"
+    assert matrices.versions("mine", workspace=workspace) == (1, 2)
+    assert "invalidation level" in matrices.path_for("mine", 2, workspace=workspace).read_text(
+        encoding="utf-8"
+    )
+
+
+def test_create_needs_a_new_name_and_leaves_the_old_set_unchanged(
+    lab_client: TestClient, tmp_path: Path
+) -> None:
+    workspace = tmp_path / "workspace"
+    flat = _stored(lab_client)
+    before = matrices.path_for("mine", 1, workspace=workspace).read_bytes()
+    posted = _changed(flat) | {"action": "save", "choice": "create"}
+
+    blank = lab_client.post("/matrices/mine", data=posted | {"new_name": ""})
+    taken = lab_client.post("/matrices/mine", data=posted | {"new_name": "mine"})
+    assert blank.status_code == 400 and "new name" in blank.text.lower()
+    assert taken.status_code == 400 and "already" in taken.text.lower()
+    assert matrices.names(workspace=workspace) == ("mine",)
+
+    made = lab_client.post(
+        "/matrices/mine", data=posted | {"new_name": "variant"}, follow_redirects=True
+    )
+
+    assert made.status_code == 200 and "uncalibrated until the nine days run again" in made.text
+    assert matrices.versions("variant", workspace=workspace) == (1,)
+    assert matrices.versions("mine", workspace=workspace) == (1,)
+    assert matrices.path_for("mine", 1, workspace=workspace).read_bytes() == before
+
+
+def test_a_save_that_changes_nothing_does_not_ask(lab_client: TestClient) -> None:
+    flat = _stored(lab_client)
+
+    response = lab_client.post("/matrices/mine", data=flat | {"action": "save"})
+
+    assert "Create new seat set" not in response.text
+    assert response.status_code == 200
+
+
+def test_the_prompt_carries_every_value_so_the_second_click_loses_nothing(
+    lab_client: TestClient, tmp_path: Path
+) -> None:
+    """The prompt is a second form, and a browser posts only what is in the form clicked. Every
+    submitted value must be in it — `instruction` first, whose value is a textarea body elsewhere
+    and is the one a copy of the neighbouring inputs would drop."""
+    import html
+    import re
+
+    flat = _stored(lab_client)
+    wording = "Weigh funding & open interest <first>.\nThen the trend."
+    posted = flat | {"candidates.0.seats.0.instruction": wording}
+
+    page = lab_client.post("/matrices/mine", data=posted | {"action": "save"}).text
+
+    hidden = {
+        html.unescape(name): html.unescape(value)
+        for name, value in re.findall(r'<input type="hidden" name="([^"]*)" value="([^"]*)"', page)
+    }
+    assert set(posted) <= set(hidden), sorted(set(posted) - set(hidden))
+    assert hidden["candidates.0.seats.0.instruction"].replace("\r\n", "\n") == wording
+
+    lab_client.post("/matrices/mine", data=hidden | {"action": "save", "choice": "update"})
+
+    stored = matrices.read("mine", workspace=tmp_path / "workspace")[1]
+    assert stored["candidates"][0]["seats"][0]["instruction"].replace("\r\n", "\n") == wording
+
+
+def test_an_unchanged_save_mints_no_version_and_says_nothing_changed(
+    lab_client: TestClient, tmp_path: Path
+) -> None:
+    """Final review M18(2): a byte-identical save has the same digest, so it is not uncalibrated,
+    and a second version of the same bytes would only make the history lie about an edit."""
+    flat = _stored(lab_client)
+
+    response = lab_client.post("/matrices/mine", data=flat | {"action": "save"})
+
+    assert response.status_code == 200
+    assert matrices.versions("mine", workspace=tmp_path / "workspace") == (1,)
+    assert "Nothing changed" in response.text
+    assert "uncalibrated until the nine days run again" not in response.text
+
+
+def test_a_document_the_writer_refuses_is_a_rendered_400_that_keeps_the_draft(
+    lab_client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Final review M18(1): the comparison renders the document too. A refusal there must reach
+    the operator as `save`'s own 400 with the draft on the page, never as a 500 that loses it."""
+    flat = _stored(lab_client)
+
+    def refuse(_: object) -> str:
+        raise ConfigError("candidates.0.seats.0.temperature is a float (0.5)")
+
+    monkeypatch.setattr(matrices, "dumps", refuse)
+    wording = "Name the invalidation level first."
+    response = lab_client.post(
+        "/matrices/mine",
+        data=flat | {"candidates.0.seats.0.instruction": wording, "action": "save"},
+    )
+
+    assert response.status_code == 400
+    assert "is a float" in response.text
+    assert wording in response.text, "the draft is kept"
+    assert matrices.versions("mine", workspace=tmp_path / "workspace") == (1,)
+
+
+def test_a_refused_create_renders_under_the_new_name(
+    lab_client: TestClient, tmp_path: Path
+) -> None:
+    """Final review M18(4): Create asked for `variant`, so the refusal is shown as `variant`'s."""
+    flat = _stored(lab_client)
+    posted = _changed(flat) | {
+        "action": "save",
+        "choice": "create",
+        "new_name": "variant",
+        "candidates.0.seats.0.provider_id": "no-such-provider",
+    }
+
+    response = lab_client.post("/matrices/mine", data=posted)
+
+    assert response.status_code == 400
+    assert "Seat set: variant" in response.text
+    assert 'action="/matrices/variant"' in response.text
+    assert matrices.versions("variant", workspace=tmp_path / "workspace") == ()

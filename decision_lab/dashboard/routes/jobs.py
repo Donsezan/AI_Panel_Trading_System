@@ -29,6 +29,7 @@ from decision_lab import calibration_days as cday
 from decision_lab import candidates as cd
 from decision_lab import corpus as cp
 from decision_lab import gate, jobs
+from decision_lab.dashboard.routes.periods import evaluate_period_argv
 from decision_lab.dashboard.views import LabState, render, state_of
 from tradebot.core.errors import ConfigError
 from tradebot.core.schema import Money
@@ -38,7 +39,7 @@ router = APIRouter()
 #: The commands whose CLI takes `--budget`. `corpus build` and `calibrate long` are absent
 #: because their commands have no such flag — and a form offering one would imply a ceiling that
 #: does not exist (§12.4).
-BUDGETED: Final = frozenset({"calibrate-normal", "calibrate-shock", "sweep"})
+BUDGETED: Final = frozenset({"calibrate-normal", "calibrate-shock", "sweep", "evaluate-period"})
 
 
 def _required(fields: Mapping[str, str], name: str) -> str:
@@ -130,6 +131,8 @@ BUILDERS: Final[dict[str, Callable[[Mapping[str, str]], list[str]]]] = {
     "calibrate-shock": _calibrate("shock"),
     "sweep": _sweep,
     "calibrate-long": _calibrate_long,
+    # Its form is on `/periods`, where the period list follows the dataset (period spec §8).
+    "evaluate-period": evaluate_period_argv,
 }
 
 

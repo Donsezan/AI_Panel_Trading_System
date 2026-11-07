@@ -1,0 +1,256 @@
+{% extends "base.html" %}
+{% block title %}decision_lab — period {{ meta.period.label if meta else view.run_id }}{% endblock %}
+{% block content %}
+<p><a href="/periods?{{ query }}">&larr; evaluate a period</a></p>
+
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+{% if job %}<p class="busy">Started as job <code>{{ job }}</code> — <a href="/jobs?job={{ job }}">its log</a>.</p>{% endif %}
+
+{% if not meta %}
+<h1>Period run <code>{{ view.run_id }}</code></h1>
+<p class="warning">{{ view.problem }}</p>
+<p class="muted">A run being written shows here once its first month ends; this page refreshes
+while a job holds the workspace.</p>
+{% else %}
+{% set analysed = view.analysis %}
+<h1>{{ meta.candidate_id }} · {{ meta.period.label }}</h1>
+
+{# Every disclaimer before a number, in the CLI page's banner order (render.period_markdown). #}
+{% if meta.news_blind %}
+<p class="warning"><strong>NEWS-BLIND.</strong> No news archive was read: the seats had no news,
+so nothing here says anything about how they read it.</p>
+{% endif %}
+{% if meta.plumbing_check %}
+<p class="warning"><strong>PLUMBING CHECK.</strong> A seat is bound to the offline stub: these
+numbers measure canned answers, not a model.</p>
+{% endif %}
+{% if meta.gate_skipped %}
+<p class="warning"><strong>GATE SKIPPED.</strong> This run went ahead without the §10.6
+calibration gate.</p>
+{% endif %}
+{% if meta.lifts %}
+<p class="warning"><strong>PAUSE LIFTED.</strong> The basket stopped on
+<code>max_consecutive_losses</code>, which in the bot needs a human to clear. This run cleared it
+in its own workspace at {{ meta.lifts | length }} month boundar{{ "y" if meta.lifts | length == 1 else "ies" }}
+and gave the basket its allowance back, so its profit is what the panel made with that rule
+suspended between months. It is not what the bot would have done.</p>
+{% endif %}
+{% if view.incomplete %}
+<p class="warning"><strong>REPORT INCOMPLETE: {{ view.incomplete }}.</strong> The run's result is
+safe: its months, profit and spend below come from the run's own record. No accuracy, seat, spike
+or cycle figure is shown, because the log they are scored from could not be read.</p>
+{% endif %}
+{% if analysed and analysed.contaminated %}
+<p class="warning"><strong>{{ analysed.contaminated }} cycle(s) were contaminated by a substitute
+model</strong> and are never scored. Their trades still happened, so the profit includes them.</p>
+{% endif %}
+
+{# §5.7's three endings, in the words the spec gives the page. #}
+{% if meta.ending.value == "RULE_ENDED" %}
+<p class="error">Model failed: {{ meta.ending_reason }}. Needs tuning. Later months were not run,
+and there is no Continue: a rule's verdict is the result.</p>
+{% elif meta.ending.value == "INTERRUPTED" %}
+<div class="warning">
+  <p><strong>Interrupted: {{ meta.ending_reason }}.</strong>
+  {% if meta.months %}Last month end kept: {{ meta.months[-1].label }}.{% endif %}
+  Months after the last one shown were not run.
+  {% if meta.budget_stopped %}Spend passed the budget, so continuing needs a larger budget.{% endif %}</p>
+  <form method="post" action="/periods/{{ view.run_id }}/continue" class="inline">
+    <input type="hidden" name="configs" value="{{ view.configs }}">
+    <input type="hidden" name="news_source" value="{{ view.sources | join(' ') }}">
+    <label>budget (USD, required) <input type="text" name="budget" required></label>
+    <button type="submit">Continue</button>
+  </form>
+</div>
+{% elif meta.ending.value == "RUNNING" %}
+{# Only while a process holds the workspace: a run whose process died without writing an ending
+   reads as interrupted, above, and is offered Continue (`period.standing`). #}
+<p class="busy">Running: a process holds the workspace and this run has recorded no ending yet.
+Months appear as they end.</p>
+{% else %}
+<p>Completed.</p>
+{% endif %}
+
+<section>
+<h2>Period summary</h2>
+<div class="stats">
+  {% if meta.profit.unvaluable %}
+  <div class="stat"><small>Start → end equity</small><b class="warning">UNVALUABLE</b>
+    <small>{{ meta.profit.freeze_reason }} — no figure is shown for a portfolio that could not be valued.</small></div>
+  {% else %}
+  <div class="stat"><small>Start → end equity</small><b>{{ meta.profit.start_equity | money }} → {{ meta.profit.equity | money }}</b></div>
+  <div class="stat"><small>Net profit after model costs</small>
+    <b class="{{ 'good' if meta.profit.net > 0 else 'bad' if meta.profit.net < 0 else '' }}">{{ meta.profit.net | money }}</b>
+    <small>realized {{ meta.profit.realized | money }} · unrealized {{ meta.profit.unrealized | money }}</small>
+    {% if meta.lifts %}<small class="warning">with {{ meta.lifts | length }} lifted pause(s)</small>{% endif %}</div>
+  {% endif %}
+  <div class="stat"><small>Model costs</small><b>{{ meta.spent_usd | money }}</b>
+    {% if meta.abandoned_cost_usd > 0 %}<small>incl. {{ meta.abandoned_cost_usd | money }} abandoned by Continue</small>{% endif %}</div>
+  {% if analysed %}
+  <div class="stat"><small>Decisions graded correct</small><b>{{ summary.accuracy | percent }}</b>
+    <small>{{ summary.graded | count }} graded, {{ (summary.decisions - summary.graded) | count }} unscored</small></div>
+  {% endif %}
+  <div class="stat"><small>Coverage</small>
+    <b class="{{ 'warning' if summary.ran < summary.planned else '' }}">{{ summary.ran | count }} / {{ summary.planned | count }}</b>
+    <small>{{ summary.paused_months }} month(s) paused early{% if summary.late_start %}; first cycle {{ meta.first_cycle_at | moment }} (late: warm-up){% endif %}</small></div>
+  <div class="stat"><small>Pauses lifted</small><b>{{ meta.lifts | length }}</b></div>
+</div>
+
+<h3>Equity through the period</h3>
+{% if equity_svg %}
+<div class="scroll">{{ equity_svg | safe }}</div>
+<p class="muted">One point per month end. ⚠ marks a month the loss rule paused; a gap is a month
+that is unvaluable or was not run. Hover a point for its value.</p>
+{% elif meta.months %}
+{% set only = meta.months[0] %}
+<p>One month: {{ only.start_equity | money }} → {% if only.unvaluable %}<span class="warning">UNVALUABLE</span>{% else %}{{ only.end_equity | money }}{% endif %}{% if only.paused_at %} ⚠ paused {{ only.paused_at | moment }}{% endif %}.</p>
+{% else %}
+<p class="empty">No month has ended yet.</p>
+{% endif %}
+</section>
+
+{% if analysed %}
+<section>
+<h2>Performance in spikes</h2>
+<table>
+  <thead><tr>
+    <th>Market</th><th>The question</th><th>Events</th><th>Graded decisions</th><th>Panel correct</th>
+    {% for seat in view.panel_seats %}<th>{{ seat }}</th>{% endfor %}<th>Unscored</th>
+  </tr></thead>
+  <tbody>
+  {% for row in regime_rows %}
+    <tr>
+      <td>{{ {"SHOCK_UP": "↑ ", "SHOCK_DOWN": "↓ "}.get(row.key, "") }}{{ row.name }}</td>
+      <td class="muted">{{ row.question }}</td>
+      <td>{{ row.events if row.key != "NORMAL" else absent }}</td>
+      <td>{{ row.graded | count }}</td>
+      <td>{{ row.accuracy | percent }}</td>
+      {% for cell in row.seats %}<td>{{ cell | percent(0) }}</td>{% endfor %}
+      <td>{{ row.unscored | count }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+<p class="muted">All three rows always appear, even with nothing graded. Spike up and spike down
+are never combined. Long-only: standing aside from a fall while flat is correct.</p>
+
+<h3>Spike events, largest move first</h3>
+{% if not analysed.events %}
+<p class="empty">No spikes in this period.</p>
+{% else %}
+{# A year can hold ~100 events: the largest are shown, the rest folded, none dropped. #}
+{% for event in analysed.events %}
+{% if loop.index0 == 15 %}<details><summary>{{ analysed.events | length - 15 }} smaller events</summary>{% endif %}
+<details class="drill" hx-get="/periods/{{ view.run_id }}/events/{{ loop.index0 }}?{{ query }}" hx-trigger="toggle once" hx-target="find .drill-body">
+  <summary>{{ {"SHOCK_UP": "↑ spike up", "SHOCK_DOWN": "↓ spike down"}.get(event.direction.value) }}
+    · {{ event.start | moment }} → {{ event.end | moment }}
+    · move {{ "+" if event.move_pct > 0 else "" }}{{ event.move_pct | money(2) }}%
+    {% if event.window_name %}· {{ event.window_name }}{% endif %}</summary>
+  <div class="drill-body"><a href="/periods/{{ view.run_id }}/events/{{ loop.index0 }}?{{ query }}">Open this event</a></div>
+</details>
+{% if loop.last and loop.length > 15 %}</details>{% endif %}
+{% endfor %}
+{% endif %}
+</section>
+
+<section>
+<h2>Seats compared</h2>
+{% if summary.graded == 0 %}
+<p class="empty">There was no scored decision, so no seat was measured.</p>
+{% else %}
+<table>
+  <thead><tr>
+    <th>Seat</th><th>Correct, final vote</th><th>Correct, first vote</th><th>Changed vote in debate</th>
+    {% for bucket in buckets %}<th>{{ bucket }}</th>{% endfor %}
+  </tr></thead>
+  <tbody>
+  {% for row in seat_table %}
+    <tr>
+      <td><code>{{ row.seat_id }}</code></td>
+      <td>{{ row.final | percent }}</td>
+      <td>{{ row.first | percent }}</td>
+      <td>{{ row.changed | percent(0) }}</td>
+      {% for cell in row.trend %}<td>{{ cell | percent(0) }}</td>{% endfor %}
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+<p class="muted">{{ absent }} is a bucket in which the seat had no graded vote: not measured, never zero.</p>
+{% endif %}
+</section>
+{% endif %}
+
+<section>
+<h2>Months</h2>
+{# The approved mockup's rows: each month that ran is a <details> that opens in place onto its
+   timeline and cycles, loaded when opened (fix round 1, item 2). A month that never ran is a row
+   that says so and has nothing to open; it is never a zero. #}
+{% macro month_cells(month) %}
+  {% set row = month.row %}
+  <span>{{ month.name }}</span>
+  {% if row %}
+  <span>{{ row.start_equity | money }} → {% if row.unvaluable %}<span class="warning">UNVALUABLE</span>{% else %}{{ row.end_equity | money }}{% endif %}</span>
+  <span>{% if row.unvaluable or row.start_equity is none %}{{ absent }}{% else %}{{ (row.end_equity - row.start_equity) | money }}{% endif %}</span>
+  <span>{{ month.accuracy | percent }}{% if analysed %} <small class="muted">of {{ month.graded }}</small>{% endif %}</span>
+  <span class="{{ 'warning' if row.ran_cycles < row.planned_cycles else '' }}">{{ row.ran_cycles }} / {{ row.planned_cycles }}</span>
+  <span>{{ row.cost_usd | money }}</span>
+  <span>{% if row.paused_at %}<span class="warning">⚠ Paused {{ row.paused_at | moment }}: too many losses in a row</span>{% else %}Completed{% endif %}</span>
+  {% else %}
+  <span class="muted month-gap">not run</span>
+  {% endif %}
+{% endmacro %}
+<div class="scroll"><div class="months">
+  <div class="mrow mhead"><span></span><span>Month</span><span>Start → end</span><span>Net before cost</span><span>Correct</span><span>Cycles</span><span>Cost</span><span>Ended</span></div>
+  {% for month in months %}
+  {% if month.row and analysed %}
+  <details class="drill month-row" hx-get="/periods/{{ view.run_id }}/months/{{ month.label }}?{{ query }}" hx-trigger="toggle once" hx-target="find .drill-body">
+    <summary class="mrow"><span class="tw"></span>{{ month_cells(month) }}</summary>
+    <div class="drill-body"><a href="/periods/{{ view.run_id }}/months/{{ month.label }}?{{ query }}">Open {{ month.name }}</a></div>
+  </details>
+  {% else %}
+  <div class="mrow"><span></span>{{ month_cells(month) }}</div>
+  {% endif %}
+  {% endfor %}
+</div></div>
+{% if meta.abandoned_cost_usd > 0 %}
+<p class="muted">The month costs above add to {{ shown_month_cost | money }}. The run also paid
+{{ meta.abandoned_cost_usd | money }} abandoned by Continue, which the model costs above include.</p>
+{% endif %}
+</section>
+
+<section>
+<h2>Spend</h2>
+<table>
+  <tbody>
+    <tr><th>budget</th><td>{{ meta.budget | money }}</td></tr>
+    <tr><th>projection</th><td>{% if meta.projected_usd is none %}no projection was available (no calibrated cost per cycle for this candidate){% else %}{{ meta.projected_usd | money }}{% endif %}</td></tr>
+    <tr><th>spent</th><td>{{ meta.spent_usd | money }}</td></tr>
+    <tr><th>abandoned by Continue</th><td>{{ meta.abandoned_cost_usd | money }}</td></tr>
+  </tbody>
+</table>
+<p class="muted">The budget and projection this run ran under. Spend is checked at each month end, so {{ cost_note }}.</p>
+
+<h2>Lifted pauses</h2>
+{% if not meta.lifts %}
+<p class="empty">No pause was lifted.</p>
+{% else %}
+<table>
+  <thead><tr><th>at</th><th>streak</th><th>new limit</th></tr></thead>
+  <tbody>{% for lift in meta.lifts %}<tr><td>{{ lift.at | moment }}</td><td>{{ lift.streak }}</td><td>{{ lift.new_limit }}</td></tr>{% endfor %}</tbody>
+</table>
+{% endif %}
+
+<h2>Identity</h2>
+<table>
+  <tbody>
+    <tr><th>run</th><td><code>{{ view.run_id }}</code></td></tr>
+    <tr><th>dataset</th><td>{{ meta.dataset_directory }} (<code>{{ meta.dataset_digest }}</code>)</td></tr>
+    <tr><th>seat set</th><td>{{ view.configs or absent }} · panel <code>{{ meta.panel_digest }}</code></td></tr>
+    <tr><th>news archive</th><td>{{ meta.archive_digest or "none (news-blind)" }}</td></tr>
+    <tr><th>cadence</th><td>{{ meta.cadence_seconds }}s</td></tr>
+    <tr><th>incidents</th><td>{{ meta.incidents }}</td></tr>
+  </tbody>
+</table>
+</section>
+{% endif %}
+{% endblock %}

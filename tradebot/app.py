@@ -47,7 +47,7 @@ import httpx
 from sqlalchemy import Engine
 
 from tradebot.control.arming import ArmingStore, LivePermission, live_permission
-from tradebot.control.basket_runner import BasketRunner
+from tradebot.control.basket_runner import BasketRunner, Deliberate
 from tradebot.control.config_store import SINGLETON_ID, ConfigRecord, ConfigStore
 from tradebot.control.context_builder import ContextBuilder
 from tradebot.control.live import EffectivePolicy, effective_policy
@@ -654,6 +654,7 @@ class RunnerBuilder:
         news_feed: NewsFeed | None,
         quote_currency: str,
         marks: Marks,
+        deliberate: Deliberate | None = None,
     ) -> None:
         self._clock = clock
         self._mode = mode
@@ -670,6 +671,7 @@ class RunnerBuilder:
         self._quote_currency = quote_currency
         #: One cache for the whole process, shared by every runner and the supervisor's sweep.
         self._marks = marks
+        self._deliberate = deliberate
         self._pools: dict[str, ProviderPool] = {}
 
     def calendar_for(self, basket: Basket) -> TradingCalendar:  # noqa: ARG002 — one venue in v1
@@ -718,6 +720,7 @@ class RunnerBuilder:
             config_refs=(record.ref, policy_record.ref),
             quote_currency=self._quote_currency,
             shadow=ShadowEvaluator(decision_engine, self._store) if basket.shadow_panel else None,
+            deliberate=self._deliberate,
         )
 
     def _providers(self, record: ConfigRecord[Basket]) -> dict[str, LLMProvider]:
@@ -893,6 +896,7 @@ async def _assemble(
     news_sources: tuple[str, ...],
     panel_id: str,
     news_feed: NewsFeed | None = None,
+    deliberate: Deliberate | None = None,
 ) -> Application:
     """Wire one mode. Everything above the venue is identical for all of them (DESIGN §5).
 
@@ -913,6 +917,12 @@ async def _assemble(
             f"a substituted news feed is simulation-only; {mode.value} must read live sources. "
             "An archived feed decides on news that is not current, and in paper it would "
             "contaminate the evidence report promotion reads."
+        )
+    # The same closures: an answer that did not come from the configured panel is evidence of
+    # nothing in paper, and in live it would be a real order sized by whatever gave that answer.
+    if deliberate is not None and mode is not Mode.SIM:
+        raise ConfigError(
+            f"a substituted deliberation is simulation-only; {mode.value} must ask its own panel."
         )
     engine = create_database(db_path)
     writer = SingleWriter(engine)
@@ -1025,6 +1035,7 @@ async def _assemble(
         news_feed=news_feed,
         quote_currency=quote_currency,
         marks=marks,
+        deliberate=deliberate,
     )
     return Application(
         mode=mode,
@@ -1240,6 +1251,10 @@ async def build_sim(
     #: every call: wired into one, it would stamp today's headlines with the replayed `observed_at`
     #: and serve them into a past decision (DESIGN [L12]).
     news_feed: NewsFeed | None = None,
+    #: Answers for the panel instead of `DecisionEngine.deliberate`, whose engine is still built and
+    #: validated. Simulation only, refused alike by `_assemble`. For a replay of answers already
+    #: recorded, which must neither be asked for again nor paid for twice.
+    deliberate: Deliberate | None = None,
 ) -> Application:
     """Wire the simulation stack: replayed data, a panel, and `SimBroker`.
 
@@ -1270,6 +1285,7 @@ async def build_sim(
         news_sources=news_sources,
         panel_id=panel_id,
         news_feed=news_feed,
+        deliberate=deliberate,
     )
 
 
