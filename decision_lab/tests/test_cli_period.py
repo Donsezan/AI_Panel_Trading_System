@@ -46,12 +46,14 @@ NOW = datetime(2026, 11, 1, tzinfo=UTC)
 
 
 @pytest.fixture
-def lab(
-    calibrated_corpus: tuple[str, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> Path:
-    """The dataset `calibrated_corpus` built, with `period`'s workspace redirected as well."""
+def lab(calibrated_dataset: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A verified dataset with a pinned day set, `period`'s workspace redirected as well.
+
+    No reference corpus: `evaluate period` never reads one, and building it was most of this
+    file's run time.
+    """
     monkeypatch.setattr(pd, "workspace_root", lambda: tmp_path / "workspace")
-    return calibrated_corpus[1]
+    return calibrated_dataset
 
 
 def _matrix(data: Path) -> cd.Matrix:

@@ -50,6 +50,30 @@ def seeded_stub(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+def verified_dataset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, days: int = 40, **shocks: object
+) -> Path:
+    """Write and verify a shocked dataset under `tmp_path`, with no reference pass over it.
+
+    The cheap half of `built_corpus`, for tests that need the history and never read a corpus: the
+    reference pass is most of the cost of every fixture built on it.
+    """
+    data = tmp_path / "history"
+    workspace = tmp_path / "workspace"
+    monkeypatch.setattr(cp, "workspace_root", lambda: workspace)
+    # `corpus build` and `report`, both called through `cli.main` by this helper's callers, are
+    # §12.4-locked: `main` takes `jobs.WorkspaceLock()` around them, which reads
+    # `params.workspace_root()` directly — untouched by the rebinding above, since that only
+    # redirects `corpus.py`'s own copy of the name. Left unset, every caller would take that lock
+    # in the operator's real `decision_lab/workspace/`.
+    monkeypatch.setenv("DECISION_LAB_WORKSPACE", str(workspace))
+    seeded_stub(monkeypatch)
+    f.write_dataset(data, {(f.instrument(), "1h"): f.shocked_walk(days=days, **shocks)})  # type: ignore[arg-type]
+
+    assert cli.main(["dataset", "verify", "--data", str(data)]) == cli.EXIT_OK
+    return data
+
+
 def built_corpus(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, days: int = 40, **shocks: object
 ) -> str:
@@ -60,20 +84,8 @@ def built_corpus(
     forty a scoring test needs and seven over the sixty `dataset days` needs to fill three pools
     (`test_calibration_days.DAYS`). A caller wanting a pinned day set must ask for the longer one.
     """
-    data = tmp_path / "history"
+    data = verified_dataset(tmp_path, monkeypatch, days=days, **shocks)
     workspace = tmp_path / "workspace"
-    monkeypatch.setattr(cp, "workspace_root", lambda: workspace)
-    # `corpus build` and `report`, both called below through `cli.main`, are §12.4-locked: `main`
-    # takes `jobs.WorkspaceLock()` around them, which reads `params.workspace_root()` directly —
-    # untouched by the rebinding above, since that only redirects `corpus.py`'s own copy of the
-    # name. Left unset, every caller of this helper (four tests, two of them through the
-    # `built_corpus_id`/`calibrated_corpus` fixtures) would take that lock in the operator's real
-    # `decision_lab/workspace/`.
-    monkeypatch.setenv("DECISION_LAB_WORKSPACE", str(workspace))
-    seeded_stub(monkeypatch)
-    f.write_dataset(data, {(f.instrument(), "1h"): f.shocked_walk(days=days, **shocks)})  # type: ignore[arg-type]
-
-    assert cli.main(["dataset", "verify", "--data", str(data)]) == cli.EXIT_OK
     assert (
         cli.main(
             ["corpus", "build", "--data", str(data), "--every", "4h", "--reference-panel", "sim"]
