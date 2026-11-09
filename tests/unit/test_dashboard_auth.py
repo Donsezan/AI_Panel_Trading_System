@@ -10,6 +10,9 @@ unauthenticated (ADR 0024).
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from typing import Any, Final
+
 import httpx
 import pytest
 from fastapi import FastAPI
@@ -137,22 +140,100 @@ def test_is_public(path: str, public: bool) -> None:
     assert is_public(path) is public
 
 
+#: Every router the app includes, by the module its endpoints live in. A router dropped from the
+#: app, or one the walk stopped reaching, fails `test_the_walk_reaches_every_router`.
+ROUTERS: Final = frozenset(
+    {
+        "tradebot.dashboard.routes.workspace",
+        "tradebot.dashboard.routes.monitor",
+        "tradebot.dashboard.routes.configure",
+        "tradebot.dashboard.routes.control",
+    }
+)
+#: A value for every path parameter a route declares, so a parameterised route is walked too.
+PARAMETERS: Final = {
+    "basket_id": "demo",
+    "alert_id": "a",
+    "kind": "basket",
+    "config_id": "demo",
+    "cycle_id": "c",
+}
+#: Route/method pairs the app serves behind the gate today, less a margin for a route retired.
+#: The walk falling below it means it has stopped reaching a router, as it once did silently.
+MIN_PROTECTED: Final = 30
+
+
+def served_routes(app: Any) -> Iterator[tuple[str, frozenset[str], str]]:
+    """Every route the app serves, as `(path, methods, endpoint module)`, routers included.
+
+    FastAPI 0.141 lists an included router in `app.routes` as one `_IncludedRouter` with no path,
+    so walking `app.routes` alone reached only `/login`, `/logout` and the static mount: the
+    workspace, monitor, configure and control routes were never proven protected. This descends
+    into each included router and applies its prefix.
+    """
+    for route in app.routes:
+        nested = getattr(route, "original_router", None)
+        if nested is not None:
+            prefix = route.include_context.prefix
+            for inner, methods, module in served_routes(nested):
+                yield prefix + inner, methods, module
+            continue
+        path = getattr(route, "path", None)
+        if path is None:
+            continue
+        endpoint = getattr(route, "endpoint", None)
+        yield (
+            path,
+            frozenset(getattr(route, "methods", None) or ()),
+            getattr(endpoint, "__module__", ""),
+        )
+
+
+def filled(path: str) -> str:
+    for name, value in PARAMETERS.items():
+        path = path.replace("{" + name + "}", value)
+    assert "{" not in path, f"no value for a path parameter in {path}; add it to PARAMETERS"
+    return path
+
+
+#: FastAPI's own schema and docs routes, which carry no data of ours.
+PUBLIC_DOCS: Final = frozenset({"/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc"})
+
+
+def protected_routes(app: FastAPI) -> list[tuple[str, frozenset[str]]]:
+    return [
+        (path, methods)
+        for path, methods, _ in served_routes(app)
+        if methods and not is_public(path) and path not in PUBLIC_DOCS
+    ]
+
+
+def test_the_walk_reaches_every_router(dashboard: FastAPI) -> None:
+    reached = {module for _, _, module in served_routes(dashboard)}
+    assert reached >= ROUTERS, f"routers the walk does not reach: {sorted(ROUTERS - reached)}"
+
+
 async def test_every_route_is_protected(dashboard: FastAPI, http: httpx.AsyncClient) -> None:
     """No route outside the public set may be reachable without a session.
 
     Walks the app rather than a hand-written list on purpose: a route added by a later pass is
-    covered by this assertion without anyone remembering to extend it.
+    covered by this assertion without anyone remembering to extend it. GET is redirected to the
+    login form; anything else is refused outright, because redirecting a POST would report success
+    for a state change that never happened.
     """
     checked = 0
-    for route in dashboard.routes:
-        path = getattr(route, "path", "")
-        if not path or is_public(path) or "{" in path:
-            continue
-        response = await http.get(path)
-        assert response.status_code == 303, path
-        assert response.headers["location"] == "/login", path
-        checked += 1
-    assert checked, "no protected routes were found; the walk is not testing anything"
+    for path, methods in protected_routes(dashboard):
+        target = filled(path)
+        for method in sorted(methods - {"HEAD"}):
+            if method == "GET":
+                response = await http.get(target)
+                assert response.status_code == 303, (method, path)
+                assert response.headers["location"] == "/login", path
+            else:
+                response = await http.request(method, target, data={})
+                assert response.status_code == 401, (method, path)
+            checked += 1
+    assert checked >= MIN_PROTECTED, f"only {checked} route/method pairs were walked"
 
 
 async def test_unauthenticated_post_is_refused_not_redirected(http: httpx.AsyncClient) -> None:
