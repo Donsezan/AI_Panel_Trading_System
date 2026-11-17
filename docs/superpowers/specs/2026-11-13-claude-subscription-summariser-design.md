@@ -234,3 +234,38 @@ the CLI; and the live-readiness refusal if it ever reached `tradebot`'s `PRESETS
 Module names and layout; how the SDK fake is shaped; the exact wording of the prompt within §6;
 whether the bake-off gets a helper command or is two manual runs; an ADR (suggested: 0032, "a
 summariser may run on the operator's subscription") recording §5.5 and §5.4.
+
+## 10. Spike findings (2026-11-17)
+
+`claude-agent-sdk` 0.2.183, which runs its **bundled** CLI 2.1.326 (not the operator's installed
+`claude`), on the operator's login. Facts from three real calls and the CLI's own session
+transcript (`api-request-shape` / `api-request-blob` records):
+
+- **(a) Options that work.** `tools=[]` (→ `--tools ""`), `allowed_tools=[]`, `mcp_servers={}`,
+  `strict_mcp_config=True`, `setting_sources=[]`, `max_turns=1`, `system_prompt=<str>`,
+  `effort="low"`; `extra_args={"no-session-persistence": None}` stops the CLI writing a session
+  folder under `~/.claude/projects` (without it, **every call leaves one**, holding the article).
+  `--bare` would strip most injection but **refuses OAuth** (API key only), so it is unusable here.
+- **(b) Init message.** `data.apiKeySource == "none"` on the subscription; `data.tools == []`;
+  `data.mcp_servers == []`; `data.claude_code_version == "2.1.326"`; `data.model`.
+- **(c) Model.** `claude-haiku-5-5` is reported back exactly, on the assistant message, in
+  `model_usage` and as `canonicalModel`. No dated suffix.
+- **(d) What the CLI adds — more than an identity line. This trips the §5.2 gate.**
+  1. System block 1: `You are a Claude agent, built on Anthropic's Claude Agent SDK.` (fixed)
+  2. A system message `# Environment`: the temp working directory (changes every call), platform,
+     shell, OS version, two security notes, and "You are powered by … knowledge cutoff June 2026".
+  3. A user-turn reminder carrying **the operator's account email**.
+  4. A user-turn reminder `Today's date is <today>` (changes daily) and a token-budget reminder.
+  5. Request params: `thinking: adaptive` **whatever `thinking` says**; `effort` is honoured.
+  `--exclude-dynamic-system-prompt-sections` removes none of 2–4.
+  Measured overhead: ~620 input tokens per call; a real summary spent ~1 000–1 150 thinking
+  tokens at effort medium.
+- **(e) Errors.** Failures surface as `claude_agent_sdk.ResultError` / `ProcessError` with the
+  API's message as text. A content-safeguard block is one such error (`Details: [...]`) and must
+  be a **refused row**, not a stop. A `RateLimitEvent` message arrives on every call with
+  `rate_limit_info.status` (`allowed` …), `resets_at`, and per-window `utilization` — the quota
+  signal can be read **before** it runs out, not only parsed from an error.
+- **(f) Auth.** `env={"ANTHROPIC_API_KEY": "", "ANTHROPIC_AUTH_TOKEN": ""}` with the login gives
+  `apiKeySource: "none"`.
+
+**Status:** stopped at the gate; the operator decides how to proceed.
