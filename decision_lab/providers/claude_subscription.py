@@ -80,6 +80,9 @@ _PINNED: Final = re.compile(r"^claude-[a-z]+-\d+-\d+(-\d{8})?$")
 _LIMIT_TEXT: Final = re.compile(r"(?i)usage limit|rate limit|limit reached")
 _LOGIN_TEXT: Final = re.compile(r"(?i)not logged in|/login")
 
+#: The result subtype the CLI reports when a call goes past `max_turns` (SDK `ResultError`).
+MAX_TURNS_SUBTYPE: Final = "error_max_turns"
+
 QueryFn = Callable[..., AsyncIterator[object]]
 
 
@@ -140,6 +143,9 @@ class ClaudeSubscriptionProvider:
                     f"the Claude Code CLI was not found ({exc}); {INSTALL_HINT}"
                 ) from exc
             except self._sdk.ProcessError as exc:
+                subtype = getattr(exc, "subtype", None)
+                if subtype == MAX_TURNS_SUBTYPE:
+                    raise _over_one_turn(subtype) from exc
                 raise _classify(_error_text(exc)) from exc
             except self._sdk.ClaudeSDKError as exc:
                 raise ProviderError(f"{PROVIDER_ID} SDK failure: {exc}") from exc
@@ -230,10 +236,15 @@ class ClaudeSubscriptionProvider:
     def _finish(
         self, message: ResultMessage, answered: bool, parts: list[str]
     ) -> tuple[str, int, int]:
+        # Turns first: past `max_turns` the CLI reports an *error* result (`error_max_turns`), and
+        # routed as an error it would be a retryable provider failure — retrying a call that
+        # broke the one-turn contract is the opposite of stopping.
+        if message.subtype == MAX_TURNS_SUBTYPE or message.num_turns > 1:
+            raise _over_one_turn(message.subtype, message.num_turns)
         if message.is_error:
-            raise _classify(" ".join([message.result or "", *(message.errors or [])]))
-        if message.num_turns > 1:
-            raise SubscriptionContractError(f"the call ran {message.num_turns} turns, not one")
+            raise _classify(
+                " ".join([message.subtype, message.result or "", *(message.errors or [])])
+            )
         if not answered:
             raise ProviderError(f"{PROVIDER_ID} returned a result with no answer")
         if message.total_cost_usd is not None:
@@ -245,6 +256,11 @@ class ClaudeSubscriptionProvider:
             for key in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
         )
         return "".join(parts), prompt_tokens, _tokens(usage, "output_tokens")
+
+
+def _over_one_turn(subtype: str, num_turns: int | None = None) -> SubscriptionContractError:
+    turns = f"{num_turns} turns" if num_turns is not None else "more than one turn"
+    return SubscriptionContractError(f"the call ran {turns}, not one ({subtype})")
 
 
 def _require_init(initialised: bool) -> None:
@@ -267,7 +283,11 @@ def _check_rate_limit(status: str, resets_at: int | None) -> None:
 
 
 def _error_text(exc: BaseException) -> str:
+    """The exception's text, plus its result payload, so an empty result still names its cause."""
     extra: list[str] = []
+    subtype = getattr(exc, "subtype", None)
+    if isinstance(subtype, str):
+        extra.append(subtype)
     result = getattr(exc, "result", None)
     if isinstance(result, str):
         extra.append(result)

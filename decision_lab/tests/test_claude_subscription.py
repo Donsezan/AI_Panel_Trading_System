@@ -77,10 +77,15 @@ def assistant(text: str = GOOD, model: str = MODEL) -> AssistantMessage:
 
 
 def result(
-    *, is_error: bool = False, text: str = GOOD, num_turns: int = 1, cost: Any = 0.0012
+    *,
+    is_error: bool = False,
+    text: str | None = GOOD,
+    num_turns: int = 1,
+    cost: Any = 0.0012,
+    subtype: str = "success",
 ) -> ResultMessage:
     return ResultMessage(
-        subtype="success",
+        subtype=subtype,
         duration_ms=5,
         duration_api_ms=4,
         is_error=is_error,
@@ -229,6 +234,30 @@ async def test_an_answer_without_an_init_message_stops() -> None:
 async def test_more_than_one_turn_stops() -> None:
     fake = FakeQuery([init(), assistant(), result(num_turns=2)])
     with pytest.raises(SubscriptionContractError, match="turn"):
+        await ClaudeSubscriptionProvider(query_fn=fake).complete(REQ)
+
+
+async def test_running_past_max_turns_is_a_contract_stop_not_a_retry() -> None:
+    over = result(is_error=True, text=None, num_turns=2, subtype="error_max_turns")
+    fake = FakeQuery([init(), assistant(), over])
+    with pytest.raises(SubscriptionContractError, match="error_max_turns"):
+        await ClaudeSubscriptionProvider(query_fn=fake).complete(REQ)
+
+
+async def test_a_max_turns_result_error_is_a_contract_stop_not_a_retry() -> None:
+    error = ResultError(
+        "Claude Code returned an error result", data={"subtype": "error_max_turns"}, exit_code=1
+    )
+    assert error.subtype == "error_max_turns"
+    fake = FakeQuery([init(), assistant()], error=error)
+    with pytest.raises(SubscriptionContractError, match="error_max_turns"):
+        await ClaudeSubscriptionProvider(query_fn=fake).complete(REQ)
+
+
+async def test_an_empty_error_result_still_names_its_subtype() -> None:
+    failed = result(is_error=True, text=None, subtype="error_during_execution")
+    fake = FakeQuery([init(), rate_limit(), failed])
+    with pytest.raises(ProviderError, match="error_during_execution"):
         await ClaudeSubscriptionProvider(query_fn=fake).complete(REQ)
 
 
