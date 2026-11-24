@@ -268,4 +268,19 @@ transcript (`api-request-shape` / `api-request-blob` records):
 - **(f) Auth.** `env={"ANTHROPIC_API_KEY": "", "ANTHROPIC_AUTH_TOKEN": ""}` with the login gives
   `apiKeySource: "none"`.
 
-**Status:** stopped at the gate; the operator decides how to proceed.
+**Decision (operator, 2026-11-24): continue on the subscription, and record the additions rather
+than strip them.** None of them carries news or market content: the email reaches only Anthropic,
+which holds it already; the date says nothing about 2025; the traceability check still measures
+whether summaries stay on the text. Consequences for §5:
+
+- `prompt_digest` covers the fixed identity line, **the pinned CLI version** and our prompt. The
+  CLI version decides what the CLI adds, and it is pinned through the SDK's hash-locked version, so
+  an SDK upgrade is a new archive identity. The per-call parts (date, temp directory) are named in
+  ADR 0032 as known CLI context, not digested.
+- The contract check also requires `claude_code_version` to equal the pinned version, and
+  `mcp_servers == []`.
+- `effort="low"`; `thinking` is not sent, because the CLI ignores it.
+- `no-session-persistence` is always passed.
+- The quota stop reads `RateLimitEvent.rate_limit_info.status` (anything but `allowed` stops,
+  carrying `resets_at`), with the error-text match as a fallback.
+- A safeguard block is a `ProviderError`, so it ends as a refused row.

@@ -10,6 +10,34 @@
 
 **Spec:** [docs/superpowers/specs/2026-11-13-claude-subscription-summariser-design.md](../specs/2026-11-13-claude-subscription-summariser-design.md)
 
+## Spike amendments (Task 1 done — read spec §10 first)
+
+Task 1 is **complete** (spec §10, commit 50e61a1). These amendments override the task text below:
+
+- SDK pin: `claude-agent-sdk==0.2.183` (bundled CLI `2.1.326`).
+- `IDENTITY_PREAMBLE = "You are a Claude agent, built on Anthropic's Claude Agent SDK."`;
+  `PINNED_CLI_VERSION = "2.1.326"`.
+  `digest_for(sub_policy) = prompt_digest(f"{IDENTITY_PREAMBLE}
+[claude-code {PINNED_CLI_VERSION}]
+{system_for(policy)}")`.
+- Options, all asserted by `test_one_request_is_one_fresh_query_with_our_prompt_alone`:
+  `system_prompt=<str>`, `tools=[]`, `allowed_tools=[]`, `mcp_servers={}`, `strict_mcp_config=True`,
+  `setting_sources=[]`, `max_turns=1`, `effort="low"`, `model=<pinned>`, a fresh empty temp `cwd`,
+  `env={"ANTHROPIC_API_KEY": "", "ANTHROPIC_AUTH_TOKEN": ""}`,
+  `extra_args={"no-session-persistence": None}`. `thinking` is **not** set (the CLI ignores it).
+- Contract stop (`SubscriptionContractError`) when the init `SystemMessage` (`subtype == "init"`) has
+  `data["apiKeySource"] != "none"`, `data["tools"] != []`, `data["mcp_servers"] != []`, or
+  `data["claude_code_version"] != PINNED_CLI_VERSION`; or when the `AssistantMessage.model` differs
+  from the request's model.
+- Quota stop (`QuotaExhausted`) when a `RateLimitEvent` has `rate_limit_info.status != "allowed"`,
+  carrying `resets_at`. Fallback: a `ResultError`/`ProcessError` whose text matches
+  `(?i)usage limit|rate limit|limit reached`.
+- Every other `ResultError`/`ProcessError` (including a content-safeguard block) → `ProviderError`.
+- Tokens: `ResultMessage.usage["input_tokens"] + ["cache_creation_input_tokens"] +
+  ["cache_read_input_tokens"]` as prompt tokens, `["output_tokens"]` as completion tokens;
+  `str(ResultMessage.total_cost_usd)` into `notional_usd`.
+- `runtime` = `f"claude-code {data['claude_code_version']}"`.
+
 ## Global Constraints
 
 - `git diff --stat main -- tradebot/` stays **empty**. Nothing under `tradebot/` names `decision_lab` or imports `claude_agent_sdk`.
