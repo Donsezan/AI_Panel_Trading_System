@@ -25,13 +25,14 @@ with warnings.catch_warnings():
 
 from decision_lab import analysis, jobs, registry
 from decision_lab import period as pd
+from decision_lab.archive.fields import EventType
 from decision_lab.dashboard.app import create_lab_dashboard
 from decision_lab.dashboard.routes import periods as periods_routes
 from decision_lab.records import records_from_store
 from decision_lab.regimes import RegimeLabel
 from decision_lab.spikes import SpikeEvent
 from decision_lab.tests.test_analysis_period_report import feed_of, story, with_news
-from decision_lab.tests.test_newsfeed import archive
+from decision_lab.tests.test_newsfeed import archive, item
 from decision_lab.tests.test_period_pause import (  # noqa: F401 - pytest fixtures
     Ran,
     Scenarios,
@@ -508,6 +509,29 @@ def test_could_see_and_published_later_are_separate_blocks(
     assert could < page.index("the served story") < later
     assert page.index("the later story") > later
     assert "NEWS-BLIND" not in page
+
+
+def test_the_period_page_marks_commentary(
+    paused: tuple[TestClient, Ran, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, ran, workspace = paused
+    fed = with_meta(workspace, ran, "fed", archive_digest="fed-digest", news_blind=False)
+    comment = item(
+        at=at(24),
+        title="a prediction",
+        summary="an analyst predicts",
+        url="https://x/prediction",
+        event_type=EventType.MARKET_COMMENTARY,
+    )
+    feed = feed_of(
+        archive(story(1, "early"), story(24, "the plain story"), comment, story(28, "late"))
+    )
+    monkeypatch.setattr(periods_routes, "_feed_for", lambda *_a, **_k: (feed, ""))
+    monkeypatch.setattr(analysis, "find_events", lambda *_a, **_k: (spike(at(20), at(25)),))
+    later = client.get(f"/periods/{fed}/events/0").text.split("Published later")[1]
+    assert re.search(r'class="tag">commentary</span>\s*<strong>a prediction', later)
+    assert "the plain story" in later and "commentary</span> <strong>the plain" not in later
+    assert later.count(">commentary<") == 1
 
 
 def test_the_nav_reaches_the_page(tmp_path: Path) -> None:

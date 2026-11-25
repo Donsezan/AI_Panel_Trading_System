@@ -70,7 +70,7 @@ empty list here is not a quiet market.</p>
 {% else %}
 <ul>
 {% for item in news.published_later %}
-  <li>{{ item.observed_at | moment }} · <strong>{{ item.title }}</strong> — {{ item.summary }}</li>
+  <li>{{ item.observed_at | moment }} · {% if item.event_type.value == "MARKET_COMMENTARY" %}<span class="tag">commentary</span> {% endif %}<strong>{{ item.title }}</strong> — {{ item.summary }}</li>
 {% endfor %}
 </ul>
 {% endif %}

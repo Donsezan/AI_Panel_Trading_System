@@ -43,6 +43,7 @@ def item(
     summary: str,
     url: str | None = None,
     entities: tuple[str, ...] = ("Kraken",),
+    event_type: EventType = EventType.REGULATORY,
 ) -> ArchiveItem:
     link = url or f"https://x.test/{abs(hash(title)) % 10_000}"
     return ArchiveItem(
@@ -51,7 +52,7 @@ def item(
         url_hash=f"h{abs(hash(link)) % 10_000}",
         title=title,
         summary=summary,
-        event_type=EventType.REGULATORY,
+        event_type=event_type,
         entities=entities,
         assets=("BTC",),
         magnitudes=(),
@@ -296,3 +297,47 @@ def test_load_feed_refuses_an_archive_published_under_another_window(tmp_path: P
 
     with pytest.raises(ConfigError, match="different window or floor"):
         load_feed(data, ("cryptoslate",), _policy())
+
+
+# ------------------------------------------------ commentary is a record, never evidence (§6.1)
+
+NOON = datetime(2025, 3, 4, 12, tzinfo=UTC)
+
+
+def _commentary_pair() -> tuple[ArchiveItem, ArchiveItem]:
+    real = item(at=NOON - timedelta(hours=2), title="Bitcoin ETF approved", summary="Approved.")
+    comment = item(
+        at=NOON - timedelta(hours=1),
+        title="Bitcoin to 200k says analyst",
+        summary="An analyst predicts a rise.",
+        event_type=EventType.MARKET_COMMENTARY,
+    )
+    return real, comment
+
+
+@pytest.mark.asyncio
+async def test_commentary_is_never_served() -> None:
+    real, comment = _commentary_pair()
+    views, _ = await feed(real, comment).snapshot_news((BTC,), NOON)
+    assert [v.title for v in views] == ["Bitcoin ETF approved"]
+
+
+def test_commentary_is_not_in_the_drill_down_window() -> None:
+    real, comment = _commentary_pair()
+    assert feed(real, comment).in_window(NOON) == (real,)
+
+
+@pytest.mark.asyncio
+async def test_a_window_of_only_commentary_inside_the_span_reports_ok() -> None:
+    """Silence of the evidence is not silence of the source: the span still covers the cycle."""
+    early = item(at=NOON - timedelta(days=5), title="Old", summary="Old news.")
+    _, comment = _commentary_pair()
+    late = item(at=NOON + timedelta(days=1), title="Later", summary="Later news.")
+    views, coverage = await feed(early, comment, late).snapshot_news((BTC,), NOON)
+    assert views == () and coverage.sources_ok == ("cryptoslate",)
+    assert coverage.sources_failed == ()
+
+
+def test_items_keeps_commentary() -> None:
+    real, comment = _commentary_pair()
+    assert set(feed(real, comment).items) == {real, comment}

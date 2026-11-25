@@ -251,6 +251,14 @@ def test_published_later_never_appears_in_could_see() -> None:
     assert served.isdisjoint({i.title for i in n.published_later})
 
 
+def test_published_later_keeps_commentary() -> None:
+    commentary = item("opinion", utc(2025, 3, 10, 6)).model_copy(
+        update={"event_type": EventType.MARKET_COMMENTARY}
+    )
+    n = spikes.news_for(EVENT, records_with_news(), (*ITEMS, commentary), coverage=True)
+    assert "opinion" in {i.title for i in n.published_later}
+
+
 def test_published_later_is_deduplicated_by_url_hash() -> None:
     twice = (
         *ITEMS,
