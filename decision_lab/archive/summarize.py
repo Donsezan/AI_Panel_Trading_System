@@ -37,12 +37,13 @@ circular.
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Sequence
 from datetime import timedelta
 from decimal import Decimal
 from typing import Final
 
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 
 from decision_lab.archive.collect import DEFAULT_PAUSE
 from decision_lab.archive.config import ArchivePolicy
@@ -65,22 +66,62 @@ logger = get_logger(__name__)
 #: for relevance.
 ALLOWED_ASSETS: Final = ("BTC", "ETH", "OTHER", "NONE")
 
+#: Delimit the worked example so a test can read it alone and prove it names neither traded asset
+#: (subscription-summariser spec §6 item 7): an example about BTC or ETH would tilt the asset field.
+EXAMPLE_START: Final = "<example>"
+EXAMPLE_END: Final = "</example>"
+
+#: Invented, not taken from the archive, so it can be neither a memorised outcome nor a row the
+#: traceability sample later scores. It shows the four habits the prompt asks for at once: the
+#: evaluative word ("devastating") dropped, a magnitude copied, "OTHER" for a named non-traded
+#: asset, and entities in their shortest common name.
+_EXAMPLE_ARTICLE: Final = (
+    "TITLE: Lumen hit by $41M hot-wallet hack\n"
+    "ARTICLE: Singapore-based exchange Lumen said on Tuesday it had suspended withdrawals after "
+    "attackers drained $41 million in SOL and USDC from one of its hot wallets. The company said "
+    "customer balances would be covered from its reserves. Critics called the breach a "
+    "devastating blow to the young exchange."
+)
+_EXAMPLE_REPLY: Final = json.dumps(
+    {
+        "summary": (
+            "Lumen suspended withdrawals after attackers drained $41 million in SOL and USDC from "
+            "one of its hot wallets; it said customer balances would be covered from its reserves."
+        ),
+        "event_type": EventType.SECURITY_INCIDENT.value,
+        "entities": ["Lumen"],
+        "assets": ["OTHER"],
+        "magnitudes": ["$41 million"],
+        "modality": Modality.CONFIRMED.value,
+    }
+)
+
 #: `{max_chars}` is a literal placeholder, substituted by the pass with `str.replace`. It is not a
 #: `.format()` field: the body is JSON, and `format` would raise on every brace in it.
+#:
+#: Everything the original §6.5 prompt said is still here. One phrase moved: "a price direction"
+#: became "a price direction of your own", because §4.3 now keeps a move the article states with
+#: its cause, and the unqualified rule would forbid that. What was added is subscription-summariser
+#: spec §6: entities as a cluster key, attribution, own knowledge, the register to strip, §4.3's
+#: price rule, §6.1's commentary mark, edge cases, one example. Rules carry their reason where one
+#: fits on a line, because a model follows a reason better than a bare rule.
 SUMMARY_SYSTEM: Final = f"""\
 You compress one news article into a short factual record. You are not an analyst.
 
 Restate only what the article's own text says. You must not offer an outlook, a market
-implication, a price direction, a sentiment, or any reference to events after this article was
-published. If the article states something as expected, proposed or rumoured, record it that way
-rather than as fact.
+implication, a price direction of your own, a sentiment, or any reference to events after this
+article was published. If the article states something as expected, proposed or rumoured, record
+it that way rather than as fact.
+
+You may know what happened after this article was published. Do not use any of it. Add no fact
+the text does not state, from your own knowledge or anywhere else, however sure you are of it.
 
 Reply with JSON only, matching this schema exactly. No prose, no code fences.
 
 {{
   "summary": "<at most {{max_chars}} characters, plain factual prose, no evaluation>",
   "event_type": "<one of: {" | ".join(m.value for m in EventType)}>",
-  "entities": ["<who acted, and on whom, as the article names them>"],
+  "entities": ["<at most three: the actor first, then whom it acted on>"],
   "assets": ["<only those the text names, from: {" | ".join(ALLOWED_ASSETS)}>"],
   "magnitudes": ["<figures exactly as stated, e.g. \\"$2.2B inflow\\"; omit if none>"],
   "modality": "<one of: {" | ".join(m.value for m in Modality)}>"
@@ -92,8 +133,33 @@ Rules you must follow:
 - CONFIRMED means the article reports the event as having happened. PROPOSED means announced or
   intended. RUMOURED means unconfirmed or sourced to speculation. DENIED means a party denies it.
   CORRECTED means this article corrects or walks back an earlier claim.
-- Use "NONE" in assets when the text names no crypto asset. Do not infer one from context.
+- Use "NONE" in assets when the text names no crypto asset. Do not infer one from context. "OTHER"
+  means the text names a crypto asset other than BTC or ETH.
+- Entities: at most three, the actor first, then whom it acted on. Give each its shortest common
+  name ("SEC", "BlackRock", "Binance"), with no titles, and name a person only when a person is
+  the actor. Two articles about one event are matched on these names, so both must list the
+  same names.
+- A prediction, forecast or opinion is a claim its author made. Record it as that claim ("Analyst
+  X said ..."), never as the event.
+- Strip praising or alarming words: "empowers", "innovative", "plunges", "soars" judge the news
+  rather than state it. Say what happened instead.
+- A price move whose cause the article states is kept: the move, its figures exactly as stated,
+  and the cause. A cause the article only attributes to others ("analysts say ...") is recorded as
+  their claim, with modality RUMOURED.
+- Pure market commentary - technical analysis, price targets or predictions, or a recap of moves
+  that states no cause - is event_type MARKET_COMMENTARY. Its summary is one neutral line saying
+  what kind of piece it is ("Technical analysis of support levels"), with no levels, targets or
+  predictions in it. Its entities and magnitudes are empty and its modality is CONFIRMED.
+- When the title and the body disagree, the body wins.
+- A roundup of several stories is recorded as its headline event alone.
 - Add no keys beyond the schema.
+
+One worked example. The article is invented: follow its form, not its subject.
+{EXAMPLE_START}
+{_EXAMPLE_ARTICLE}
+
+{_EXAMPLE_REPLY}
+{EXAMPLE_END}
 """
 
 
@@ -162,6 +228,21 @@ class SummaryResponse(DomainModel):
             )
         return value
 
+    @model_validator(mode="after")
+    def _commentary_carries_no_figures_or_names(self) -> SummaryResponse:
+        # §6.1: a commentary row is the record that a piece was seen, not an event. A level or a
+        # target is the prediction the mark exists to keep out, and a name would give a row the
+        # feed drops anyway a cluster key it must never contribute to.
+        if self.event_type is EventType.MARKET_COMMENTARY:
+            carried = [n for n in ("entities", "magnitudes") if getattr(self, n)]
+            if carried:
+                raise ValueError(
+                    f"MARKET_COMMENTARY carries {' and '.join(carried)}, which must be empty. "
+                    "Commentary is recorded as the kind of piece it was, with no levels, targets "
+                    "or names in it"
+                )
+        return self
+
 
 def parse_summary(text: str, *, max_chars: int) -> SummaryResponse:
     """Extract and validate one summariser reply.
@@ -203,6 +284,9 @@ class SummaryReport(DomainModel):
     already: int = 0
     requested: int = 0
     summarised: int = 0
+    #: Of `summarised`, how many were marked `MARKET_COMMENTARY` (§6.1). A subset, not a third
+    #: outcome beside `refused`: the row parsed and was paid for, so `per_row_cost` divides by it.
+    commentary: int = 0
     refused: int = 0
     bodyless: int = 0
     cost_usd: Money = ZERO
@@ -369,7 +453,10 @@ async def summarize_store(
                         "summary_prompt_digest": digest,
                     }
                 )
-                report = report.added(summarised=1)
+                report = report.added(
+                    summarised=1,
+                    commentary=int(parsed.event_type is EventType.MARKET_COMMENTARY),
+                )
         finally:
             if updated:
                 # Only the six §6.5 fields and their provenance move. Every other field was

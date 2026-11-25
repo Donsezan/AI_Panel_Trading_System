@@ -350,3 +350,28 @@ async def test_an_interrupt_flushes_the_rows_already_summarised(tmp_path: Path) 
         await summarize_store(_Interrupts(at=3), store, POLICY, clock(), pause=timedelta(0))
 
     assert [a.is_summarised for a in store.read_all()] == [True, True, False, False]
+
+
+COMMENTARY = json.dumps(
+    {
+        "summary": "Technical analysis of support and resistance levels.",
+        "event_type": "MARKET_COMMENTARY",
+        "entities": [],
+        "assets": ["NONE"],
+        "magnitudes": [],
+        "modality": "CONFIRMED",
+    }
+)
+
+
+@pytest.mark.asyncio
+async def test_the_pass_counts_commentary_inside_summarised(tmp_path: Path) -> None:
+    """§6.1: a commentary row is summarised (it is the record that we saw it) and also counted,
+    so `per_row_cost` still divides by every row that was paid for and parsed."""
+    store = store_with(tmp_path, (row(1), row(2)))
+    provider = StubLLMProvider([GOOD, COMMENTARY])
+
+    report = await summarize_store(provider, store, POLICY, clock(), pause=timedelta(0))
+
+    assert (report.summarised, report.commentary, report.refused) == (2, 1, 0)
+    assert store.read_all()[1].event_type is EventType.MARKET_COMMENTARY

@@ -45,3 +45,9 @@ def test_an_unknown_value_is_refused_rather_than_coerced() -> None:
 def test_event_type_carries_a_catch_all_so_a_real_article_always_classifies() -> None:
     """A vocabulary with no escape hatch refuses rows for being ordinary."""
     assert EventType.OTHER in set(EventType)
+
+
+def test_market_commentary_is_a_member_so_seen_commentary_is_a_record() -> None:
+    """Subscription-summariser spec §6.1: pure commentary is kept in the archive, marked, and
+    dropped by the feed before the panel reads it - a mark needs a value to be."""
+    assert EventType("MARKET_COMMENTARY") is EventType.MARKET_COMMENTARY

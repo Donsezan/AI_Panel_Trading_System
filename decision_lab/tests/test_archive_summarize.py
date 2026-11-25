@@ -15,6 +15,8 @@ import pytest
 from decision_lab.archive.config import ArchivePolicy
 from decision_lab.archive.fields import EventType, Modality
 from decision_lab.archive.summarize import (
+    EXAMPLE_END,
+    EXAMPLE_START,
     SUMMARY_SYSTEM,
     SummaryResponse,
     digest_for,
@@ -164,3 +166,71 @@ def test_the_digest_covers_the_preamble_and_the_cli_version(
     monkeypatch.undo()
     monkeypatch.setattr(cs, "IDENTITY_PREAMBLE", "X")
     assert digest_for(sub) != first
+
+
+# The revised prompt (subscription-summariser spec §6). These assert the few phrases whose absence
+# would mean a rule was dropped, not the wording around them.
+
+
+def test_the_prompt_limits_entities_and_says_why() -> None:
+    """§6 item 1: entities are a third of the cluster key, an exact match on the sorted names."""
+    assert "at most three" in SUMMARY_SYSTEM
+    assert "same names" in SUMMARY_SYSTEM
+
+
+def test_the_prompt_forbids_outside_knowledge() -> None:
+    """§6 item 3: the hindsight channel, closed by prompt as well as by what the model is given."""
+    assert "what happened after" in SUMMARY_SYSTEM
+    assert "your own knowledge" in SUMMARY_SYSTEM
+
+
+def test_the_prompt_names_commentary_and_the_price_rule() -> None:
+    """§4.3 and §6.1: a move with a stated cause is kept; pure commentary is marked."""
+    assert "MARKET_COMMENTARY" in SUMMARY_SYSTEM
+    assert "cause" in SUMMARY_SYSTEM
+
+
+def _example() -> str:
+    return SUMMARY_SYSTEM.split(EXAMPLE_START)[1].split(EXAMPLE_END)[0]
+
+
+def test_the_worked_example_names_neither_traded_asset() -> None:
+    """§6 item 7: an example about BTC or ETH would tilt the asset field toward them."""
+    example = _example()
+    for word in ("BTC", "ETH", "Bitcoin", "Ethereum", "bitcoin", "ether"):
+        assert word not in example
+
+
+def test_the_worked_example_parses() -> None:
+    """An example the contract refuses would teach the model to be refused."""
+    example = _example()
+    reply = example[example.index("{") : example.rindex("}") + 1]
+    parsed = parse_summary(reply, max_chars=280)
+    assert parsed.event_type is not EventType.MARKET_COMMENTARY
+
+
+COMMENTARY = {
+    "summary": "Technical analysis of support and resistance levels.",
+    "event_type": "MARKET_COMMENTARY",
+    "entities": [],
+    "assets": ["BTC"],
+    "magnitudes": [],
+    "modality": "CONFIRMED",
+}
+
+
+def test_commentary_parses_with_no_entities_or_magnitudes() -> None:
+    parsed = parse_summary(json.dumps(COMMENTARY), max_chars=280)
+    assert parsed.event_type is EventType.MARKET_COMMENTARY
+    assert (parsed.entities, parsed.magnitudes) == ((), ())
+
+
+def test_commentary_with_magnitudes_is_refused() -> None:
+    """§6.1: a level or a target in a commentary row is the prediction the mark exists to drop."""
+    with pytest.raises(SchemaViolationError, match="magnitudes"):
+        parse_summary(json.dumps(dict(COMMENTARY, magnitudes=["$120k target"])), max_chars=280)
+
+
+def test_commentary_with_entities_is_refused() -> None:
+    with pytest.raises(SchemaViolationError, match="entities"):
+        parse_summary(json.dumps(dict(COMMENTARY, entities=["Analyst X"])), max_chars=280)

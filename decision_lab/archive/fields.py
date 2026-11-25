@@ -39,6 +39,12 @@ class EventType(StrEnum):
     TECHNOLOGY = "TECHNOLOGY"
     PERSONNEL = "PERSONNEL"
     OTHER = "OTHER"
+    #: Technical analysis, price targets, predictions, recaps of moves with no stated cause.
+    #: Not an event at all: the row is kept as the record that the article was seen and the feed
+    #: drops it before the panel reads (subscription-summariser spec §6.1). Appended last, and a
+    #: member an archive simply never uses, so an archive published without it still reads and
+    #: still digests as it did - the digest is taken over row values, never over the vocabulary.
+    MARKET_COMMENTARY = "MARKET_COMMENTARY"
 
 
 class Modality(StrEnum):
