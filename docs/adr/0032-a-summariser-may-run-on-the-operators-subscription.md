@@ -59,8 +59,10 @@ equal to the pin. A mismatch is a stop with nothing spent.
 
 **Cost is zero by construction.** `cost_usd` is `ZERO`, the operator's real marginal spend, so
 `per_row_cost` reads 0 under this binding and the projection says why. The SDK's API-equivalent
-price is logged per batch as `notional_usd`, as text, and never summed as money. The log also
-carries `runtime`.
+price is logged per batch as text and never summed as money, bounded to `notional_usd_calls`,
+`notional_usd_first` and `notional_usd_last` rather than one entry per call. The log also carries
+`runtime`, and a quota, contract or login stop's own line carries the same provenance plus the
+batch's `summarised`, `refused` and `commentary` counts, so a stopped batch says what it did.
 
 **The quota is a stop, not a failure.** `RateLimitEvent.rate_limit_info.status` other than
 `allowed` stops the pass, carrying `resets_at` and naming `rate_limit_type` (`five_hour`,

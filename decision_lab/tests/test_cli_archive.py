@@ -636,7 +636,11 @@ def test_the_summarised_log_carries_runtime_and_notional(
         if r.getMessage() == "archive summarised" and r.name == "decision_lab.cli"
     ]
     assert record.runtime == "claude-code 2.1.0"  # type: ignore[attr-defined]
-    assert record.notional_usd == "0.0123,0.0123"  # type: ignore[attr-defined]
+    # Bounded, never one entry per call: a 14 000-row pass must not log a 14 000-item list.
+    assert record.notional_usd_calls == 2  # type: ignore[attr-defined]
+    assert record.notional_usd_first == "0.0123"  # type: ignore[attr-defined]
+    assert record.notional_usd_last == "0.0123"  # type: ignore[attr-defined]
+    assert not hasattr(record, "notional_usd")
     assert record.per_row_cost == "0"  # type: ignore[attr-defined]
     assert "not billed per call" in record.per_row_cost_note  # type: ignore[attr-defined]
 
@@ -656,4 +660,69 @@ def test_a_non_subscription_log_carries_no_runtime_or_notional(
         for r in caplog.records
         if r.getMessage() == "archive summarised" and r.name == "decision_lab.cli"
     ]
-    assert not hasattr(record, "runtime") and not hasattr(record, "notional_usd")
+    assert not hasattr(record, "runtime") and not hasattr(record, "notional_usd_calls")
+
+
+def test_a_login_lost_on_a_call_exits_candidate_not_dataset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Final-review finding 2: `SdkMissing` from a *call* (a lost login, a missing CLI) escaped
+    `summarize_store` and `main` mapped it to exit 3. Every pre-spend refusal is exit 4."""
+    from claude_agent_sdk import ResultError
+
+    from decision_lab.providers.claude_subscription import ClaudeSubscriptionProvider
+    from decision_lab.tests.test_claude_subscription import FakeQuery, init
+
+    data = tmp_path / "history"
+    store = RawStore.open(data / RAW_DIR, source_id="cryptoslate")
+    store.append(summarisable_row(1))
+    text = "Invalid API key · Please run /login"
+    fake = FakeQuery([init()], error=ResultError(f"error result: {text}", data={"result": text}))
+    provider = ClaudeSubscriptionProvider(query_fn=fake)
+    monkeypatch.setattr(cli, "build_summariser", lambda policy: provider)
+
+    code, text_logged = _refusal(_summarise_args(data, _subscription_policy(tmp_path)), caplog)
+
+    assert code == cli.EXIT_CANDIDATE
+    assert "claude /login" in text_logged
+    assert not store.read_all()[0].is_summarised
+
+
+def test_a_login_lost_on_a_call_exits_candidate_through_main(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from decision_lab.providers.claude_subscription import SdkMissing
+
+    data = tmp_path / "history"
+    RawStore.open(data / RAW_DIR, source_id="cryptoslate").append(summarisable_row(1))
+    fake = _fake_subscription(error=SdkMissing("the CLI is not logged in; log in"))
+    monkeypatch.setattr(cli, "build_summariser", lambda policy: fake)
+
+    assert cli.main(_summarise_args(data, _subscription_policy(tmp_path))) == cli.EXIT_CANDIDATE
+
+
+@pytest.mark.parametrize("kind", ["quota", "contract"])
+def test_a_stop_logs_what_the_batch_did(
+    kind: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Final-review finding 6: the stop's own log line carries the batch's counts, the runtime
+    and the notional summary - the success line's provenance, on the path that needs it most."""
+    from decision_lab.providers.claude_subscription import QuotaExhausted, SubscriptionContractError
+
+    errors = {"quota": QuotaExhausted("limit"), "contract": SubscriptionContractError("a tool")}
+    data = tmp_path / "history"
+    store = RawStore.open(data / RAW_DIR, source_id="cryptoslate")
+    for n in (1, 2, 3):
+        store.append(summarisable_row(n))
+    fake = _fake_subscription(error=errors[kind], after=2)
+    monkeypatch.setattr(cli, "build_summariser", lambda policy: fake)
+
+    _refusal(_summarise_args(data, _subscription_policy(tmp_path)), caplog)
+
+    (record,) = [r for r in caplog.records if r.name == "decision_lab.cli"]
+    assert (record.summarised, record.refused, record.commentary) == (2, 0, 0)  # type: ignore[attr-defined]
+    assert record.runtime == "claude-code 2.1.0"  # type: ignore[attr-defined]
+    assert record.notional_usd_calls == 2  # type: ignore[attr-defined]

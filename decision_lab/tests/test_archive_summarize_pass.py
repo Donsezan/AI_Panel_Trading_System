@@ -380,8 +380,8 @@ async def test_the_pass_counts_commentary_inside_summarised(tmp_path: Path) -> N
 class _StopsAt(StubLLMProvider):
     """Answers until its `at`-th call, then raises `error` - a limit reached mid-pass."""
 
-    def __init__(self, *, at: int, error: Exception) -> None:
-        super().__init__([GOOD])
+    def __init__(self, *, at: int, error: Exception, responses: tuple[str, ...] = (GOOD,)) -> None:
+        super().__init__(list(responses))
         self._at = at
         self._error = error
         self._n = 0
@@ -423,3 +423,30 @@ async def test_a_contract_stop_is_not_tallied_as_a_refusal(tmp_path: Path) -> No
         await summarize_store(stopping, store, POLICY, clock(), pause=timedelta(0))
 
     assert [a.is_summarised for a in store.read_all()] == [True, False, False]
+
+
+@pytest.mark.asyncio
+async def test_a_stop_carries_the_partial_report_of_its_batch(tmp_path: Path) -> None:
+    """Final-review finding 6: a quota or contract stop must still say what the batch did, or
+    the rows it paid for and refused are visible only by diffing the store."""
+    from decision_lab.archive.summarize import partial_report
+    from decision_lab.providers.claude_subscription import QuotaExhausted
+
+    store = store_with(tmp_path, tuple(row(n) for n in range(1, 6)))
+    # Row 3 answers prose twice (the call and its repair) and is refused; row 4 hits the limit.
+    stopping = _StopsAt(
+        at=5, error=QuotaExhausted("limit"), responses=(GOOD, COMMENTARY, "prose", "prose")
+    )
+
+    with pytest.raises(QuotaExhausted) as caught:
+        await summarize_store(stopping, store, POLICY, clock(), pause=timedelta(0))
+
+    report = partial_report(caught.value)
+    assert report is not None
+    assert (report.rows, report.summarised, report.commentary, report.refused) == (5, 2, 1, 1)
+
+
+def test_an_unrelated_exception_carries_no_partial_report() -> None:
+    from decision_lab.archive.summarize import partial_report
+
+    assert partial_report(RuntimeError("x")) is None

@@ -308,6 +308,15 @@ class SummaryReport(DomainModel):
         return divide(self.cost_usd, Decimal(self.summarised))
 
 
+_PARTIAL_REPORT: Final = "summary_report"
+
+
+def partial_report(error: BaseException) -> SummaryReport | None:
+    """What the batch `error` ended had done, as `summarize_store` attached it; else `None`."""
+    report = getattr(error, _PARTIAL_REPORT, None)
+    return report if isinstance(report, SummaryReport) else None
+
+
 def system_for(policy: ArchivePolicy) -> str:
     """`SUMMARY_SYSTEM` with the policy's character limit substituted.
 
@@ -460,6 +469,12 @@ async def summarize_store(
                     summarised=1,
                     commentary=int(parsed.event_type is EventType.MARKET_COMMENTARY),
                 )
+        except BaseException as exc:
+            # A quota or contract stop ends the batch by propagating, so without this the only
+            # record of what it summarised and refused is a diff of the store. Attached rather
+            # than logged here so the caller's one stop line carries it with its own provenance.
+            setattr(exc, _PARTIAL_REPORT, report)
+            raise
         finally:
             if updated:
                 # Only the six §6.5 fields and their provenance move. Every other field was

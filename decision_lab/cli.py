@@ -56,12 +56,12 @@ from decision_lab.archive.collect import (
     collect,
     collect_site,
 )
-from decision_lab.archive.config import DEFAULT_POLICY_FILE, load_policy
+from decision_lab.archive.config import DEFAULT_POLICY_FILE, ArchivePolicy, load_policy
 from decision_lab.archive.publish import publish_archive
 from decision_lab.archive.reshard import reshard
 from decision_lab.archive.sites import PROFILES, parse_site_article
 from decision_lab.archive.store import RAW_DIR, RawArticle, RawStore
-from decision_lab.archive.summarize import project, summarize_store
+from decision_lab.archive.summarize import partial_report, project, summarize_store
 from decision_lab.dashboard import auth as lab_auth
 from decision_lab.dashboard import create_lab_dashboard
 from decision_lab.newsfeed import load_feed
@@ -1874,8 +1874,9 @@ async def archive_summarise(args: argparse.Namespace) -> int:
     try:
         provider = build_summariser(policy)
     except SdkMissing as error:
-        # Raised at construction, so before the first row: nothing was spent and the store is
-        # untouched. The same exit as an unreachable key - both are "fix the install, re-run".
+        # A missing SDK is raised here, at construction. A missing CLI or a lost login is not:
+        # it surfaces only when a call starts the CLI, and is caught around the pass below. Both
+        # are the same refusal and the same exit as an unreachable key - "fix the install, re-run".
         logger.error("summarise refused; nothing was spent", extra={"reason": str(error)})
         return EXIT_CANDIDATE
     if provider is None:
@@ -1904,7 +1905,7 @@ async def archive_summarise(args: argparse.Namespace) -> int:
         # re-raising, and the pass is keyed on `is_summarised`, so the same command resumes.
         logger.error(
             "summarise stopped at the subscription limit; re-run the same command to resume",
-            extra={"reason": str(error), "store": str(store.path)},
+            extra=_summarise_stop(error, policy, provider, store),
         )
         return EXIT_BUDGET
     except SubscriptionContractError as error:
@@ -1912,7 +1913,16 @@ async def archive_summarise(args: argparse.Namespace) -> int:
         # resume would repeat it, so this is a refusal rather than a pause.
         logger.error(
             "summarise stopped; the call did not run under the subscription contract",
-            extra={"reason": str(error), "store": str(store.path)},
+            extra=_summarise_stop(error, policy, provider, store),
+        )
+        return EXIT_CANDIDATE
+    except SdkMissing as error:
+        # The CLI missing or its login gone, found by the first call that starts it. Escaping,
+        # `main` would report it as exit 3, a dataset problem; it is the construction refusal
+        # above arriving one step later, so it takes the same line and the same exit.
+        logger.error(
+            "summarise refused; nothing was spent",
+            extra=_summarise_stop(error, policy, provider, store),
         )
         return EXIT_CANDIDATE
     extra: dict[str, object] = {
@@ -1920,17 +1930,50 @@ async def archive_summarise(args: argparse.Namespace) -> int:
         "model": f"{policy.provider_id}:{policy.model}",
         "per_row_cost": str(report.per_row_cost),
         "store": str(store.path),
-    }
+    } | _subscription_provenance(policy, provider)
     if policy.provider_id == SUBSCRIPTION_ID:
-        extra |= {
-            "runtime": getattr(provider, "runtime", None),
-            # Text, joined and never summed: the SDK's figure is a float, and money is Decimal.
-            "notional_usd": ",".join(getattr(provider, "notional_usd", [])),
-            "per_row_cost_note": "per_row_cost is 0 because the subscription is not billed per "
-            "call; notional_usd is the API-equivalent price, for reference only",
-        }
+        extra["per_row_cost_note"] = (
+            "per_row_cost is 0 because the subscription is not billed per call; notional_usd is "
+            "the API-equivalent price, for reference only"
+        )
     logger.info("archive summarised", extra=report.model_dump(mode="json") | extra)
     return EXIT_OK
+
+
+def _subscription_provenance(policy: ArchivePolicy, provider: object) -> dict[str, object]:
+    """`runtime` and a bounded notional summary under the subscription binding; else nothing.
+
+    The notional figures stay text and are never summed: the SDK's figure is a float, and money is
+    `Decimal` (ADR 0001). Count, first and last rather than the list, because the list has one
+    entry per call and a whole pass would put thousands of them on one log line.
+    """
+    if policy.provider_id != SUBSCRIPTION_ID:
+        return {}
+    notional: list[str] = getattr(provider, "notional_usd", [])
+    return {
+        "runtime": getattr(provider, "runtime", None),
+        "notional_usd_calls": len(notional),
+        "notional_usd_first": notional[0] if notional else None,
+        "notional_usd_last": notional[-1] if notional else None,
+    }
+
+
+def _summarise_stop(
+    error: BaseException, policy: ArchivePolicy, provider: object, store: RawStore
+) -> dict[str, object]:
+    """What a stopped batch did, beside why it stopped: the rows it already flushed are
+    otherwise visible only by diffing the store, and the stop is when the operator reads."""
+    partial = partial_report(error)
+    counts = (
+        partial.model_dump(mode="json", include={"requested", "summarised", "refused", "commentary"})
+        if partial is not None
+        else {}
+    )
+    return (
+        {"reason": str(error), "store": str(store.path)}
+        | counts
+        | _subscription_provenance(policy, provider)
+    )
 
 
 async def archive_publish(args: argparse.Namespace) -> int:
