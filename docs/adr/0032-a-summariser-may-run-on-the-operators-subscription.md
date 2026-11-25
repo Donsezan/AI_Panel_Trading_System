@@ -41,8 +41,9 @@ no tools, no MCP (strict), `setting_sources=[]`, `max_turns=1`, an empty tempora
 `effort="low"`, and `no-session-persistence` always (without it every call leaves a session folder
 under `~/.claude/projects` holding the article). The model is an exact pinned id
 (`claude-haiku-5-5`); `archive.toml` refuses a family alias for this provider. The model that
-answered must equal it or be a dated snapshot of it, and a snapshot changing partway through an
-archive stops the pass.
+answered must equal it exactly, or the pass stops with a contract error. If the CLI ever reports
+a dated id, the operator pins that dated id in `archive.toml`; `summary_model` then names the
+snapshot itself, and `archive publish`'s existing refusal of mixed models covers a change.
 
 **The digest covers what we control and what the CLI adds that is fixed.** `prompt_digest` covers
 the identity line, the pinned CLI version (`PINNED_CLI_VERSION = "2.1.326"`) and our prompt. The CLI

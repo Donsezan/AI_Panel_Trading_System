@@ -122,14 +122,12 @@ the module docstring (it matters for seats, §7). Our `parse_summary` remains th
   (BTC, 2025) argues for a smaller model.
 - `ArchivePolicy` **refuses a family alias** (`haiku`, `sonnet`, `opus`, `default`, anything not of
   the form `claude-<family>-<major>-<minor>[-<YYYYMMDD>]`) for this provider.
-- **Fingerprint check (my call).** The adapter reads the model that actually answered from the SDK's
-  messages and returns it as `model_fingerprint`. It must **equal the requested id, or be a dated
-  snapshot of it** (`requested + "-" + 8 digits`). Anything else — a fallback model the CLI chose —
-  raises a stop (§5.6), not a refusal.
-- **Provenance records both.** `summary_model` stays the requested id, as today, and the pass also
-  records the snapshot id that answered. If the answering snapshot **changes partway through an
-  archive**, the pass stops: two snapshots under one name are two models, and `archive publish`
-  must be able to refuse that mix, as it already refuses a mixed provider or prompt.
+- **Fingerprint check (amended after the spike).** The adapter reads the model that actually
+  answered from the SDK's messages and returns it as `model_fingerprint`. It must **equal the
+  requested id exactly**; anything else, such as a fallback model the CLI chose, raises a contract
+  stop (§5.6), not a refusal. If the CLI ever reports a dated id, the operator pins that dated id
+  in `archive.toml`, so `summary_model` names the snapshot itself and `archive publish`'s existing
+  refusal of mixed models covers a change.
 
 ### 5.4 Cost
 
