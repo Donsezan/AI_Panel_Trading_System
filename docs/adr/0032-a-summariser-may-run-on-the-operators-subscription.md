@@ -83,6 +83,8 @@ the cycle drill-down, and marked on the period page.
   learns of it. It must never reach `tradebot`'s `PRESETS`.
 - The SDK is an optional extra, installed from its own lock
   (`pip install --require-hashes -r requirements-claude.lock`), not a main dependency. Without it
-  the binding refuses before spend.
+  the binding refuses before spend. That lock is compiled constrained by `requirements.lock`
+  (`-c requirements.lock`), so installing it into the bot's `.venv` adds the SDK and its own
+  dependencies and moves no pin the money path runs on.
 - Thinking is always adaptive, so token counts include thinking tokens the prompt did not ask for.
 - The shipped binding in `archive.toml` stays the offline stub.

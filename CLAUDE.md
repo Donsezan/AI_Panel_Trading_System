@@ -172,7 +172,14 @@ Dependencies are hash-pinned. After editing `pyproject.toml`:
 ```powershell
 python -m uv pip compile pyproject.toml --generate-hashes -o requirements.lock
 python -m uv pip compile pyproject.toml --extra dev --generate-hashes -o requirements-dev.lock
+python -m uv pip compile pyproject.toml --extra claude-subscription --generate-hashes `
+    -c requirements.lock -o requirements-claude.lock
 ```
+
+The `-c requirements.lock` is not optional. `requirements-claude.lock` is installed into the same
+`.venv` that runs paper and live, so every pin it shares with `requirements.lock` must be that
+pin; compiled unconstrained it resolves the newest sqlalchemy, pydantic and fastapi it can find
+and the install silently swaps the money path's stack for versions no gate ran.
 
 ## Non-negotiables
 
