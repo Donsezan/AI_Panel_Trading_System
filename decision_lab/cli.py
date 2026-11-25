@@ -75,6 +75,14 @@ from decision_lab.params import (
     WINDOW_DAYS,
     reports_dir,
 )
+from decision_lab.providers.claude_subscription import (
+    PROVIDER_ID as SUBSCRIPTION_ID,
+)
+from decision_lab.providers.claude_subscription import (
+    QuotaExhausted,
+    SdkMissing,
+    SubscriptionContractError,
+)
 from decision_lab.providers.resolve import build_summariser
 from tradebot.app import dataset_basket, select_panel
 from tradebot.core.clock import SystemClock, ensure_utc
@@ -1863,7 +1871,13 @@ async def archive_summarise(args: argparse.Namespace) -> int:
         )
         return EXIT_CANDIDATE
 
-    provider = build_summariser(policy)
+    try:
+        provider = build_summariser(policy)
+    except SdkMissing as error:
+        # Raised at construction, so before the first row: nothing was spent and the store is
+        # untouched. The same exit as an unreachable key - both are "fix the install, re-run".
+        logger.error("summarise refused; nothing was spent", extra={"reason": str(error)})
+        return EXIT_CANDIDATE
     if provider is None:
         logger.error(
             "summarise refused; nothing was spent",
@@ -1875,25 +1889,47 @@ async def archive_summarise(args: argparse.Namespace) -> int:
         )
         return EXIT_CANDIDATE
 
-    report = await summarize_store(
-        provider,
-        store,
-        policy,
-        SystemClock(),
-        limit=args.limit,
-        pause=timedelta(milliseconds=args.pause_ms),
-        resummarise_stale=args.resummarise_stale,
-    )
-    logger.info(
-        "archive summarised",
-        extra=report.model_dump(mode="json")
-        | {
-            "source": args.source,
-            "model": f"{policy.provider_id}:{policy.model}",
-            "per_row_cost": str(report.per_row_cost),
-            "store": str(store.path),
-        },
-    )
+    try:
+        report = await summarize_store(
+            provider,
+            store,
+            policy,
+            SystemClock(),
+            limit=args.limit,
+            pause=timedelta(milliseconds=args.pause_ms),
+            resummarise_stale=args.resummarise_stale,
+        )
+    except QuotaExhausted as error:
+        # A limit, not a failure: `summarize_store` flushed every row already summarised before
+        # re-raising, and the pass is keyed on `is_summarised`, so the same command resumes.
+        logger.error(
+            "summarise stopped at the subscription limit; re-run the same command to resume",
+            extra={"reason": str(error), "store": str(store.path)},
+        )
+        return EXIT_BUDGET
+    except SubscriptionContractError as error:
+        # Not a limit: retrying cannot fix a call that ran outside the contract (§5), and a
+        # resume would repeat it, so this is a refusal rather than a pause.
+        logger.error(
+            "summarise stopped; the call did not run under the subscription contract",
+            extra={"reason": str(error), "store": str(store.path)},
+        )
+        return EXIT_CANDIDATE
+    extra: dict[str, object] = {
+        "source": args.source,
+        "model": f"{policy.provider_id}:{policy.model}",
+        "per_row_cost": str(report.per_row_cost),
+        "store": str(store.path),
+    }
+    if policy.provider_id == SUBSCRIPTION_ID:
+        extra |= {
+            "runtime": getattr(provider, "runtime", None),
+            # Text, joined and never summed: the SDK's figure is a float, and money is Decimal.
+            "notional_usd": ",".join(getattr(provider, "notional_usd", [])),
+            "per_row_cost_note": "per_row_cost is 0 because the subscription is not billed per "
+            "call; notional_usd is the API-equivalent price, for reference only",
+        }
+    logger.info("archive summarised", extra=report.model_dump(mode="json") | extra)
     return EXIT_OK
 
 

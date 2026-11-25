@@ -496,3 +496,164 @@ def test_a_repeated_news_source_is_refused_before_anything_loads(
 
     assert code == cli.EXIT_CANDIDATE
     assert "repeats a source" in " ".join(str(getattr(r, "reason", "")) for r in caplog.records)
+
+
+# --- the Claude-subscription binding: stops, resumes and what the log says (Task 6) -----------
+
+
+def _subscription_policy(tmp_path: Path) -> Path:
+    text = DEFAULT_POLICY_FILE.read_text(encoding="utf-8")
+    text = text.replace('provider = "stub"', 'provider = "claude-subscription"')
+    text = text.replace('model = "stub-summary"', 'model = "claude-haiku-5-5"')
+    path = tmp_path / "subscription.toml"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+_GOOD_REPLY = (
+    '{"summary": "Kraken received EMI authorisation.", "event_type": "REGULATORY", '
+    '"entities": ["Kraken"], "assets": ["NONE"], "magnitudes": [], "modality": "CONFIRMED"}'
+)
+
+
+def _fake_subscription(*, error: Exception | None = None, after: int = 0) -> object:
+    """A stand-in for `ClaudeSubscriptionProvider` that never spawns a `claude` process."""
+    from tradebot.decision.providers.stub import StubLLMProvider
+
+    class Fake(StubLLMProvider):
+        runtime: str | None = "claude-code 2.1.0"
+
+        def __init__(self) -> None:
+            super().__init__([_GOOD_REPLY])
+            self.notional_usd: list[str] = []
+            self._n = 0
+
+        async def complete(self, request):  # type: ignore[no-untyped-def]
+            self._n += 1
+            if error is not None and self._n > after:
+                raise error
+            self.notional_usd.append("0.0123")
+            return await super().complete(request)
+
+    return Fake()
+
+
+def _summarise_args(data: Path, policy: Path) -> list[str]:
+    return [
+        "archive",
+        "summarise",
+        "--data",
+        str(data),
+        "--source",
+        "cryptoslate",
+        "--policy",
+        str(policy),
+        "--pause-ms",
+        "0",
+    ]
+
+
+def _all_text(caplog: pytest.LogCaptureFixture) -> str:
+    return " ".join(
+        r.getMessage() + " " + " ".join(str(v) for v in vars(r).values()) for r in caplog.records
+    )
+
+
+def test_summarise_exits_budget_on_a_quota_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from decision_lab.providers.claude_subscription import QuotaExhausted
+
+    data = tmp_path / "history"
+    store = RawStore.open(data / RAW_DIR, source_id="cryptoslate")
+    for n in (1, 2, 3):
+        store.append(summarisable_row(n))
+    fake = _fake_subscription(error=QuotaExhausted("limit reached; resets 03:00 UTC"), after=1)
+    monkeypatch.setattr(cli, "build_summariser", lambda policy: fake)
+
+    code, text = _refusal(_summarise_args(data, _subscription_policy(tmp_path)), caplog)
+
+    assert code == cli.EXIT_BUDGET
+    assert "resume" in text and "03:00 UTC" in text
+    assert [a.is_summarised for a in store.read_all()] == [True, False, False]
+
+
+def test_summarise_exits_candidate_on_a_contract_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from decision_lab.providers.claude_subscription import SubscriptionContractError
+
+    data = tmp_path / "history"
+    RawStore.open(data / RAW_DIR, source_id="cryptoslate").append(summarisable_row(1))
+    fake = _fake_subscription(error=SubscriptionContractError("a tool was offered"))
+    monkeypatch.setattr(cli, "build_summariser", lambda policy: fake)
+
+    code, text = _refusal(_summarise_args(data, _subscription_policy(tmp_path)), caplog)
+
+    assert code == cli.EXIT_CANDIDATE
+    assert "a tool was offered" in text
+
+
+def test_summarise_refuses_a_missing_sdk_before_spend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from decision_lab.providers.claude_subscription import SdkMissing
+
+    data = tmp_path / "history"
+    store = RawStore.open(data / RAW_DIR, source_id="cryptoslate")
+    store.append(summarisable_row(1))
+
+    def missing(policy: object) -> object:
+        raise SdkMissing("claude-agent-sdk is not installed; install the extra")
+
+    monkeypatch.setattr(cli, "build_summariser", missing)
+
+    code, text = _refusal(_summarise_args(data, _subscription_policy(tmp_path)), caplog)
+
+    assert code == cli.EXIT_CANDIDATE
+    assert "claude-agent-sdk" in text
+    assert not store.read_all()[0].is_summarised
+
+
+def test_the_summarised_log_carries_runtime_and_notional(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    data = tmp_path / "history"
+    store = RawStore.open(data / RAW_DIR, source_id="cryptoslate")
+    store.append(summarisable_row(1))
+    store.append(summarisable_row(2))
+    fake = _fake_subscription()
+    monkeypatch.setattr(cli, "build_summariser", lambda policy: fake)
+    parsed = cli.parse_args(_summarise_args(data, _subscription_policy(tmp_path)))
+
+    with caplog.at_level(logging.INFO, logger="decision_lab.cli"):
+        code = asyncio.run(cli.archive_summarise(parsed))
+
+    assert code == cli.EXIT_OK
+    (record,) = [
+        r
+        for r in caplog.records
+        if r.getMessage() == "archive summarised" and r.name == "decision_lab.cli"
+    ]
+    assert record.runtime == "claude-code 2.1.0"  # type: ignore[attr-defined]
+    assert record.notional_usd == "0.0123,0.0123"  # type: ignore[attr-defined]
+    assert record.per_row_cost == "0"  # type: ignore[attr-defined]
+    assert "not billed per call" in record.per_row_cost_note  # type: ignore[attr-defined]
+
+
+def test_a_non_subscription_log_carries_no_runtime_or_notional(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    data = tmp_path / "history"
+    RawStore.open(data / RAW_DIR, source_id="cryptoslate").append(summarisable_row(1))
+    parsed = cli.parse_args([*_summarise_args(data, DEFAULT_POLICY_FILE), "--plumbing-check"])
+
+    with caplog.at_level(logging.INFO, logger="decision_lab.cli"):
+        asyncio.run(cli.archive_summarise(parsed))
+
+    (record,) = [
+        r
+        for r in caplog.records
+        if r.getMessage() == "archive summarised" and r.name == "decision_lab.cli"
+    ]
+    assert not hasattr(record, "runtime") and not hasattr(record, "notional_usd")
