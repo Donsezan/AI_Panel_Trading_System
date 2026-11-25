@@ -139,8 +139,8 @@ Rules you must follow:
   name ("SEC", "BlackRock", "Binance"), with no titles, and name a person only when a person is
   the actor. Two articles about one event are matched on these names, so both must list the
   same names.
-- A prediction, forecast or opinion is a claim its author made. Record it as that claim ("Analyst
-  X said ..."), never as the event.
+- Inside an article about an event, a prediction, forecast or opinion is a claim its author made.
+  Record it as that claim ("the bank said it expects ..."), never as the event.
 - Strip praising or alarming words: "empowers", "innovative", "plunges", "soars" judge the news
   rather than state it. Say what happened instead.
 - A price move whose cause the article states is kept: the move, its figures exactly as stated,
@@ -150,6 +150,9 @@ Rules you must follow:
   that states no cause - is event_type MARKET_COMMENTARY. Its summary is one neutral line saying
   what kind of piece it is ("Technical analysis of support levels"), with no levels, targets or
   predictions in it. Its entities and magnitudes are empty and its modality is CONFIRMED.
+- An article whose substance is a prediction, a price target or an analysis is MARKET_COMMENTARY
+  even when it is attributed to someone. Recording a claim, as above, is only for an opinion
+  reported inside an article about an event.
 - When the title and the body disagree, the body wins.
 - A roundup of several stories is recorded as its headline event alone.
 - Add no keys beyond the schema.

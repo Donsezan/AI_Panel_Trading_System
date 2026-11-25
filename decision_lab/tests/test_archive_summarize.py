@@ -234,3 +234,14 @@ def test_commentary_with_magnitudes_is_refused() -> None:
 def test_commentary_with_entities_is_refused() -> None:
     with pytest.raises(SchemaViolationError, match="entities"):
         parse_summary(json.dumps(dict(COMMENTARY, entities=["Analyst X"])), max_chars=280)
+
+
+def test_an_attributed_prediction_is_commentary_not_a_claim() -> None:
+    """Review fix: an article whose subject is an analyst's target matches both the attribution
+    rule and the commentary rule. Recorded as a claim it would be a non-commentary row carrying a
+    price prediction, which the feed's event_type filter cannot catch - so commentary must win,
+    and the attribution rule must be scoped to an opinion inside an article about an event."""
+    assert "MARKET_COMMENTARY\n  even when it is attributed" in SUMMARY_SYSTEM
+    assert "Inside an article about an event, a prediction" in SUMMARY_SYSTEM
+    # The old template put a person in entities, against the entities rule and §6.1.
+    assert "Analyst" not in SUMMARY_SYSTEM
