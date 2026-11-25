@@ -140,9 +140,10 @@ was lost.
 .venv\Scripts\python.exe -m decision_lab evaluate period <the same arguments> --budget 10 --continue
 # Summarising on the operator's Claude subscription instead of an API key (ADR 0032)
 .venv\Scripts\python.exe -m pip install --require-hashes -r requirements-claude.lock
-# archive.toml: provider = "claude-subscription", model = "claude-haiku-5-5"; bake off on two copies of one store
-.venv\Scripts\python.exe -m decision_lab archive summarise --data <copy-a> --source <source> --limit 50
-.venv\Scripts\python.exe -m decision_lab archive summarise --data <copy-b> --source <source> --limit 50   # model = "claude-sonnet-5-5"
+# bake off: two copies of one store, one --policy file per model, archive.toml left alone
+# haiku.toml: provider = "claude-subscription", model = "claude-haiku-5-5"; sonnet.toml: model = "claude-sonnet-5-5"
+.venv\Scripts\python.exe -m decision_lab archive summarise --data <copy-a> --source <source> --policy haiku.toml --limit 50
+.venv\Scripts\python.exe -m decision_lab archive summarise --data <copy-b> --source <source> --policy sonnet.toml --limit 50
 .\decision_lab\check.ps1                                                      # its own format/lint/mypy/tests
 ```
 
@@ -458,7 +459,9 @@ Rules that are easy to get backwards:
   The CLI adds an identity line, an environment block, the account email and the date to every call:
   the digest covers the identity line, the pinned CLI version and our prompt, and the per-call parts
   are named in the ADR, never digested. A bake-off compares refusals, commentary rate,
-  traceability, entity consistency and quota used.
+  traceability, entity consistency and quota used, and runs each model from its own `--policy`
+  file: editing `archive.toml` between the two runs leaves the shipped binding in whichever state
+  the second run needed, and nothing records which file the first run read.
 - **`archive publish` refuses a store whose rows mix summariser provenance**, or disagree with the
   policy in force: `archive_digest` feeds `corpus_id`, so a digest vouching for two prompts' output
   would key a corpus on evidence nobody can name.
