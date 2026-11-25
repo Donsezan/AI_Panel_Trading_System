@@ -71,17 +71,31 @@ ALLOWED_ASSETS: Final = ("BTC", "ETH", "OTHER", "NONE")
 EXAMPLE_START: Final = "<example>"
 EXAMPLE_END: Final = "</example>"
 
+def summary_user(*, title: str, body: str) -> str:
+    """The user message. Two strings, and that is §6.5's second closure made structural.
+
+    There is no instrument parameter, no market-data parameter and no sibling-article parameter,
+    so the model cannot tilt toward BTC because it does not know we trade BTC. §16.2 asserts this
+    on the recorded call arguments.
+    """
+    return f"TITLE:\n{title.strip()}\n\nARTICLE:\n{body.strip()}\n"
+
+
 #: Invented, not taken from the archive, so it can be neither a memorised outcome nor a row the
 #: traceability sample later scores. It shows the four habits the prompt asks for at once: the
-#: evaluative word ("devastating") dropped, a magnitude copied, "OTHER" for a named non-traded
-#: asset, and entities in their shortest common name.
-_EXAMPLE_ARTICLE: Final = (
-    "TITLE: Lumen hit by $41M hot-wallet hack\n"
-    "ARTICLE: Singapore-based exchange Lumen said on Tuesday it had suspended withdrawals after "
-    "attackers drained $41 million in SOL and USDC from one of its hot wallets. The company said "
-    "customer balances would be covered from its reserves. Critics called the breach a "
-    "devastating blow to the young exchange."
-)
+#: evaluative remark dropped, a magnitude copied, "OTHER" for a named non-traded asset, and
+#: entities in their shortest common name. Built by `summary_user`, so the example is laid out
+#: exactly as every real request is. The dropped remark is the writer's own: attributed to
+#: someone it would be their claim, which the attribution rule says to keep.
+_EXAMPLE_ARTICLE: Final = summary_user(
+    title="Lumen hit by $41M hot-wallet hack",
+    body=(
+        "Singapore-based exchange Lumen said on Tuesday it had suspended withdrawals after "
+        "attackers drained $41 million in SOL and USDC from one of its hot wallets. The company "
+        "said customer balances would be covered from its reserves. The breach is a devastating "
+        "blow to the young exchange."
+    ),
+).rstrip("\n")
 _EXAMPLE_REPLY: Final = json.dumps(
     {
         "summary": (
@@ -143,6 +157,8 @@ Rules you must follow:
   Record it as that claim ("the bank said it expects ..."), never as the event.
 - Strip praising or alarming words: "empowers", "innovative", "plunges", "soars" judge the news
   rather than state it. Say what happened instead.
+- A purely evaluative remark that nobody is named as holding (the writer's own "a devastating
+  blow") states no event and no one's claim. Drop it.
 - A price move whose cause the article states is kept: the move, its figures exactly as stated,
   and the cause. A cause the article only attributes to others ("analysts say ...") is recorded as
   their claim, with modality RUMOURED.
@@ -185,16 +201,6 @@ def digest_for(policy: ArchivePolicy) -> str:
             f"[claude-code {claude_subscription.PINNED_CLI_VERSION}]\n{system}"
         )
     return prompt_digest(system)
-
-
-def summary_user(*, title: str, body: str) -> str:
-    """The user message. Two strings, and that is §6.5's second closure made structural.
-
-    There is no instrument parameter, no market-data parameter and no sibling-article parameter,
-    so the model cannot tilt toward BTC because it does not know we trade BTC. §16.2 asserts this
-    on the recorded call arguments.
-    """
-    return f"TITLE:\n{title.strip()}\n\nARTICLE:\n{body.strip()}\n"
 
 
 class SummaryResponse(DomainModel):

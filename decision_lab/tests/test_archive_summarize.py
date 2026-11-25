@@ -245,3 +245,24 @@ def test_an_attributed_prediction_is_commentary_not_a_claim() -> None:
     assert "Inside an article about an event, a prediction" in SUMMARY_SYSTEM
     # The old template put a person in entities, against the entities rule and §6.1.
     assert "Analyst" not in SUMMARY_SYSTEM
+
+
+def test_the_worked_example_uses_the_real_user_layout() -> None:
+    """Final-review finding 5: an example laid out unlike `summary_user` teaches a form the model
+    is never shown, so its input is built by `summary_user` itself."""
+    example = _example()
+    article = example[: example.index("{")].strip()
+    title = article.split("TITLE:\n", 1)[1].split("\n\nARTICLE:\n", 1)[0]
+    body = article.split("\n\nARTICLE:\n", 1)[1]
+    assert article == summary_user(title=title, body=body).strip()
+
+
+def test_the_worked_example_follows_the_attribution_rule() -> None:
+    """Finding 5: an *attributed* opinion inside an event article is recorded as its holder's
+    claim, so an example that silently dropped "Critics called ..." contradicted the rule. The
+    dropped remark is now the writer's own, and a rule says such a remark is dropped."""
+    example = _example()
+    reply = example[example.index("{") :]
+    assert "devastating" in example and "devastating" not in reply
+    assert "Critics" not in example
+    assert "nobody is named as holding" in SUMMARY_SYSTEM
