@@ -1965,7 +1965,9 @@ def _summarise_stop(
     otherwise visible only by diffing the store, and the stop is when the operator reads."""
     partial = partial_report(error)
     counts = (
-        partial.model_dump(mode="json", include={"requested", "summarised", "refused", "commentary"})
+        partial.model_dump(
+            mode="json", include={"requested", "summarised", "refused", "commentary"}
+        )
         if partial is not None
         else {}
     )

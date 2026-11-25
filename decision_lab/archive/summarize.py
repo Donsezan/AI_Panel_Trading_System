@@ -71,6 +71,7 @@ ALLOWED_ASSETS: Final = ("BTC", "ETH", "OTHER", "NONE")
 EXAMPLE_START: Final = "<example>"
 EXAMPLE_END: Final = "</example>"
 
+
 def summary_user(*, title: str, body: str) -> str:
     """The user message. Two strings, and that is §6.5's second closure made structural.
 
