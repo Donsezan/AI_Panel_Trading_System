@@ -67,8 +67,19 @@ def init(**overrides: Any) -> SystemMessage:
     return SystemMessage(subtype="init", data=data)
 
 
-def rate_limit(status: str = "allowed", resets_at: int | None = None) -> RateLimitEvent:
-    info = RateLimitInfo(status=status, resets_at=resets_at)  # type: ignore[arg-type]
+def rate_limit(
+    status: str = "allowed",
+    resets_at: int | None = None,
+    *,
+    rate_limit_type: str | None = None,
+    overage_status: str | None = None,
+) -> RateLimitEvent:
+    info = RateLimitInfo(
+        status=status,  # type: ignore[arg-type]
+        resets_at=resets_at,
+        rate_limit_type=rate_limit_type,  # type: ignore[arg-type]
+        overage_status=overage_status,  # type: ignore[arg-type]
+    )
     return RateLimitEvent(rate_limit_info=info, uuid="u", session_id="s")
 
 
@@ -288,6 +299,45 @@ async def test_a_usage_limit_is_quota_exhausted_not_a_provider_error() -> None:
 async def test_a_limit_warning_also_stops() -> None:
     fake = FakeQuery([init(), rate_limit("allowed_warning"), assistant(), result()])
     with pytest.raises(QuotaExhausted, match="allowed_warning"):
+        await ClaudeSubscriptionProvider(query_fn=fake).complete(REQ)
+
+
+async def test_running_on_overage_stops_even_while_allowed() -> None:
+    """Finding 3: on an account with extra usage enabled the CLI may carry on into paid overage
+    while `status` still reads `allowed` - billing nobody approved. Fail closed."""
+    fake = FakeQuery([init(), rate_limit("allowed", rate_limit_type="overage"), assistant()])
+    with pytest.raises(QuotaExhausted, match="overage"):
+        await ClaudeSubscriptionProvider(query_fn=fake).complete(REQ)
+
+
+@pytest.mark.parametrize("overage", ["allowed", "allowed_warning"])
+async def test_an_open_overage_window_stops_even_while_allowed(overage: str) -> None:
+    fake = FakeQuery(
+        [init(), rate_limit("allowed", rate_limit_type="five_hour", overage_status=overage)]
+    )
+    with pytest.raises(QuotaExhausted, match=f"overage status {overage!r}"):
+        await ClaudeSubscriptionProvider(query_fn=fake).complete(REQ)
+
+
+async def test_a_rejected_overage_with_the_window_allowed_runs_on() -> None:
+    """`rejected` overage is the safe state: extra usage is off, so nothing can bill."""
+    fake = FakeQuery(
+        [
+            init(),
+            rate_limit("allowed", rate_limit_type="five_hour", overage_status="rejected"),
+            assistant(),
+            result(),
+        ]
+    )
+    outcome = await ClaudeSubscriptionProvider(query_fn=fake).complete(REQ)
+    assert outcome.text == GOOD
+
+
+@pytest.mark.parametrize("window", ["five_hour", "seven_day"])
+async def test_the_stop_names_which_window_was_hit(window: str) -> None:
+    """Finding 4: a 5-hour pause and a weekly one ask for different waits."""
+    fake = FakeQuery([init(), rate_limit("rejected", rate_limit_type=window)])
+    with pytest.raises(QuotaExhausted, match=window):
         await ClaudeSubscriptionProvider(query_fn=fake).complete(REQ)
 
 

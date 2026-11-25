@@ -63,9 +63,16 @@ price is logged per batch as `notional_usd`, as text, and never summed as money.
 carries `runtime`.
 
 **The quota is a stop, not a failure.** `RateLimitEvent.rate_limit_info.status` other than
-`allowed` stops the pass, carrying `resets_at`; the error text is the fallback. `archive summarise`
-exits 5 on it and the same command resumes. A content-safeguard block is a `ProviderError` and ends
-as a refused row. A contract stop or a missing SDK exits 4.
+`allowed` stops the pass, carrying `resets_at` and naming `rate_limit_type` (`five_hour`,
+`seven_day`, ...), so a five-hour pause reads differently from a weekly one; the error text is the
+fallback. **Overage stops too, whatever `status` says**: on an account with extra usage enabled the
+CLI can continue past the included window on pay-as-you-go while `status` still reads `allowed`.
+So `rate_limit_type == "overage"`, or an `overage_status` other than absent or `rejected`, is a
+`QuotaExhausted` (fail closed). An operator whose account reports open overage on every call
+turns extra usage off for the pass; billing nobody approved is the one outcome this binding is
+priced as never producing. `archive summarise` exits 5 on any of these and the same command
+resumes. A content-safeguard block is a `ProviderError` and ends as a refused row. A contract stop,
+a missing SDK or CLI, or a lost login exits 4, whether it surfaces at construction or on a call.
 
 **Commentary is a record, not evidence.** The prompt marks an attributed prediction or opinion as
 `MARKET_COMMENTARY`. Those rows are kept and published, never served to the panel, never listed in

@@ -29,9 +29,11 @@ becomes money (ADR 0001).
 
 Failure semantics, per fault row of §5.6:
 
-* Usage or rate limit — a `RateLimitEvent` whose status is anything but `allowed`, or an error
-  whose text names a limit — raises `QuotaExhausted` (fatal), carrying the reset time when the
-  SDK gives one. The pass stops; resuming after the window is the operator's act.
+* Usage or rate limit — a `RateLimitEvent` whose status is anything but `allowed`, any sign of
+  paid overage (`rate_limit_type == "overage"`, or an `overage_status` other than none or
+  `rejected`), or an error whose text names a limit — raises `QuotaExhausted` (fatal), naming
+  the window and carrying the reset time when the SDK gives them. The pass stops; resuming after
+  the window is the operator's act.
 * Wrong auth source, tools or MCP servers offered, a different CLI version, more than one turn,
   a tool used, or an answer from a model other than the one requested raises
   `SubscriptionContractError` (fatal). Nothing further is asked.
@@ -57,7 +59,7 @@ from tradebot.core.money import ZERO
 from tradebot.interfaces.llm import CompletionRequest, CompletionResult
 
 if TYPE_CHECKING:
-    from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, SystemMessage
+    from claude_agent_sdk import ClaudeAgentOptions, RateLimitInfo, ResultMessage, SystemMessage
 
 PROVIDER_ID: Final = "claude-subscription"
 
@@ -195,7 +197,7 @@ class ClaudeSubscriptionProvider:
                 self._check_init(message)
                 initialised = True
             elif isinstance(message, sdk.RateLimitEvent):
-                _check_rate_limit(message.rate_limit_info.status, message.rate_limit_info.resets_at)
+                _check_rate_limit(message.rate_limit_info)
             elif isinstance(message, sdk.AssistantMessage):
                 _require_init(initialised)
                 if message.model != request.model:
@@ -269,17 +271,38 @@ def _require_init(initialised: bool) -> None:
         raise SubscriptionContractError("no init message; the auth source cannot be confirmed")
 
 
-def _check_rate_limit(status: str, resets_at: int | None) -> None:
-    # `allowed_warning` stops too (spike amendment): the pass is resumable, and running into the
-    # hard limit mid-batch would spend the window on rows that then refuse.
-    if status == "allowed":
+def _check_rate_limit(info: RateLimitInfo) -> None:
+    """Stop unless the call is plainly inside the subscription's included usage.
+
+    `allowed_warning` stops too (spike amendment): the pass is resumable, and running into the
+    hard limit mid-batch would spend the window on rows that then refuse.
+
+    Overage stops whatever `status` says (fail closed). On an account with extra usage enabled
+    the CLI can carry on past the included window into pay-as-you-go while `status` reads
+    `allowed`, and that is billing nobody approved for a pass costed at zero. Only `None` (no
+    overage reported) and `rejected` (extra usage unavailable, so nothing can bill) let it run.
+    """
+    window = info.rate_limit_type or "unreported"
+    if info.rate_limit_type == "overage":
+        reason = "the call is running on paid overage"
+    elif info.overage_status not in (None, "rejected"):
+        reason = f"overage status {info.overage_status!r}: paid extra usage is open"
+    elif info.status != "allowed":
+        reason = f"subscription limit status {info.status!r}"
+    else:
         return
+    resets_at = (
+        info.overage_resets_at
+        if info.rate_limit_type == "overage" and info.overage_resets_at is not None
+        else info.resets_at
+    )
     when = (
         datetime.fromtimestamp(resets_at, tz=UTC).isoformat()
         if resets_at is not None
         else "an unreported time"
     )
-    raise QuotaExhausted(f"subscription limit status {status!r}; resets at {when}")
+    # The window is named so the operator can tell a five-hour pause from a weekly one.
+    raise QuotaExhausted(f"{reason}; window {window}; resets at {when}")
 
 
 def _error_text(exc: BaseException) -> str:
