@@ -7,6 +7,11 @@
 # The binding ships as the offline stub, so `pytest` and the demo cost nothing. Point it at a
 # real provider to run the pass for real; the provider's key is read from the environment by
 # name (`OPENROUTER_API_KEY` for openrouter) and is never written here.
+#
+# Or run on the operator's Claude subscription, which needs no key and costs nothing per row
+# (ADR 0032; install `requirements-claude.lock` first): provider = "claude-subscription" with an
+# exact pinned model id such as "claude-haiku-5-5" - an alias like "haiku" is refused. It stays
+# the stub here.
 
 [summarizer]
 provider = "stub"

@@ -138,6 +138,11 @@ was lost.
 .venv\Scripts\python.exe -m decision_lab evaluate period --data data\history --configs <matrix.toml> `
     --candidate baseline --start-equity 1000 --every 4h --period 2025-Q1 --budget 5   # a month, quarter or year
 .venv\Scripts\python.exe -m decision_lab evaluate period <the same arguments> --budget 10 --continue
+# Summarising on the operator's Claude subscription instead of an API key (ADR 0032)
+.venv\Scripts\python.exe -m pip install --require-hashes -r requirements-claude.lock
+# archive.toml: provider = "claude-subscription", model = "claude-haiku-5-5"; bake off on two copies of one store
+.venv\Scripts\python.exe -m decision_lab archive summarise --data <copy-a> --source <source> --limit 50
+.venv\Scripts\python.exe -m decision_lab archive summarise --data <copy-b> --source <source> --limit 50   # model = "claude-sonnet-5-5"
 .\decision_lab\check.ps1                                                      # its own format/lint/mypy/tests
 ```
 
@@ -441,6 +446,12 @@ Rules that are easy to get backwards:
   has no `body` field, so there is nowhere to write one. A row the model refuses is counted and left
   unsummarised — never back-filled from the publisher's abstract, which is the baseline the pass is
   measured against and carries the evaluative register it exists to strip.
+- **A subscription pass is billed to nobody and stops on its limit.** Exit 5 is "resume later" with
+  the same command, never a failure, and `per_row_cost` reads 0 by construction ([ADR 0032](docs/adr/0032-a-summariser-may-run-on-the-operators-subscription.md)).
+  The CLI adds an identity line, an environment block, the account email and the date to every call:
+  the digest covers the identity line, the pinned CLI version and our prompt, and the per-call parts
+  are named in the ADR, never digested. A bake-off compares refusals, commentary rate,
+  traceability, entity consistency and quota used.
 - **`archive publish` refuses a store whose rows mix summariser provenance**, or disagree with the
   policy in force: `archive_digest` feeds `corpus_id`, so a digest vouching for two prompts' output
   would key a corpus on evidence nobody can name.
