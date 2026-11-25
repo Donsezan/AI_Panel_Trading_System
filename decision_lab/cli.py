@@ -75,6 +75,7 @@ from decision_lab.params import (
     WINDOW_DAYS,
     reports_dir,
 )
+from decision_lab.providers.resolve import build_summariser
 from tradebot.app import dataset_basket, select_panel
 from tradebot.core.clock import SystemClock, ensure_utc
 from tradebot.core.errors import ConfigError, MoneyError, TradebotError
@@ -82,7 +83,7 @@ from tradebot.core.logging import configure_logging, get_logger
 from tradebot.core.money import ZERO, to_decimal
 from tradebot.core.schema import Money
 from tradebot.dashboard.auth import assert_bind_allowed
-from tradebot.decision.providers.registry import build_providers, preset
+from tradebot.decision.providers.registry import preset
 from tradebot.interfaces.exchange import VenueTransport
 from tradebot.marketdata.recorder import MANIFEST, ReplayDataset
 from tradebot.news.http import build_fetcher
@@ -1862,16 +1863,14 @@ async def archive_summarise(args: argparse.Namespace) -> int:
         )
         return EXIT_CANDIDATE
 
-    settings = preset(policy.provider_id)
-    pool = build_providers((settings,), SystemClock())
-    provider = pool.providers.get(policy.provider_id)
+    provider = build_summariser(policy)
     if provider is None:
         logger.error(
             "summarise refused; nothing was spent",
             extra={
-                "reason": f"{policy.provider_id} is unreachable: {settings.secret_ref} is not "
-                "set. Set it and re-run - a pass against an unwired provider refuses every row "
-                "for a reason only the log explains"
+                "reason": f"{policy.provider_id} is unreachable: "
+                f"{preset(policy.provider_id).secret_ref} is not set. Set it and re-run - a pass "
+                "against an unwired provider refuses every row for a reason only the log explains"
             },
         )
         return EXIT_CANDIDATE

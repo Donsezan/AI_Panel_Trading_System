@@ -12,13 +12,16 @@ import json
 
 import pytest
 
+from decision_lab.archive.config import ArchivePolicy
 from decision_lab.archive.fields import EventType, Modality
 from decision_lab.archive.summarize import (
     SUMMARY_SYSTEM,
     SummaryResponse,
+    digest_for,
     parse_summary,
     prompt_digest,
     summary_user,
+    system_for,
 )
 from tradebot.core.errors import SchemaViolationError
 
@@ -136,3 +139,28 @@ def test_the_response_model_is_the_only_validation() -> None:
     constraint cannot be forgotten in a second place (the `forms.py` rule, one package over)."""
     with pytest.raises(ValueError):
         SummaryResponse.model_validate(dict(GOOD, event_type="NOPE"))
+
+
+def _bound(provider: str, model: str) -> ArchivePolicy:
+    return ArchivePolicy(provider_id=provider, model=model)
+
+
+def test_stub_digest_is_unchanged() -> None:
+    policy = _bound("stub", "stub-summary")
+    assert digest_for(policy) == prompt_digest(system_for(policy))
+
+
+def test_the_digest_covers_the_preamble_and_the_cli_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from decision_lab.providers import claude_subscription as cs
+
+    sub = _bound("claude-subscription", "claude-haiku-5-5")
+    assert system_for(sub) == system_for(_bound("stub", "stub-summary"))
+    first = digest_for(sub)
+    assert first != digest_for(_bound("stub", "stub-summary"))
+    monkeypatch.setattr(cs, "PINNED_CLI_VERSION", "9.9.9")
+    assert digest_for(sub) != first
+    monkeypatch.undo()
+    monkeypatch.setattr(cs, "IDENTITY_PREAMBLE", "X")
+    assert digest_for(sub) != first

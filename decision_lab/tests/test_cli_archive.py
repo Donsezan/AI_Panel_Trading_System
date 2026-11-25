@@ -21,6 +21,7 @@ import pytest
 from decision_lab import cli
 from decision_lab.archive.config import DEFAULT_POLICY_FILE
 from decision_lab.archive.store import RAW_DIR, RawArticle, RawStore
+from decision_lab.providers import resolve
 from decision_lab.tests.test_archive_coindesk import LD_JSON, article_page
 from decision_lab.tests.test_archive_collect import FakeFetcher, listing, url_for
 
@@ -228,7 +229,7 @@ def test_dry_run_makes_no_provider_calls_and_reports_what_is_pending(
     def explode(*_: object, **__: object) -> None:
         raise AssertionError("a projection must not construct a provider")
 
-    monkeypatch.setattr(cli, "build_providers", explode)
+    monkeypatch.setattr(resolve, "build_providers", explode)
 
     code = cli.main(
         ["archive", "summarise", "--data", str(data), "--source", "cryptoslate", "--dry-run"]
@@ -454,7 +455,7 @@ def test_summarise_with_the_flag_redoes_stale_rows_through_main(
     )
     provider = StubLLMProvider([good])
     monkeypatch.setattr(
-        cli, "build_providers", lambda *_a, **_k: SimpleNamespace(providers={"stub": provider})
+        resolve, "build_providers", lambda *_a, **_k: SimpleNamespace(providers={"stub": provider})
     )
     data = tmp_path / "history"
     store = _stale_store(data)

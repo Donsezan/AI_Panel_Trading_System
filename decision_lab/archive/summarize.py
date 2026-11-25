@@ -48,6 +48,7 @@ from decision_lab.archive.collect import DEFAULT_PAUSE
 from decision_lab.archive.config import ArchivePolicy
 from decision_lab.archive.fields import EventType, Modality
 from decision_lab.archive.store import RawArticle, RawStore, StoreLock
+from decision_lab.providers import claude_subscription
 from tradebot.core.clock import Clock
 from tradebot.core.errors import ProviderError, SchemaViolationError
 from tradebot.core.logging import get_logger
@@ -99,6 +100,22 @@ Rules you must follow:
 def prompt_digest(system: str) -> str:
     """A third of `archive_digest` (§6.6), so an edited prompt is a different archive."""
     return hashlib.blake2s(system.encode("utf-8"), digest_size=16).hexdigest()
+
+
+def digest_for(policy: ArchivePolicy) -> str:
+    """The prompt digest a row is stamped with under `policy`.
+
+    The subscription binding's CLI prepends its own identity preamble and is versioned by the
+    pinned CLI build; both decide what the model reads, so both are in the archive identity.
+    Every other provider is digested over the system text alone, unchanged.
+    """
+    system = system_for(policy)
+    if policy.provider_id == claude_subscription.PROVIDER_ID:
+        return prompt_digest(
+            f"{claude_subscription.IDENTITY_PREAMBLE}\n"
+            f"[claude-code {claude_subscription.PINNED_CLI_VERSION}]\n{system}"
+        )
+    return prompt_digest(system)
 
 
 def summary_user(*, title: str, body: str) -> str:
@@ -243,7 +260,7 @@ def is_stale(article: RawArticle, policy: ArchivePolicy) -> bool:
         article.summary_provider,
         article.summary_model,
         article.summary_prompt_digest,
-    ) != (policy.provider_id, policy.model, prompt_digest(system_for(policy)))
+    ) != (policy.provider_id, policy.model, digest_for(policy))
 
 
 def _pending(
@@ -303,7 +320,7 @@ async def summarize_store(
     CryptoSlate it carries exactly the evaluative register the pass exists to strip.
     """
     system = system_for(policy)
-    digest = prompt_digest(system)
+    digest = digest_for(policy)
     with StoreLock(store):
         rows = store.read_all()
         report = SummaryReport(rows=len(rows))

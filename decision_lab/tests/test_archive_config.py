@@ -139,3 +139,23 @@ def test_a_misspelt_summarizer_key_is_refused_not_read_as_an_empty_model(tmp_pat
     path = write(tmp_path, '[summarizer]\nprovider = "stub"\nmodle = "stub-summary"\n')
     with pytest.raises(ConfigError, match="modle"):
         load_policy(path)
+
+
+SUBSCRIPTION = GOOD.replace('provider = "stub"', 'provider = "claude-subscription"')
+
+
+def test_the_subscription_provider_is_a_known_binding(tmp_path: Path) -> None:
+    body = SUBSCRIPTION.replace("stub-summary", "claude-haiku-5-5")
+    policy = load_policy(write(tmp_path, body))
+    assert policy.provider_id == "claude-subscription"
+    assert not policy.is_stub
+
+
+def test_an_alias_is_refused_for_the_subscription_provider(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match="pin"):
+        load_policy(write(tmp_path, SUBSCRIPTION.replace("stub-summary", "haiku")))
+
+
+def test_an_alias_is_still_allowed_for_other_providers(tmp_path: Path) -> None:
+    body = GOOD.replace('"stub"', '"openrouter"').replace("stub-summary", "anthropic/claude-x")
+    assert load_policy(write(tmp_path, body)).model == "anthropic/claude-x"
