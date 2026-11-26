@@ -31,6 +31,9 @@ from typing import Any, Final
 
 from pydantic import field_validator
 
+from decision_lab.providers.claude_subscription import PROVIDER_ID as SUBSCRIPTION_ID
+from decision_lab.providers.claude_subscription import is_pinned
+from decision_lab.providers.resolve import LAB_PROVIDERS
 from tradebot.core.errors import ConfigError, MoneyError
 from tradebot.core.schema import DomainModel, Money, parse_money
 from tradebot.decision.providers.registry import PRESETS
@@ -155,11 +158,18 @@ def load_policy(path: Path) -> ArchivePolicy:
     for key, value in document.get("archive", {}).items():
         settings[key] = _money_field(path, key, value) if key == "cluster_floor" else value
 
-    if settings["provider_id"] not in PRESETS and settings["provider_id"] != "stub":
-        known = ", ".join(sorted({*PRESETS, "stub"}))
+    if settings["provider_id"] not in {*PRESETS, "stub", *LAB_PROVIDERS}:
+        known = ", ".join(sorted({*PRESETS, "stub", *LAB_PROVIDERS}))
         raise ConfigError(
             f"{path} binds the summarizer to unknown provider "
             f"{settings['provider_id']!r}; known providers: {known}"
+        )
+    if settings["provider_id"] == SUBSCRIPTION_ID and not is_pinned(settings["model"]):
+        raise ConfigError(
+            f"{path} binds {SUBSCRIPTION_ID} to {settings['model']!r}, which is not a pinned id. "
+            "Use an exact (pinned) model id such as 'claude-haiku-5-5', never a family alias: an "
+            "alias moves under the "
+            "archive, so two passes would not be the same experiment"
         )
     try:
         return ArchivePolicy.model_validate(settings)

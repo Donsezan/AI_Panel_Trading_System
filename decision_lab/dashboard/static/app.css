@@ -154,6 +154,7 @@ button {
 .good { color: var(--good); }
 .bad { color: var(--bad); }
 .muted { color: var(--muted); }
+.tag { border: 1px solid var(--muted); border-radius: 3px; color: var(--muted); font-size: 0.8em; padding: 0 0.3em; }
 
 .stats {
   display: grid;

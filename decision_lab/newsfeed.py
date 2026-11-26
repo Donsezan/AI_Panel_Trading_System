@@ -41,6 +41,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from decision_lab.archive.config import ArchivePolicy
+from decision_lab.archive.fields import EventType
 from decision_lab.archive.publish import archive_path
 from decision_lab.archive.published import ArchiveHeader, ArchiveItem, PublishedArchive
 from decision_lab.clustering import annotate, fold
@@ -137,14 +138,27 @@ class ArchiveNewsFeed:
 
     @property
     def items(self) -> tuple[ArchiveItem, ...]:
-        """Every archived row of every source, for explaining an event after the fact."""
+        """Every archived row of every source, commentary included, for explaining an event after
+        the fact. This is the one surface that shows `MARKET_COMMENTARY` (spec §6.1): the period
+        page's "published later" list marks it as such. Evidence (`in_window`) never holds it."""
         return tuple(row for a in self._archives for row in a.items)
 
     def in_window(self, as_of: datetime) -> tuple[ArchiveItem, ...]:
         """The point-in-time read, before relevance and before the limit. Public because §16.2
         asserts on it directly, and because the drill-down reconstructs a cycle's evidence from
-        exactly this set."""
-        return tuple(row for a in self._archives for row in a.window(as_of, self._window))
+        exactly this set.
+
+        `MARKET_COMMENTARY` is excluded (spec §6.1): a prediction or price target is a record of
+        what was said, not a claim about what happened, so it must reach neither the panel nor
+        the drill-down's reconstruction of what the panel saw. Coverage is untouched - a window
+        holding only commentary inside the archive's span is a quiet market, not a failed source.
+        """
+        return tuple(
+            row
+            for a in self._archives
+            for row in a.window(as_of, self._window)
+            if row.event_type is not EventType.MARKET_COMMENTARY
+        )
 
     async def snapshot_news(
         self,

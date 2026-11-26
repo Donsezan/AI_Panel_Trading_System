@@ -34,6 +34,17 @@ def bot_sources() -> list[tuple[Path, ast.Module]]:
 SOURCES = bot_sources()
 
 
+def _imported_roots(tree: ast.Module) -> set[str]:
+    """Top-level package of every import in a module."""
+    roots: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            roots |= {a.name.split(".")[0] for a in node.names}
+        if isinstance(node, ast.ImportFrom) and node.module:
+            roots.add(node.module.split(".")[0])
+    return roots
+
+
 @pytest.mark.parametrize("path,tree", SOURCES, ids=lambda v: getattr(v, "name", ""))
 def test_no_bot_module_imports_the_tool(path: Path, tree: ast.Module) -> None:
     """An import is the hard failure: it would make the tool a runtime dependency of the bot."""
@@ -59,6 +70,12 @@ def test_no_bot_module_names_the_tool(path: Path, tree: ast.Module) -> None:
     assert not offenders, f"{path.name} names {TOOL}: {offenders}"
 
 
+@pytest.mark.parametrize("path,tree", SOURCES, ids=lambda v: getattr(v, "name", ""))
+def test_no_bot_module_imports_the_agent_sdk(path: Path, tree: ast.Module) -> None:
+    """The subscription summariser's SDK is an optional extra of the tool, never of the bot."""
+    assert "claude_agent_sdk" not in _imported_roots(tree), path
+
+
 def test_the_guard_can_actually_fail() -> None:
     """A structural test that cannot fail is a comment. Prove the detector works."""
     tree = ast.parse("from decision_lab.corpus import Corpus\n")
@@ -68,3 +85,5 @@ def test_the_guard_can_actually_fail() -> None:
         if isinstance(n, ast.ImportFrom) and (n.module or "").split(".")[0] == TOOL
     ]
     assert found == ["decision_lab.corpus"]
+    sdk = ast.parse("import claude_agent_sdk.types; from claude_agent_sdk import query")
+    assert "claude_agent_sdk" in _imported_roots(sdk)

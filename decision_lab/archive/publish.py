@@ -37,7 +37,7 @@ from decision_lab.archive.published import (
     PublishedArchive,
 )
 from decision_lab.archive.store import RawArticle, RawStore
-from decision_lab.archive.summarize import prompt_digest, system_for
+from decision_lab.archive.summarize import digest_for
 from tradebot.core.clock import Clock
 from tradebot.core.errors import ConfigError
 from tradebot.core.logging import get_logger
@@ -118,7 +118,7 @@ def _agreed_provenance(
     one the policy no longer describes, would publish a digest that vouches for output it did not
     produce - and `archive_digest` feeds `corpus_id`, so the corpus would carry the wrong identity.
     """
-    in_force = (policy.provider_id, policy.model, prompt_digest(system_for(policy)))
+    in_force = (policy.provider_id, policy.model, digest_for(policy))
     seen = Counter(
         (a.summary_provider or "?", a.summary_model or "?", a.summary_prompt_digest or "?")
         for a in ready

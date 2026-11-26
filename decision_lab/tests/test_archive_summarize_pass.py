@@ -350,3 +350,103 @@ async def test_an_interrupt_flushes_the_rows_already_summarised(tmp_path: Path) 
         await summarize_store(_Interrupts(at=3), store, POLICY, clock(), pause=timedelta(0))
 
     assert [a.is_summarised for a in store.read_all()] == [True, True, False, False]
+
+
+COMMENTARY = json.dumps(
+    {
+        "summary": "Technical analysis of support and resistance levels.",
+        "event_type": "MARKET_COMMENTARY",
+        "entities": [],
+        "assets": ["NONE"],
+        "magnitudes": [],
+        "modality": "CONFIRMED",
+    }
+)
+
+
+@pytest.mark.asyncio
+async def test_the_pass_counts_commentary_inside_summarised(tmp_path: Path) -> None:
+    """§6.1: a commentary row is summarised (it is the record that we saw it) and also counted,
+    so `per_row_cost` still divides by every row that was paid for and parsed."""
+    store = store_with(tmp_path, (row(1), row(2)))
+    provider = StubLLMProvider([GOOD, COMMENTARY])
+
+    report = await summarize_store(provider, store, POLICY, clock(), pause=timedelta(0))
+
+    assert (report.summarised, report.commentary, report.refused) == (2, 1, 0)
+    assert store.read_all()[1].event_type is EventType.MARKET_COMMENTARY
+
+
+class _StopsAt(StubLLMProvider):
+    """Answers until its `at`-th call, then raises `error` - a limit reached mid-pass."""
+
+    def __init__(self, *, at: int, error: Exception, responses: tuple[str, ...] = (GOOD,)) -> None:
+        super().__init__(list(responses))
+        self._at = at
+        self._error = error
+        self._n = 0
+
+    async def complete(self, request):  # type: ignore[no-untyped-def]
+        self._n += 1
+        if self._n == self._at:
+            raise self._error
+        return await super().complete(request)
+
+
+@pytest.mark.asyncio
+async def test_a_quota_stop_flushes_and_a_rerun_resumes(tmp_path: Path) -> None:
+    from decision_lab.providers.claude_subscription import QuotaExhausted
+
+    store = store_with(tmp_path, tuple(row(n) for n in range(1, 7)))
+    stopping = _StopsAt(at=4, error=QuotaExhausted("usage limit; resets 2026-11-14T03:00Z"))
+
+    with pytest.raises(QuotaExhausted, match="resets"):
+        await summarize_store(stopping, store, POLICY, clock(), pause=timedelta(0))
+
+    assert [a.is_summarised for a in store.read_all()] == [True] * 3 + [False] * 3
+    healthy = StubLLMProvider([GOOD])
+    report = await summarize_store(healthy, store, POLICY, clock(), pause=timedelta(0))
+    assert (report.already, report.requested, report.summarised) == (3, 3, 3)
+    assert len(healthy.calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_a_contract_stop_is_not_tallied_as_a_refusal(tmp_path: Path) -> None:
+    from decision_lab.providers.claude_subscription import SubscriptionContractError
+
+    store = store_with(tmp_path, (row(1), row(2), row(3)))
+    stopping = _StopsAt(at=2, error=SubscriptionContractError("a tool was offered"))
+
+    # It propagates rather than being absorbed as a refused row, so no `refused` tally exists to
+    # be wrong: the one summarised row is flushed and the unreached rows stay unsummarised.
+    with pytest.raises(SubscriptionContractError):
+        await summarize_store(stopping, store, POLICY, clock(), pause=timedelta(0))
+
+    assert [a.is_summarised for a in store.read_all()] == [True, False, False]
+
+
+@pytest.mark.asyncio
+async def test_a_stop_carries_the_partial_report_of_its_batch(tmp_path: Path) -> None:
+    """Final-review finding 6: a quota or contract stop must still say what the batch did, or
+    the rows it paid for and refused are visible only by diffing the store."""
+    from decision_lab.archive.summarize import partial_report
+    from decision_lab.providers.claude_subscription import QuotaExhausted
+
+    store = store_with(tmp_path, tuple(row(n) for n in range(1, 6)))
+    # Row 3 answers prose twice (the call and its repair) and is refused; row 4 hits the limit.
+    stopping = _StopsAt(
+        at=5, error=QuotaExhausted("limit"), responses=(GOOD, COMMENTARY, "prose", "prose")
+    )
+
+    with pytest.raises(QuotaExhausted) as caught:
+        await summarize_store(stopping, store, POLICY, clock(), pause=timedelta(0))
+
+    report = partial_report(caught.value)
+    assert report is not None
+    assert (report.rows, report.summarised, report.commentary, report.refused) == (5, 2, 1, 1)
+
+
+def test_an_unrelated_exception_carries_no_partial_report() -> None:
+    from decision_lab.archive.summarize import partial_report
+
+    assert partial_report(RuntimeError("x")) is None

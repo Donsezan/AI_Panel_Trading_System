@@ -19,7 +19,7 @@ that needs the operator's decision. Nothing passes one by default.
 | 2a | *if yes:* design note → ADR → plan → implement. This changes the order of the live money path and adds a venue call per cycle, so it gets its own spec. Afterwards remove the `STUB_SEED = 2024` pin | D1 = yes | an ADR, a fix, scenario tests, the pin removed | none |
 | 2b | *if no:* add `corpus build --seed` and resume support, so a pass that dies can be re-run rather than lost | D1 = no | a reproducible pass that can be retried | none |
 | 3 | **2025 reference corpus** — `corpus build --data data\history-2025 --every 8h --reference-panel sim`, about 1 095 cycles, news-blind first | 1, and 2a or 2b | a corpus id over the news year | none (sim panel) |
-| 4 | ⛔ **D2: spend money.** `OPENROUTER_API_KEY` set, model ids verified against openrouter.ai/models | operator | — | — |
+| 4 | ⛔ **D2: spend money.** subscription binding ([ADR 0032](../../adr/0032-a-summariser-may-run-on-the-operators-subscription.md)) or `OPENROUTER_API_KEY` set, model ids verified against openrouter.ai/models | operator | — | — |
 | 5 | **Summarise, then publish** — the six steps in the plan's "When the real key arrives": dry run, `--limit 50` to price it, batches of 1 000, traceability sample, `archive publish` | 1, D2 | the §6.6 travelling archive, `archive_digest` | about 11 894 rows × per-row cost, priced at step 3 first |
 | 6 | **News-fed corpus** over 2025 using both sources | 3, 5 | a corpus whose `corpus_id` includes the archive | none |
 | 7 | **Calibrate (the nine days) → sweep → `calibrate long`** on a real panel | 6, D2 | the §10.6 gate passed, a ranked candidate table, a six-month profit run | the calibration page projects the sweep's cost |

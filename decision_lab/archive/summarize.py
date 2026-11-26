@@ -37,17 +37,19 @@ circular.
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Sequence
 from datetime import timedelta
 from decimal import Decimal
 from typing import Final
 
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 
 from decision_lab.archive.collect import DEFAULT_PAUSE
 from decision_lab.archive.config import ArchivePolicy
 from decision_lab.archive.fields import EventType, Modality
 from decision_lab.archive.store import RawArticle, RawStore, StoreLock
+from decision_lab.providers import claude_subscription
 from tradebot.core.clock import Clock
 from tradebot.core.errors import ProviderError, SchemaViolationError
 from tradebot.core.logging import get_logger
@@ -64,22 +66,77 @@ logger = get_logger(__name__)
 #: for relevance.
 ALLOWED_ASSETS: Final = ("BTC", "ETH", "OTHER", "NONE")
 
+#: Delimit the worked example so a test can read it alone and prove it names neither traded asset
+#: (subscription-summariser spec §6 item 7): an example about BTC or ETH would tilt the asset field.
+EXAMPLE_START: Final = "<example>"
+EXAMPLE_END: Final = "</example>"
+
+
+def summary_user(*, title: str, body: str) -> str:
+    """The user message. Two strings, and that is §6.5's second closure made structural.
+
+    There is no instrument parameter, no market-data parameter and no sibling-article parameter,
+    so the model cannot tilt toward BTC because it does not know we trade BTC. §16.2 asserts this
+    on the recorded call arguments.
+    """
+    return f"TITLE:\n{title.strip()}\n\nARTICLE:\n{body.strip()}\n"
+
+
+#: Invented, not taken from the archive, so it can be neither a memorised outcome nor a row the
+#: traceability sample later scores. It shows the four habits the prompt asks for at once: the
+#: evaluative remark dropped, a magnitude copied, "OTHER" for a named non-traded asset, and
+#: entities in their shortest common name. Built by `summary_user`, so the example is laid out
+#: exactly as every real request is. The dropped remark is the writer's own: attributed to
+#: someone it would be their claim, which the attribution rule says to keep.
+_EXAMPLE_ARTICLE: Final = summary_user(
+    title="Lumen hit by $41M hot-wallet hack",
+    body=(
+        "Singapore-based exchange Lumen said on Tuesday it had suspended withdrawals after "
+        "attackers drained $41 million in SOL and USDC from one of its hot wallets. The company "
+        "said customer balances would be covered from its reserves. The breach is a devastating "
+        "blow to the young exchange."
+    ),
+).rstrip("\n")
+_EXAMPLE_REPLY: Final = json.dumps(
+    {
+        "summary": (
+            "Lumen suspended withdrawals after attackers drained $41 million in SOL and USDC from "
+            "one of its hot wallets; it said customer balances would be covered from its reserves."
+        ),
+        "event_type": EventType.SECURITY_INCIDENT.value,
+        "entities": ["Lumen"],
+        "assets": ["OTHER"],
+        "magnitudes": ["$41 million"],
+        "modality": Modality.CONFIRMED.value,
+    }
+)
+
 #: `{max_chars}` is a literal placeholder, substituted by the pass with `str.replace`. It is not a
 #: `.format()` field: the body is JSON, and `format` would raise on every brace in it.
+#:
+#: Everything the original §6.5 prompt said is still here. One phrase moved: "a price direction"
+#: became "a price direction of your own", because §4.3 now keeps a move the article states with
+#: its cause, and the unqualified rule would forbid that. What was added is subscription-summariser
+#: spec §6: entities as a cluster key, attribution, own knowledge, the register to strip, §4.3's
+#: price rule, §6.1's commentary mark, edge cases, one example. Rules carry their reason where one
+#: fits on a line, because a model follows a reason better than a bare rule.
 SUMMARY_SYSTEM: Final = f"""\
 You compress one news article into a short factual record. You are not an analyst.
 
 Restate only what the article's own text says. You must not offer an outlook, a market
-implication, a price direction, a sentiment, or any reference to events after this article was
-published. If the article states something as expected, proposed or rumoured, record it that way
-rather than as fact.
+implication, a price direction of your own, a sentiment, or any reference to events after this
+article was published. If the article states something as expected, proposed or rumoured, record
+it that way rather than as fact.
+
+You may know what happened after this article was published. Do not use any of it. Add no fact
+the text does not state, from your own knowledge or anywhere else, however sure you are of it.
 
 Reply with JSON only, matching this schema exactly. No prose, no code fences.
 
 {{
   "summary": "<at most {{max_chars}} characters, plain factual prose, no evaluation>",
   "event_type": "<one of: {" | ".join(m.value for m in EventType)}>",
-  "entities": ["<who acted, and on whom, as the article names them>"],
+  "entities": ["<at most three: the actor first, then whom it acted on>"],
   "assets": ["<only those the text names, from: {" | ".join(ALLOWED_ASSETS)}>"],
   "magnitudes": ["<figures exactly as stated, e.g. \\"$2.2B inflow\\"; omit if none>"],
   "modality": "<one of: {" | ".join(m.value for m in Modality)}>"
@@ -91,8 +148,38 @@ Rules you must follow:
 - CONFIRMED means the article reports the event as having happened. PROPOSED means announced or
   intended. RUMOURED means unconfirmed or sourced to speculation. DENIED means a party denies it.
   CORRECTED means this article corrects or walks back an earlier claim.
-- Use "NONE" in assets when the text names no crypto asset. Do not infer one from context.
+- Use "NONE" in assets when the text names no crypto asset. Do not infer one from context. "OTHER"
+  means the text names a crypto asset other than BTC or ETH.
+- Entities: at most three, the actor first, then whom it acted on. Give each its shortest common
+  name ("SEC", "BlackRock", "Binance"), with no titles, and name a person only when a person is
+  the actor. Two articles about one event are matched on these names, so both must list the
+  same names.
+- Inside an article about an event, a prediction, forecast or opinion is a claim its author made.
+  Record it as that claim ("the bank said it expects ..."), never as the event.
+- Strip praising or alarming words: "empowers", "innovative", "plunges", "soars" judge the news
+  rather than state it. Say what happened instead.
+- A purely evaluative remark that nobody is named as holding (the writer's own "a devastating
+  blow") states no event and no one's claim. Drop it.
+- A price move whose cause the article states is kept: the move, its figures exactly as stated,
+  and the cause. A cause the article only attributes to others ("analysts say ...") is recorded as
+  their claim, with modality RUMOURED.
+- Pure market commentary - technical analysis, price targets or predictions, or a recap of moves
+  that states no cause - is event_type MARKET_COMMENTARY. Its summary is one neutral line saying
+  what kind of piece it is ("Technical analysis of support levels"), with no levels, targets or
+  predictions in it. Its entities and magnitudes are empty and its modality is CONFIRMED.
+- An article whose substance is a prediction, a price target or an analysis is MARKET_COMMENTARY
+  even when it is attributed to someone. Recording a claim, as above, is only for an opinion
+  reported inside an article about an event.
+- When the title and the body disagree, the body wins.
+- A roundup of several stories is recorded as its headline event alone.
 - Add no keys beyond the schema.
+
+One worked example. The article is invented: follow its form, not its subject.
+{EXAMPLE_START}
+{_EXAMPLE_ARTICLE}
+
+{_EXAMPLE_REPLY}
+{EXAMPLE_END}
 """
 
 
@@ -101,14 +188,20 @@ def prompt_digest(system: str) -> str:
     return hashlib.blake2s(system.encode("utf-8"), digest_size=16).hexdigest()
 
 
-def summary_user(*, title: str, body: str) -> str:
-    """The user message. Two strings, and that is §6.5's second closure made structural.
+def digest_for(policy: ArchivePolicy) -> str:
+    """The prompt digest a row is stamped with under `policy`.
 
-    There is no instrument parameter, no market-data parameter and no sibling-article parameter,
-    so the model cannot tilt toward BTC because it does not know we trade BTC. §16.2 asserts this
-    on the recorded call arguments.
+    The subscription binding's CLI prepends its own identity preamble and is versioned by the
+    pinned CLI build; both decide what the model reads, so both are in the archive identity.
+    Every other provider is digested over the system text alone, unchanged.
     """
-    return f"TITLE:\n{title.strip()}\n\nARTICLE:\n{body.strip()}\n"
+    system = system_for(policy)
+    if policy.provider_id == claude_subscription.PROVIDER_ID:
+        return prompt_digest(
+            f"{claude_subscription.IDENTITY_PREAMBLE}\n"
+            f"[claude-code {claude_subscription.PINNED_CLI_VERSION}]\n{system}"
+        )
+    return prompt_digest(system)
 
 
 class SummaryResponse(DomainModel):
@@ -144,6 +237,21 @@ class SummaryResponse(DomainModel):
                 "job and that filter is the bot's"
             )
         return value
+
+    @model_validator(mode="after")
+    def _commentary_carries_no_figures_or_names(self) -> SummaryResponse:
+        # §6.1: a commentary row is the record that a piece was seen, not an event. A level or a
+        # target is the prediction the mark exists to keep out, and a name would give a row the
+        # feed drops anyway a cluster key it must never contribute to.
+        if self.event_type is EventType.MARKET_COMMENTARY:
+            carried = [n for n in ("entities", "magnitudes") if getattr(self, n)]
+            if carried:
+                raise ValueError(
+                    f"MARKET_COMMENTARY carries {' and '.join(carried)}, which must be empty. "
+                    "Commentary is recorded as the kind of piece it was, with no levels, targets "
+                    "or names in it"
+                )
+        return self
 
 
 def parse_summary(text: str, *, max_chars: int) -> SummaryResponse:
@@ -186,6 +294,9 @@ class SummaryReport(DomainModel):
     already: int = 0
     requested: int = 0
     summarised: int = 0
+    #: Of `summarised`, how many were marked `MARKET_COMMENTARY` (§6.1). A subset, not a third
+    #: outcome beside `refused`: the row parsed and was paid for, so `per_row_cost` divides by it.
+    commentary: int = 0
     refused: int = 0
     bodyless: int = 0
     cost_usd: Money = ZERO
@@ -202,6 +313,15 @@ class SummaryReport(DomainModel):
         if not self.summarised:
             return ZERO
         return divide(self.cost_usd, Decimal(self.summarised))
+
+
+_PARTIAL_REPORT: Final = "summary_report"
+
+
+def partial_report(error: BaseException) -> SummaryReport | None:
+    """What the batch `error` ended had done, as `summarize_store` attached it; else `None`."""
+    report = getattr(error, _PARTIAL_REPORT, None)
+    return report if isinstance(report, SummaryReport) else None
 
 
 def system_for(policy: ArchivePolicy) -> str:
@@ -243,7 +363,7 @@ def is_stale(article: RawArticle, policy: ArchivePolicy) -> bool:
         article.summary_provider,
         article.summary_model,
         article.summary_prompt_digest,
-    ) != (policy.provider_id, policy.model, prompt_digest(system_for(policy)))
+    ) != (policy.provider_id, policy.model, digest_for(policy))
 
 
 def _pending(
@@ -303,7 +423,7 @@ async def summarize_store(
     CryptoSlate it carries exactly the evaluative register the pass exists to strip.
     """
     system = system_for(policy)
-    digest = prompt_digest(system)
+    digest = digest_for(policy)
     with StoreLock(store):
         rows = store.read_all()
         report = SummaryReport(rows=len(rows))
@@ -352,7 +472,16 @@ async def summarize_store(
                         "summary_prompt_digest": digest,
                     }
                 )
-                report = report.added(summarised=1)
+                report = report.added(
+                    summarised=1,
+                    commentary=int(parsed.event_type is EventType.MARKET_COMMENTARY),
+                )
+        except BaseException as exc:
+            # A quota or contract stop ends the batch by propagating, so without this the only
+            # record of what it summarised and refused is a diff of the store. Attached rather
+            # than logged here so the caller's one stop line carries it with its own provenance.
+            setattr(exc, _PARTIAL_REPORT, report)
+            raise
         finally:
             if updated:
                 # Only the six §6.5 fields and their provenance move. Every other field was

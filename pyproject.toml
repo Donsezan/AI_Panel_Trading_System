@@ -49,7 +49,10 @@ dev = [
     "freezegun>=1.5",
     "ruff>=0.6",
     "mypy>=1.11",
+    "claude-agent-sdk==0.2.183",
 ]
+# decision_lab's summariser on the operator's Claude subscription; never a bot dependency.
+claude-subscription = ["claude-agent-sdk==0.2.183"]
 
 [project.scripts]
 tradebot = "tradebot.__main__:main"

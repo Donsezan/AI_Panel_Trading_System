@@ -176,3 +176,10 @@ def test_an_empty_digest_is_refused_by_name(tmp_path: Path) -> None:
 
     with pytest.raises(ConfigError, match=r"news\.jsonl carries no archive_digest"):
         PublishedArchive.read(path)
+
+
+def test_an_archive_without_commentary_keeps_its_digest() -> None:
+    """§6.1: `MARKET_COMMENTARY` is a schema change to the travelling archive. An archive holding
+    none must digest exactly as it did before the member existed, or every corpus keyed on one
+    would silently become a different experiment. Pinned from the build before the member."""
+    assert archive_digest(header(), (item(),)) == "9ce6695b3135b2326ddb121e27affe71"
